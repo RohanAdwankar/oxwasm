@@ -53,19 +53,24 @@ server and a filesystem. A runtime that carries GIMP carries most software.
 ## Milestones
 
 - **M1 — one command, one file, real Linux. Done.** Unmodified kernel +
-  userspace boot to an interactive shell in a single offline HTML file.
-- **M2 — pixels.** A 32-bit graphical guest: X11 + GIMP 2.x (i386 build)
-  through the same pipeline. v86 already emulates SVGA; this is guest
-  assembly work, not engine work. Expect it to run, and to be slow.
+  userspace boot to an interactive shell in a single offline HTML file
+  (~6 s to a prompt in headless Chromium).
+- **M2 — pixels. Done.** `make-gimp-demo.sh` builds a stock Ubuntu bionic
+  i386 guest — GIMP 2.8, Xorg (vesa), matchbox, 280 packages, zero bytes
+  patched — and packages it as one offline `gimp.html` (179 MB). X is up
+  ~1 min after open; GIMP's full UI ~3 min; it accepts keyboard and
+  emulated PS/2 mouse input. Slow, real, and entirely client-side.
 - **M3 — speed, and the actual AppImage.** AppImages are x86-64; v86
   executes 32-bit x86 only. The fast path is an x86-64 → WASM JIT — the
   engine oxwasm must eventually own (today's only comparable engine,
-  CheerpX, is proprietary). This is the core project.
-- **M4 — the platform.** The second lane from the design discussion:
-  a browser syscall ABI + processes-as-workers + Wayland-ish display, with
-  software *recompiled* to WASM as packages — native speed, no emulation.
-  M3 runs everything; M4 makes flagship apps fast. They converge: same
-  kernel surface, two ways in.
+  CheerpX, is proprietary). Design: `docs/m3-engine.md`. This is the core
+  project.
+- **M4 — the platform. Spike running.** `platform/` is the second lane:
+  a syscall ABI as wasm imports, processes as workers, pipes as
+  SharedArrayBuffer rings with real blocking reads. Two freestanding C
+  programs run `producer | upper` to completion in Chromium — see
+  `platform/README.md`. M3 runs everything; M4 makes flagship apps fast.
+  They converge: same kernel surface, two ways in.
 
 ## Layout
 
