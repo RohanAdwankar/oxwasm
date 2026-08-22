@@ -1,0 +1,24 @@
+#!/bin/busybox sh
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+/bin/busybox mount -t proc proc /proc
+/bin/busybox mount -t sysfs sysfs /sys
+/bin/busybox mount -t devtmpfs devtmpfs /dev 2>/dev/null
+/bin/busybox mount -t tmpfs tmpfs /tmp
+/bin/busybox mount -t tmpfs tmpfs /run
+exec > /dev/ttyS0 2>&1        # init log -> serial (VGA stays clean for X)
+echo "oxinit: starting"
+/bin/busybox insmod /lib/modules/psmouse.ko && echo "oxinit: psmouse loaded"
+export HOME=/root DISPLAY=:0 XKB_BINDIR=/usr/bin
+echo "oxinit: starting Xorg"
+/usr/lib/xorg/Xorg :0 -config /etc/X11/xorg.conf -logfile /var/log/Xorg.0.log -noreset vt01 &
+n=0
+while [ ! -S /tmp/.X11-unix/X0 ] && [ $n -lt 120 ]; do /bin/busybox sleep 1; n=$((n+1)); done
+if [ ! -S /tmp/.X11-unix/X0 ]; then
+  echo "oxinit: XORG FAILED, log follows:"; /bin/busybox cat /var/log/Xorg.0.log
+  exec /bin/busybox sh
+fi
+echo "oxinit: X up after ${n}s, starting matchbox + gimp"
+matchbox-window-manager -use_titlebar yes &
+/bin/busybox sleep 1
+cd /root
+exec gimp

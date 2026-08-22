@@ -3,14 +3,17 @@
 
     oxwasm build --kernel vmlinuz --initrd initrd.gz -o linux.html
     oxwasm build boot.iso -o out.html
+    oxwasm build --kernel vmlinuz disk.img -o gimp.html
     oxwasm build gimp.AppImage          # roadmap: see the error it prints
 
 The output is one self-contained .html: open it from disk, from a static
 host, or email it to someone. No server, no network, no install. Inside is
-a WASM x86 machine (v86) booting the exact bytes you gave it.
+a WASM x86 machine (v86) booting the exact bytes you gave it. Payloads are
+gzip-compressed and inflated in-browser with DecompressionStream.
 """
 import argparse
 import base64
+import gzip
 import json
 import os
 import sys
@@ -23,20 +26,20 @@ error: {name} is an x86-64 binary (AppImages are 64-bit ELF).
 
 oxwasm's current engine (v86) executes 32-bit x86. Running 64-bit desktop
 apps at usable speed needs the M3 engine — an x86-64 -> WASM JIT. Today you
-can package any 32-bit guest (kernel+initrd or bootable ISO/disk image).
+can package any 32-bit guest (kernel+initrd, bootable ISO, or disk image).
 
-  M1 (now)   kernel/initrd or ISO -> single-file HTML, boots offline
-  M2 (next)  32-bit graphical guest: X11 + GIMP via emulation (slow but real)
+  M1 (done)  kernel/initrd or ISO -> single-file HTML, boots offline
+  M2 (done)  32-bit graphical guest: X11 + GIMP via emulation
   M3         fast engine: x86-64 -> WASM JIT, AppImage in, usable GIMP out
 """
 
 
-def b64(path_or_bytes):
+def gzb64(path_or_bytes, level=6):
     data = path_or_bytes
     if isinstance(data, str):
         with open(data, "rb") as f:
             data = f.read()
-    return base64.b64encode(data).decode()
+    return base64.b64encode(gzip.compress(data, level)).decode()
 
 
 def runtime_file(name):
@@ -46,28 +49,25 @@ def runtime_file(name):
     return p
 
 
-def build_html(*, title, memory_mb, cmdline, images, out):
-    payload = {k: b64(v) for k, v in images.items()}
-    cfg = {"memory_mb": memory_mb, "cmdline": cmdline,
-           "boot": sorted(images.keys() - {"bios", "vga_bios"})}
+def build_html(*, title, memory_mb, vga_mb, cmdline, images, out):
+    cfg = {"memory_mb": memory_mb, "vga_mb": vga_mb, "cmdline": cmdline}
     html = TEMPLATE
     html = html.replace("__TITLE__", title)
     html = html.replace("__CONFIG__", json.dumps(cfg))
     html = html.replace("__LIBV86__", open(runtime_file("libv86.js")).read())
-    html = html.replace("__WASM_B64__", b64(runtime_file("v86.wasm")))
-    html = html.replace("__BIOS_B64__", payload.get("bios", ""))
-    html = html.replace("__VGABIOS_B64__", payload.get("vga_bios", ""))
-    html = html.replace("__BZIMAGE_B64__", payload.get("bzimage", ""))
-    html = html.replace("__INITRD_B64__", payload.get("initrd", ""))
-    html = html.replace("__CDROM_B64__", payload.get("cdrom", ""))
-    html = html.replace("__HDA_B64__", payload.get("hda", ""))
+    html = html.replace("__WASM_B64__", gzb64(runtime_file("v86.wasm"), 9))
+    html = html.replace("__BIOS_B64__", gzb64(runtime_file("bios.bin"), 9))
+    html = html.replace("__VGABIOS_B64__", gzb64(runtime_file("vgabios.bin"), 9))
+    for slot in ("bzimage", "initrd", "cdrom", "hda"):
+        marker = "__%s_B64__" % slot.upper()
+        html = html.replace(marker, gzb64(images[slot]) if slot in images else "")
     with open(out, "w") as f:
         f.write(html)
     print(f"oxwasm: wrote {out} ({os.path.getsize(out)/1e6:.1f} MB, fully self-contained)")
 
 
 def cmd_build(args):
-    images = {"bios": runtime_file("bios.bin"), "vga_bios": runtime_file("vgabios.bin")}
+    images = {}
     if args.target:
         t = args.target
         low = t.lower()
@@ -83,10 +83,10 @@ def cmd_build(args):
         images["bzimage"] = args.kernel
         if args.initrd:
             images["initrd"] = args.initrd
-    if not (images.keys() - {"bios", "vga_bios"}):
+    if not images:
         sys.exit("error: nothing to boot; give a TARGET or --kernel/--initrd")
-    build_html(title=args.title, memory_mb=args.memory, cmdline=args.cmdline,
-               images=images, out=args.out)
+    build_html(title=args.title, memory_mb=args.memory, vga_mb=args.vga_memory,
+               cmdline=args.cmdline, images=images, out=args.out)
 
 
 def main():
@@ -100,6 +100,7 @@ def main():
     b.add_argument("--cmdline", default="console=ttyS0 console=tty0 rdinit=/init",
                    help="kernel command line")
     b.add_argument("--memory", type=int, default=256, help="guest RAM in MB")
+    b.add_argument("--vga-memory", type=int, default=16, help="VGA RAM in MB")
     b.add_argument("--title", default="oxwasm", help="page title")
     b.add_argument("-o", "--out", default="out.html")
     b.set_defaults(func=cmd_build)
@@ -120,9 +121,9 @@ TEMPLATE = r"""<!doctype html>
     justify-content:center;gap:14px;padding:16px;box-sizing:border-box}
   #status{color:#7d8590;font-size:12px}
   #screen_container{background:#000;padding:10px;border-radius:8px;
-    box-shadow:0 0 0 1px #1d2330,0 12px 40px rgba(0,0,0,.6);cursor:text}
+    box-shadow:0 0 0 1px #1d2330,0 12px 40px rgba(0,0,0,.6);cursor:default}
   #screen_container>div{white-space:pre;font:14px/14px ui-monospace,Menlo,Consolas,monospace}
-  #screen_container>canvas{display:none}
+  #screen_container>canvas{display:block}
   #foot{color:#4a5160;font-size:11px}
   #foot b{color:#7d8590}
 </style>
@@ -130,60 +131,63 @@ TEMPLATE = r"""<!doctype html>
 <body>
 <div id="wrap">
   <div id="status">unpacking machine&hellip;</div>
-  <div id="screen_container" tabindex="0"><div></div><canvas></canvas></div>
-  <div id="foot"><b>oxwasm</b> &middot; an unmodified operating system, executing in this tab &middot; no server, works offline &middot; click the screen and type</div>
+  <div id="screen_container" tabindex="0"><div></div><canvas style="display:none"></canvas></div>
+  <div id="foot"><b>oxwasm</b> &middot; an unmodified operating system, executing in this tab &middot; no server, works offline &middot; click the screen to type</div>
 </div>
 <script>__LIBV86__</script>
 <script>
 "use strict";
 var CONFIG = __CONFIG__;
-function unb64(s){
+var statusEl = document.getElementById("status");
+async function unpack(s){
   if(!s) return null;
   var bin = atob(s), n = bin.length, u = new Uint8Array(n);
   for(var i=0;i<n;i++) u[i] = bin.charCodeAt(i);
-  return u.buffer;
+  var ds = new Response(new Blob([u]).stream().pipeThrough(new DecompressionStream("gzip")));
+  return await ds.arrayBuffer();
 }
-var PAYLOAD = {
-  wasm:     unb64("__WASM_B64__"),
-  bios:     unb64("__BIOS_B64__"),
-  vga_bios: unb64("__VGABIOS_B64__"),
-  bzimage:  unb64("__BZIMAGE_B64__"),
-  initrd:   unb64("__INITRD_B64__"),
-  cdrom:    unb64("__CDROM_B64__"),
-  hda:      unb64("__HDA_B64__")
-};
-var statusEl = document.getElementById("status");
-var opts = {
-  wasm_fn: function(env){
-    return WebAssembly.instantiate(PAYLOAD.wasm, env).then(function(r){return r.instance.exports;});
-  },
-  screen_container: document.getElementById("screen_container"),
-  memory_size: CONFIG.memory_mb << 20,
-  vga_memory_size: 8 << 20,
-  bios: {buffer: PAYLOAD.bios},
-  vga_bios: {buffer: PAYLOAD.vga_bios},
-  cmdline: CONFIG.cmdline,
-  autostart: true,
-  disable_speaker: true
-};
-if(PAYLOAD.bzimage) opts.bzimage = {buffer: PAYLOAD.bzimage};
-if(PAYLOAD.initrd)  opts.initrd  = {buffer: PAYLOAD.initrd};
-if(PAYLOAD.cdrom)   opts.cdrom   = {buffer: PAYLOAD.cdrom};
-if(PAYLOAD.hda)     opts.hda     = {buffer: PAYLOAD.hda};
+(async function(){
+  var PAYLOAD = {
+    wasm:     await unpack("__WASM_B64__"),
+    bios:     await unpack("__BIOS_B64__"),
+    vga_bios: await unpack("__VGABIOS_B64__"),
+    bzimage:  await unpack("__BZIMAGE_B64__"),
+    initrd:   await unpack("__INITRD_B64__"),
+    cdrom:    await unpack("__CDROM_B64__"),
+    hda:      await unpack("__HDA_B64__")
+  };
+  var opts = {
+    wasm_fn: function(env){
+      return WebAssembly.instantiate(PAYLOAD.wasm, env).then(function(r){return r.instance.exports;});
+    },
+    screen_container: document.getElementById("screen_container"),
+    memory_size: CONFIG.memory_mb << 20,
+    vga_memory_size: CONFIG.vga_mb << 20,
+    bios: {buffer: PAYLOAD.bios},
+    vga_bios: {buffer: PAYLOAD.vga_bios},
+    cmdline: CONFIG.cmdline,
+    autostart: true,
+    disable_speaker: true
+  };
+  if(PAYLOAD.bzimage) opts.bzimage = {buffer: PAYLOAD.bzimage};
+  if(PAYLOAD.initrd)  opts.initrd  = {buffer: PAYLOAD.initrd};
+  if(PAYLOAD.cdrom)   opts.cdrom   = {buffer: PAYLOAD.cdrom};
+  if(PAYLOAD.hda)     opts.hda     = {buffer: PAYLOAD.hda};
 
-var emulator = new V86(opts);
-window.__serial = "";                       // observable from test harnesses
-emulator.add_listener("serial0-output-byte", function(b){
-  window.__serial += String.fromCharCode(b);
-});
-emulator.add_listener("emulator-started", function(){
-  statusEl.textContent = "machine started — booting…";
-});
-setInterval(function(){
-  var t = document.getElementById("screen_container").firstElementChild.textContent;
-  if(/[$#] $/m.test(t)) statusEl.textContent = "ready — this is a real shell; click and type";
-}, 500);
-document.getElementById("screen_container").addEventListener("click", function(){ this.focus(); });
+  var emulator = window.emulator = new V86(opts);
+  window.__serial = "";                       // observable from test harnesses
+  emulator.add_listener("serial0-output-byte", function(b){
+    window.__serial += String.fromCharCode(b);
+  });
+  emulator.add_listener("emulator-started", function(){
+    statusEl.textContent = "machine started — booting…";
+  });
+  setInterval(function(){
+    var t = document.getElementById("screen_container").firstElementChild.textContent;
+    if(/[$#] $/m.test(t)) statusEl.textContent = "ready — this is a real shell; click and type";
+  }, 500);
+  document.getElementById("screen_container").addEventListener("click", function(){ this.focus(); });
+})();
 </script>
 </body>
 </html>
