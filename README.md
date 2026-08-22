@@ -60,11 +60,16 @@ server and a filesystem. A runtime that carries GIMP carries most software.
   patched — and packages it as one offline `gimp.html` (179 MB). X is up
   ~1 min after open; GIMP's full UI ~3 min; it accepts keyboard and
   emulated PS/2 mouse input. Slow, real, and entirely client-side.
-- **M3 — speed, and the actual AppImage.** AppImages are x86-64; v86
-  executes 32-bit x86 only. The fast path is an x86-64 → WASM JIT — the
-  engine oxwasm must eventually own (today's only comparable engine,
-  CheerpX, is proprietary). Design: `docs/m3-engine.md`. This is the core
-  project.
+- **M3 — speed, and the actual AppImage. Foundation verified.** AppImages
+  are x86-64; v86 executes 32-bit x86 only. The fast path is an x86-64 →
+  WASM JIT — the engine oxwasm must own (the only comparable engine today,
+  CheerpX, is proprietary). `engine/` has a decoder, a tier-0 interpreter
+  proven step-for-step against the real CPU (`ptrace` single-stepping —
+  316 synthetic cases + gcc -O1/-O2 output, ~6700 instructions, zero
+  divergence), and a tier-1 JIT seed that emits real WebAssembly matching
+  the interpreter. `engine/test.sh` runs the suite. Design and next steps:
+  `docs/m3-engine.md`. This is the core project; the foundation is real,
+  the hot-path JIT is the road ahead.
 - **M4 — the platform. Spike running.** `platform/` is the second lane:
   a syscall ABI as wasm imports, processes as workers, pipes as
   SharedArrayBuffer rings with real blocking reads. Two freestanding C
@@ -80,4 +85,7 @@ mkcpio.py        pure-Python newc cpio / initramfs builder
 fetch-runtime.sh reproduce runtime/ (engine + BIOS)
 make-demo.sh     reproduce the M1 demo guest and linux.html
 demo-init.sh     the demo guest's /init
+platform/        M4 — syscall ABI, processes-as-workers, pipe demo
+engine/          M3 — x86-64 decoder, tier-0 interpreter, tier-1 JIT seed
+docs/m3-engine.md  M3 — the x86-64 -> WASM JIT design
 ```
