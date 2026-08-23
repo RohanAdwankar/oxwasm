@@ -100,6 +100,7 @@ export function decode(fetch, rip) {
   if (op === 0xE9) return fin({ mnem: 'jmp', rel: imm(4) });
   if (op === 0xEB) return fin({ mnem: 'jmp', rel: imm(1) });
   if (op === 0x90 && !rex) return fin({ mnem: 'nop' });
+  if (op === 0xF4) return fin({ mnem: 'hlt' });
   if (op === 0xF7) {
     const [, rm, g] = modrm(osz); const sub = g & 7;
     if (sub === 0) return fin({ mnem: 'test', dst: rm, src: { kind: 'imm', v: imm(osz === 2 ? 2 : 4) }, size: osz });

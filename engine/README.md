@@ -38,6 +38,39 @@ Undefined-flag cases (SF/ZF/PF after `imul`, OF after a variable-count
 shift) are masked in the comparison, because the hardware result there is
 genuinely unspecified — asserting on it would test noise.
 
+## The tiering engine (`engine.mjs`)
+
+`Engine` ties the pieces into one runnable whole. It holds one
+`WebAssembly.Memory` as canonical guest state — the 16-entry i64 register
+file at offset 0, guest RAM mapped at a fixed offset — and gives the
+interpreter a `Uint8Array` view over that same buffer, so interpreter and
+compiled code share memory with zero copying; only the 16 registers sync
+around a compiled-block call.
+
+It interprets instruction by instruction, profiling backward-branch targets.
+When a loop head crosses the hotness threshold it compiles it — SIMD
+vectorizer first, superblock JIT second, interpreter fallback if both
+decline — and thereafter reaching that head runs the compiled wasm to
+completion and resumes interpreting at the loop exit.
+
+```
+$ node engine/diff/enginetest.mjs
+pixel output: byte-exact vs interpreter
+checksum: engine=522240 interpreter=522240  MATCH
+tiers compiled: {"simd":1,"superblock":1}
+instructions interpreted: 119  (vs 49152+ if fully interpreted)
+PASS: correct end-to-end, both SIMD and superblock tiers fired
+```
+
+A whole program runs through it: cold preamble interpreted, a hot pixel loop
+vectorized, a hot integer reduction superblock-compiled — 119 of ~49k
+instructions actually interpreted, the rest run as compiled wasm, output
+byte-exact. Integrating the tiers this way surfaced a real bug the
+component tests had masked: the byte load used `i64.load8_s` (signed) where
+byte *stores* hid the sign, but accumulating the full register value exposed
+it — caught by the end-to-end differential, fixed to `load8_u`. That is the
+case for an oracle and for integration testing, in one bug.
+
 ## The two tiers
 
 - **tier 0 — `interp.mjs`.** BigInt-exact, slow, complete for the core

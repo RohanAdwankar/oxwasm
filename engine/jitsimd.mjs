@@ -30,7 +30,7 @@ const V128_LOAD = [SIMD, ...uLEB(0)], V128_STORE = [SIMD, ...uLEB(11)];
 const I8X16_SPLAT = [SIMD, ...uLEB(15)];
 const SIMDOP = { add: [SIMD, ...uLEB(110)], sub: [SIMD, ...uLEB(113)],
                  and: [SIMD, ...uLEB(78)], or: [SIMD, ...uLEB(80)], xor: [SIMD, ...uLEB(81)] };
-const I64_LOAD8U = 0x30, I64_STORE8 = 0x3c, I64_LOAD = 0x29, I64_STORE = 0x37;
+const I64_LOAD8U = 0x31, I64_STORE8 = 0x3c, I64_LOAD = 0x29, I64_STORE = 0x37;
 const I64_CONST = 0x42, I32_CONST = 0x41, LOCAL_GET = 0x20, LOCAL_SET = 0x21, I32_WRAP = 0xa7, I32_ADD = 0x6a;
 const I64_ADD = 0x7c, I64_SUB = 0x7d, I64_AND = 0x83, I64_OR = 0x84, I64_XOR = 0x85, I64_EQZ = 0x50, I64_LT_U = 0x54;
 const SCALAR = { add: I64_ADD, sub: I64_SUB, and: I64_AND, or: I64_OR, xor: I64_XOR };

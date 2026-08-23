@@ -13,3 +13,4 @@ node memtest.mjs
 node membench.mjs
 node simdtest.mjs
 node simdbench.mjs
+node enginetest.mjs

@@ -26,7 +26,7 @@ const section = (id, body) => [id, ...uLEB(body.length), ...body];
 const vec = (items) => [...uLEB(items.length), ...items.flat()];
 
 const I64_CONST=0x42, I32_CONST=0x41, LOCAL_GET=0x20, LOCAL_SET=0x21;
-const I64_LOAD=0x29, I64_STORE=0x37, I64_LOAD8U=0x30, I64_LOAD16U=0x33, I64_LOAD32U=0x35;
+const I64_LOAD=0x29, I64_STORE=0x37, I64_LOAD8U=0x31, I64_LOAD16U=0x33, I64_LOAD32U=0x35;
 const I64_STORE8=0x3c, I64_STORE16=0x3d, I64_STORE32=0x3e;
 const I64_ADD=0x7c, I64_SUB=0x7d, I64_AND=0x83, I64_OR=0x84, I64_XOR=0x85, I64_MUL=0x7e;
 const I32_ADD=0x6a, I32_WRAP=0xa7;

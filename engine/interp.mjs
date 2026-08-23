@@ -115,6 +115,7 @@ export class CPU {
     const S = insn.size, M = MASK[S];
     switch (insn.mnem) {
       case 'nop': break;
+      case 'hlt': this.halted = true; break;
       case 'mov': this.set(insn.dst, this.get(insn.src)); break;
       case 'lea': this.setReg(insn.dst, this.ea(insn.src)); break;
       case 'movzx': this.setReg(insn.dst, this.get(insn.src)); break;
