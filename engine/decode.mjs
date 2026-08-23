@@ -7,14 +7,19 @@ const COND = ['o','no','b','ae','e','ne','be','a','s','ns','p','np','l','ge','le
 export function decode(fetch, rip) {
   let i = 0;
   const b = () => fetch(i++);
-  let rex = 0, opsize = 4;
+  let rex = 0, opsize = 4, fsSeg = 0, rep = 0, rep2 = 0, lock = 0;
   let p;
   for (;;) {                                  // prefixes
     p = b();
     if (p === 0x66) { opsize = 2; continue; }
+    if (p === 0x64) { fsSeg = 1; continue; }   // fs segment override (TLS)
+    if (p === 0xF3) { rep = 1; continue; }     // rep / repe
+    if (p === 0xF2) { rep2 = 1; continue; }    // repne / scalar-double
+    if (p === 0xF0) { lock = 1; continue; }    // lock: single-hart, plain semantics
     if ((p & 0xF0) === 0x40) { rex = p; continue; }
-    if (p === 0xF2 || p === 0xF3 || p === 0x2E || p === 0x3E || p === 0x26 ||
-        p === 0x36 || p === 0x64 || p === 0x65 || p === 0x67)
+    if (p === 0x2E || p === 0x3E) { continue; } // cs/ds overrides: meaningless in 64-bit (padding/notrack)
+    if (p === 0x26 ||
+        p === 0x36 || p === 0x65 || p === 0x67)
       throw new Error(`unsupported prefix ${p.toString(16)}`);
     break;
   }
@@ -38,7 +43,7 @@ export function decode(fetch, rip) {
     } else if ((m & 7) === 5 && mod === 0) { base = -1; ripRel = true; disp = imm(4); }
     if (mod === 1) disp = imm(1);
     else if (mod === 2) disp = imm(4);
-    const out = [mkreg(reg, size), { kind: 'mem', base, index, scale, disp, ripRel, size }];
+    const out = [mkreg(reg, size), { kind: 'mem', base, index, scale, disp, ripRel, size, fs: fsSeg }];
     out[2] = reg; return out;
   }
   function imm(n) {                           // sign-extended immediate
@@ -100,24 +105,61 @@ export function decode(fetch, rip) {
   if (op === 0xE9) return fin({ mnem: 'jmp', rel: imm(4) });
   if (op === 0xEB) return fin({ mnem: 'jmp', rel: imm(1) });
   if (op === 0x90 && !rex) return fin({ mnem: 'nop' });
+  if (op === 0x98) return fin({ mnem: 'cwde', size: osz });   // cbw/cwde/cdqe
+  if (op === 0x99) return fin({ mnem: 'cdq', size: osz });    // cwd/cdq/cqo
   if (op === 0xF4) return fin({ mnem: 'hlt' });
-  if (op === 0xF7) {
-    const [, rm, g] = modrm(osz); const sub = g & 7;
-    if (sub === 0) return fin({ mnem: 'test', dst: rm, src: { kind: 'imm', v: imm(osz === 2 ? 2 : 4) }, size: osz });
-    if (sub === 2) return fin({ mnem: 'not', dst: rm, size: osz });
-    if (sub === 3) return fin({ mnem: 'neg', dst: rm, size: osz });
+  if (op === 0xA4) return fin({ mnem: 'movs', size: 1, rep });
+  if (op === 0xA5) return fin({ mnem: 'movs', size: osz, rep });
+  if (op === 0xAA) return fin({ mnem: 'stos', size: 1, rep });
+  if (op === 0xAB) return fin({ mnem: 'stos', size: osz, rep });
+  if (op === 0x86) { const [r, rm] = modrm(1);   return fin({ mnem: 'xchg', dst: rm, src: r, size: 1 }); }
+  if (op === 0x87) { const [r, rm] = modrm(osz); return fin({ mnem: 'xchg', dst: rm, src: r, size: osz }); }
+  if (op === 0xF6 || op === 0xF7) {
+    const sz = op === 0xF6 ? 1 : osz;
+    const [, rm, g] = modrm(sz); const sub = g & 7;
+    if (sub === 0) return fin({ mnem: 'test', dst: rm, src: { kind: 'imm', v: op === 0xF6 ? imm(1) : imm(sz === 2 ? 2 : 4) }, size: sz });
+    if (sub === 2) return fin({ mnem: 'not', dst: rm, size: sz });
+    if (sub === 3) return fin({ mnem: 'neg', dst: rm, size: sz });
+    if (sub === 4) return fin({ mnem: 'mul1', src: rm, size: sz });
+    if (sub === 5) return fin({ mnem: 'imul1', src: rm, size: sz });
+    if (sub === 6) return fin({ mnem: 'div1', src: rm, size: sz });
+    if (sub === 7) return fin({ mnem: 'idiv1', src: rm, size: sz });
     throw new Error('grp3 ' + sub);
   }
   if (op === 0xFF) {
     const [, rm, g] = modrm(osz); const sub = g & 7;
     if (sub === 0) return fin({ mnem: 'inc', dst: rm, size: osz });
     if (sub === 1) return fin({ mnem: 'dec', dst: rm, size: osz });
+    if (sub === 2) { rm.size = 8; return fin({ mnem: 'callind', src: rm }); }
+    if (sub === 4) { rm.size = 8; return fin({ mnem: 'jmpind', src: rm }); }
     if (sub === 6) { rm.size = 8; return fin({ mnem: 'push', src: rm, size: 8 }); }
     throw new Error('grp5 ' + sub);
   }
   if (op === 0x0F) {
     const o2 = b();
     if (o2 >= 0x80 && o2 <= 0x8F) return fin({ mnem: 'jcc', cond: COND[o2 - 0x80], rel: imm(4) });
+    if (o2 === 0x05) return fin({ mnem: 'syscall' });
+    const SSE_OPS = { 0x6E:1, 0x7E:1, 0xD6:1, 0x6F:1, 0x7F:1, 0x10:1, 0x11:1,
+                      0x28:1, 0x29:1, 0x6C:1, 0xEF:1, 0x74:1, 0xD7:1, 0xDB:1, 0xEB:1 };
+    if (SSE_OPS[o2]) {
+      const m = b(), mod = m >> 6, xr = ((m >> 3) & 7) | (R << 3);
+      let rm;
+      if (mod === 3) rm = { kind: 'xmm', r: (m & 7) | (B << 3) };
+      else {
+        i--;                                   // re-read modrm via the standard path
+        const [, mem] = modrm(16);
+        rm = mem;
+      }
+      return fin({ mnem: 'sse', op: o2, p66: opsize === 2, pF3: !!rep, pF2: !!rep2, W, xr, rm });
+    }
+    if (o2 === 0x1E) { b(); return fin({ mnem: 'nop' }); }   // endbr64 / nop variants
+    if (o2 === 0xB0) { const [r, rm] = modrm(1);   return fin({ mnem: 'cmpxchg', dst: rm, src: r, size: 1 }); }
+    if (o2 === 0xB1) { const [r, rm] = modrm(osz); return fin({ mnem: 'cmpxchg', dst: rm, src: r, size: osz }); }
+    if (o2 === 0xC0) { const [r, rm] = modrm(1);   return fin({ mnem: 'xadd', dst: rm, src: r, size: 1 }); }
+    if (o2 === 0xC1) { const [r, rm] = modrm(osz); return fin({ mnem: 'xadd', dst: rm, src: r, size: osz }); }
+    if (o2 === 0xBC) { const [r, rm] = modrm(osz); return fin({ mnem: 'bsf', dst: r, src: rm, size: osz }); }
+    if (o2 === 0xBD) { const [r, rm] = modrm(osz); return fin({ mnem: 'bsr', dst: r, src: rm, size: osz }); }
+    if (o2 === 0xA2) return fin({ mnem: 'cpuid' });
     if (o2 >= 0x40 && o2 <= 0x4F) { const [r, rm] = modrm(osz); return fin({ mnem: 'cmov', cond: COND[o2 - 0x40], dst: r, src: rm, size: osz }); }
     if (o2 >= 0x90 && o2 <= 0x9F) { const [, rm] = modrm(1); return fin({ mnem: 'setcc', cond: COND[o2 - 0x90], dst: rm, size: 1 }); }
     if (o2 === 0xAF) { const [r, rm] = modrm(osz); return fin({ mnem: 'imul2', dst: r, src: rm, size: osz }); }

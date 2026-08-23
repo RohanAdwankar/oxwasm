@@ -32,6 +32,11 @@ const I64_ADD=0x7c, I64_SUB=0x7d, I64_AND=0x83, I64_OR=0x84, I64_XOR=0x85, I64_M
 const I32_ADD=0x6a, I32_WRAP=0xa7;
 const I64_EQZ=0x50, I64_NE=0x52, I64_LT_S=0x53, I64_GT_S=0x55, I64_LE_S=0x57, I64_GE_S=0x59;
 const ALUOP = { add: I64_ADD, sub: I64_SUB, and: I64_AND, or: I64_OR, xor: I64_XOR };
+const SHIFTOP = { shl: 0x86, shr: 0x88, sar: 0x87 };
+const I64_EQ = 0x51, I64_NE2 = 0x52, I64_LTS = 0x53, I64_LTU = 0x54, I64_GTS = 0x55,
+      I64_GTU = 0x56, I64_LES = 0x57, I64_LEU = 0x58, I64_GES = 0x59, I64_GEU = 0x5a;
+const CMPOP = { e: I64_EQ, ne: I64_NE2, l: I64_LTS, ge: I64_GES, le: I64_LES, g: I64_GTS,
+                b: I64_LTU, ae: I64_GEU, be: I64_LEU, a: I64_GTU };
 const LOADOP = { 1: I64_LOAD8U, 2: I64_LOAD16U, 4: I64_LOAD32U, 8: I64_LOAD };
 const STOREOP = { 1: I64_STORE8, 2: I64_STORE16, 4: I64_STORE32, 8: I64_STORE };
 const MASKLO = { 1: 0xFFFFFFFFFFFFFF00n, 2: 0xFFFFFFFFFFFF0000n, 4: 0n /*32-bit zero-extends*/, 8: 0n };
@@ -52,17 +57,20 @@ export function compileLoop(mem, ripStart, { guestBase = 0n, ramBase = 0, maxIns
   const target = (branch.next + branch.rel) & 0xFFFFFFFFFFFFFFFFn;
   if (target < ripStart || target >= branch.rip) return null;
 
-  // condition from the last flag-setting op (ALU / inc / dec)
+  // condition source: the last flag-setting op — either a result (ALU/inc/
+  // dec/shift: compare result vs 0) or an explicit cmp/test (compare operands)
   let flagOp = null;
   for (let i = insns.length - 1; i >= 0; i--) {
     const m = insns[i].mnem;
-    if (ALUOP[m] || m === 'inc' || m === 'dec') { flagOp = insns[i]; break; }
+    if (ALUOP[m] || SHIFTOP[m] || m === 'inc' || m === 'dec' || m === 'cmp' || m === 'test') { flagOp = insns[i]; break; }
   }
   if (!flagOp || flagOp.dst.kind !== 'reg') return null;
+  const explicitCmp = flagOp.mnem === 'cmp' || flagOp.mnem === 'test';
   const condReg = flagOp.dst.r;
   const CMP = { e: [I64_EQZ], ne: [I64_CONST, 0, I64_NE], l: [I64_CONST, 0, I64_LT_S],
                 ge: [I64_CONST, 0, I64_GE_S], g: [I64_CONST, 0, I64_GT_S], le: [I64_CONST, 0, I64_LE_S] };
-  if (!(branch.cond in CMP)) return null;
+  if (explicitCmp) { if (!(branch.cond in CMPOP)) return null; }
+  else if (!(branch.cond in CMP)) return null;
 
   // live register set (any reg touched as reg operand or mem base)
   const used = new Set();
@@ -89,7 +97,20 @@ export function compileLoop(mem, ripStart, { guestBase = 0n, ramBase = 0, maxIns
     const m = insn.mnem;
     if (ALUOP[m]) {
       const dl = L.get(insn.dst.r);
-      body.push(LOCAL_GET, ...uLEB(dl), ...pushRegOrImm(insn.src), ALUOP[m], LOCAL_SET, ...uLEB(dl));
+      body.push(LOCAL_GET, ...uLEB(dl), ...pushRegOrImm(insn.src), ALUOP[m]);
+      if (insn.size === 4) body.push(I64_CONST, ...sLEB(0xFFFFFFFFn), I64_AND);   // 32-bit zero-extends
+      body.push(LOCAL_SET, ...uLEB(dl));
+    } else if (SHIFTOP[m]) {
+      const dl = L.get(insn.dst.r);
+      const cnt = insn.src.v & (insn.size === 8 ? 0x3Fn : 0x1Fn);
+      body.push(LOCAL_GET, ...uLEB(dl));
+      if (insn.size === 4 && m === 'sar')                      // sign for 32-bit sar
+        body.push(I64_CONST, 32, 0x86, I64_CONST, 32, 0x87);
+      body.push(I64_CONST, ...sLEB(cnt), SHIFTOP[m]);
+      if (insn.size === 4) body.push(I64_CONST, ...sLEB(0xFFFFFFFFn), I64_AND);
+      body.push(LOCAL_SET, ...uLEB(dl));
+    } else if (m === 'cmp' || m === 'test') {
+      /* flags only — evaluated at the branch below */
     } else if (m === 'inc' || m === 'dec') {
       const dl = L.get(insn.dst.r);
       body.push(LOCAL_GET, ...uLEB(dl), I64_CONST, 1, m === 'inc' ? I64_ADD : I64_SUB, LOCAL_SET, ...uLEB(dl));
@@ -113,7 +134,27 @@ export function compileLoop(mem, ripStart, { guestBase = 0n, ramBase = 0, maxIns
     } else return null;
   }
 
-  body.push(LOCAL_GET, ...uLEB(L.get(condReg)), ...CMP[branch.cond], 0x0d, 0x00, 0x0b);  // br_if 0; end loop
+  if (explicitCmp) {
+    const sz = flagOp.size;
+    const pushOp = (op) => {
+      const out = op.kind === 'imm' ? [I64_CONST, ...sLEB(BigInt.asIntN(64, op.v))]
+                                    : [LOCAL_GET, ...uLEB(L.get(op.r))];
+      if (sz === 4) {
+        const signed = 'l le g ge e ne'.includes(branch.cond);
+        if (signed) out.push(I64_CONST, 32, 0x86, I64_CONST, 32, 0x87);   // sext32
+        else out.push(I64_CONST, ...sLEB(0xFFFFFFFFn), I64_AND);
+      }
+      return out;
+    };
+    if (flagOp.mnem === 'cmp')
+      body.push(...pushOp(flagOp.dst), ...pushOp(flagOp.src), CMPOP[branch.cond]);
+    else  // test: (a & b) vs 0
+      body.push(...pushOp(flagOp.dst), ...pushOp(flagOp.src), I64_AND,
+                I64_CONST, 0, branch.cond === 'e' ? I64_EQ : I64_NE2);
+    body.push(0x0d, 0x00, 0x0b);
+  } else {
+    body.push(LOCAL_GET, ...uLEB(L.get(condReg)), ...CMP[branch.cond], 0x0d, 0x00, 0x0b);  // br_if 0; end loop
+  }
   for (const r of regs) body.push(I32_CONST, ...sLEB(r * 8), LOCAL_GET, ...uLEB(L.get(r)), I64_STORE, 0x03, 0x00);
   body.push(0x0b);
 
@@ -131,7 +172,10 @@ export function compileLoop(mem, ripStart, { guestBase = 0n, ramBase = 0, maxIns
 
 function accepts(insn) {
   const m = insn.mnem;
-  if (ALUOP[m]) return insn.size === 8 && insn.dst.kind === 'reg' && (!insn.src || insn.src.kind !== 'mem');
+  const w = insn.size === 8 || insn.size === 4;
+  if (ALUOP[m]) return w && insn.dst.kind === 'reg' && (!insn.src || insn.src.kind !== 'mem');
+  if (m === 'cmp' || m === 'test') return w && insn.dst.kind === 'reg' && insn.src && insn.src.kind !== 'mem';
+  if (SHIFTOP[m]) return w && insn.dst.kind === 'reg' && insn.src.kind === 'imm';
   if (m === 'inc' || m === 'dec') return insn.dst.kind === 'reg';
   if (m === 'movzx') return insn.dst.kind === 'reg' && [1,2,4].includes(insn.src.size);
   if (m === 'mov') {

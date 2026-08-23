@@ -35,6 +35,7 @@ export class CPU {
     this.mem = mem;
     this.regs = new Array(16).fill(0n);
     this.rip = 0n;
+    this.xmm = new Array(16).fill(0n);          // 128-bit values as BigInt
     this.f = { cf: 0, pf: 0, zf: 0, sf: 0, of: 0, af: 0 };
   }
   flagsValue() {
@@ -60,6 +61,7 @@ export class CPU {
     if (op.base >= 0) a += this.regs[op.base];
     if (op.index >= 0) a += this.regs[op.index] * BigInt(op.scale);
     if (op.ripRel) a += this.ripNext;
+    if (op.fs) a += this.fsBase || 0n;
     return a & MASK[8];
   }
   get(op) {
@@ -116,6 +118,135 @@ export class CPU {
     switch (insn.mnem) {
       case 'nop': break;
       case 'hlt': this.halted = true; break;
+      case 'syscall':
+        this.regs[1] = next;                      // rcx = return rip (arch behavior)
+        this.regs[11] = this.flagsValue();        // r11 = rflags
+        if (this.onSyscall) this.onSyscall(this); else throw new Error('syscall with no handler');
+        break;
+      case 'sse': {
+        const M128 = (1n << 128n) - 1n;
+        const rdRm = (bytes) => insn.rm.kind === 'xmm' ? this.xmm[insn.rm.r] & ((1n << BigInt(bytes*8)) - 1n)
+                     : this.mem.read(this.ea(insn.rm), BigInt(bytes));
+        const wrRm = (bytes, v) => { if (insn.rm.kind === 'xmm')
+            this.xmm[insn.rm.r] = bytes === 16 ? v & M128 : (this.xmm[insn.rm.r] & ~((1n << BigInt(bytes*8)) - 1n)) | (v & ((1n << BigInt(bytes*8)) - 1n));
+          else this.mem.write(this.ea(insn.rm), BigInt(bytes), v); };
+        switch (insn.op) {
+          case 0x6E:   // movd/movq xmm <- r/m (zero-extend to 128)
+            this.xmm[insn.xr] = (insn.rm.kind === 'xmm' ? this.regs[insn.rm.r] :
+              (insn.rm.kind === 'mem' ? this.mem.read(this.ea(insn.rm), insn.W ? 8n : 4n) : 0n));
+            if (insn.rm.kind === 'reg') this.xmm[insn.xr] = this.regs[insn.rm.r];
+            this.xmm[insn.xr] &= insn.W ? 0xFFFFFFFFFFFFFFFFn : 0xFFFFFFFFn;
+            break;
+          case 0x7E:
+            if (insn.pF3) { this.xmm[insn.xr] = rdRm(8); }                        // movq xmm <- xmm/m64
+            else {                                                                 // movd/movq r/m <- xmm
+              const v = this.xmm[insn.xr] & (insn.W ? 0xFFFFFFFFFFFFFFFFn : 0xFFFFFFFFn);
+              if (insn.rm.kind === 'xmm') this.regs[insn.rm.r] = v;                // mod=3: dest is GPR
+              else this.mem.write(this.ea(insn.rm), insn.W ? 8n : 4n, v);
+            }
+            break;
+          case 0xD6: wrRm(8, this.xmm[insn.xr] & 0xFFFFFFFFFFFFFFFFn); break;      // movq m/xmm <- xmm
+          case 0x6F: case 0x10: case 0x28:
+            if (insn.op === 0x10 && insn.pF3) { this.xmm[insn.xr] = (this.xmm[insn.xr] & ~0xFFFFFFFFn) | rdRm(4); }
+            else if (insn.op === 0x10 && insn.pF2) { this.xmm[insn.xr] = (this.xmm[insn.xr] & ~0xFFFFFFFFFFFFFFFFn) | rdRm(8); }
+            else this.xmm[insn.xr] = rdRm(16);
+            break;
+          case 0x7F: case 0x11: case 0x29:
+            if (insn.op === 0x11 && insn.pF3) wrRm(4, this.xmm[insn.xr]);
+            else if (insn.op === 0x11 && insn.pF2) wrRm(8, this.xmm[insn.xr]);
+            else wrRm(16, this.xmm[insn.xr]);
+            break;
+          case 0x6C: {  // punpcklqdq: dst = [dst.lo64, src.lo64]
+            const lo = this.xmm[insn.xr] & 0xFFFFFFFFFFFFFFFFn;
+            this.xmm[insn.xr] = lo | ((rdRm(16) & 0xFFFFFFFFFFFFFFFFn) << 64n); break; }
+          case 0xEF: this.xmm[insn.xr] = (this.xmm[insn.xr] ^ rdRm(16)) & M128; break;  // pxor
+          case 0xDB: this.xmm[insn.xr] = this.xmm[insn.xr] & rdRm(16); break;           // pand
+          case 0xEB: this.xmm[insn.xr] = (this.xmm[insn.xr] | rdRm(16)) & M128; break;  // por
+          case 0x74: {  // pcmpeqb
+            const a = this.xmm[insn.xr], b2 = rdRm(16); let r = 0n;
+            for (let k = 0n; k < 16n; k++)
+              if (((a >> (8n*k)) & 0xFFn) === ((b2 >> (8n*k)) & 0xFFn)) r |= 0xFFn << (8n*k);
+            this.xmm[insn.xr] = r; break; }
+          case 0xD7: {  // pmovmskb r32 <- xmm  (rm field is the GPR dest? no: reg=dst GPR, rm=xmm)
+            const src = this.xmm[insn.rm.kind === 'xmm' ? insn.rm.r : 0]; let msk = 0n;
+            for (let k = 0n; k < 16n; k++) if ((src >> (8n*k + 7n)) & 1n) msk |= 1n << k;
+            this.regs[insn.xr] = msk; break; }
+          default: throw new Error('sse op ' + insn.op.toString(16));
+        }
+        break; }
+      case 'mul1': { const a = this.regs[0] & M, b2 = this.get(insn.src), full = a * b2;
+        const hi = (full >> BigInt(S*8)) & M;
+        this.setReg({kind:'reg',r:0,size:S}, full & M);
+        if (S === 1) this.regs[0] = (this.regs[0] & ~0xFFFFn) | (full & 0xFFFFn);
+        else this.setReg({kind:'reg',r:2,size:S}, hi);
+        this.f.cf = this.f.of = hi !== 0n ? 1 : 0; break; }
+      case 'imul1': { const sx = (v) => (v ^ SIGN[S]) - SIGN[S];
+        const full = sx(this.regs[0] & M) * sx(this.get(insn.src));
+        const lo = full & M, hi = (full >> BigInt(S*8)) & M;
+        this.setReg({kind:'reg',r:0,size:S}, lo);
+        if (S === 1) this.regs[0] = (this.regs[0] & ~0xFFFFn) | (full & 0xFFFFn);
+        else this.setReg({kind:'reg',r:2,size:S}, hi);
+        const sxlo = (lo ^ SIGN[S]) - SIGN[S];
+        this.f.cf = this.f.of = sxlo !== full ? 1 : 0; break; }
+      case 'div1': { const b2 = this.get(insn.src);
+        if (b2 === 0n) throw new Error('divide by zero');
+        const num = S === 1 ? this.regs[0] & 0xFFFFn
+                  : ((this.regs[2] & M) << BigInt(S*8)) | (this.regs[0] & M);
+        const q = num / b2, r = num % b2;
+        if (S === 1) this.regs[0] = (this.regs[0] & ~0xFFFFn) | (q & 0xFFn) | ((r & 0xFFn) << 8n);
+        else { this.setReg({kind:'reg',r:0,size:S}, q & M); this.setReg({kind:'reg',r:2,size:S}, r & M); }
+        break; }
+      case 'idiv1': { const sxN = (v, bits) => (v ^ (1n << (bits-1n))) - (1n << (bits-1n));
+        const b2 = sxN(this.get(insn.src), BigInt(S*8));
+        if (b2 === 0n) throw new Error('divide by zero');
+        const num = S === 1 ? sxN(this.regs[0] & 0xFFFFn, 16n)
+                  : sxN(((this.regs[2] & M) << BigInt(S*8)) | (this.regs[0] & M), BigInt(S*16));
+        let q = num / b2; const r = num - q * b2;
+        if (S === 1) this.regs[0] = (this.regs[0] & ~0xFFFFn) | (q & 0xFFn) | ((r & 0xFFn) << 8n);
+        else { this.setReg({kind:'reg',r:0,size:S}, q & M); this.setReg({kind:'reg',r:2,size:S}, r & M); }
+        break; }
+      case 'cwde': {   // sign-extend low half of rax into the full width
+        const half = S === 8 ? 4 : S === 4 ? 2 : 1;
+        let v = this.regs[0] & MASK[half];
+        v = ((v ^ SIGN[half]) - SIGN[half]) & MASK[S];
+        this.setReg({ kind: 'reg', r: 0, size: S }, v); break; }
+      case 'cdq': {    // sign of rax fills rdx
+        const neg = (this.regs[0] & SIGN[S]) !== 0n;
+        this.setReg({ kind: 'reg', r: 2, size: S }, neg ? MASK[S] : 0n); break; }
+      case 'cpuid': this.regs[0] = 0n; this.regs[3] = 0n; this.regs[1] = 0n; this.regs[2] = 0n; break;
+      case 'movs': {
+        const n = BigInt(S);
+        do {
+          if (insn.rep && this.regs[1] === 0n) break;
+          this.mem.write(this.regs[7], n, this.mem.read(this.regs[6], n));
+          this.regs[6] = (this.regs[6] + n) & MASK[8];
+          this.regs[7] = (this.regs[7] + n) & MASK[8];
+          if (insn.rep) this.regs[1] = (this.regs[1] - 1n) & MASK[8];
+        } while (insn.rep && this.regs[1] > 0n);
+        break; }
+      case 'stos': {
+        const n = BigInt(S), v = this.regs[0] & MASK[S];
+        do {
+          if (insn.rep && this.regs[1] === 0n) break;
+          this.mem.write(this.regs[7], n, v);
+          this.regs[7] = (this.regs[7] + n) & MASK[8];
+          if (insn.rep) this.regs[1] = (this.regs[1] - 1n) & MASK[8];
+        } while (insn.rep && this.regs[1] > 0n);
+        break; }
+      case 'xchg': { const a = this.get(insn.dst), b2 = this.get(insn.src);
+        this.set(insn.dst, b2); this.set(insn.src, a); break; }
+      case 'cmpxchg': { const dstv = this.get(insn.dst), acc = this.regs[0] & M;
+        const r = (acc - dstv) & M; this.subFlags(acc, dstv, r, S);
+        if (acc === dstv) this.set(insn.dst, this.get(insn.src) & M);
+        else this.setReg({ kind: 'reg', r: 0, size: S }, dstv);
+        break; }
+      case 'xadd': { const a = this.get(insn.dst), b2 = this.get(insn.src), r = (a + b2) & M;
+        this.addFlags(a, b2, r, S, a + b2 > M ? 1 : 0);
+        this.set(insn.src, a); this.set(insn.dst, r); break; }
+      case 'bsf': { const v = this.get(insn.src); this.f.zf = v === 0n ? 1 : 0;
+        if (v !== 0n) { let k = 0n; while (!((v >> k) & 1n)) k++; this.setReg(insn.dst, k); } break; }
+      case 'bsr': { const v = this.get(insn.src); this.f.zf = v === 0n ? 1 : 0;
+        if (v !== 0n) { let k = BigInt(S*8 - 1); while (!((v >> k) & 1n)) k--; this.setReg(insn.dst, k); } break; }
       case 'mov': this.set(insn.dst, this.get(insn.src)); break;
       case 'lea': this.setReg(insn.dst, this.ea(insn.src)); break;
       case 'movzx': this.setReg(insn.dst, this.get(insn.src)); break;
@@ -179,6 +310,8 @@ export class CPU {
       case 'push': this.push(this.get(insn.src)); break;
       case 'pop': this.set(insn.dst, this.pop()); break;
       case 'jmp': this.rip = (next + insn.rel) & MASK[8]; break;
+      case 'jmpind': this.rip = this.get(insn.src); break;
+      case 'callind': this.push(next); this.rip = this.get(insn.src); break;
       case 'jcc': if (this.cond(insn.cond)) this.rip = (next + insn.rel) & MASK[8]; break;
       case 'cmov': { const v = this.get(insn.src);
         if (this.cond(insn.cond)) this.setReg(insn.dst, v);
