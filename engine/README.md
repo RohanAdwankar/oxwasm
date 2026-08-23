@@ -12,6 +12,10 @@ $ node engine/diff/realcode.mjs        # gcc -O1/-O2 fib, strlen, mix
 6/6 real-code cases, 697 hardware-verified instructions
 $ node engine/diff/jittest.mjs         # tier-1 wasm output vs tier-0
 3/3 JIT blocks match tier-0
+$ node engine/diff/looptest.mjs        # superblock loop JIT vs tier-0
+3/3 loops verified
+$ node engine/diff/bench2.mjs          # superblock JIT vs native
+superblock JIT    2.3x native   (interpreter ~7200x)
 ```
 
 ## How correctness is established

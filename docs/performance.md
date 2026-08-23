@@ -76,10 +76,31 @@ stored once) and the loop body — including its backward branch — inside
 wasm, so the boundary is crossed once per loop instead of once per
 iteration. That removes both overhead sources the benchmark exposes.
 
-Single-digit x native is the realistic JIT destination. 1.2x specifically —
-for the *emulated* application — is the M4 recompile lane (compile the app
-itself to WASM, no emulator in the path), not the JIT. Stated plainly so the
-target picks the right architecture.
+### The superblock loop JIT reaches it (`engine/diff/bench2.mjs`)
+
+Compiling a whole hot loop into one wasm function — guest registers in wasm
+locals, the loop and its backward branch inside wasm, boundary crossed once —
+does exactly what the analysis predicted. Same loop, 50M iterations:
+
+| path | ns/iter | vs native |
+|---|---|---|
+| native (gcc -O2) | 1.22 | 1.0x |
+| **superblock JIT** | 2.76 | **2.3x** |
+| tier-0 interpreter | 8802 | ~7200x |
+
+**2.3x native**, byte-exact with native, and **3193x faster than the
+interpreter** — verified against the tier-0 oracle on real loops
+(`diff/looptest.mjs`). That is the realistic JIT destination reached: low
+single-digit x native on the tight loops that dominate hot paths.
+
+The residual gap from 2.3x toward 1.2x is the wasm engine not optimizing a
+tiny hand-emitted function as hard as gcc -O2 (no cross-loop register
+allocation, cold tier). Closing it further is register allocation and letting
+V8 tier the wasm up — real work, diminishing returns. And 1.2x for *emulated*
+code is essentially the theoretical floor even the proprietary CheerpX does
+not reliably hit; the guaranteed route to literal 1.2x is the M4 recompile
+lane (compile the app itself to WASM, no emulator in the path), not the JIT.
+Stated plainly so the target picks the right architecture.
 
 ## Build-time optimizations already applied
 
