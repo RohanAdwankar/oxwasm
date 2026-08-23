@@ -34,6 +34,14 @@ are the one line written to `/etc/oxwasm-run`. Swap the spec, get a different
 program in the browser. `make-demo.sh` builds the barest guest of all — just
 a kernel and a shell — in one offline `linux.html`.
 
+Add `--snapshot` to boot the app once at build time and ship a **frozen
+machine state**, so opening the HTML restores a ready app instead of booting
+(GIMP: ~6 s of restore compute vs ~2 min of cold boot). See
+`docs/performance.md` for the measured numbers and the honest ceiling —
+short version: snapshot fixes *startup*; near-native *runtime* needs the
+M3 JIT or M4 recompile lane, because emulation's per-instruction overhead is
+irreducible.
+
 ## How it works
 
 ```

@@ -19,7 +19,8 @@ set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
 SPEC=$1; shift
 OUT=out.html
-while [ $# -gt 0 ]; do case "$1" in -o) OUT=$2; shift 2;; *) echo "unknown arg $1"; exit 1;; esac; done
+SNAPSHOT=0
+while [ $# -gt 0 ]; do case "$1" in -o) OUT=$2; shift 2;; --snapshot) SNAPSHOT=1; shift;; *) echo "unknown arg $1"; exit 1;; esac; done
 [ -r "$SPEC" ] || { echo "usage: pack-app.sh SPEC.app -o out.html"; exit 1; }
 
 # defaults, then the spec overrides them
@@ -100,4 +101,15 @@ mke2fs -q -t ext2 -d rootfs -b 4096 -m 0 -F disk.img $((SZ + SZ/8 + 20))M
 python3 "$HERE/oxwasm.py" build --kernel kern/boot/vmlinuz-4.15.0-20-generic disk.img \
   --cmdline "root=/dev/sda rw rootwait init=/sbin/oxinit console=ttyS0" \
   --memory "$MEMORY" --title "$TITLE" -o "$OUT"
-echo "==> done: $OUT  (open it — no server needed)"
+
+if [ "$SNAPSHOT" = "1" ]; then
+  # Boot once, freeze the machine at "app ready", repackage as restore-to-ready.
+  # Skips emulated Linux+X+app boot on every open; needs a headless chromium.
+  echo "==> capturing snapshot (boots the app once; a few minutes)"
+  node "$HERE/tools/snapshot.js" "$OUT" "$W/app.state"
+  python3 "$HERE/oxwasm.py" build --state "$W/app.state" --memory "$MEMORY" \
+    --title "$TITLE" -o "$OUT"
+  echo "==> done: $OUT  (restore-to-ready — no boot on open)"
+else
+  echo "==> done: $OUT  (open it — no server needed)"
+fi
