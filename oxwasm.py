@@ -58,7 +58,7 @@ def build_html(*, title, memory_mb, vga_mb, cmdline, images, out):
     html = html.replace("__WASM_B64__", gzb64(runtime_file("v86.wasm"), 9))
     html = html.replace("__BIOS_B64__", gzb64(runtime_file("bios.bin"), 9))
     html = html.replace("__VGABIOS_B64__", gzb64(runtime_file("vgabios.bin"), 9))
-    for slot in ("bzimage", "initrd", "cdrom", "hda"):
+    for slot in ("bzimage", "initrd", "cdrom", "hda", "state"):
         marker = "__%s_B64__" % slot.upper()
         html = html.replace(marker, gzb64(images[slot]) if slot in images else "")
     with open(out, "w") as f:
@@ -83,6 +83,8 @@ def cmd_build(args):
         images["bzimage"] = args.kernel
         if args.initrd:
             images["initrd"] = args.initrd
+    if args.state:
+        images["state"] = args.state
     if not images:
         sys.exit("error: nothing to boot; give a TARGET or --kernel/--initrd")
     build_html(title=args.title, memory_mb=args.memory, vga_mb=args.vga_memory,
@@ -101,6 +103,7 @@ def main():
                    help="kernel command line")
     b.add_argument("--memory", type=int, default=256, help="guest RAM in MB")
     b.add_argument("--vga-memory", type=int, default=16, help="VGA RAM in MB")
+    b.add_argument("--state", help="v86 save_state image: restore-to-ready instead of booting")
     b.add_argument("--title", default="oxwasm", help="page title")
     b.add_argument("-o", "--out", default="out.html")
     b.set_defaults(func=cmd_build)
@@ -154,7 +157,8 @@ async function unpack(s){
     bzimage:  await unpack("__BZIMAGE_B64__"),
     initrd:   await unpack("__INITRD_B64__"),
     cdrom:    await unpack("__CDROM_B64__"),
-    hda:      await unpack("__HDA_B64__")
+    hda:      await unpack("__HDA_B64__"),
+    state:    await unpack("__STATE_B64__")
   };
   var opts = {
     wasm_fn: function(env){
@@ -173,6 +177,7 @@ async function unpack(s){
   if(PAYLOAD.initrd)  opts.initrd  = {buffer: PAYLOAD.initrd};
   if(PAYLOAD.cdrom)   opts.cdrom   = {buffer: PAYLOAD.cdrom};
   if(PAYLOAD.hda)     opts.hda     = {buffer: PAYLOAD.hda};
+  if(PAYLOAD.state)   opts.initial_state = {buffer: PAYLOAD.state};
 
   var emulator = window.emulator = new V86(opts);
   window.__serial = "";                       // observable from test harnesses

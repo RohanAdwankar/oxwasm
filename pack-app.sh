@@ -23,7 +23,7 @@ while [ $# -gt 0 ]; do case "$1" in -o) OUT=$2; shift 2;; *) echo "unknown arg $
 [ -r "$SPEC" ] || { echo "usage: pack-app.sh SPEC.app -o out.html"; exit 1; }
 
 # defaults, then the spec overrides them
-PACKAGES=""; RUN=""; WM=""; TITLE="oxwasm"; MEMORY=512
+PACKAGES=""; RUN=""; WM=""; WARM=""; TITLE="oxwasm"; MEMORY=512
 . "$SPEC"
 [ -n "$RUN" ] || { echo "spec must set RUN"; exit 1; }
 # every graphical guest needs these regardless of the app
@@ -76,6 +76,15 @@ chroot rootfs /usr/bin/fc-cache -f 2>/dev/null || true
 [ -x rootfs/usr/bin/gtk-update-icon-cache ] && for t in hicolor Adwaita; do
   [ -d rootfs/usr/share/icons/$t ] && chroot rootfs /usr/bin/gtk-update-icon-cache -f /usr/share/icons/$t 2>/dev/null || true
 done
+
+# WARM: run the app once, headless, in the chroot so its expensive first-run
+# work (plugin registration, config generation) is frozen into the image
+# instead of paid on every browser boot. Process spawns are the priciest
+# thing under emulation, so precomputing them here is the single biggest win.
+if [ -n "$WARM" ]; then
+  echo "==> warming app first-run state: $WARM"
+  chroot rootfs /bin/sh -c "export HOME=/root; $WARM" >/dev/null 2>&1 || true
+fi
 
 echo "==> pruning docs/locale to shrink the image"
 rm -rf rootfs/usr/share/locale rootfs/usr/share/doc rootfs/usr/share/man \
