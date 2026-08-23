@@ -3,8 +3,8 @@
 
     oxwasm build --kernel vmlinuz --initrd initrd.gz -o linux.html
     oxwasm build boot.iso -o out.html
-    oxwasm build --kernel vmlinuz disk.img -o gimp.html
-    oxwasm build gimp.AppImage          # roadmap: see the error it prints
+    oxwasm build --kernel vmlinuz disk.img -o app.html
+    oxwasm build app.AppImage           # roadmap: see the error it prints
 
 The output is one self-contained .html: open it from disk, from a static
 host, or email it to someone. No server, no network, no install. Inside is
@@ -29,8 +29,8 @@ apps at usable speed needs the M3 engine — an x86-64 -> WASM JIT. Today you
 can package any 32-bit guest (kernel+initrd, bootable ISO, or disk image).
 
   M1 (done)  kernel/initrd or ISO -> single-file HTML, boots offline
-  M2 (done)  32-bit graphical guest: X11 + GIMP via emulation
-  M3         fast engine: x86-64 -> WASM JIT, AppImage in, usable GIMP out
+  M2 (done)  32-bit graphical guest: X11 + any app via emulation (pack-app.sh)
+  M3         fast engine: x86-64 -> WASM JIT, AppImage in, usable app out
 """
 
 
