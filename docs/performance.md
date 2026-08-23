@@ -209,6 +209,21 @@ superblock JIT (2.3x native) and SIMD vectorizer (native-class on pixel
 kernels) attack the pixel loops that dominate blur/scale. That is the road from
 30–70x toward single digits; whole-app native remains the M4 recompile lane.
 
+## Runtime parity: the recompile lane closes it (`platform/imgops/`)
+
+The final piece. The same big resample GIMP does in ~30 s natively (and the
+emulator does in ~127 s) runs in **1.3–1.5 s in the browser** as a wasm
+kernel — ~20x faster than native GIMP — with output **bit-identical** to the
+same C compiled natively (checksum-verified every run). Full numbers,
+methodology, and the honest caveat (hand-tuned AVX2 native C is still 4–6x
+faster than wasm's 128-bit SIMD ceiling) in `platform/imgops/README.md`.
+The race video: native GIMP in an xterm vs the kernel live in a tab.
+
+So the complete runtime story, one line each:
+- emulation (v86): ~30–70x slower than native — compatibility, not speed.
+- recompiled compute (M4/imgops): beats the native app, trails hand-AVX2.
+- the M3 engine: the measured bridge between the two for unmodified binaries.
+
 ## Build-time optimizations already applied
 
 - **WARM cache freeze** (`pack-app.sh` WARM hook): the app's first-run work —
