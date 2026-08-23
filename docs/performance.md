@@ -182,6 +182,33 @@ possible at all. Nothing app-specific is involved: `--split-state` and
 `--split-disk` are generic build flags, the snapshot tool watches for any
 app window, and the app itself comes from a spec.
 
+## Runtime, measured end to end: real GIMP operations, native vs emulated
+
+Same GIMP 2.8 binary, same Script-Fu batch operations, run natively (chroot,
+warm) and inside the emulated guest (v86 in headless Chromium, 192 MB). The
+guest runs the benchmark itself via a bench app-spec and reports on serial —
+no app-specific code in the tool. Operation cost = (run with op) − (baseline
+run), isolating the op from GIMP startup.
+
+| operation | native | emulated | slowdown |
+|---|---|---|---|
+| GIMP core startup (batch, warm) | 1.62 s | 46.6 s | **29x** |
+| Gaussian blur, 512×512, r=25 (plug-in) | 0.13 s | 3.8 s | **29x** |
+| Scale 512→2048 (core, interpolation) | 1.81 s | 127 s | **70x** |
+
+So the honest split: **loading** beats native (snapshot resume does no
+compute), while **runtime compute is ~30–70x native** under the v86 engine.
+Integer-ish work (startup, the blur plug-in) sits at ~29x; the scale op is
+~70x, consistent with heavy floating-point interpolation — v86 emulates the
+FPU through softfloat, its slowest path. Interactively this means menus and
+typing feel fine (mostly idle, event-driven), a small blur is a perceptible
+~4 s, and a large scale is a coffee break.
+
+These are exactly the workloads the M3 engine work targets: the measured
+superblock JIT (2.3x native) and SIMD vectorizer (native-class on pixel
+kernels) attack the pixel loops that dominate blur/scale. That is the road from
+30–70x toward single digits; whole-app native remains the M4 recompile lane.
+
 ## Build-time optimizations already applied
 
 - **WARM cache freeze** (`pack-app.sh` WARM hook): the app's first-run work —
