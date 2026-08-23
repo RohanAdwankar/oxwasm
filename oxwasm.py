@@ -49,8 +49,24 @@ def runtime_file(name):
     return p
 
 
-def build_html(*, title, memory_mb, vga_mb, cmdline, images, out):
+def build_html(*, title, memory_mb, vga_mb, cmdline, images, out, split_state=False,
+               split_disk=False):
     cfg = {"memory_mb": memory_mb, "vga_mb": vga_mb, "cmdline": cmdline}
+    if split_disk and "hda" in images:
+        src = images.pop("hda")
+        sidecar = out + ".disk.img"
+        if os.path.abspath(src) != os.path.abspath(sidecar):
+            import shutil; shutil.copyfile(src, sidecar)
+        cfg["hda_url"] = os.path.basename(sidecar)
+        cfg["hda_size"] = os.path.getsize(sidecar)
+        print(f"oxwasm: wrote {sidecar} ({cfg['hda_size']/1e6:.1f} MB, "
+              f"served lazily via Range requests)")
+    if split_state and "state" in images:
+        sidecar = out + ".state.gz"
+        with open(images.pop("state"), "rb") as f, open(sidecar, "wb") as g:
+            g.write(gzip.compress(f.read(), 6))
+        cfg["state_url"] = os.path.basename(sidecar)
+        print(f"oxwasm: wrote {sidecar} ({os.path.getsize(sidecar)/1e6:.1f} MB, host next to the HTML)")
     html = TEMPLATE
     html = html.replace("__TITLE__", title)
     html = html.replace("__CONFIG__", json.dumps(cfg))
@@ -88,7 +104,8 @@ def cmd_build(args):
     if not images:
         sys.exit("error: nothing to boot; give a TARGET or --kernel/--initrd")
     build_html(title=args.title, memory_mb=args.memory, vga_mb=args.vga_memory,
-               cmdline=args.cmdline, images=images, out=args.out)
+               cmdline=args.cmdline, images=images, out=args.out,
+               split_state=args.split_state, split_disk=args.split_disk)
 
 
 def main():
@@ -104,6 +121,13 @@ def main():
     b.add_argument("--memory", type=int, default=256, help="guest RAM in MB")
     b.add_argument("--vga-memory", type=int, default=16, help="VGA RAM in MB")
     b.add_argument("--state", help="v86 save_state image: restore-to-ready instead of booting")
+    b.add_argument("--split-disk", action="store_true",
+                   help="serve the disk as a sidecar fetched lazily over HTTP Range "
+                        "requests — snapshots then exclude disk contents (much smaller)")
+    b.add_argument("--split-state", action="store_true",
+                   help="serve the state as a sidecar .state.gz fetched over HTTP "
+                        "(streamed + DecompressionStream) instead of inlining it — "
+                        "much faster load; needs the HTML hosted, not opened from disk")
     b.add_argument("--title", default="oxwasm", help="page title")
     b.add_argument("-o", "--out", default="out.html")
     b.set_defaults(func=cmd_build)
@@ -142,6 +166,13 @@ TEMPLATE = r"""<!doctype html>
 "use strict";
 var CONFIG = __CONFIG__;
 var statusEl = document.getElementById("status");
+async function fetchState(url){
+  statusEl.textContent = "fetching machine state\u2026";
+  var resp = await fetch(url);
+  if(!resp.ok) throw new Error("state fetch failed: " + resp.status);
+  var ds = new Response(resp.body.pipeThrough(new DecompressionStream("gzip")));
+  return await ds.arrayBuffer();
+}
 async function unpack(s){
   if(!s) return null;
   var bin = atob(s), n = bin.length, u = new Uint8Array(n);
@@ -158,7 +189,7 @@ async function unpack(s){
     initrd:   await unpack("__INITRD_B64__"),
     cdrom:    await unpack("__CDROM_B64__"),
     hda:      await unpack("__HDA_B64__"),
-    state:    await unpack("__STATE_B64__")
+    state:    CONFIG.state_url ? await fetchState(CONFIG.state_url) : await unpack("__STATE_B64__")
   };
   var opts = {
     wasm_fn: function(env){
@@ -177,6 +208,7 @@ async function unpack(s){
   if(PAYLOAD.initrd)  opts.initrd  = {buffer: PAYLOAD.initrd};
   if(PAYLOAD.cdrom)   opts.cdrom   = {buffer: PAYLOAD.cdrom};
   if(PAYLOAD.hda)     opts.hda     = {buffer: PAYLOAD.hda};
+  if(CONFIG.hda_url)  opts.hda     = {url: CONFIG.hda_url, size: CONFIG.hda_size, async: true};
   if(PAYLOAD.state)   opts.initial_state = {buffer: PAYLOAD.state};
 
   var emulator = window.emulator = new V86(opts);

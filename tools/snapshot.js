@@ -28,7 +28,7 @@ const fs = require('fs');
   }
   if (!appUp) { console.log('APP NEVER CAME UP'); await browser.close(); process.exit(1); }
   console.log(`app up at ${((Date.now()-t0)/1000).toFixed(1)}s; letting it settle`);
-  await page.waitForTimeout(8000);   // let GIMP finish idle work before freezing
+  await page.waitForTimeout(8000);   // let the app finish idle work before freezing
 
   // save_state -> stash on window, then read out in chunks
   const len = await page.evaluate(async () => {

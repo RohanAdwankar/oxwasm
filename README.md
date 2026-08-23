@@ -35,8 +35,12 @@ program in the browser. `make-demo.sh` builds the barest guest of all — just
 a kernel and a shell — in one offline `linux.html`.
 
 Add `--snapshot` to boot the app once at build time and ship a **frozen
-machine state**, so opening the HTML restores a ready app instead of booting
-(GIMP: ~6 s of restore compute vs ~2 min of cold boot). See
+machine state**, so opening the HTML restores a ready app instead of booting.
+With `--split-state` (state as a streamed sidecar) and `--split-disk` (disk
+as a lazily-fetched Range-request device, so snapshots exclude disk
+contents), the hosted page restores **GIMP in 1.6 s — faster than the same
+GIMP starts natively (2.0 s) on the same machine**; `tools/rangeserver.py`
+serves it locally. See
 `docs/performance.md` for the measured numbers and the honest ceiling —
 short version: snapshot fixes *startup*; near-native *runtime* needs the
 M3 JIT or M4 recompile lane, because emulation's per-instruction overhead is

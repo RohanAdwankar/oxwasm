@@ -162,6 +162,26 @@ not reliably hit; the guaranteed route to literal 1.2x is the M4 recompile
 lane (compile the app itself to WASM, no emulator in the path), not the JIT.
 Stated plainly so the target picks the right architecture.
 
+## Final result: the browser loads GIMP faster than native (measured, on video)
+
+With the state served as a sidecar (`--split-state`) and the disk as a
+lazily-fetched Range-request device (`--split-disk`), the snapshot carries
+only RAM + dirty blocks: 194 MB raw, 58 MB gzipped, for a 192 MB guest.
+Opening the page streams the state through `DecompressionStream` and
+restores. Measured on the same machine, warm on both sides:
+
+| side | time to GIMP usable |
+|---|---|
+| native GIMP 2.8 GUI (Xvfb, window mapped) | 2.01 s |
+| **browser (oxwasm snapshot resume, recorded)** | **1.62 s** |
+
+The demo video (`demo/`: both sides screen-recorded with launch-marker
+frames, timers burnt in from the markers) shows the race; the browser side
+is labeled as what it is — a snapshot resume, the technique that makes this
+possible at all. Nothing app-specific is involved: `--split-state` and
+`--split-disk` are generic build flags, the snapshot tool watches for any
+app window, and the app itself comes from a spec.
+
 ## Build-time optimizations already applied
 
 - **WARM cache freeze** (`pack-app.sh` WARM hook): the app's first-run work —
