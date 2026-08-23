@@ -52,6 +52,35 @@ filters run at emulated speed; only M3/M4 change that. Snapshot is the right
 answer for "make it start fast"; the JIT is the answer for "make it *run*
 fast."
 
+## The JIT vs native — measured (`engine/diff/bench.mjs`)
+
+The same 16-op integer block, run 5M times with a per-iteration input so the
+work genuinely executes each pass:
+
+| path | ns/run | vs native |
+|---|---|---|
+| native (gcc -O2) | 1.9 | 1.0x |
+| **tier-1 JIT** (compiled to wasm) | 78.9 | **~40x** |
+| tier-0 interpreter (BigInt) | 21432 | ~11000x |
+
+So the JIT is **~270x faster than the interpreter** already, and lands ~40x
+native for a first, un-optimized code generator. The 40x is almost entirely
+overhead *around* the work, not the work: every block entry crosses the
+JS↔WASM boundary and reloads all 16 guest registers from linear memory, then
+stores them back. The 16 ALU ops themselves are a few ns.
+
+The path from ~40x toward single-digit x is the standard one, and it's what
+the next engine iterations do: compile a whole hot loop into one wasm
+function with the guest registers held in **wasm locals** (loaded once,
+stored once) and the loop body — including its backward branch — inside
+wasm, so the boundary is crossed once per loop instead of once per
+iteration. That removes both overhead sources the benchmark exposes.
+
+Single-digit x native is the realistic JIT destination. 1.2x specifically —
+for the *emulated* application — is the M4 recompile lane (compile the app
+itself to WASM, no emulator in the path), not the JIT. Stated plainly so the
+target picks the right architecture.
+
 ## Build-time optimizations already applied
 
 - **WARM cache freeze** (`pack-app.sh` WARM hook): the app's first-run work —
