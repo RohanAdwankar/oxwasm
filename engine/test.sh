@@ -9,3 +9,5 @@ node jittest.mjs
 node looptest.mjs
 node bench.mjs
 node bench2.mjs
+node memtest.mjs
+node membench.mjs

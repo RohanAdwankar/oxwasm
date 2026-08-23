@@ -69,7 +69,7 @@ for (const [name, asm, _] of loops) {
   while (cpu2.rip < loopTop) cpu2.step();
   const blk = compileLoop(rmem, loopTop);
   if (!blk) { console.log(`${name}: compiler declined (unsupported shape)`); continue; }
-  const wmem = new WebAssembly.Memory({ initial: 1 });
+  const wmem = new WebAssembly.Memory({ initial: 256 });
   const view = new BigInt64Array(wmem.buffer);
   for (let r = 0; r < 16; r++) view[r] = BigInt.asIntN(64, cpu2.regs[r]);
   const { instance } = await WebAssembly.instantiate(blk.wasm, { js: { mem: wmem } });

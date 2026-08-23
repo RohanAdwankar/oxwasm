@@ -93,6 +93,26 @@ interpreter** — verified against the tier-0 oracle on real loops
 (`diff/looptest.mjs`). That is the realistic JIT destination reached: low
 single-digit x native on the tight loops that dominate hot paths.
 
+### And on GIMP's actual shape — pixel loops with memory (`diff/membench.mjs`)
+
+GIMP is image processing: its hot loops read and write pixels. The superblock
+JIT compiles those too (byte/word/dword load, store, movzx, pointer bumps,
+counter + branch — all inside the wasm loop). A `dst[i] = (src[i]+0x10)^0x55`
+transform over 8M pixels:
+
+| path | ns/px | vs native |
+|---|---|---|
+| native (gcc -O2, **auto-vectorized**) | 0.78 | 1.0x |
+| **superblock JIT** (scalar) | 4.45 | **5.7x** |
+| tier-0 interpreter | 13608 | ~17600x |
+
+Byte-for-byte identical output to the interpreter (`diff/memtest.mjs`), 3062x
+faster than interpreting. The gap is wider than the register loop's 2.3x for
+one honest reason: gcc **vectorizes** the pixel loop with SIMD, while the JIT
+emits **scalar** byte ops. Against scalar native the JIT is ~2x; the rest is
+vectorization. Emitting wasm SIMD (v128) for vectorizable loops is the lever
+that closes most of that — the next engine step.
+
 The residual gap from 2.3x toward 1.2x is the wasm engine not optimizing a
 tiny hand-emitted function as hard as gcc -O2 (no cross-loop register
 allocation, cold tier). Closing it further is register allocation and letting
