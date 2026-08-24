@@ -159,8 +159,8 @@ export function decode(fetch, rip) {
                       0xE8:1, 0xE9:1, 0xEC:1, 0xED:1, 0xE0:1, 0xE3:1, 0xD5:1, 0xE5:1, 0xE4:1,
                       0xF4:1, 0xF6:1, 0x63:1, 0x67:1, 0x6B:1, 0xC5:1, 0xC4:1,
                       0x54:1, 0x55:1, 0x56:1, 0x57:1, 0x2A:1, 0x2C:1, 0x2D:1, 0x2E:1, 0x2F:1,
-                      0x51:1, 0x58:1, 0x59:1, 0x5A:1, 0x5B:1, 0x5C:1, 0x5D:1, 0x5E:1, 0x5F:1, 0x2B:1 };
-    const SSE_IMM8 = { 0x70:1, 0xC5:1, 0xC4:1 };
+                      0x51:1, 0x58:1, 0x59:1, 0x5A:1, 0x5B:1, 0x5C:1, 0x5D:1, 0x5E:1, 0x5F:1, 0x2B:1, 0xC6:1 };
+    const SSE_IMM8 = { 0x70:1, 0xC5:1, 0xC4:1, 0xC6:1 };
     const SSE_GRP_SHIFT = { 0x71:1, 0x72:1, 0x73:1 };
     if (SSE_GRP_SHIFT[o2]) {
       const m = b(), sub = (m >> 3) & 7, xrm = (m & 7) | (B << 3);
@@ -197,6 +197,10 @@ export function decode(fetch, rip) {
     if (o2 === 0xAC) { const [r, rm] = modrm(osz); return fin({ mnem: 'shrd', dst: rm, src: r, src2: { kind: 'imm', v: immU(1) }, size: osz }); }
     if (o2 === 0xAD) { const [r, rm] = modrm(osz); return fin({ mnem: 'shrd', dst: rm, src: r, src2: { kind: 'reg', r: 1, size: 1 }, size: osz }); }
     if (o2 === 0xA2) return fin({ mnem: 'cpuid' });
+    if (o2 === 0x31) return fin({ mnem: 'rdtsc' });
+    if (o2 === 0x01) { const m = b();
+      if (m === 0xF9) return fin({ mnem: 'rdtscp' });
+      throw new Error('0f 01 /' + m.toString(16)); }
     if (o2 >= 0xC8 && o2 <= 0xCF) return fin({ mnem: 'bswap', dst: mkreg((o2 - 0xC8) | (B << 3), osz === 2 ? 4 : osz), size: osz === 2 ? 4 : osz });
     if (o2 >= 0x40 && o2 <= 0x4F) { const [r, rm] = modrm(osz); return fin({ mnem: 'cmov', cond: COND[o2 - 0x40], dst: r, src: rm, size: osz }); }
     if (o2 >= 0x90 && o2 <= 0x9F) { const [, rm] = modrm(1); return fin({ mnem: 'setcc', cond: COND[o2 - 0x90], dst: rm, size: 1 }); }

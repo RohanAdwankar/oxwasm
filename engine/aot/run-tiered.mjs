@@ -20,7 +20,33 @@ const assembleWat = (wat) => {
 const files = {};
 for (const a of args) { try { files[a] = new Uint8Array(readFileSync(a)); } catch {} }
 const elf = new Uint8Array(readFileSync(binPath));
-const eng = new LinuxEngine(elf, { argv: [binPath, ...args], files, memMB: 1024, assembleWat });
+
+// dynamic executable: bundle the interpreter + ldd-resolved libraries
+const env = [];
+{
+  const dv = new DataView(elf.buffer, elf.byteOffset, elf.length);
+  const phoff = Number(dv.getBigUint64(32, true));
+  const phentsize = dv.getUint16(54, true), phnum = dv.getUint16(56, true);
+  let interp = null;
+  for (let i = 0; i < phnum; i++) {
+    const o = phoff + i * phentsize;
+    if (dv.getUint32(o, true) === 3) {
+      const off = Number(dv.getBigUint64(o + 8, true)), sz = Number(dv.getBigUint64(o + 32, true));
+      interp = Buffer.from(elf.subarray(off, off + sz - 1)).toString();
+    }
+  }
+  if (interp) {
+    files[interp] = new Uint8Array(readFileSync(interp));
+    try {
+      for (const line of execFileSync('ldd', [binPath]).toString().split('\n')) {
+        const m = line.match(/=>\s*(\/\S+)/);
+        if (m) files[m[1]] = new Uint8Array(readFileSync(m[1]));
+      }
+    } catch {}
+    env.push('LD_LIBRARY_PATH=/lib/x86_64-linux-gnu');
+  }
+}
+const eng = new LinuxEngine(elf, { argv: [binPath, ...args], env, files, memMB: 1024, assembleWat });
 
 const t = process.hrtime.bigint();
 const res = eng.run(2e9);

@@ -380,6 +380,18 @@ export class CPU {
                 out |= v << (32n*k); } }
             this.xmm[insn.xr] = out; break; }
           case 0x2B: wrRm(16, this.xmm[insn.xr]); break;   // movntps/pd: plain store
+          case 0xC6: {                                     // shufps (ps) / shufpd (66)
+            const a = this.xmm[insn.xr], b2 = rdRm(16), im = insn.imm8;
+            if (insn.p66) {
+              const lo = (a >> (64n * BigInt(im & 1))) & 0xFFFFFFFFFFFFFFFFn;
+              const hi = (b2 >> (64n * BigInt((im >> 1) & 1))) & 0xFFFFFFFFFFFFFFFFn;
+              this.xmm[insn.xr] = lo | (hi << 64n);
+            } else {
+              const lane = (v, k) => (v >> (32n * BigInt(k))) & 0xFFFFFFFFn;
+              this.xmm[insn.xr] = lane(a, im & 3) | (lane(a, (im >> 2) & 3) << 32n) |
+                                  (lane(b2, (im >> 4) & 3) << 64n) | (lane(b2, (im >> 6) & 3) << 96n);
+            }
+            break; }
           case 0xC5: {                                 // pextrw r32 <- xmm[imm3]
             const src = this.xmm[insn.rm.kind === 'xmm' ? insn.rm.r : 0];
             this.regs[insn.xr] = (src >> (16n * BigInt(insn.imm8 & 7))) & 0xFFFFn; break; }
@@ -444,7 +456,26 @@ export class CPU {
           const s = (e ^ (1n << (eb-1n))) - (1n << (eb-1n)); return (s >> (c >= eb ? eb-1n : c)); });
         else throw new Error('sse shift sub ' + insn.sub);
         break; }
-      case 'cpuid': this.regs[0] = 0n; this.regs[3] = 0n; this.regs[1] = 0n; this.regs[2] = 0n; break;
+      case 'cpuid': {
+        // claim exactly baseline x86-64 (v1): fpu..cmov, mmx, fxsr, sse, sse2.
+        // No sse3+ — glibc then selects the generic/SSE2 string functions,
+        // which is precisely the instruction set this engine implements.
+        const leaf = Number(this.regs[0] & 0xFFFFFFFFn);
+        let a = 0n, b2 = 0n, c = 0n, d = 0n;
+        if (leaf === 0) { a = 7n; b2 = 0x756e6547n; d = 0x49656e69n; c = 0x6c65746en; }   // "GenuineIntel"
+        else if (leaf === 1) { a = 0x000306a0n; b2 = 0x00010800n; c = 0x80000001n /* hypervisor|sse3? no: bit0 sse3 OFF -> 0x80000000|1? */ , d = 0x178bfbffn;
+          c = 0x80000000n; }                          // ecx: only the hypervisor bit; edx: baseline incl. sse2
+        else if (leaf === 7) { a = 0n; b2 = 0n; c = 0n; d = 0n; }
+        else if (leaf === 0x80000000) { a = 0x80000008n; }
+        else if (leaf === 0x80000001) { c = 1n; d = 0x28100800n; }   // lahf_lm; syscall+nx+rdtscp+lm
+        else if (leaf === 0x80000008) { a = 0x3027n; }               // 39/48 address bits
+        this.regs[0] = a; this.regs[3] = b2; this.regs[1] = c; this.regs[2] = d;
+        break; }
+      case 'rdtsc': case 'rdtscp': {   // synthetic monotonic timestamp
+        const t = (this.tsc = (this.tsc || 0n) + 1000n);
+        this.regs[0] = t & 0xFFFFFFFFn; this.regs[2] = (t >> 32n) & 0xFFFFFFFFn;
+        if (insn.mnem === 'rdtscp') this.regs[1] = 0n;
+        break; }
       case 'cld': this.f.df = 0; break;
       case 'std': this.f.df = 1; break;
       case 'clc': this.f.cf = 0; break;

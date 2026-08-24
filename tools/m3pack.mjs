@@ -58,6 +58,41 @@ if (!elfPath) { console.error('usage: m3pack ELF|AppImage [-o out.html] [--arg A
 
 const gzb64 = (buf) => Buffer.from(gzipSync(buf, { level: 9 })).toString('base64');
 
+// Dynamic executables: bundle the PT_INTERP dynamic linker and every library
+// ldd resolves, each at the absolute path the guest will ask for. The app's
+// bundled libs (AppImage payload under /app) take precedence via
+// LD_LIBRARY_PATH.
+const env = [];
+function bundleDynamic(elfBytes, elfFsPath) {
+  const dv = new DataView(elfBytes.buffer, elfBytes.byteOffset, elfBytes.length);
+  if (dv.getUint32(0, true) !== 0x464c457f) return;
+  const phoff = Number(dv.getBigUint64(32, true));
+  const phentsize = dv.getUint16(54, true), phnum = dv.getUint16(56, true);
+  let interp = null;
+  for (let i = 0; i < phnum; i++) {
+    const o = phoff + i * phentsize;
+    if (dv.getUint32(o, true) === 3) {
+      const off = Number(dv.getBigUint64(o + 8, true)), sz = Number(dv.getBigUint64(o + 32, true));
+      interp = Buffer.from(elfBytes.subarray(off, off + sz - 1)).toString();
+    }
+  }
+  if (!interp) return;
+  files[interp] = interp;                            // the dynamic linker itself
+  try {
+    const out = execFileSync('ldd', [elfFsPath], { env: { ...process.env } }).toString();
+    for (const line of out.split('\n')) {
+      const m = line.match(/=>\s*(\/\S+)/) || line.match(/^\s*(\/\S+\.so[\d.]*)\s/);
+      if (m && m[1] !== interp) {
+        files[m[1]] = m[1];
+        const soname = m[1].split('/').pop();
+        if (!files['/lib/x86_64-linux-gnu/' + soname]) files['/lib/x86_64-linux-gnu/' + soname] = m[1];
+      }
+    }
+  } catch { /* ldd unavailable: caller must pass --file for each lib */ }
+  env.push('LD_LIBRARY_PATH=/app/usr/lib:/app/lib:/lib/x86_64-linux-gnu');
+  console.log(`m3pack: dynamic executable — bundled ${interp} + ${Object.keys(files).length - 1} resolved libraries`);
+}
+
 // engine modules with relative imports rewritten to bare specifiers, so an
 // import map can resolve them from data: URLs inside the page
 const MODS = ['interp', 'decode', 'jit2', 'jitsimd', 'aot_wat', 'linux'];
@@ -70,6 +105,7 @@ for (const m of MODS)
   importMap.imports['ox/' + m] = 'data:text/javascript;base64,' + Buffer.from(modSrc[m]).toString('base64');
 
 const wabtJs = readFileSync('/tmp/package/index.js', 'utf8');   // wabt 1.0.39 UMD
+bundleDynamic(readFileSync(elfPath), elfPath);
 const elfB64 = gzb64(readFileSync(elfPath));
 const fileEntries = Object.entries(files).map(([g, h]) => [g, gzb64(readFileSync(h))]);
 
@@ -101,7 +137,7 @@ const html = `<!doctype html>
 <script type="importmap">${JSON.stringify(importMap)}</script>
 <script type="module">
 import { LinuxEngine } from 'ox/linux';
-const CONFIG = { argv: ${JSON.stringify(argv)}, title: ${JSON.stringify(title)} };
+const CONFIG = { argv: ${JSON.stringify(argv)}, env: ${JSON.stringify(env)}, title: ${JSON.stringify(title)} };
 const term = document.getElementById('term'), stat = document.getElementById('stat');
 const put = (s) => { term.textContent += s; term.scrollTop = term.scrollHeight; };
 async function inflate(b64) {
@@ -121,7 +157,7 @@ async function inflate(b64) {
   const files = {};
   for (const [g, b] of ${JSON.stringify(fileEntries)}) files[g] = await inflate(b);
   stat.textContent = 'running…';
-  const eng = new LinuxEngine(elf, { argv: CONFIG.argv, files, memMB: 512, assembleWat });
+  const eng = new LinuxEngine(elf, { argv: CONFIG.argv, env: CONFIG.env, files, memMB: 512, assembleWat });
   let shown = 0;
   const t0 = performance.now();
   const pump = () => {
