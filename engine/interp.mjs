@@ -380,6 +380,12 @@ export class CPU {
                 out |= v << (32n*k); } }
             this.xmm[insn.xr] = out; break; }
           case 0x2B: wrRm(16, this.xmm[insn.xr]); break;   // movntps/pd: plain store
+          case 0x50: {                                     // movmskps / movmskpd (66) -> GPR
+            const src = this.xmm[insn.rm.kind === 'xmm' ? insn.rm.r : 0];
+            let msk = 0n;
+            if (insn.p66) { for (const k of [0n, 1n]) if ((src >> (64n*k + 63n)) & 1n) msk |= 1n << k; }
+            else { for (const k of [0n, 1n, 2n, 3n]) if ((src >> (32n*k + 31n)) & 1n) msk |= 1n << k; }
+            this.regs[insn.xr] = msk; break; }
           case 0xC6: {                                     // shufps (ps) / shufpd (66)
             const a = this.xmm[insn.xr], b2 = rdRm(16), im = insn.imm8;
             if (insn.p66) {
@@ -470,6 +476,195 @@ export class CPU {
         else if (leaf === 0x80000001) { c = 1n; d = 0x28100800n; }   // lahf_lm; syscall+nx+rdtscp+lm
         else if (leaf === 0x80000008) { a = 0x3027n; }               // 39/48 address bits
         this.regs[0] = a; this.regs[3] = b2; this.regs[1] = c; this.regs[2] = d;
+        break; }
+      case 'x87': {
+        // f64-backed x87: 8-slot register stack, control word (rounding mode
+        // honored on integer conversion), status word C0/C2/C3. 80-bit memory
+        // operands convert through f64 — a documented precision approximation;
+        // formatting/strtod paths that only need double-precision math are exact.
+        if (!this.fst) { this.fst = new Float64Array(8); this.ftop = 0; this.fcw = 0x037F; this.fsw = 0; }
+        const ST = (k) => this.fst[(this.ftop + k) & 7];
+        const setST = (k, v) => { this.fst[(this.ftop + k) & 7] = v; };
+        const fpush = (v) => { this.ftop = (this.ftop - 1) & 7; this.fst[this.ftop] = v; };
+        const fpop = () => { const v = this.fst[this.ftop]; this.ftop = (this.ftop + 1) & 7; return v; };
+        const rnd = (x) => {                     // per RC field of the control word
+          switch ((this.fcw >> 10) & 3) {
+            case 0: { const f = Math.floor(x), d = x - f;      // nearest, ties to even
+                      return d < 0.5 ? f : d > 0.5 ? f + 1 : (f % 2 === 0 ? f : f + 1); }
+            case 1: return Math.floor(x);
+            case 2: return Math.ceil(x);
+            default: return Math.trunc(x);
+          }
+        };
+        const ldM = (bytes) => {                 // load float from memory operand
+          const a = this.ea(insn.rm);
+          if (bytes === 4) return FP.getF32(this.mem.read(a, 4n));
+          if (bytes === 8) return FP.getF64(this.mem.read(a, 8n));
+          // 80-bit: sign(1) exp(15) | explicit-integer-bit + 63-bit fraction
+          const lo = this.mem.read(a, 8n), se = Number(this.mem.read(a + 8n, 2n));
+          const sign = se & 0x8000 ? -1 : 1, e = se & 0x7FFF;
+          if (e === 0 && lo === 0n) return sign * 0;
+          if (e === 0x7FFF) return (lo << 1n) ? NaN : sign * Infinity;
+          return sign * Number(lo) / 2 ** 63 * 2 ** (e - 16383);
+        };
+        const stM = (bytes, v) => {
+          const a = this.ea(insn.rm);
+          if (bytes === 4) { this.mem.write(a, 4n, FP.putF32(v)); return; }
+          if (bytes === 8) { this.mem.write(a, 8n, FP.putF64(v)); return; }
+          let sign = (v < 0 || Object.is(v, -0)) ? 0x8000 : 0; v = Math.abs(v);
+          let se, lo;
+          if (v === 0) { se = sign; lo = 0n; }
+          else if (!Number.isFinite(v)) { se = sign | 0x7FFF; lo = Number.isNaN(v) ? (3n << 62n) : (1n << 63n); }
+          else { let e = Math.floor(Math.log2(v)); let mant = v / 2 ** e;
+                 if (mant >= 2) { e++; mant /= 2; } if (mant < 1) { e--; mant *= 2; }
+                 se = sign | (e + 16383); lo = BigInt(Math.round(mant * 2 ** 63 / 1024)) << 10n; }
+          this.mem.write(a, 8n, lo); this.mem.write(a + 8n, 2n, BigInt(se));
+        };
+        const ldIntM = (bytes) => {              // signed integer from memory
+          const a = this.ea(insn.rm);
+          return Number(BigInt.asIntN(bytes * 8, this.mem.read(a, BigInt(bytes))));
+        };
+        const stIntM = (bytes, x) => {
+          const a = this.ea(insn.rm);
+          const lim = 2 ** (bytes * 8 - 1);
+          const g = rnd(x);
+          const v = (!Number.isFinite(g) || g >= lim || g < -lim)
+            ? (1n << BigInt(bytes * 8 - 1)) : BigInt.asUintN(bytes * 8, BigInt(g));
+          this.mem.write(a, BigInt(bytes), v);
+        };
+        const setC = (c0, c2, c3) => { this.fsw = (this.fsw & ~0x4500) | (c0 ? 0x100 : 0) | (c2 ? 0x400 : 0) | (c3 ? 0x4000 : 0); };
+        const fcomVals = (a, b2) => { if (Number.isNaN(a) || Number.isNaN(b2)) setC(1, 1, 1);
+                                      else setC(a < b2, 0, a === b2); };
+        const fcomiVals = (a, b2) => { if (Number.isNaN(a) || Number.isNaN(b2)) { this.f.zf = 1; this.f.pf = 1; this.f.cf = 1; }
+                                       else { this.f.zf = a === b2 ? 1 : 0; this.f.pf = 0; this.f.cf = a < b2 ? 1 : 0; }
+                                       this.f.sf = 0; this.f.of = 0; this.f.af = 0; };
+        const ARITH = (k, a, b2) => k === 0 ? a + b2 : k === 1 ? a * b2 : k === 4 ? a - b2 : k === 5 ? b2 - a : k === 6 ? a / b2 : b2 / a;
+        const op = insn.op, sub = insn.sub, sti = insn.sti, mem = sti < 0;
+        if (op === 0xD8) {
+          const b2 = mem ? ldM(4) : ST(sti);
+          if (sub === 2) fcomVals(ST(0), b2);
+          else if (sub === 3) { fcomVals(ST(0), b2); fpop(); }
+          else setST(0, ARITH(sub, ST(0), b2));
+        } else if (op === 0xD9 && mem) {
+          if (sub === 0) fpush(ldM(4));
+          else if (sub === 2) stM(4, ST(0));
+          else if (sub === 3) stM(4, fpop());
+          else if (sub === 4) { /* fldenv: ignore */ }
+          else if (sub === 5) this.fcw = Number(this.mem.read(this.ea(insn.rm), 2n));
+          else if (sub === 6) { /* fnstenv: write zeros-ish */ const a = this.ea(insn.rm);
+            for (let k = 0; k < 28; k += 2) this.mem.write(a + BigInt(k), 2n, 0n);
+            this.mem.write(a, 2n, BigInt(this.fcw)); }
+          else if (sub === 7) this.mem.write(this.ea(insn.rm), 2n, BigInt(this.fcw));
+          else throw new Error('x87 d9/' + sub);
+        } else if (op === 0xD9) {
+          const mb = insn.modbyte;
+          if (mb >= 0xC0 && mb <= 0xC7) fpush(ST(mb - 0xC0));
+          else if (mb >= 0xC8 && mb <= 0xCF) { const i2 = mb - 0xC8; const t = ST(0); setST(0, ST(i2)); setST(i2, t); }
+          else if (mb === 0xD0) { /* fnop */ }
+          else if (mb === 0xE0) setST(0, -ST(0));
+          else if (mb === 0xE1) setST(0, Math.abs(ST(0)));
+          else if (mb === 0xE4) fcomVals(ST(0), 0);
+          else if (mb === 0xE5) { const v = ST(0);   // fxam (coarse)
+            setC(v < 0 || Object.is(v, -0), Number.isFinite(v) && v !== 0, v === 0); }
+          else if (mb === 0xE8) fpush(1);
+          else if (mb === 0xE9) fpush(Math.log2(10));
+          else if (mb === 0xEA) fpush(Math.LOG2E);
+          else if (mb === 0xEB) fpush(Math.PI);
+          else if (mb === 0xEC) fpush(Math.log10(2));
+          else if (mb === 0xED) fpush(Math.LN2);
+          else if (mb === 0xEE) fpush(0);
+          else if (mb === 0xF0) setST(0, 2 ** ST(0) - 1);
+          else if (mb === 0xF1) { const y = ST(1); setST(1, y * Math.log2(ST(0))); fpop(); }
+          else if (mb === 0xF3) { const y = ST(1); setST(1, Math.atan2(y, ST(0))); fpop(); }
+          else if (mb === 0xF8) { const r = ST(0) % ST(1); setST(0, r); setC(0, 0, 0); }
+          else if (mb === 0xF9) { const y = ST(1); setST(1, y * Math.log2(ST(0) + 1)); fpop(); }
+          else if (mb === 0xFA) setST(0, Math.sqrt(ST(0)));
+          else if (mb === 0xFC) setST(0, rnd(ST(0)));
+          else if (mb === 0xFD) setST(0, ST(0) * 2 ** Math.trunc(ST(1)));
+          else if (mb === 0xFE) setST(0, Math.sin(ST(0)));
+          else if (mb === 0xFF) setST(0, Math.cos(ST(0)));
+          else throw new Error('x87 d9 ' + mb.toString(16));
+        } else if (op === 0xDA && mem) {
+          const b2 = ldIntM(4);
+          if (sub === 2) fcomVals(ST(0), b2);
+          else if (sub === 3) { fcomVals(ST(0), b2); fpop(); }
+          else setST(0, ARITH(sub, ST(0), b2));
+        } else if (op === 0xDA) {
+          const mb = insn.modbyte;
+          if (mb === 0xE9) { fcomVals(ST(0), ST(1)); fpop(); fpop(); }        // fucompp
+          else { const i2 = mb & 7, cc = (mb >> 3) & 3;                        // fcmovb/e/be/u
+            const take = cc === 0 ? this.f.cf : cc === 1 ? this.f.zf : cc === 2 ? (this.f.cf || this.f.zf) : this.f.pf;
+            if (take) setST(0, ST(i2)); }
+        } else if (op === 0xDB && mem) {
+          if (sub === 0) fpush(ldIntM(4));
+          else if (sub === 1) { const save = this.fcw; this.fcw |= 0xC00;      // fisttp: truncate + pop
+                                stIntM(4, ST(0)); this.fcw = save; fpop(); }
+          else if (sub === 2) stIntM(4, ST(0));
+          else if (sub === 3) { stIntM(4, ST(0)); fpop(); }
+          else if (sub === 5) fpush(ldM(10));
+          else if (sub === 7) { stM(10, fpop()); }
+          else throw new Error('x87 db/' + sub);
+        } else if (op === 0xDB) {
+          const mb = insn.modbyte;
+          if (mb >= 0xC0 && mb <= 0xDF) { const i2 = mb & 7, cc = (mb >> 3) & 3;   // fcmovnb/ne/nbe/nu
+            const take = cc === 0 ? !this.f.cf : cc === 1 ? !this.f.zf : cc === 2 ? !(this.f.cf || this.f.zf) : !this.f.pf;
+            if (take) setST(0, ST(i2)); }
+          else if (mb >= 0xE8 && mb <= 0xEF) fcomiVals(ST(0), ST(mb - 0xE8));  // fucomi
+          else if (mb >= 0xF0 && mb <= 0xF7) fcomiVals(ST(0), ST(mb - 0xF0));  // fcomi
+          else if (mb === 0xE2 || mb === 0xE3) { /* fnclex / fninit */ this.fsw = 0; }
+          else throw new Error('x87 db ' + mb.toString(16));
+        } else if (op === 0xDC) {
+          const b2 = mem ? ldM(8) : ST(sti);
+          if (mem) {
+            if (sub === 2) fcomVals(ST(0), b2);
+            else if (sub === 3) { fcomVals(ST(0), b2); fpop(); }
+            else setST(0, ARITH(sub, ST(0), b2));
+          } else {
+            // register form: st(i) = st(i) OP st(0), with subr/divr swapped
+            const k = sub === 4 ? 5 : sub === 5 ? 4 : sub === 6 ? 7 : sub === 7 ? 6 : sub;
+            setST(sti, ARITH(k, ST(sti), ST(0)));
+          }
+        } else if (op === 0xDD && mem) {
+          if (sub === 0) fpush(ldM(8));
+          else if (sub === 1) { const save = this.fcw; this.fcw |= 0xC00;      // fisttp m64: truncate + pop
+                                stIntM(8, ST(0)); this.fcw = save; fpop(); }
+          else if (sub === 2) stM(8, ST(0));
+          else if (sub === 3) stM(8, fpop());
+          else if (sub === 7) this.mem.write(this.ea(insn.rm), 2n, BigInt(this.fsw | (this.ftop << 11)));
+          else throw new Error('x87 dd/' + sub);
+        } else if (op === 0xDD) {
+          const mb = insn.modbyte;
+          if (mb >= 0xC0 && mb <= 0xC7) { /* ffree */ }
+          else if (mb >= 0xD0 && mb <= 0xD7) setST(mb - 0xD0, ST(0));
+          else if (mb >= 0xD8 && mb <= 0xDF) { setST(mb - 0xD8, ST(0)); fpop(); }
+          else if (mb >= 0xE0 && mb <= 0xE7) fcomVals(ST(0), ST(mb - 0xE0));
+          else if (mb >= 0xE8 && mb <= 0xEF) { fcomVals(ST(0), ST(mb - 0xE8)); fpop(); }
+          else throw new Error('x87 dd ' + mb.toString(16));
+        } else if (op === 0xDE && mem) {
+          const b2 = ldIntM(2);
+          if (sub === 2) fcomVals(ST(0), b2);
+          else if (sub === 3) { fcomVals(ST(0), b2); fpop(); }
+          else setST(0, ARITH(sub, ST(0), b2));
+        } else if (op === 0xDE) {
+          const mb = insn.modbyte;
+          if (mb === 0xD9) { fcomVals(ST(0), ST(1)); fpop(); fpop(); }         // fcompp
+          else { const i2 = mb & 7;
+            const k = sub === 4 ? 5 : sub === 5 ? 4 : sub === 6 ? 7 : sub === 7 ? 6 : sub;
+            setST(i2, ARITH(k, ST(i2), ST(0))); fpop(); }                      // faddp etc.
+        } else if (op === 0xDF && mem) {
+          if (sub === 0) fpush(ldIntM(2));
+          else if (sub === 2) stIntM(2, ST(0));
+          else if (sub === 3) { stIntM(2, ST(0)); fpop(); }
+          else if (sub === 5) fpush(ldIntM(8));
+          else if (sub === 7) { stIntM(8, ST(0)); fpop(); }
+          else throw new Error('x87 df/' + sub);
+        } else if (op === 0xDF) {
+          const mb = insn.modbyte;
+          if (mb === 0xE0) this.setReg({ kind: 'reg', r: 0, size: 2 }, BigInt(this.fsw | (this.ftop << 11)));  // fnstsw ax
+          else if (mb >= 0xE8 && mb <= 0xEF) { fcomiVals(ST(0), ST(mb - 0xE8)); fpop(); }   // fucomip
+          else if (mb >= 0xF0 && mb <= 0xF7) { fcomiVals(ST(0), ST(mb - 0xF0)); fpop(); }   // fcomip
+          else throw new Error('x87 df ' + mb.toString(16));
+        } else throw new Error('x87 ' + op.toString(16) + '/' + sub);
         break; }
       case 'rdtsc': case 'rdtscp': {   // synthetic monotonic timestamp
         const t = (this.tsc = (this.tsc || 0n) + 1000n);

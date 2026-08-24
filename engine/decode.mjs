@@ -104,6 +104,13 @@ export function decode(fetch, rip) {
               : { kind: 'reg', r: 1, size: 1 };
     return fin({ mnem: m, dst: rm, src: cnt, size: sz });
   }
+  if (op >= 0xD8 && op <= 0xDF) {              // x87: dispatch on (op, reg field, mod)
+    const m = b(), mod = m >> 6, sub = (m >> 3) & 7;
+    if (mod === 3) return fin({ mnem: 'x87', op, sub, sti: m & 7, modbyte: m, rm: null });
+    i--;                                        // re-read modrm for the memory form
+    const [, mem] = modrm(8);
+    return fin({ mnem: 'x87', op, sub, sti: -1, rm: mem });
+  }
   if (op === 0xC3) return fin({ mnem: 'ret' });
   if (op === 0xC2) return fin({ mnem: 'retn', n: immU(2) });
   if (op === 0xC9) return fin({ mnem: 'leave' });
@@ -159,7 +166,7 @@ export function decode(fetch, rip) {
                       0xE8:1, 0xE9:1, 0xEC:1, 0xED:1, 0xE0:1, 0xE3:1, 0xD5:1, 0xE5:1, 0xE4:1,
                       0xF4:1, 0xF6:1, 0x63:1, 0x67:1, 0x6B:1, 0xC5:1, 0xC4:1,
                       0x54:1, 0x55:1, 0x56:1, 0x57:1, 0x2A:1, 0x2C:1, 0x2D:1, 0x2E:1, 0x2F:1,
-                      0x51:1, 0x58:1, 0x59:1, 0x5A:1, 0x5B:1, 0x5C:1, 0x5D:1, 0x5E:1, 0x5F:1, 0x2B:1, 0xC6:1 };
+                      0x50:1, 0x51:1, 0x58:1, 0x59:1, 0x5A:1, 0x5B:1, 0x5C:1, 0x5D:1, 0x5E:1, 0x5F:1, 0x2B:1, 0xC6:1 };
     const SSE_IMM8 = { 0x70:1, 0xC5:1, 0xC4:1, 0xC6:1 };
     const SSE_GRP_SHIFT = { 0x71:1, 0x72:1, 0x73:1 };
     if (SSE_GRP_SHIFT[o2]) {

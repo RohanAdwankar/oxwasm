@@ -113,6 +113,7 @@ export class LinuxEngine {
     this.stats = { interpreted: 0, compiledRuns: 0, aotRuns: 0, tiers: {}, syscalls: {} };
     this.exitCode = null;
     this.stdout = [];
+    this.stdoutBytes = [];                    // raw chunks — binary-safe (gzip -c etc.)
     // ---- tier-2: runtime whole-function AOT ----
     // assembleWat: (watText) -> Uint8Array of wasm; injected because the text
     // assembler differs by host (wat2wasm CLI under node, wabt.js in a page).
@@ -243,6 +244,7 @@ export class LinuxEngine {
     switch (nr) {
       case 1: {                                              // write(fd, buf, len)
         this.stdout.push(this.readCStrMem(a2, Number(a3)));
+        this.stdoutBytes.push(this.ram.slice(Number(a2 - this.base), Number(a2 - this.base) + Number(a3)));
         ret(a3); break; }
       case 20: {                                             // writev(fd, iov, cnt)
         const view = new DataView(this.wmem.buffer);
@@ -250,7 +252,8 @@ export class LinuxEngine {
         for (let i = 0; i < Number(a3); i++) {
           const io = this.RAMOFF + Number(a2 - this.base) + i * 16;
           const b = view.getBigUint64(io, true), l = view.getBigUint64(io + 8, true);
-          if (l) this.stdout.push(this.readCStrMem(b, Number(l)));
+          if (l) { this.stdout.push(this.readCStrMem(b, Number(l)));
+                   this.stdoutBytes.push(this.ram.slice(Number(b - this.base), Number(b - this.base) + Number(l))); }
           total += l;
         }
         ret(total); break; }
