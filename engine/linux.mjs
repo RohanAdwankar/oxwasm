@@ -13,7 +13,10 @@ const PAGE = 4096n;
 const align = (v, a) => (v + a - 1n) & ~(a - 1n);
 
 export class LinuxEngine {
-  constructor(elfBytes, { argv = ['prog'], memMB = 256, threshold = 8 } = {}) {
+  constructor(elfBytes, { argv = ['prog'], memMB = 256, threshold = 8, files = {} } = {}) {
+    this.files = files;                       // path -> Uint8Array (read-only)
+    this.fds = new Map();                     // fd -> { bytes, pos } ; 0/1/2 reserved
+    this.nextFd = 3;
     const dv = new DataView(elfBytes.buffer, elfBytes.byteOffset, elfBytes.length);
     if (dv.getUint32(0, true) !== 0x464c457f || elfBytes[4] !== 2)
       throw new Error('not an ELF64');
@@ -110,6 +113,27 @@ export class LinuxEngine {
         const addr = this.mmapNext; this.mmapNext += len;
         ret(addr); break; }
       case 11: ret(0n); break;                               // munmap
+      case 10: ret(0n); break;                               // mprotect (no page prot here)
+      case 273: ret(0n); break;                              // set_robust_list
+      case 334: ret(-38n); break;                            // rseq -> ENOSYS (glibc copes)
+      case 302: {                                            // prlimit64: report infinity
+        const oldp = cpu.regs[2];                            // rdx = old_limit
+        if (oldp) { const v = new DataView(this.wmem.buffer);
+          const off = this.RAMOFF + Number(oldp - this.base);
+          v.setBigUint64(off, 0xFFFFFFFFFFFFFFFFn, true);
+          v.setBigUint64(off + 8, 0xFFFFFFFFFFFFFFFFn, true); }
+        ret(0n); break; }
+      case 267: {                                            // readlinkat: /proc/self/exe -> argv0
+        const buf = cpu.regs[2], sz = cpu.regs[10] ?? cpu.regs[8];
+        const p = new TextEncoder().encode('/prog');
+        this.ram.set(p.subarray(0, Number(sz)), Number(buf - this.base));
+        ret(BigInt(Math.min(p.length, Number(sz)))); break; }
+      case 318: {                                            // getrandom
+        const buf = a1, len = Number(a2);
+        const bytes = new Uint8Array(len);
+        crypto.getRandomValues(bytes.subarray(0, Math.min(len, 65536)));
+        this.ram.set(bytes, Number(buf - this.base));
+        ret(BigInt(len)); break; }
       case 16: ret(-25n); break;                             // ioctl -> ENOTTY
       case 158:                                              // arch_prctl
         if (Number(a1) === 0x1002) { cpu.fsBase = a2; ret(0n); } else ret(-22n);
@@ -120,6 +144,46 @@ export class LinuxEngine {
       case 228: ret(0n); break;                              // clock_gettime (zeros)
       case 35: ret(0n); break;                               // nanosleep
       case 39: ret(1n); break;                               // getpid
+      case 102: case 104: case 107: case 108: ret(0n); break; // getuid/getgid/geteuid/getegid
+      case 105: case 106: ret(0n); break;                     // setuid/setgid
+      case 157: ret(0n); break;                               // prctl
+      case 96: ret(0n); break;                                // gettimeofday
+      case 257: {                                             // openat(dirfd, path, flags)
+        let p = ''; let a = cpu.regs[6];                      // rsi = path
+        for (;;) { const c = Number(this.mem.read(a, 1n)); if (!c) break; p += String.fromCharCode(c); a++; }
+        const f = this.files[p] ?? this.files[p.replace(/^\.\//, '')];
+        if (f === undefined) { ret(-2n); break; }             // ENOENT
+        const fd = this.nextFd++;
+        this.fds.set(fd, { bytes: f, pos: 0 });
+        ret(BigInt(fd)); break; }
+      case 0: {                                               // read(fd, buf, len)
+        const fd = Number(a1), h = this.fds.get(fd);
+        if (!h) { ret(fd === 0 ? 0n : -9n); break; }          // stdin -> EOF
+        const n = Math.min(Number(a3), h.bytes.length - h.pos);
+        this.ram.set(h.bytes.subarray(h.pos, h.pos + n), Number(a2 - this.base));
+        h.pos += n; ret(BigInt(n)); break; }
+      case 3: this.fds.delete(Number(a1)); ret(0n); break;    // close
+      case 8: {                                               // lseek
+        const h = this.fds.get(Number(a1));
+        if (!h) { ret(-9n); break; }
+        const w = Number(a3);                                 // rdx = whence
+        const off = BigInt.asIntN(64, a2);
+        h.pos = w === 0 ? Number(off) : w === 1 ? h.pos + Number(off) : h.bytes.length + Number(off);
+        ret(BigInt(h.pos)); break; }
+      case 5: case 262: {                                     // fstat / newfstatat (minimal)
+        const isAt = nr === 262;
+        const fd = Number(a1);
+        const buf = isAt ? cpu.regs[2] : a2;
+        const h = this.fds.get(fd);
+        const size = h ? h.bytes.length : 0;
+        const mode = h ? 0o100644 : 0o020620;                 // file vs char dev
+        const off = this.RAMOFF + Number(buf - this.base);
+        new Uint8Array(this.wmem.buffer, off, 144).fill(0);
+        const v = new DataView(this.wmem.buffer);
+        v.setBigUint64(off + 24, BigInt(mode), true);         // st_mode at 24
+        v.setBigUint64(off + 48, BigInt(size), true);         // st_size at 48
+        v.setBigUint64(off + 56, 4096n, true);                // st_blksize
+        ret(0n); break; }
       default:
         ret(-38n);                                           // ENOSYS
         (this.unknown ||= new Set()).add(nr);

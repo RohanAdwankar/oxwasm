@@ -62,7 +62,7 @@ export class CPU {
     if (op.index >= 0) a += this.regs[op.index] * BigInt(op.scale);
     if (op.ripRel) a += this.ripNext;
     if (op.fs) a += this.fsBase || 0n;
-    return a & MASK[8];
+    return a & (op.a32 ? MASK[4] : MASK[8]);
   }
   get(op) {
     if (op.kind === 'imm') return op.v & MASK[op.size || 8];
@@ -171,6 +171,75 @@ export class CPU {
             const src = this.xmm[insn.rm.kind === 'xmm' ? insn.rm.r : 0]; let msk = 0n;
             for (let k = 0n; k < 16n; k++) if ((src >> (8n*k + 7n)) & 1n) msk |= 1n << k;
             this.regs[insn.xr] = msk; break; }
+          case 0x12: this.xmm[insn.xr] = (this.xmm[insn.xr] & ~0xFFFFFFFFFFFFFFFFn) | rdRm(8); break;   // movlps/movlpd load low
+          case 0x13: wrRm(8, this.xmm[insn.xr] & 0xFFFFFFFFFFFFFFFFn); break;                             // movlps store
+          case 0x16: this.xmm[insn.xr] = (this.xmm[insn.xr] & 0xFFFFFFFFFFFFFFFFn) | (rdRm(8) << 64n); break; // movhps load high
+          case 0x17: wrRm(8, this.xmm[insn.xr] >> 64n); break;                                            // movhps store
+          case 0x14: {   // unpcklps/pd
+            const a = this.xmm[insn.xr], b2 = rdRm(16);
+            if (insn.p66) this.xmm[insn.xr] = (a & 0xFFFFFFFFFFFFFFFFn) | ((b2 & 0xFFFFFFFFFFFFFFFFn) << 64n);
+            else this.xmm[insn.xr] = (a & 0xFFFFFFFFn) | ((b2 & 0xFFFFFFFFn) << 32n) |
+                 (((a >> 32n) & 0xFFFFFFFFn) << 64n) | (((b2 >> 32n) & 0xFFFFFFFFn) << 96n);
+            break; }
+          case 0x15: {   // unpckhps/pd
+            const a = this.xmm[insn.xr], b2 = rdRm(16);
+            if (insn.p66) this.xmm[insn.xr] = ((a >> 64n) & 0xFFFFFFFFFFFFFFFFn) | (((b2 >> 64n) & 0xFFFFFFFFFFFFFFFFn) << 64n);
+            else this.xmm[insn.xr] = ((a >> 64n) & 0xFFFFFFFFn) | (((b2 >> 64n) & 0xFFFFFFFFn) << 32n) |
+                 (((a >> 96n) & 0xFFFFFFFFn) << 64n) | (((b2 >> 96n) & 0xFFFFFFFFn) << 96n);
+            break; }
+          case 0x60: case 0x61: case 0x62: case 0x68: case 0x69: case 0x6A: case 0x6D: {
+            // punpck l/h bw/wd/dq/qdq via generic interleave
+            const EB = { 0x60:1, 0x61:2, 0x62:4, 0x68:1, 0x69:2, 0x6A:4, 0x6D:8 }[insn.op];
+            const high = insn.op >= 0x68;
+            const a = this.xmm[insn.xr], b2 = rdRm(16);
+            const n = 8 / EB;                        // elements per half
+            const eb = BigInt(EB * 8), off = high ? BigInt(64) : 0n;
+            let r = 0n;
+            for (let k = 0n; k < BigInt(n); k++) {
+              const ea = (a >> (off + k * eb)) & ((1n << eb) - 1n);
+              const e2 = (b2 >> (off + k * eb)) & ((1n << eb) - 1n);
+              r |= ea << (2n * k * eb);
+              r |= e2 << ((2n * k + 1n) * eb);
+            }
+            this.xmm[insn.xr] = r; break; }
+          case 0x70: {                                // pshufd (66) / pshuflw(F2)/hw(F3): implement 66 form
+            const src = rdRm(16); let r = 0n;
+            for (let k = 0n; k < 4n; k++) {
+              const sel = BigInt((insn.imm8 >> Number(k) * 2) & 3);
+              r |= ((src >> (sel * 32n)) & 0xFFFFFFFFn) << (k * 32n);
+            }
+            this.xmm[insn.xr] = r; break; }
+          case 0xFB: case 0xFA: case 0xF9: case 0xF8: {   // psubq/d/w/b
+            const EB = { 0xFB:8, 0xFA:4, 0xF9:2, 0xF8:1 }[insn.op];
+            const a = this.xmm[insn.xr], b2 = rdRm(16);
+            const eb = BigInt(EB*8), mask = (1n << eb) - 1n; let r = 0n;
+            for (let k = 0n; k < BigInt(16/EB); k++)
+              r |= ((((a >> (k*eb)) & mask) - ((b2 >> (k*eb)) & mask)) & mask) << (k*eb);
+            this.xmm[insn.xr] = r; break; }
+          case 0xD4: case 0xFE: case 0xFD: case 0xFC: {   // paddq/d/w/b
+            const EB = { 0xD4:8, 0xFE:4, 0xFD:2, 0xFC:1 }[insn.op];
+            const a = this.xmm[insn.xr], b2 = rdRm(16);
+            const eb = BigInt(EB * 8), mask = (1n << eb) - 1n; let r = 0n;
+            for (let k = 0n; k < BigInt(16 / EB); k++)
+              r |= ((((a >> (k*eb)) & mask) + ((b2 >> (k*eb)) & mask)) & mask) << (k*eb);
+            this.xmm[insn.xr] = r; break; }
+          case 0x64: case 0x65: case 0x66: {             // pcmpgtb/w/d (signed)
+            const EB = { 0x64:1, 0x65:2, 0x66:4 }[insn.op];
+            const a = this.xmm[insn.xr], b2 = rdRm(16);
+            const eb = BigInt(EB*8), mask = (1n << eb) - 1n, sbit = 1n << (eb-1n); let r = 0n;
+            for (let k = 0n; k < BigInt(16/EB); k++) {
+              const ea = ((a >> (k*eb)) & mask), e2 = ((b2 >> (k*eb)) & mask);
+              const sa = (ea ^ sbit) - sbit, s2 = (e2 ^ sbit) - sbit;
+              if (sa > s2) r |= mask << (k*eb);
+            }
+            this.xmm[insn.xr] = r; break; }
+          case 0x75: case 0x76: {                      // pcmpeqw/d
+            const EB = insn.op === 0x75 ? 2 : 4;
+            const a = this.xmm[insn.xr], b2 = rdRm(16);
+            const eb = BigInt(EB*8), mask = (1n << eb) - 1n; let r = 0n;
+            for (let k = 0n; k < BigInt(16/EB); k++)
+              if (((a >> (k*eb)) & mask) === ((b2 >> (k*eb)) & mask)) r |= mask << (k*eb);
+            this.xmm[insn.xr] = r; break; }
           default: throw new Error('sse op ' + insn.op.toString(16));
         }
         break; }
@@ -213,6 +282,21 @@ export class CPU {
       case 'cdq': {    // sign of rax fills rdx
         const neg = (this.regs[0] & SIGN[S]) !== 0n;
         this.setReg({ kind: 'reg', r: 2, size: S }, neg ? MASK[S] : 0n); break; }
+      case 'ssegrpshift': {   // psrlw/d/q, psllw/d/q, psra, pslldq/psrldq by imm
+        const M128 = (1n << 128n) - 1n;
+        const eb = insn.op === 0x71 ? 16n : insn.op === 0x72 ? 32n : 64n;
+        const v = this.xmm[insn.xrm]; const c = BigInt(insn.imm8);
+        const apply = (fn) => { const mask = (1n << eb) - 1n; let r = 0n;
+          for (let k = 0n; k < 128n / eb; k++) r |= (fn((v >> (k*eb)) & mask) & mask) << (k*eb);
+          return r; };
+        if (insn.op === 0x73 && insn.sub === 3) this.xmm[insn.xrm] = (v >> (c * 8n)) & M128;       // psrldq
+        else if (insn.op === 0x73 && insn.sub === 7) this.xmm[insn.xrm] = (v << (c * 8n)) & M128;  // pslldq
+        else if (insn.sub === 2) this.xmm[insn.xrm] = apply(e => c >= eb ? 0n : e >> c);           // psrl
+        else if (insn.sub === 6) this.xmm[insn.xrm] = apply(e => c >= eb ? 0n : e << c);           // psll
+        else if (insn.sub === 4) this.xmm[insn.xrm] = apply(e => {                                  // psra
+          const s = (e ^ (1n << (eb-1n))) - (1n << (eb-1n)); return (s >> (c >= eb ? eb-1n : c)); });
+        else throw new Error('sse shift sub ' + insn.sub);
+        break; }
       case 'cpuid': this.regs[0] = 0n; this.regs[3] = 0n; this.regs[1] = 0n; this.regs[2] = 0n; break;
       case 'movs': {
         const n = BigInt(S);
@@ -307,6 +391,12 @@ export class CPU {
           this.f.cf = (a >> BigInt(c - 1)) & 1n ? 1 : 0;
           if (c === 1) this.f.of = 0;
           this.szp(r, S); this.set(insn.dst, r); } break; }
+      case 'rol': { const w = BigInt(S*8); const c = this.get(insn.src) % w;
+        if (c) { const a = this.get(insn.dst); const r = ((a << c) | (a >> (w - c))) & M;
+          this.f.cf = Number(r & 1n); this.set(insn.dst, r); } break; }
+      case 'ror': { const w = BigInt(S*8); const c = this.get(insn.src) % w;
+        if (c) { const a = this.get(insn.dst); const r = ((a >> c) | (a << (w - c))) & M;
+          this.f.cf = Number((r >> (w - 1n)) & 1n); this.set(insn.dst, r); } break; }
       case 'push': this.push(this.get(insn.src)); break;
       case 'pop': this.set(insn.dst, this.pop()); break;
       case 'jmp': this.rip = (next + insn.rel) & MASK[8]; break;
@@ -320,6 +410,8 @@ export class CPU {
       case 'setcc': this.set(insn.dst, this.cond(insn.cond) ? 1n : 0n); break;
       case 'call': this.push(next); this.rip = (next + insn.rel) & MASK[8]; break;
       case 'ret': this.rip = this.pop(); break;
+      case 'retn': this.rip = this.pop(); this.regs[4] = (this.regs[4] + insn.n) & MASK[8]; break;
+      case 'leave': this.regs[4] = this.regs[5]; this.regs[5] = this.pop(); break;
       default: throw new Error('unimplemented ' + insn.mnem);
     }
     return insn;

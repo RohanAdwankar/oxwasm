@@ -7,19 +7,20 @@ const COND = ['o','no','b','ae','e','ne','be','a','s','ns','p','np','l','ge','le
 export function decode(fetch, rip) {
   let i = 0;
   const b = () => fetch(i++);
-  let rex = 0, opsize = 4, fsSeg = 0, rep = 0, rep2 = 0, lock = 0;
+  let rex = 0, opsize = 4, fsSeg = 0, rep = 0, rep2 = 0, lock = 0, addr32 = 0;
   let p;
   for (;;) {                                  // prefixes
     p = b();
     if (p === 0x66) { opsize = 2; continue; }
     if (p === 0x64) { fsSeg = 1; continue; }   // fs segment override (TLS)
+    if (p === 0x67) { addr32 = 1; continue; }  // address-size override
     if (p === 0xF3) { rep = 1; continue; }     // rep / repe
     if (p === 0xF2) { rep2 = 1; continue; }    // repne / scalar-double
     if (p === 0xF0) { lock = 1; continue; }    // lock: single-hart, plain semantics
     if ((p & 0xF0) === 0x40) { rex = p; continue; }
     if (p === 0x2E || p === 0x3E) { continue; } // cs/ds overrides: meaningless in 64-bit (padding/notrack)
     if (p === 0x26 ||
-        p === 0x36 || p === 0x65 || p === 0x67)
+        p === 0x36 || p === 0x65)
       throw new Error(`unsupported prefix ${p.toString(16)}`);
     break;
   }
@@ -43,7 +44,7 @@ export function decode(fetch, rip) {
     } else if ((m & 7) === 5 && mod === 0) { base = -1; ripRel = true; disp = imm(4); }
     if (mod === 1) disp = imm(1);
     else if (mod === 2) disp = imm(4);
-    const out = [mkreg(reg, size), { kind: 'mem', base, index, scale, disp, ripRel, size, fs: fsSeg }];
+    const out = [mkreg(reg, size), { kind: 'mem', base, index, scale, disp, ripRel, size, fs: fsSeg, a32: addr32 }];
     out[2] = reg; return out;
   }
   function imm(n) {                           // sign-extended immediate
@@ -59,7 +60,7 @@ export function decode(fetch, rip) {
   }
   const fin = (o) => (o.len = i, o);
   const ALU = { 0: 'add', 1: 'or', 2: 'adc', 3: 'sbb', 4: 'and', 5: 'sub', 6: 'xor', 7: 'cmp' };
-  const SHIFT = { 4: 'shl', 5: 'shr', 7: 'sar' };
+  const SHIFT = { 0: 'rol', 1: 'ror', 4: 'shl', 5: 'shr', 7: 'sar' };
 
   const op = p;
   // ALU r/m,r and r,r/m families: base opcodes 0x00,0x08,0x20,0x28,0x30,0x38
@@ -95,16 +96,23 @@ export function decode(fetch, rip) {
   if (op >= 0xB8 && op <= 0xBF) { const r = (op - 0xB8) | (B << 3); return W ? fin({ mnem: 'mov', dst: mkreg(r, 8), src: { kind: 'imm', v: immU(8) }, size: 8 }) : fin({ mnem: 'mov', dst: mkreg(r, osz), src: { kind: 'imm', v: immU(osz) }, size: osz }); }
   if (op === 0xC6) { const [, rm] = modrm(1);   return fin({ mnem: 'mov', dst: rm, src: { kind: 'imm', v: immU(1) }, size: 1 }); }
   if (op === 0xC7) { const [, rm] = modrm(osz); return fin({ mnem: 'mov', dst: rm, src: { kind: 'imm', v: imm(4) }, size: osz }); }
-  if (op === 0xC1 || op === 0xD1 || op === 0xD3) {
-    const [, rm, g] = modrm(osz); const m = SHIFT[g & 7]; if (!m) throw new Error('grp2 ' + (g & 7));
-    const cnt = op === 0xC1 ? { kind: 'imm', v: immU(1) } : op === 0xD1 ? { kind: 'imm', v: 1n } : { kind: 'reg', r: 1, size: 1 };
-    return fin({ mnem: m, dst: rm, src: cnt, size: osz });
+  if (op === 0xC0 || op === 0xC1 || op === 0xD0 || op === 0xD1 || op === 0xD2 || op === 0xD3) {
+    const sz = (op === 0xC0 || op === 0xD0 || op === 0xD2) ? 1 : osz;
+    const [, rm, g] = modrm(sz); const m = SHIFT[g & 7]; if (!m) throw new Error('grp2 ' + (g & 7));
+    const cnt = (op === 0xC0 || op === 0xC1) ? { kind: 'imm', v: immU(1) }
+              : (op === 0xD0 || op === 0xD1) ? { kind: 'imm', v: 1n }
+              : { kind: 'reg', r: 1, size: 1 };
+    return fin({ mnem: m, dst: rm, src: cnt, size: sz });
   }
   if (op === 0xC3) return fin({ mnem: 'ret' });
+  if (op === 0xC2) return fin({ mnem: 'retn', n: immU(2) });
+  if (op === 0xC9) return fin({ mnem: 'leave' });
   if (op === 0xE8) return fin({ mnem: 'call', rel: imm(4) });
   if (op === 0xE9) return fin({ mnem: 'jmp', rel: imm(4) });
   if (op === 0xEB) return fin({ mnem: 'jmp', rel: imm(1) });
   if (op === 0x90 && !rex) return fin({ mnem: 'nop' });
+  if (op >= 0x91 && op <= 0x97 || (op === 0x90 && rex))   // xchg rax, r
+    return fin({ mnem: 'xchg', dst: mkreg(0, osz), src: mkreg((op - 0x90) | (B << 3), osz), size: osz });
   if (op === 0x98) return fin({ mnem: 'cwde', size: osz });   // cbw/cwde/cdqe
   if (op === 0x99) return fin({ mnem: 'cdq', size: osz });    // cwd/cdq/cqo
   if (op === 0xF4) return fin({ mnem: 'hlt' });
@@ -140,7 +148,15 @@ export function decode(fetch, rip) {
     if (o2 >= 0x80 && o2 <= 0x8F) return fin({ mnem: 'jcc', cond: COND[o2 - 0x80], rel: imm(4) });
     if (o2 === 0x05) return fin({ mnem: 'syscall' });
     const SSE_OPS = { 0x6E:1, 0x7E:1, 0xD6:1, 0x6F:1, 0x7F:1, 0x10:1, 0x11:1,
-                      0x28:1, 0x29:1, 0x6C:1, 0xEF:1, 0x74:1, 0xD7:1, 0xDB:1, 0xEB:1 };
+                      0x28:1, 0x29:1, 0x6C:1, 0xEF:1, 0x74:1, 0xD7:1, 0xDB:1, 0xEB:1,
+                      0x60:1, 0x61:1, 0x62:1, 0x68:1, 0x69:1, 0x6A:1, 0x6D:1,
+                      0x70:1, 0xD4:1, 0xFE:1, 0xFD:1, 0xFC:1, 0x75:1, 0x76:1, 0x12:1, 0x13:1, 0x16:1, 0x17:1, 0x14:1, 0x15:1, 0x66:1, 0x65:1, 0x64:1, 0xFB:1, 0xFA:1, 0xF9:1, 0xF8:1 };
+    const SSE_IMM8 = { 0x70:1 };
+    const SSE_GRP_SHIFT = { 0x71:1, 0x72:1, 0x73:1 };
+    if (SSE_GRP_SHIFT[o2]) {
+      const m = b(), sub = (m >> 3) & 7, xrm = (m & 7) | (B << 3);
+      return fin({ mnem: 'ssegrpshift', op: o2, sub, xrm, imm8: Number(immU(1)), p66: opsize === 2 });
+    }
     if (SSE_OPS[o2]) {
       const m = b(), mod = m >> 6, xr = ((m >> 3) & 7) | (R << 3);
       let rm;
@@ -150,7 +166,8 @@ export function decode(fetch, rip) {
         const [, mem] = modrm(16);
         rm = mem;
       }
-      return fin({ mnem: 'sse', op: o2, p66: opsize === 2, pF3: !!rep, pF2: !!rep2, W, xr, rm });
+      const extra = SSE_IMM8[o2] ? Number(immU(1)) : undefined;
+      return fin({ mnem: 'sse', op: o2, p66: opsize === 2, pF3: !!rep, pF2: !!rep2, W, xr, rm, imm8: extra });
     }
     if (o2 === 0x1E) { b(); return fin({ mnem: 'nop' }); }   // endbr64 / nop variants
     if (o2 === 0xB0) { const [r, rm] = modrm(1);   return fin({ mnem: 'cmpxchg', dst: rm, src: r, size: 1 }); }

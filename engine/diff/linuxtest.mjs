@@ -1,7 +1,11 @@
 import { LinuxEngine } from '../linux.mjs';
 import { readFileSync } from 'node:fs';
 const bin = readFileSync(process.argv[2]);
-const eng = new LinuxEngine(new Uint8Array(bin), { argv: [process.argv[2]] });
+// any argv entry that is a real host file is mirrored into the guest FS
+import { existsSync } from 'node:fs';
+const files = {};
+for (const a of process.argv.slice(3)) if (existsSync(a)) files[a] = new Uint8Array(readFileSync(a));
+const eng = new LinuxEngine(new Uint8Array(bin), { argv: process.argv.slice(2), files });
 const t0 = process.hrtime.bigint();
 try {
   const r = eng.run();
