@@ -104,16 +104,26 @@ that carries GIMP carries most software — so nothing about GIMP is baked in.
   programs: GIMP 2.8 (`gimp.html`, 179 MB, full UI ~3 min, keyboard +
   emulated mouse) and xcalc (`xcalc.html`, 89 MB, ~1 min). Slow, real,
   entirely client-side — and not specialized to any one app.
-- **M3 — speed, and the actual AppImage. Foundation verified.** AppImages
-  are x86-64; v86 executes 32-bit x86 only. The fast path is an x86-64 →
-  WASM JIT — the engine oxwasm must own (the only comparable engine today,
-  CheerpX, is proprietary). `engine/` has a decoder, a tier-0 interpreter
-  proven step-for-step against the real CPU (`ptrace` single-stepping —
-  316 synthetic cases + gcc -O1/-O2 output, ~6700 instructions, zero
-  divergence), and a tier-1 JIT seed that emits real WebAssembly matching
-  the interpreter. `engine/test.sh` runs the suite. Design and next steps:
-  `docs/m3-engine.md`. This is the core project; the foundation is real,
-  the hot-path JIT is the road ahead.
+- **M3 — speed, and the actual AppImage. Shipped for static x86-64.**
+  `oxwasm build prog` (an x86-64 static ELF) or `oxwasm build app.AppImage`
+  emits one self-contained HTML that runs the unmodified binary in the tab:
+  a tier-0 interpreter proven against the real CPU by `ptrace`
+  single-stepping (316 synthetic cases + real gcc output, zero divergence)
+  profiles the run and AOT-compiles hot call-graph closures to WebAssembly
+  **at runtime, in-page** (wabt assembles the emitted WAT). Verified in
+  headless Chromium on stock Ubuntu busybox (echo/wc/sort/md5sum/sha256sum
+  bit-exact), a glibc-static md5 program, and a real third-party AppImage
+  (appimagetool's continuous build) — output and exit codes identical to
+  native. Hot compute runs at **0.84x–1.4x native** (see
+  `engine/aot/RESULTS.md`; wasm can beat native); cold code interprets, so
+  seconds of warmup precede steady state. AppImages are unpacked host-side
+  (pure-python squashfs — a browser has no FUSE) and the payload rides in
+  the guest FS, bytes unmodified. Current engine limits, stated plainly:
+  static binaries only (no `ld.so` lane yet, so dynamically-linked
+  AppImages don't run), no x87 long-double (float `printf` paths), CLI
+  apps only (a GUI app needs the display server the M2/v86 lane provides).
+  `engine/test.sh` runs the differential suite; `engine/aot/bench-all.mjs`
+  reproduces the performance table.
 - **M4 — the platform. Spike running.** `platform/` is the second lane:
   a syscall ABI as wasm imports, processes as workers, pipes as
   SharedArrayBuffer rings with real blocking reads. Two freestanding C
@@ -124,15 +134,17 @@ that carries GIMP carries most software — so nothing about GIMP is baked in.
 ## Layout
 
 ```
-oxwasm.py        CLI — packs engine + BIOS + guest into one HTML
-pack-app.sh      turn any app spec into a single-file HTML (the general tool)
+oxwasm.py        CLI — v86 lane (kernel/ISO/disk -> HTML) + M3 lane (x86-64 ELF/AppImage -> HTML)
+pack-app.sh      turn any app spec into a single-file HTML (the M2 general tool)
 examples/*.app   app specs (gimp, xcalc) — data, not code
 resolve-debs.py  dependency-closure resolver over the Ubuntu archive
 mkcpio.py        pure-Python newc cpio / initramfs builder
 fetch-runtime.sh reproduce runtime/ (engine + BIOS)
 make-demo.sh     reproduce the barebones M1 guest and linux.html
 demo-init.sh     the M1 guest's /init; guest/oxinit is the generic graphical init
+tools/m3pack.mjs        M3 packer: ELF/AppImage -> single HTML with in-page JIT
+tools/appimage-extract.py  type-2 AppImage unpack without FUSE (pure python)
 platform/        M4 — syscall ABI, processes-as-workers, pipe demo
-engine/          M3 — x86-64 decoder, tier-0 interpreter, tier-1 JIT seed
+engine/          M3 — decoder, hardware-verified interpreter, runtime AOT x86-64 -> wasm
 docs/m3-engine.md  M3 — the x86-64 -> WASM JIT design
 ```

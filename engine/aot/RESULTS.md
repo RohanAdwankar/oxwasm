@@ -86,3 +86,31 @@ shifts/rotates, `lea`, `movzx`/`movsx`, `push`/`pop`/`leave`, two/three-operand
 and widening multiply (`imul`/`mul`), `cmov`, `setcc`, and the full
 conditional-branch set with lazy flags. Not yet: SSE/AVX vector instructions
 (auto-vectorized loops), `div`/`idiv`, and calls that leave the function.
+
+## Update: runtime tiering + the browser product (this session)
+
+The translator above became the engine's tier-2: the interpreter profiles
+call targets and hot loop heads at runtime and AOT-compiles whole call-graph
+closures mid-run — no symbols, no hints, unmodified binaries. Escapes
+(syscall / indirect target / undecodable byte) resolve against the live
+engine; a deopt UNWINDS the wasm frames (all state is in the regfile and
+guest stack), so escape handling is O(1) in stack depth.
+
+Proven end-to-end, bit-exact against native output and exit codes:
+
+| binary | provenance | result |
+|---|---|---|
+| `md5-native` | glibc -static, full libc init + TLS + printf | digest bit-exact on 16MB |
+| busybox | stock Ubuntu, stripped | echo/wc/sort/md5sum/sha256sum/gzip bit-exact |
+| appimagetool | third-party AppImage, GitHub releases | version banner, exit 0 |
+
+And as a product: `oxwasm build <x86-64 ELF or .AppImage>` emits ONE
+self-contained offline HTML embedding the engine, wabt (the in-page WAT
+assembler), the unmodified binary, and its data files. In headless Chromium
+the busybox AppImage build sha256-hashes a 1MB embedded file bit-exact in
+3.4s with 6 AOT units JIT-compiled in-page (5.25MB HTML).
+
+Honest limits of the M3 lane today: static binaries (no ld.so), no x87, CLI
+only (GUI needs the M2/v86 lane's display server), and interpreter warmup
+dominates short runs — the AOT covers the hot 99% of cycles, not the cold
+tail.
