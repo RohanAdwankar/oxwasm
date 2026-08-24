@@ -411,26 +411,40 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     return false;
   };
   const CALLS = new Set(['call', 'callind', 'syscall']);
+  // block 0 re-executes iff it is a loop header (some edge targets it): then a
+  // prologue push would re-read the stale regfile slot every iteration.
+  const entryIsLoopHeader = succs.some(sl => sl.includes(0));
   const disciplined = (X) => {
-    let sawBarrier = false;                       // write to X, or a call, in the entry block
+    if (entryIsLoopHeader) return false;
+    // exactly one push of X, in the entry block, before any write to X or call
+    let pushCount = 0;
+    for (let bi = 0; bi < N; bi++) for (const insn of blocks[bi].insns)
+      if (insn.mnem === 'push' && insn.src?.kind === 'reg' && insn.src.r === X) { if (bi !== 0) return false; pushCount++; }
+    if (pushCount !== 1) return false;
+    let sawBarrier = false, sawPush = false;
     for (const insn of blocks[0].insns) {
-      if (insn.mnem === 'push' && insn.src?.kind === 'reg' && insn.src.r === X) {
-        if (sawBarrier) return false; continue;
-      }
+      if (insn.mnem === 'push' && insn.src?.kind === 'reg' && insn.src.r === X) { if (sawBarrier) return false; sawPush = true; continue; }
       if (CALLS.has(insn.mnem) || touchesReg(insn, X)) sawBarrier = true;
     }
+    if (!sawPush) return false;
+    // EVERY ret-terminated block must restore X via exactly one pop, with no
+    // access to X and no call between that pop and the ret; a pop of X may
+    // appear only in ret blocks. This is what makes the epilogue-skip sound:
+    // regfile[X] holds the restored caller value on every exit path.
     for (let bi = 0; bi < N; bi++) {
       const insns = blocks[bi].insns;
+      let poppedHere = 0;
       for (let k = 0; k < insns.length; k++) {
         const insn = insns[k];
-        if (insn.mnem === 'push' && insn.src?.kind === 'reg' && insn.src.r === X && bi !== 0) return false;
         if (insn.mnem === 'pop' && insn.dst?.kind === 'reg' && insn.dst.r === X) {
+          poppedHere++;
           if (term[bi].kind !== 'ret') return false;
           for (let j = k + 1; j < insns.length; j++)
             if (CALLS.has(insns[j].mnem) || touchesReg(insns[j], X) ||
                 (insns[j].mnem === 'pop' && insns[j].dst?.kind === 'reg' && insns[j].dst.r === X)) return false;
         }
       }
+      if (term[bi].kind === 'ret' && poppedHere !== 1) return false;
     }
     return true;
   };
@@ -628,8 +642,14 @@ function emitUnitFunction(a0, fnAddr, ctx) {
             if (prod) { L.push(`(local.set $fr (local.get ${t}))`); flagState = { kind: insn.mnem, size: S }; } }
           break; }
         case 'not': L.push(wr(insn.dst,S,`(i64.xor ${rd(insn.dst,S,next)} (i64.const ${m}))`,next)); break;
-        case 'neg': { const t=T(); L.push(`(local.set ${t} (i64.and (i64.sub (i64.const 0) ${rd(insn.dst,S,next)}) (i64.const ${m})))`);
-          L.push(wr(insn.dst,S,`(local.get ${t})`,next)); setFlags('sub',S,'(i64.const 0)',rd(insn.dst,S,next),`(local.get ${t})`); break; }
+        case 'neg': { const t=T(), orig=T();
+          // neg computes flags as (0 - old); capture the ORIGINAL operand
+          // before the destructive write, or signed conditions after neg
+          // (cmovl-based abs) invert.
+          L.push(`(local.set ${orig} ${rd(insn.dst,S,next)})`);
+          L.push(`(local.set ${t} (i64.and (i64.sub (i64.const 0) (local.get ${orig})) (i64.const ${m})))`);
+          L.push(wr(insn.dst,S,`(local.get ${t})`,next));
+          setFlags('sub',S,'(i64.const 0)',`(local.get ${orig})`,`(local.get ${t})`); break; }
         case 'shl': case 'shr': case 'sar': {
           if (S === 4 && insn.dst.kind === 'reg') {
             const c=`(i32.and ${rd32(insn.src,next)} (i32.const 31))`; const a=rd32(insn.dst,next); let e;
