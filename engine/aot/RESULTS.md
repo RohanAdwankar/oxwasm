@@ -81,11 +81,28 @@ native (1.68x → 1.45x over the ceiling).
 
 ## Instruction coverage
 
-Validated on four structurally different binaries. Supported: the integer ALU,
-shifts/rotates, `lea`, `movzx`/`movsx`, `push`/`pop`/`leave`, two/three-operand
-and widening multiply (`imul`/`mul`), `cmov`, `setcc`, and the full
-conditional-branch set with lazy flags. Not yet: SSE/AVX vector instructions
-(auto-vectorized loops), `div`/`idiv`, and calls that leave the function.
+Supported: the integer ALU, shifts/rotates, `lea`, `movzx`/`movsx`,
+`push`/`pop`/`leave`, two/three-operand and one-operand widening multiply
+(`imul`/`mul`, incl. the 64x64->128 high word from 32-bit half-products),
+`div`/`idiv` (64-bit via a runtime rdx-guard that deopts only on a true
+128-bit dividend), `xchg`, `bsf`/`bsr`, `bswap`, the `bt` family,
+`shld`/`shrd`, `rep movs`/`stos`, `cmov`, `setcc`, and the full
+conditional-branch set with **cross-block lazy flags** — a reaching-definition
+dataflow lets a flag producer in one basic block feed a consumer in another.
+The SSE2 vocabulary lowers to wasm `v128`.
+
+Calls that leave the unit, indirect jumps, undecodable bytes, `cpuid`, `hlt`
+padding, and the rare unmodeled case (`adc`/`sbb`, a `jcc` reading a callee's
+flags) escape to the interpreter via `callout`/`deopt` rather than poisoning —
+total coverage, degrading only in speed. Measured across sha256sum/gzip/sort/
+busybox, this cut interpreted-instruction counts 7-8x and drove failed
+tier-ups to near zero.
+
+An **experimental** `br_table` dispatch fallback compiles irreducible CFGs the
+scope-nesting Stackifier can't handle; it is OFF by default because it still
+miscompiles some complex irreducible loops (an infinite loop in glibc's
+ctype-table init). With it off, an irreducible CFG poisons and the function is
+interpreted — correct, just not compiled.
 
 ## Update: runtime tiering + the browser product (this session)
 
@@ -110,7 +127,12 @@ assembler), the unmodified binary, and its data files. In headless Chromium
 the busybox AppImage build sha256-hashes a 1MB embedded file bit-exact in
 3.4s with 6 AOT units JIT-compiled in-page (5.25MB HTML).
 
-Honest limits of the M3 lane today: static binaries (no ld.so), no x87, CLI
-only (GUI needs the M2/v86 lane's display server), and interpreter warmup
-dominates short runs — the AOT covers the hot 99% of cycles, not the cold
-tail.
+Since extended to dynamic executables (PT_INTERP + ld.so + the SysV auxv and
+the syscall surface glibc's loader needs) and the x87 FPU (float printf/
+strtod), so unmodified dynamically-linked glibc programs run — verified
+byte-exact vs native on `gzip` (compressed payload bit-identical), `sha256sum`,
+and busybox `md5sum`/`sha256sum`/`wc`/`sort`/`cksum`. Honest limits today: CLI
+only (a GUI still needs the M2/v86 lane's display server), and interpreter
+warmup dominates short runs — the AOT covers the hot cycles, not the cold
+startup tail (ld.so + libc init interpret once, ~1.5s, before the hot loops
+tier up and run compiled at ~1x native).
