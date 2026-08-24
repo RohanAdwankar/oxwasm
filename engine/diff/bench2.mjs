@@ -51,7 +51,7 @@ const cpuP = new CPU(new Memory([{ base: CODE, bytes: code }])); cpuP.rip = CODE
 for (let r=0;r<16;r++) cpuP.regs[r]=0n;
 while (cpuP.rip < loopTop) cpuP.step();
 const blk = compileLoop(m, loopTop);
-const wmem = new WebAssembly.Memory({ initial: 1 });
+const wmem = new WebAssembly.Memory({ initial: 256 });
 const view = new BigInt64Array(wmem.buffer);
 for (let r=0;r<16;r++) view[r] = BigInt.asIntN(64, cpuP.regs[r]);
 const { instance } = await WebAssembly.instantiate(blk.wasm, { js: { mem: wmem } });

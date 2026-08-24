@@ -228,6 +228,15 @@ function analyze(mem, entry, { maxInsns = 20000 } = {}) {
       insnAt.set(key, { mnem: 'udec', rip, next: rip + 1n, len: 1 });
       continue;
     }
+    // Trap instructions (hlt/ud2/int3) are almost always unreachable padding
+    // the analyzer walks into after a noreturn call (e.g. the `hlt` after
+    // `call __libc_start_main` in _start). Treat them as deopt points rather
+    // than poisoning the whole function: if control ever truly reaches one,
+    // the engine resumes in the interpreter and traps exactly as native would.
+    if (insn.mnem === 'hlt' || insn.mnem === 'ud2' || insn.mnem === 'int3' || insn.mnem === 'int') {
+      insnAt.set(key, { mnem: 'udec', rip, next: rip + BigInt(insn.len), len: insn.len });
+      continue;
+    }
     insn.rip = rip; insn.next = rip + BigInt(insn.len); insnAt.set(key, insn);
     if (insn.mnem === 'ret' || insn.mnem === 'retn' || insn.mnem === 'jmpind') continue;
     if (insn.mnem === 'jmp') { work.push((insn.next + insn.rel) & M); continue; }
@@ -914,14 +923,49 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           }
           break; }
         case 'mul1': case 'imul1': {
-          // one-operand widening multiply: rdx:rax = rax * src. Handle widths <= 4 via i64.
-          if (S > 4) throw new Error('AOT: 128-bit '+insn.mnem+' @ '+insn.rip.toString(16));
-          const ext = insn.mnem === 'imul1' ? 'i64.extend_i32_s' : 'i64.extend_i32_u';
-          const a = `(${ext} ${rd32({kind:'reg',r:0,size:S},next)})`;
-          const b = `(${ext} ${rd32(insn.src,next)})`;
-          const t = T(); L.push(`(local.set ${t} (i64.mul ${a} ${b}))`);
-          L.push(wr32reg(0, `(i32.wrap_i64 ${andmask(`(local.get ${t})`,S)})`));       // rax = low
-          L.push(wr32reg(2, `(i32.wrap_i64 (i64.shr_u (local.get ${t}) (i64.const ${S*8})))`)); // rdx = high
+          // one-operand widening multiply: rdx:rax = rax * src.
+          const sgn = insn.mnem === 'imul1';
+          if (S <= 4) {                    // widths <= 32 fit in one i64 product
+            const ext = sgn ? 'i64.extend_i32_s' : 'i64.extend_i32_u';
+            const a = `(${ext} ${rd32({kind:'reg',r:0,size:S},next)})`;
+            const b = `(${ext} ${rd32(insn.src,next)})`;
+            const t = T(); L.push(`(local.set ${t} (i64.mul ${a} ${b}))`);
+            L.push(wr32reg(0, `(i32.wrap_i64 ${andmask(`(local.get ${t})`,S)})`));       // rax = low
+            L.push(wr32reg(2, `(i32.wrap_i64 (i64.shr_u (local.get ${t}) (i64.const ${S*8})))`)); // rdx = high
+            break;
+          }
+          // 64x64 -> 128. WASM has no mulhi, so build the high word from the
+          // four 32-bit half-products; the low word is the wrapping i64 product.
+          const a = T(), b = T(), al = T(), ah = T(), bl = T(), bh = T(),
+                lh = T(), hl = T(), mid = T(), hi = T(), lo = T();
+          L.push(`(local.set ${a} ${rd({kind:'reg',r:0,size:8},8,next)})`);
+          L.push(`(local.set ${b} ${rd(insn.src,8,next)})`);
+          L.push(`(local.set ${lo} (i64.mul (local.get ${a}) (local.get ${b})))`);
+          L.push(`(local.set ${al} (i64.and (local.get ${a}) (i64.const 0xFFFFFFFF)))`);
+          L.push(`(local.set ${ah} (i64.shr_u (local.get ${a}) (i64.const 32)))`);
+          L.push(`(local.set ${bl} (i64.and (local.get ${b}) (i64.const 0xFFFFFFFF)))`);
+          L.push(`(local.set ${bh} (i64.shr_u (local.get ${b}) (i64.const 32)))`);
+          L.push(`(local.set ${lh} (i64.mul (local.get ${al}) (local.get ${bh})))`);
+          L.push(`(local.set ${hl} (i64.mul (local.get ${ah}) (local.get ${bl})))`);
+          // mid = (al*bl >> 32) + (lh & 0xffffffff) + (hl & 0xffffffff)
+          L.push(`(local.set ${mid} (i64.add (i64.add ` +
+                 `(i64.shr_u (i64.mul (local.get ${al}) (local.get ${bl})) (i64.const 32)) ` +
+                 `(i64.and (local.get ${lh}) (i64.const 0xFFFFFFFF))) ` +
+                 `(i64.and (local.get ${hl}) (i64.const 0xFFFFFFFF))))`);
+          // hi = ah*bh + (lh>>32) + (hl>>32) + (mid>>32)
+          L.push(`(local.set ${hi} (i64.add (i64.add (i64.add ` +
+                 `(i64.mul (local.get ${ah}) (local.get ${bh})) ` +
+                 `(i64.shr_u (local.get ${lh}) (i64.const 32))) ` +
+                 `(i64.shr_u (local.get ${hl}) (i64.const 32))) ` +
+                 `(i64.shr_u (local.get ${mid}) (i64.const 32))))`);
+          if (sgn) {   // signed correction: hi -= (a<0?b:0) + (b<0?a:0)
+            L.push(`(local.set ${hi} (i64.sub (local.get ${hi}) ` +
+                   `(i64.and (i64.shr_s (local.get ${a}) (i64.const 63)) (local.get ${b}))))`);
+            L.push(`(local.set ${hi} (i64.sub (local.get ${hi}) ` +
+                   `(i64.and (i64.shr_s (local.get ${b}) (i64.const 63)) (local.get ${a}))))`);
+          }
+          L.push(wr({kind:'reg',r:0,size:8},8,`(local.get ${lo})`,next));   // rax = low 64
+          L.push(wr({kind:'reg',r:2,size:8},8,`(local.get ${hi})`,next));   // rdx = high 64
           break; }
         case 'cwde': {   // sign-extend the low half of rax into the full width (cbw/cwde/cdqe)
           const half = S === 8 ? 4 : S === 4 ? 2 : 1;
