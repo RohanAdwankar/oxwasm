@@ -17,6 +17,46 @@
 # the spec, get a different app; the pipeline is identical.
 set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
+
+# --- host portability -------------------------------------------------------
+# The build assembles a Debian/Ubuntu i386 guest, so it needs Linux packaging
+# tools (dpkg-deb, mke2fs, chroot). On macOS/Windows — or any host missing
+# them — transparently re-run the whole build inside a Linux container, so the
+# same command works everywhere. Set OXWASM_NO_DOCKER=1 to force the native path.
+if [ -z "$OXWASM_IN_DOCKER" ] && [ -z "$OXWASM_NO_DOCKER" ] && \
+   { ! command -v dpkg-deb >/dev/null 2>&1 || ! command -v mke2fs >/dev/null 2>&1; }; then
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "error: this build needs Linux tools (dpkg-deb, mke2fs) not found on $(uname -s)." >&2
+    echo "       install Docker Desktop (recommended) and re-run, or run on Linux." >&2
+    exit 1
+  fi
+  echo "==> $(uname -s): Linux build tools not found — running the build inside Docker"
+  IMAGE=oxwasm-builder
+  if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    echo "==> building one-time builder image '$IMAGE' (first run only)"
+    docker build -t "$IMAGE" - <<'DOCKER'
+FROM ubuntu:18.04
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3 curl ca-certificates e2fsprogs dpkg util-linux busybox-static \
+    && rm -rf /var/lib/apt/lists/*
+DOCKER
+  fi
+  # mount the repo and the working dir so relative SPEC paths and -o output
+  # resolve exactly as on the host; keep the same cwd inside the container.
+  # Prefer a single mount of the common ancestor to avoid overlapping binds.
+  case "$HERE/" in
+    "$PWD/"*) MNT="-v $PWD:$PWD";;                       # repo is inside cwd
+    *) case "$PWD/" in
+         "$HERE/"*) MNT="-v $HERE:$HERE";;               # cwd is inside repo
+         *)         MNT="-v $HERE:$HERE -v $PWD:$PWD";;   # disjoint trees
+       esac;;
+  esac
+  # shellcheck disable=SC2086
+  exec docker run --rm -i $MNT -w "$PWD" -e OXWASM_IN_DOCKER=1 \
+       "$IMAGE" "$HERE/pack-app.sh" "$@"
+fi
+# ---------------------------------------------------------------------------
+
 SPEC=$1; shift
 OUT=out.html
 SNAPSHOT=0
@@ -102,6 +142,12 @@ python3 "$HERE/oxwasm.py" build --kernel kern/boot/vmlinuz-4.15.0-20-generic dis
   --cmdline "root=/dev/sda rw rootwait init=/sbin/oxinit console=ttyS0" \
   --memory "$MEMORY" --title "$TITLE" -o "$OUT"
 
+if [ "$SNAPSHOT" = "1" ] && ! command -v node >/dev/null 2>&1; then
+  echo "==> note: --snapshot needs Node + headless Chromium, which the lean Docker" >&2
+  echo "    builder image doesn't carry. Wrote the un-snapshotted $OUT; run the" >&2
+  echo "    snapshot step (tools/snapshot.js) on a host with Node + Chromium." >&2
+  SNAPSHOT=0
+fi
 if [ "$SNAPSHOT" = "1" ]; then
   # Boot once, freeze the machine at "app ready", repackage as restore-to-ready.
   # Skips emulated Linux+X+app boot on every open; needs a headless chromium.

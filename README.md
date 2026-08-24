@@ -11,7 +11,16 @@ $ open gimp.html
 ```
 
 The `.html` is the entire deliverable: open it from disk, host it on any
-static site, or email it. Inside is a WebAssembly machine that boots a tiny
+static site, or email it.
+
+**macOS / Windows:** the build assembles a Debian/Ubuntu i386 guest, so it
+needs Linux packaging tools (`dpkg-deb`, `mke2fs`). If they aren't on the
+host, `pack-app.sh` detects that and transparently re-runs the whole build
+inside a Linux container — just have Docker installed and run the same
+command. The first run builds a small one-time builder image; the output
+`.html` lands in your current directory as usual. (`OXWASM_NO_DOCKER=1`
+forces the native path; `--snapshot` additionally needs Node + headless
+Chromium, so run that step on Linux.) Inside is a WebAssembly machine that boots a tiny
 Linux and runs the program you named. **The tool is general — GIMP is just
 the test case.** `examples/xcalc.app` is the same pipeline with a different
 program; a new app is a new spec, not new code. Issue: drapoz/0#1345.
