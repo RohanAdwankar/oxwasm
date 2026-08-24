@@ -86,17 +86,20 @@ Supported: the integer ALU, shifts/rotates, `lea`, `movzx`/`movsx`,
 (`imul`/`mul`, incl. the 64x64->128 high word from 32-bit half-products),
 `div`/`idiv` (64-bit via a runtime rdx-guard that deopts only on a true
 128-bit dividend), `xchg`, `bsf`/`bsr`, `bswap`, the `bt` family,
-`shld`/`shrd`, `rep movs`/`stos`, `cmov`, `setcc`, and the full
-conditional-branch set with **cross-block lazy flags** — a reaching-definition
-dataflow lets a flag producer in one basic block feed a consumer in another.
-The SSE2 vocabulary lowers to wasm `v128`.
+`shld`/`shrd`, `rep movs`/`stos`, `cmov`, `setcc`, `adc`/`sbb` (add/subtract
+with carry, for 128-bit and bignum arithmetic), and the full conditional-branch
+set with **cross-block lazy flags** — a reaching-definition dataflow lets a flag
+producer in one basic block feed a consumer in another, and add/sub reconstruct
+the full CF/OF/SF/ZF set (so `add;jc`, `add;jo`, `sub;jo` compile too). The SSE2
+vocabulary lowers to wasm `v128`.
 
 Calls that leave the unit, indirect jumps, undecodable bytes, `cpuid`, `hlt`
-padding, and the rare unmodeled case (`adc`/`sbb`, a `jcc` reading a callee's
-flags) escape to the interpreter via `callout`/`deopt` rather than poisoning —
-total coverage, degrading only in speed. Measured across sha256sum/gzip/sort/
-busybox, this cut interpreted-instruction counts 7-8x and drove failed
-tier-ups to near zero.
+padding, and a `jcc` reading a callee's flags escape to the interpreter via
+`callout`/`deopt` rather than poisoning — total coverage, degrading only in
+speed. Measured across sha256sum/gzip/sort/busybox, this cut interpreted-
+instruction counts 7-8x and drove failed tier-ups to near zero: the only
+remaining poison reason is the irreducible-CFG case handled by the (off-by-
+default) dispatch fallback below.
 
 An **experimental** `br_table` dispatch fallback compiles irreducible CFGs the
 scope-nesting Stackifier can't handle; it is OFF by default because it still
