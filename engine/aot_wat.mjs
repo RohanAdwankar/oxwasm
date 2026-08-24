@@ -368,10 +368,16 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   // back to a flat br_table dispatch loop (a relooper), which handles ANY CFG
   // at the cost of an indirect branch per non-fallthrough edge. Either way the
   // function compiles instead of poisoning the whole unit.
+  // The dispatch fallback is EXPERIMENTAL and OFF by default: it still
+  // miscompiles some complex irreducible loops (a nested counted loop in
+  // glibc's ctype-table init hangs). Until that is fixed, an irreducible CFG
+  // poisons (the function is interpreted, exactly as before the fallback
+  // existed) — correct, just not compiled. Set globalThis.__enableDispatch to
+  // exercise the dispatch code path (see diff/disptest.mjs).
   let mode = 'structured', open = null, closeAfter = null;
   try { ({ open, closeAfter } = structure(N, succs)); }
   catch (e) {
-    if (!/overlap|irreducible|unclosed|converge/.test(e.message)) throw e;
+    if (!/overlap|irreducible|unclosed|converge/.test(e.message) || !globalThis.__enableDispatch) throw e;
     mode = 'dispatch';
   }
   const DISP = mode === 'dispatch';

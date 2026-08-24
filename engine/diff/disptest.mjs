@@ -2,6 +2,7 @@
 // control flow the scope-nesting Stackifier can't handle). Compiles an
 // irreducible-CFG function to wasm in dispatch mode and checks it bit-exact
 // against the hardware-verified interpreter across many inputs.
+globalThis.__enableDispatch = true;   // exercise the (experimental, off-by-default) br_table dispatch fallback
 import { LinuxEngine } from '../linux.mjs';
 import { compileUnitWat } from '../aot_wat.mjs';
 import { execFileSync } from 'node:child_process';
