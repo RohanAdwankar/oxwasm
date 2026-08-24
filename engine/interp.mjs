@@ -248,6 +248,73 @@ export class CPU {
             for (let k = 0n; k < BigInt(16/EB); k++)
               if (((a >> (k*eb)) & mask) === ((b2 >> (k*eb)) & mask)) r |= mask << (k*eb);
             this.xmm[insn.xr] = r; break; }
+          // ---- element-wise SSE2 integer ops (min/max, saturating, avg, mul, pack) ----
+          case 0xDA: case 0xDE: case 0xEA: case 0xEE: case 0xD8: case 0xD9:
+          case 0xDC: case 0xDD: case 0xE8: case 0xE9: case 0xEC: case 0xED:
+          case 0xE0: case 0xE3: case 0xD5: case 0xE5: case 0xE4: {
+            const OPS = {
+              0xDA:[1,'minu'], 0xDE:[1,'maxu'], 0xEA:[2,'mins'], 0xEE:[2,'maxs'],
+              0xD8:[1,'subus'], 0xD9:[2,'subus'], 0xDC:[1,'addus'], 0xDD:[2,'addus'],
+              0xE8:[1,'subss'], 0xE9:[2,'subss'], 0xEC:[1,'addss'], 0xED:[2,'addss'],
+              0xE0:[1,'avg'], 0xE3:[2,'avg'], 0xD5:[2,'mullo'], 0xE5:[2,'mulhs'], 0xE4:[2,'mulhu'],
+            };
+            const [EB, kind] = OPS[insn.op];
+            const a = this.xmm[insn.xr], b2 = rdRm(16);
+            const eb = BigInt(EB*8), mask = (1n << eb) - 1n, sbit = 1n << (eb-1n);
+            const smin = -(sbit), smax = sbit - 1n;
+            let r = 0n;
+            for (let k = 0n; k < BigInt(16/EB); k++) {
+              const ea = (a >> (k*eb)) & mask, e2 = (b2 >> (k*eb)) & mask;
+              const sa = (ea ^ sbit) - sbit, s2 = (e2 ^ sbit) - sbit;
+              let v;
+              switch (kind) {
+                case 'minu': v = ea < e2 ? ea : e2; break;
+                case 'maxu': v = ea > e2 ? ea : e2; break;
+                case 'mins': v = (sa < s2 ? sa : s2) & mask; break;
+                case 'maxs': v = (sa > s2 ? sa : s2) & mask; break;
+                case 'subus': v = ea > e2 ? ea - e2 : 0n; break;
+                case 'addus': { const s = ea + e2; v = s > mask ? mask : s; break; }
+                case 'subss': { let s = sa - s2; if (s < smin) s = smin; if (s > smax) s = smax; v = s & mask; break; }
+                case 'addss': { let s = sa + s2; if (s < smin) s = smin; if (s > smax) s = smax; v = s & mask; break; }
+                case 'avg': v = (ea + e2 + 1n) >> 1n; break;
+                case 'mullo': v = (sa * s2) & mask; break;
+                case 'mulhs': v = ((sa * s2) >> eb) & mask; break;
+                case 'mulhu': v = ((ea * e2) >> eb) & mask; break;
+              }
+              r |= v << (k*eb);
+            }
+            this.xmm[insn.xr] = r; break; }
+          case 0xF4: {                                 // pmuludq: lanes 0,2 u32 -> u64
+            const a = this.xmm[insn.xr], b2 = rdRm(16);
+            const lo = (a & 0xFFFFFFFFn) * (b2 & 0xFFFFFFFFn);
+            const hi = ((a >> 64n) & 0xFFFFFFFFn) * ((b2 >> 64n) & 0xFFFFFFFFn);
+            this.xmm[insn.xr] = (lo & 0xFFFFFFFFFFFFFFFFn) | ((hi & 0xFFFFFFFFFFFFFFFFn) << 64n); break; }
+          case 0xF6: {                                 // psadbw: sum |a-b| per 8-byte half
+            const a = this.xmm[insn.xr], b2 = rdRm(16); let r = 0n;
+            for (const h of [0n, 1n]) { let s = 0n;
+              for (let k = 0n; k < 8n; k++) { const i = h*8n + k;
+                const ea = (a >> (8n*i)) & 0xFFn, e2 = (b2 >> (8n*i)) & 0xFFn;
+                s += ea > e2 ? ea - e2 : e2 - ea; }
+              r |= (s & 0xFFFFn) << (64n*h); }
+            this.xmm[insn.xr] = r; break; }
+          case 0x63: case 0x67: case 0x6B: {           // packsswb / packuswb / packssdw
+            const [EB, uns] = insn.op === 0x6B ? [4, false] : [2, insn.op === 0x67];
+            const eb = BigInt(EB*8), ob = eb/2n, mask = (1n << eb) - 1n, omask = (1n << ob) - 1n;
+            const sbit = 1n << (eb-1n);
+            const lo = uns ? 0n : -(1n << (ob-1n)), hi = uns ? omask : (1n << (ob-1n)) - 1n;
+            const sat = (x) => { const s = (x ^ sbit) - sbit; return (s < lo ? lo : s > hi ? hi : s) & omask; };
+            const a = this.xmm[insn.xr], b2 = rdRm(16);
+            const n = BigInt(16/EB); let r = 0n;
+            for (let k = 0n; k < n; k++) r |= sat((a  >> (k*eb)) & mask) << (k*ob);
+            for (let k = 0n; k < n; k++) r |= sat((b2 >> (k*eb)) & mask) << ((n+k)*ob);
+            this.xmm[insn.xr] = r; break; }
+          case 0xC5: {                                 // pextrw r32 <- xmm[imm3]
+            const src = this.xmm[insn.rm.kind === 'xmm' ? insn.rm.r : 0];
+            this.regs[insn.xr] = (src >> (16n * BigInt(insn.imm8 & 7))) & 0xFFFFn; break; }
+          case 0xC4: {                                 // pinsrw xmm[imm3] <- r/m16
+            const v = insn.rm.kind === 'xmm' ? (this.regs[insn.rm.r] & 0xFFFFn) : this.mem.read(this.ea(insn.rm), 2n);
+            const sh = 16n * BigInt(insn.imm8 & 7);
+            this.xmm[insn.xr] = (this.xmm[insn.xr] & ~(0xFFFFn << sh)) | (v << sh); break; }
           default: throw new Error('sse op ' + insn.op.toString(16));
         }
         break; }
@@ -362,6 +429,50 @@ export class CPU {
       case 'xadd': { const a = this.get(insn.dst), b2 = this.get(insn.src), r = (a + b2) & M;
         this.addFlags(a, b2, r, S, a + b2 > M ? 1 : 0);
         this.set(insn.src, a); this.set(insn.dst, r); break; }
+      case 'bswap': {
+        const v = this.get(insn.dst); let r = 0n;
+        for (let k = 0; k < S; k++) r |= ((v >> BigInt(8*k)) & 0xFFn) << BigInt(8*(S-1-k));
+        this.set(insn.dst, r); break; }
+      case 'bt': case 'bts': case 'btr': case 'btc': {
+        const width = BigInt(S * 8);
+        let bit, addr = null, cur;
+        if (insn.dst.kind === 'reg') {
+          bit = this.get(insn.src) % width;
+          cur = this.get(insn.dst);
+          this.f.cf = Number((cur >> bit) & 1n);
+          if (insn.mnem !== 'bt') {
+            if (insn.mnem === 'bts') cur |= 1n << bit;
+            else if (insn.mnem === 'btr') cur &= ~(1n << bit);
+            else cur ^= 1n << bit;
+            this.set(insn.dst, cur & MASK[S]);
+          }
+        } else {
+          // bit-string form: the bit index (signed for the register form)
+          // selects a byte relative to the effective address
+          const raw = insn.src.kind === 'imm' ? (insn.src.v % width) : BigInt.asIntN(64, this.get(insn.src));
+          addr = this.ea(insn.dst) + (raw >> 3n);
+          bit = ((raw % 8n) + 8n) % 8n;
+          cur = this.mem.read(addr, 1n);
+          this.f.cf = Number((cur >> bit) & 1n);
+          if (insn.mnem !== 'bt') {
+            if (insn.mnem === 'bts') cur |= 1n << bit;
+            else if (insn.mnem === 'btr') cur &= ~(1n << bit);
+            else cur ^= 1n << bit;
+            this.mem.write(addr, 1n, cur & 0xFFn);
+          }
+        }
+        break; }
+      case 'shld': case 'shrd': {
+        const width = BigInt(S * 8);
+        const c = this.get(insn.src2) % (S === 8 ? 64n : 32n);
+        if (c === 0n) break;
+        const a = this.get(insn.dst), b2 = this.get(insn.src);
+        let r;
+        if (insn.mnem === 'shld') r = ((a << c) | (b2 >> (width - c))) & MASK[S];
+        else r = ((a >> c) | (b2 << (width - c))) & MASK[S];
+        this.f.cf = insn.mnem === 'shld' ? Number((a >> (width - c)) & 1n) : Number((a >> (c - 1n)) & 1n);
+        this.szp(r, S);
+        this.set(insn.dst, r); break; }
       case 'bsf': { const v = this.get(insn.src); this.f.zf = v === 0n ? 1 : 0;
         if (v !== 0n) { let k = 0n; while (!((v >> k) & 1n)) k++; this.setReg(insn.dst, k); } break; }
       case 'bsr': { const v = this.get(insn.src); this.f.zf = v === 0n ? 1 : 0;

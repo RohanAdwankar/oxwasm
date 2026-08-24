@@ -150,8 +150,11 @@ export function decode(fetch, rip) {
     const SSE_OPS = { 0x6E:1, 0x7E:1, 0xD6:1, 0x6F:1, 0x7F:1, 0x10:1, 0x11:1,
                       0x28:1, 0x29:1, 0x6C:1, 0xEF:1, 0x74:1, 0xD7:1, 0xDB:1, 0xEB:1,
                       0x60:1, 0x61:1, 0x62:1, 0x68:1, 0x69:1, 0x6A:1, 0x6D:1,
-                      0x70:1, 0xD4:1, 0xFE:1, 0xFD:1, 0xFC:1, 0x75:1, 0x76:1, 0x12:1, 0x13:1, 0x16:1, 0x17:1, 0x14:1, 0x15:1, 0x66:1, 0x65:1, 0x64:1, 0xFB:1, 0xFA:1, 0xF9:1, 0xF8:1 };
-    const SSE_IMM8 = { 0x70:1 };
+                      0x70:1, 0xD4:1, 0xFE:1, 0xFD:1, 0xFC:1, 0x75:1, 0x76:1, 0x12:1, 0x13:1, 0x16:1, 0x17:1, 0x14:1, 0x15:1, 0x66:1, 0x65:1, 0x64:1, 0xFB:1, 0xFA:1, 0xF9:1, 0xF8:1,
+                      0xDA:1, 0xDE:1, 0xEA:1, 0xEE:1, 0xD8:1, 0xD9:1, 0xDC:1, 0xDD:1,
+                      0xE8:1, 0xE9:1, 0xEC:1, 0xED:1, 0xE0:1, 0xE3:1, 0xD5:1, 0xE5:1, 0xE4:1,
+                      0xF4:1, 0xF6:1, 0x63:1, 0x67:1, 0x6B:1, 0xC5:1, 0xC4:1 };
+    const SSE_IMM8 = { 0x70:1, 0xC5:1, 0xC4:1 };
     const SSE_GRP_SHIFT = { 0x71:1, 0x72:1, 0x73:1 };
     if (SSE_GRP_SHIFT[o2]) {
       const m = b(), sub = (m >> 3) & 7, xrm = (m & 7) | (B << 3);
@@ -176,7 +179,19 @@ export function decode(fetch, rip) {
     if (o2 === 0xC1) { const [r, rm] = modrm(osz); return fin({ mnem: 'xadd', dst: rm, src: r, size: osz }); }
     if (o2 === 0xBC) { const [r, rm] = modrm(osz); return fin({ mnem: 'bsf', dst: r, src: rm, size: osz }); }
     if (o2 === 0xBD) { const [r, rm] = modrm(osz); return fin({ mnem: 'bsr', dst: r, src: rm, size: osz }); }
+    if (o2 === 0xA3) { const [r, rm] = modrm(osz); return fin({ mnem: 'bt',  dst: rm, src: r, size: osz }); }
+    if (o2 === 0xAB) { const [r, rm] = modrm(osz); return fin({ mnem: 'bts', dst: rm, src: r, size: osz }); }
+    if (o2 === 0xB3) { const [r, rm] = modrm(osz); return fin({ mnem: 'btr', dst: rm, src: r, size: osz }); }
+    if (o2 === 0xBB) { const [r, rm] = modrm(osz); return fin({ mnem: 'btc', dst: rm, src: r, size: osz }); }
+    if (o2 === 0xBA) { const [, rm, g] = modrm(osz); const M2 = { 4:'bt', 5:'bts', 6:'btr', 7:'btc' }[g & 7];
+      if (!M2) throw new Error('grp8 ' + (g & 7));
+      return fin({ mnem: M2, dst: rm, src: { kind: 'imm', v: immU(1) }, size: osz }); }
+    if (o2 === 0xA4) { const [r, rm] = modrm(osz); return fin({ mnem: 'shld', dst: rm, src: r, src2: { kind: 'imm', v: immU(1) }, size: osz }); }
+    if (o2 === 0xA5) { const [r, rm] = modrm(osz); return fin({ mnem: 'shld', dst: rm, src: r, src2: { kind: 'reg', r: 1, size: 1 }, size: osz }); }
+    if (o2 === 0xAC) { const [r, rm] = modrm(osz); return fin({ mnem: 'shrd', dst: rm, src: r, src2: { kind: 'imm', v: immU(1) }, size: osz }); }
+    if (o2 === 0xAD) { const [r, rm] = modrm(osz); return fin({ mnem: 'shrd', dst: rm, src: r, src2: { kind: 'reg', r: 1, size: 1 }, size: osz }); }
     if (o2 === 0xA2) return fin({ mnem: 'cpuid' });
+    if (o2 >= 0xC8 && o2 <= 0xCF) return fin({ mnem: 'bswap', dst: mkreg((o2 - 0xC8) | (B << 3), osz === 2 ? 4 : osz), size: osz === 2 ? 4 : osz });
     if (o2 >= 0x40 && o2 <= 0x4F) { const [r, rm] = modrm(osz); return fin({ mnem: 'cmov', cond: COND[o2 - 0x40], dst: r, src: rm, size: osz }); }
     if (o2 >= 0x90 && o2 <= 0x9F) { const [, rm] = modrm(1); return fin({ mnem: 'setcc', cond: COND[o2 - 0x90], dst: rm, size: 1 }); }
     if (o2 === 0xAF) { const [r, rm] = modrm(osz); return fin({ mnem: 'imul2', dst: r, src: rm, size: osz }); }

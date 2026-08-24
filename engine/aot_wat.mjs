@@ -365,7 +365,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     if (op.kind === 'reg') { seenR[op.r] = true;
       if ((op.size||8) === 8 || op.high) any64[op.r] = true; else if (isWrite) w32[op.r] = true; }
     if (op.kind === 'mem') { if (op.base>=0) { seenR[op.base]=true; any64[op.base]=true; } if (op.index>=0) { seenR[op.index]=true; any64[op.index]=true; } } };
-  const WRITES_DST = new Set(['mov','movzx','movsx','add','sub','and','or','xor','inc','dec','not','neg','shl','shr','sar','rol','ror','cmov','setcc','imul2','imul3','xchg']);
+  const WRITES_DST = new Set(['mov','movzx','movsx','add','sub','and','or','xor','inc','dec','not','neg','shl','shr','sar','rol','ror','cmov','setcc','imul2','imul3','xchg','bswap','bts','btr','btc','shld','shrd']);
   for (const b of blocks) for (const insn of b.insns) {
     const S = insn.size || 8;
     switch (insn.mnem) {
@@ -385,13 +385,58 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     }
   }
   if (hasDeopt) any64.fill(true);
-  const isI32 = (r) => seenR[r] && !any64[r] && w32[r];
   const pushed = new Set();
   for (const b of blocks) for (const insn of b.insns) {
     if (insn.mnem === 'push' && insn.src && insn.src.kind === 'reg') pushed.add(insn.src.r);
     if (insn.mnem === 'pop' && insn.dst && insn.dst.kind === 'reg') pushed.add(insn.dst.r);
   }
-  const savedI32 = (r) => isI32(r) && pushed.has(r);   // callee-saved, 32-bit working
+  // A pushed register may keep a 32-bit working local ONLY under verified
+  // prologue/epilogue discipline — real code also uses push/pop as data moves
+  // (busybox: `push $8; pop %rdi`), where the regfile-routed save/restore
+  // trick would corrupt the working value. The discipline is:
+  //   every push of X: in the entry block, before any write to X and before
+  //     any call/syscall (so the regfile still holds X's caller value), and
+  //   every pop of X: in a ret-terminated block, with no access to X and no
+  //     call/syscall between the pop and the ret (so the restored caller
+  //     value survives in the regfile for the exit skip).
+  const touchesReg = (insn, X) => {
+    for (const op of [insn.dst, insn.src, insn.src2]) {
+      if (!op) continue;
+      if (op.kind === 'reg' && op.r === X) return true;
+      if (op.kind === 'mem' && (op.base === X || op.index === X)) return true;
+    }
+    if ((insn.mnem === 'div1' || insn.mnem === 'idiv1' || insn.mnem === 'mul1' || insn.mnem === 'imul1' ||
+         insn.mnem === 'cwde' || insn.mnem === 'cdq') && (X === 0 || X === 2)) return true;
+    if (insn.mnem === 'syscall' && [0,7,6,2,10,8,9,1,11].includes(X)) return true;
+    return false;
+  };
+  const CALLS = new Set(['call', 'callind', 'syscall']);
+  const disciplined = (X) => {
+    let sawBarrier = false;                       // write to X, or a call, in the entry block
+    for (const insn of blocks[0].insns) {
+      if (insn.mnem === 'push' && insn.src?.kind === 'reg' && insn.src.r === X) {
+        if (sawBarrier) return false; continue;
+      }
+      if (CALLS.has(insn.mnem) || touchesReg(insn, X)) sawBarrier = true;
+    }
+    for (let bi = 0; bi < N; bi++) {
+      const insns = blocks[bi].insns;
+      for (let k = 0; k < insns.length; k++) {
+        const insn = insns[k];
+        if (insn.mnem === 'push' && insn.src?.kind === 'reg' && insn.src.r === X && bi !== 0) return false;
+        if (insn.mnem === 'pop' && insn.dst?.kind === 'reg' && insn.dst.r === X) {
+          if (term[bi].kind !== 'ret') return false;
+          for (let j = k + 1; j < insns.length; j++)
+            if (CALLS.has(insns[j].mnem) || touchesReg(insns[j], X) ||
+                (insns[j].mnem === 'pop' && insns[j].dst?.kind === 'reg' && insns[j].dst.r === X)) return false;
+        }
+      }
+    }
+    return true;
+  };
+  const savedOK = new Set([...pushed].filter(r => seenR[r] && !any64[r] && w32[r] && disciplined(r)));
+  const isI32 = (r) => seenR[r] && !any64[r] && w32[r] && (!pushed.has(r) || savedOK.has(r));
+  const savedI32 = (r) => savedOK.has(r);
 
   // A register this function never touches keeps no local at all: its regfile
   // slot is already the live value (ours at entry, a callee's after calls), so
@@ -407,9 +452,9 @@ function emitUnitFunction(a0, fnAddr, ctx) {
                                   : `(local.set $r${r} (i64.load (i32.const ${r*8})))`;
   const spillAll  = () => Array.from({length:16},(_,r)=>touched(r)?spillR(r):null).filter(Boolean);
   const reloadAll = () => Array.from({length:16},(_,r)=>touched(r)?reloadR(r):null).filter(Boolean);
-  // Exit spill: savedI32 regs' slots were just refreshed by their epilogue
-  // pops (full 64-bit caller values) — do not clobber them with the truncated
-  // working value.
+  // Exit spill: a disciplined savedI32 reg's slot was just refreshed by its
+  // epilogue pop (the full 64-bit caller value) — don't clobber it with the
+  // truncated working value.
   const spillExit = () => Array.from({length:16},(_,r)=>(touched(r)&&!savedI32(r))?spillR(r):null).filter(Boolean);
 
   // ---- operand / instruction emit (identical semantics to the dispatch version) ----
@@ -488,8 +533,29 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     // A flag write is live only if some later consumer reads it before it is
     // overwritten. Consumers are the terminating jcc and any mid-block cmov/setcc;
     // each consumes the nearest preceding flag-setter. Everything else is dead.
+    // If the nearest flag WRITER is one whose flags we don't model (a
+    // cl-count shift, multiply, bt on memory, ...), translating would silently
+    // use an older producer's flags — poison the function instead.
     const producers = new Set();
-    const nearestProd = (from) => { for (let k = from; k >= 0; k--) if (FLAGSET.has(blk.insns[k].mnem)) return k; return -1; };
+    const modeled = (insn) => {
+      if (FLAGSET.has(insn.mnem)) return true;
+      if ((insn.mnem === 'shl' || insn.mnem === 'shr' || insn.mnem === 'sar') &&
+          insn.src.kind === 'imm' && (insn.src.v & (BigInt((insn.size||8)===8?63:31))) !== 0n) return true;
+      if ((insn.mnem === 'bt' || insn.mnem === 'bts' || insn.mnem === 'btr' || insn.mnem === 'btc') &&
+          insn.dst.kind === 'reg') return true;
+      return false;
+    };
+    const CLOBBER = new Set(['shl','shr','sar','rol','ror','imul2','imul3','mul1','imul1','div1','idiv1',
+                             'bt','bts','btr','btc','shld','shrd','call','callind','syscall',
+                             'xadd','cmpxchg','bsf','bsr']);
+    const nearestProd = (from) => {
+      for (let k = from; k >= 0; k--) {
+        const insn = blk.insns[k];
+        if (modeled(insn)) return k;
+        if (CLOBBER.has(insn.mnem)) throw new Error('AOT: unmodeled flag producer '+insn.mnem+' @ '+insn.rip.toString(16));
+      }
+      return -1;
+    };
     for (let j = 0; j < blk.insns.length; j++)
       if (blk.insns[j].mnem === 'cmov' || blk.insns[j].mnem === 'setcc') { const p = nearestProd(j - 1); if (p >= 0) producers.add(p); }
     if (term[i].kind === 'jcc') { const p = nearestProd(blk.insns.length - 1); if (p >= 0) producers.add(p); }
@@ -511,6 +577,8 @@ function emitUnitFunction(a0, fnAddr, ctx) {
         case 'l':return `(i64.lt_s ${sx(a,S)} ${sx(b,S)})`; case 'ge':return `(i64.ge_s ${sx(a,S)} ${sx(b,S)})`;
         case 'le':return `(i64.le_s ${sx(a,S)} ${sx(b,S)})`; case 'g':return `(i64.gt_s ${sx(a,S)} ${sx(b,S)})`;
         case 's':return sf; case 'ns':return nsf; }
+      else if (fs.kind === 'cf') switch (cc) {      // fr holds the CF bit (bt family)
+        case 'b':return nz; case 'ae':return zf; }
       else switch (cc) {
         case 'e':return zf; case 'ne':return nz; case 's':return sf; case 'ns':return nsf;
         case 'le':return `(i64.le_s ${sx(r,S)} (i64.const 0))`; case 'g':return `(i64.gt_s ${sx(r,S)} (i64.const 0))`;
@@ -566,11 +634,43 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           if (S === 4 && insn.dst.kind === 'reg') {
             const c=`(i32.and ${rd32(insn.src,next)} (i32.const 31))`; const a=rd32(insn.dst,next); let e;
             if (insn.mnem==='shl') e=`(i32.shl ${a} ${c})`; else if (insn.mnem==='shr') e=`(i32.shr_u ${a} ${c})`; else e=`(i32.shr_s ${a} ${c})`;
-            L.push(wr32reg(insn.dst.r, e)); break;
+            L.push(wr32reg(insn.dst.r, e));
+            setFlags('logic', S, null, null, rd(insn.dst,S,next));   // nonzero-imm counts only (modeled() gates)
+            break;
           }
           const c=`(i64.and ${rd(insn.src,1,next)} (i64.const ${S===8?63:31}))`; const a=rd(insn.dst,S,next); let e;
           if (insn.mnem==='shl') e=`(i64.shl ${a} ${c})`; else if (insn.mnem==='shr') e=`(i64.shr_u ${a} ${c})`; else e=`(i64.shr_s ${sx(a,S)} ${c})`;
-          L.push(wr(insn.dst,S,`(i64.and ${e} (i64.const ${m}))`,next)); break; }
+          L.push(wr(insn.dst,S,`(i64.and ${e} (i64.const ${m}))`,next));
+          setFlags('logic', S, null, null, rd(insn.dst,S,next));
+          break; }
+        case 'bswap': {
+          const bs32 = (e) => `(i32.or (i32.or (i32.shl ${e} (i32.const 24)) (i32.and (i32.shl ${e} (i32.const 8)) (i32.const 16711680))) (i32.or (i32.and (i32.shr_u ${e} (i32.const 8)) (i32.const 65280)) (i32.shr_u ${e} (i32.const 24))))`;
+          if (S === 4) L.push(wr32reg(insn.dst.r, bs32(rd32(insn.dst,next))));
+          else { const t = T(); L.push(`(local.set ${t} ${rd(insn.dst,8,next)})`);
+            L.push(`(local.set ${reg(insn.dst.r)} (i64.or (i64.shl (i64.extend_i32_u ${bs32(`(i32.wrap_i64 (local.get ${t}))`)}) (i64.const 32)) (i64.extend_i32_u ${bs32(`(i32.wrap_i64 (i64.shr_u (local.get ${t}) (i64.const 32)))`)})))`); }
+          break; }
+        case 'bt': case 'bts': case 'btr': case 'btc': {
+          if (insn.dst.kind !== 'reg') throw new Error('AOT: bt on memory @ '+insn.rip.toString(16));
+          const b = insn.src.kind === 'imm'
+            ? `(i64.const ${(insn.src.v % BigInt(S*8)).toString()})`
+            : `(i64.and ${rd(insn.src,S,next)} (i64.const ${S*8-1}))`;
+          const tb = T(); L.push(`(local.set ${tb} ${b})`);
+          setFlags('cf', S, null, null, `(i64.and (i64.shr_u ${rd(insn.dst,S,next)} (local.get ${tb})) (i64.const 1))`);
+          if (insn.mnem === 'bts') L.push(wr(insn.dst,S,`(i64.or ${rd(insn.dst,S,next)} (i64.shl (i64.const 1) (local.get ${tb})))`,next));
+          else if (insn.mnem === 'btr') L.push(wr(insn.dst,S,`(i64.and ${rd(insn.dst,S,next)} (i64.xor (i64.shl (i64.const 1) (local.get ${tb})) (i64.const -1)))`,next));
+          else if (insn.mnem === 'btc') L.push(wr(insn.dst,S,`(i64.xor ${rd(insn.dst,S,next)} (i64.shl (i64.const 1) (local.get ${tb})))`,next));
+          break; }
+        case 'shld': case 'shrd': {
+          // double shift; a zero count must leave dst untouched, so route
+          // through a select. Flags are unmodeled (nearestProd poisons if used).
+          const w = BigInt(S*8);
+          const tc = T(); L.push(`(local.set ${tc} (i64.and ${rd(insn.src2,1,next)} (i64.const ${S===8?63:31})))`);
+          const a = rd(insn.dst,S,next), b2 = rd(insn.src,S,next);
+          const e = insn.mnem === 'shld'
+            ? `(i64.or (i64.shl ${a} (local.get ${tc})) (i64.shr_u ${b2} (i64.sub (i64.const ${w}) (local.get ${tc}))))`
+            : `(i64.or (i64.shr_u ${a} (local.get ${tc})) (i64.shl ${b2} (i64.sub (i64.const ${w}) (local.get ${tc}))))`;
+          L.push(wr(insn.dst,S,`(select ${andmask(e,S)} ${a} (i64.ne (local.get ${tc}) (i64.const 0)))`,next));
+          break; }
         case 'rol': case 'ror': {
           const c=`(i32.and ${rd32(insn.src,next)} (i32.const ${S===8?63:31}))`;
           if (S===8) { const a=rd(insn.dst,8,next);
@@ -642,8 +742,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           break; }
         case 'leave':    // mov rsp,rbp ; pop rbp
           L.push(`(local.set $r4 ${rd({kind:'reg',r:5,size:8},8,next)})`);
-          if (savedI32(5)) L.push(`(i64.store (i32.const 40) (i64.load ${wasmAddr({base:4,index:-1,disp:0n},next)}))`);
-          else L.push(wr({kind:'reg',r:5,size:8},8,`(i64.load ${wasmAddr({base:4,index:-1,disp:0n},next)})`,next));
+          L.push(wr({kind:'reg',r:5,size:8},8,`(i64.load ${wasmAddr({base:4,index:-1,disp:0n},next)})`,next));
           L.push(`(local.set $r4 (i64.add (local.get $r4) (i64.const 8)))`);
           break;
         case 'call': {   // push return address, spill, direct wasm call (or callout), reload
@@ -667,14 +766,13 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           L.push(...spillAll(), `(call $x_syscall)`, ...reloadAll());
           break;
         case 'push': {
-          // A callee-saved i32-working register keeps only its low 32 bits in its local;
-          // its full 64-bit caller value still lives in the register file at prologue time,
-          // so read it from there to round-trip the upper 32 bits through the stack.
+          // a disciplined savedI32 reg's prologue push reads its regfile slot,
+          // which still holds the caller's full 64-bit value at that point
           const srcExpr = (insn.src.kind === 'reg' && savedI32(insn.src.r))
             ? `(i64.load (i32.const ${insn.src.r*8}))` : rd(insn.src,8,next);
           L.push(`(local.set $r4 (i64.sub (local.get $r4) (i64.const 8)))`,`(i64.store ${wasmAddr({base:4,index:-1,disp:0n},next)} ${srcExpr})`); break; }
         case 'pop': {
-          if (insn.dst.kind === 'reg' && savedI32(insn.dst.r))
+          if (insn.dst.kind === 'reg' && savedI32(insn.dst.r))   // epilogue restore straight to the regfile
             L.push(`(i64.store (i32.const ${insn.dst.r*8}) (i64.load ${wasmAddr({base:4,index:-1,disp:0n},next)}))`, `(local.set $r4 (i64.add (local.get $r4) (i64.const 8)))`);
           else
             L.push(wr(insn.dst,8,`(i64.load ${wasmAddr({base:4,index:-1,disp:0n},next)})`,next),`(local.set $r4 (i64.add (local.get $r4) (i64.const 8)))`);
