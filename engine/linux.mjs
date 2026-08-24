@@ -30,8 +30,13 @@ export class LinuxEngine {
                           assembleWat = null, aotCallThreshold = 12, aotLoopThreshold = 40 } = {}) {
     this.files = files;                       // path -> Uint8Array (read-only)
     this.env = env;                           // "KEY=VALUE" strings
-    this.fds = new Map();                     // fd -> { bytes, pos } ; 0/1/2 reserved
-    this.nextFd = 3;
+    // real fd table: 0 empty stdin, 1 stdout, 2 stderr. open() and dup()
+    // allocate the LOWEST free fd, like Linux — busybox relies on
+    // close(0); open(file) landing the file on fd 0.
+    this.fds = new Map();
+    this.fds.set(0, { bytes: new Uint8Array(0), pos: 0 });
+    this.fds.set(1, { sink: 'out' });
+    this.fds.set(2, { sink: 'err' });
 
     const parseElf = (bytes) => {
       const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.length);
@@ -235,28 +240,50 @@ export class LinuxEngine {
     for (;;) { const c = Number(this.mem.read(a, 1n)); if (!c) break; p += String.fromCharCode(c); a++; }
     return p; }
   lookup(p) { return this.files[p] ?? this.files[p.replace(/^\.\//, '')]; }
+  allocFd() { let fd = 0; while (this.fds.has(fd)) fd++; return fd; }
 
   syscall(cpu) {
     const nr = Number(cpu.regs[0]);
     const [a1, a2, a3] = [cpu.regs[7], cpu.regs[6], cpu.regs[2]];   // rdi rsi rdx
     this.stats.syscalls[nr] = (this.stats.syscalls[nr] || 0) + 1;
     const ret = (v) => { cpu.regs[0] = BigInt.asUintN(64, v); };
+    // resolve a write target: stdout / stderr sink, or a pipe buffer
+    const defSink = (fd) => this.fds.get(fd) ?? (fd === 1 ? { sink: 'out' } : fd === 2 ? { sink: 'err' } : undefined);
+    const writeChunk = (fd, addr, len) => {
+      if (len <= 0) return;
+      const bytes = this.ram.slice(Number(addr - this.base), Number(addr - this.base) + len);
+      const h = defSink(fd);
+      if (h?.pipe) { h.pipe.chunks.push(bytes); return; }
+      const str = new TextDecoder().decode(bytes);
+      if (h?.sink === 'err') { (this.stderr ||= []).push(str); (this.stderrBytes ||= []).push(bytes); }
+      else { this.stdout.push(str); this.stdoutBytes.push(bytes); }
+    };
     switch (nr) {
-      case 1: {                                              // write(fd, buf, len)
-        this.stdout.push(this.readCStrMem(a2, Number(a3)));
-        this.stdoutBytes.push(this.ram.slice(Number(a2 - this.base), Number(a2 - this.base) + Number(a3)));
-        ret(a3); break; }
+      case 1:                                                // write(fd, buf, len)
+        writeChunk(Number(a1), a2, Number(a3)); ret(a3); break;
       case 20: {                                             // writev(fd, iov, cnt)
         const view = new DataView(this.wmem.buffer);
         let total = 0n;
         for (let i = 0; i < Number(a3); i++) {
           const io = this.RAMOFF + Number(a2 - this.base) + i * 16;
           const b = view.getBigUint64(io, true), l = view.getBigUint64(io + 8, true);
-          if (l) { this.stdout.push(this.readCStrMem(b, Number(l)));
-                   this.stdoutBytes.push(this.ram.slice(Number(b - this.base), Number(b - this.base) + Number(l))); }
-          total += l;
+          writeChunk(Number(a1), b, Number(l)); total += l;
         }
         ret(total); break; }
+      case 32: case 33: case 292: {                          // dup / dup2 / dup3
+        const old = Number(a1), h = defSink(old);
+        if (!h && !this.fds.has(old)) { ret(-9n); break; }   // EBADF
+        const handle = h ?? this.fds.get(old);
+        if (nr === 32) { const fd = this.allocFd(); this.fds.set(fd, handle); ret(BigInt(fd)); break; }
+        const nw = Number(a2); this.fds.set(nw, handle); ret(BigInt(nw)); break; }
+      case 22: case 293: {                                   // pipe / pipe2
+        const buf = { chunks: [], pos: 0, off: 0 };
+        const rfd = this.allocFd(); this.fds.set(rfd, null); const wfd = this.allocFd(); this.fds.delete(rfd);
+        this.fds.set(rfd, { pipe: buf, mode: 'r' });
+        this.fds.set(wfd, { pipe: buf, mode: 'w' });
+        const v = new DataView(this.wmem.buffer), o = this.RAMOFF + Number(a1 - this.base);
+        v.setUint32(o, rfd, true); v.setUint32(o + 4, wfd, true);
+        ret(0n); break; }
       case 12:                                               // brk
         if (a1 > this.brk) this.brk = align(a1, PAGE);
         ret(this.brk); break;
@@ -317,12 +344,23 @@ export class LinuxEngine {
         const p = this.readPath(nr === 257 ? a2 : a1);
         const f = this.lookup(p);
         if (f === undefined) { ret(-2n); break; }             // ENOENT
-        const fd = this.nextFd++;
+        const fd = this.allocFd();
         this.fds.set(fd, { bytes: f, pos: 0 });
         ret(BigInt(fd)); break; }
       case 0: {                                               // read(fd, buf, len)
         const fd = Number(a1), h = this.fds.get(fd);
         if (!h) { ret(fd === 0 ? 0n : -9n); break; }          // stdin -> EOF
+        if (h.pipe) {                                         // drain the shared pipe buffer
+          const want = Number(a3); let dst = Number(a2 - this.base), got = 0;
+          while (got < want && h.pipe.chunks.length) {
+            const c = h.pipe.chunks[0], avail = c.length - h.pipe.off;
+            const take = Math.min(avail, want - got);
+            this.ram.set(c.subarray(h.pipe.off, h.pipe.off + take), dst);
+            dst += take; got += take; h.pipe.off += take;
+            if (h.pipe.off >= c.length) { h.pipe.chunks.shift(); h.pipe.off = 0; }
+          }
+          ret(BigInt(got)); break;                            // 0 => EOF (writer done)
+        }
         const n = Math.min(Number(a3), h.bytes.length - h.pos);
         this.ram.set(h.bytes.subarray(h.pos, h.pos + n), Number(a2 - this.base));
         h.pos += n; ret(BigInt(n)); break; }
@@ -349,7 +387,9 @@ export class LinuxEngine {
           }
         } else {
           const h = this.fds.get(Number(a1));
-          if (h) { size = h.bytes.length; mode = 0o100755; }
+          if (h?.bytes) { size = h.bytes.length; mode = 0o100755; }        // regular file
+          else if (h?.pipe) { size = 0; mode = 0o010600; }                 // FIFO
+          // sink/tty: leave mode as the char-device default
         }
         const buf = isAt ? cpu.regs[2] : a2;
         const off = this.RAMOFF + Number(buf - this.base);
@@ -444,7 +484,8 @@ export class LinuxEngine {
         }
       }
     } catch (e) { if (e !== EXIT) throw e; }
-    return { exitCode: this.exitCode, stdout: this.stdout.join(''), stats: this.stats };
+    return { exitCode: this.exitCode, stdout: this.stdout.join(''),
+             stderr: (this.stderr || []).join(''), stats: this.stats };
   }
 
   tryCompile(hk, head) {
