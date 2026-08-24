@@ -327,13 +327,19 @@ export function compileFunctionWat(mem, entry, opts = {}) {
     const note = (op) => { if (!op) return;
       if (op.kind === 'reg') { if ((op.size||8) === 8 || op.high) use64[op.r] = true; }
       if (op.kind === 'mem') { if (op.base>=0) use64[op.base]=true; if (op.index>=0) use64[op.index]=true; } };
-    note(insn.dst); note(insn.src); note(insn.src2);
+    if (insn.mnem !== 'push' && insn.mnem !== 'pop') { note(insn.dst); note(insn.src); note(insn.src2); }
+    else if (insn.mnem === 'pop' && insn.dst && insn.dst.kind === 'mem') note(insn.dst);  // pop to mem still needs base
     if (insn.mnem === 'lea') use64[insn.dst.r] = true;
-    if (insn.mnem === 'push' && insn.src && insn.src.kind==='reg') use64[insn.src.r] = true;
-    if (insn.mnem === 'pop' && insn.dst && insn.dst.kind==='reg') use64[insn.dst.r] = true;
+    // push/pop handled with i32<->i64 conversion at stack boundary
     if ((insn.mnem === 'movsx' || insn.mnem === 'movzx') && (insn.size||8)===8) use64[insn.dst.r]=true;
   }
   const isI32 = (r) => !use64[r];
+  const pushed = new Set();
+  for (const b of blocks) for (const insn of b.insns) {
+    if (insn.mnem === 'push' && insn.src && insn.src.kind === 'reg') pushed.add(insn.src.r);
+    if (insn.mnem === 'pop' && insn.dst && insn.dst.kind === 'reg') pushed.add(insn.dst.r);
+  }
+  const savedI32 = (r) => isI32(r) && pushed.has(r);   // callee-saved, 32-bit working
 
   // ---- operand / instruction emit (identical semantics to the dispatch version) ----
   const hexs = (v) => BigInt.asIntN(64, v).toString();
@@ -491,8 +497,19 @@ export function compileFunctionWat(mem, entry, opts = {}) {
           else if (insn.dst.kind === 'reg') L.push(wr32reg(insn.dst.r, `(i32.${insn.mnem==='rol'?'rotl':'rotr'} ${rd32(insn.dst,next)} ${c})`));
           else L.push(wr(insn.dst,S,`(i64.and (i64.extend_i32_u (i32.${insn.mnem==='rol'?'rotl':'rotr'} ${rd32(insn.dst,next)} ${c})) (i64.const ${m}))`,next));
           break; }
-        case 'push': L.push(`(local.set $r4 (i64.sub (local.get $r4) (i64.const 8)))`,`(i64.store ${wasmAddr({base:4,index:-1,disp:0n},next)} ${rd(insn.src,8,next)})`); break;
-        case 'pop': L.push(wr(insn.dst,8,`(i64.load ${wasmAddr({base:4,index:-1,disp:0n},next)})`,next),`(local.set $r4 (i64.add (local.get $r4) (i64.const 8)))`); break;
+        case 'push': {
+          // A callee-saved i32-working register keeps only its low 32 bits in its local;
+          // its full 64-bit caller value still lives in the register file at prologue time,
+          // so read it from there to round-trip the upper 32 bits through the stack.
+          const srcExpr = (insn.src.kind === 'reg' && savedI32(insn.src.r))
+            ? `(i64.load (i32.const ${insn.src.r*8}))` : rd(insn.src,8,next);
+          L.push(`(local.set $r4 (i64.sub (local.get $r4) (i64.const 8)))`,`(i64.store ${wasmAddr({base:4,index:-1,disp:0n},next)} ${srcExpr})`); break; }
+        case 'pop': {
+          if (insn.dst.kind === 'reg' && savedI32(insn.dst.r))
+            L.push(`(i64.store (i32.const ${insn.dst.r*8}) (i64.load ${wasmAddr({base:4,index:-1,disp:0n},next)}))`, `(local.set $r4 (i64.add (local.get $r4) (i64.const 8)))`);
+          else
+            L.push(wr(insn.dst,8,`(i64.load ${wasmAddr({base:4,index:-1,disp:0n},next)})`,next),`(local.set $r4 (i64.add (local.get $r4) (i64.const 8)))`);
+          break; }
         case 'jmp': case 'jcc': case 'ret': case 'retn': case 'leave': break;  // terminator handled below
         default: throw new Error('AOT: unhandled '+insn.mnem+' @ '+insn.rip.toString(16));
       }
@@ -532,7 +549,7 @@ export function compileFunctionWat(mem, entry, opts = {}) {
     for (const _ of closeAfter[i]) wat += '      )\n';
   }
   wat += '    )\n';
-  for (let r=0;r<16;r++) wat += isI32(r) ? `    (i64.store (i32.const ${r*8}) (i64.extend_i32_u (local.get $r${r})))\n` : `    (i64.store (i32.const ${r*8}) (local.get $r${r}))\n`;
+  for (let r=0;r<16;r++) { if (savedI32(r)) continue; wat += isI32(r) ? `    (i64.store (i32.const ${r*8}) (i64.extend_i32_u (local.get $r${r})))\n` : `    (i64.store (i32.const ${r*8}) (local.get $r${r}))\n`; }
   wat += '  )\n)\n';
   return { wat, blocks: N };
 }
