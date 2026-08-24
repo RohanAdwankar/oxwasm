@@ -359,7 +359,18 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     else if (last.mnem === 'udec')   { hasDeopt = true; term.push({kind:'deopt', src:null, at:last.rip}); succs.push([]); }
     else { const t = idxOf(next); term.push({kind:'fall', t}); succs.push([t]); }
   }
-  const { open, closeAfter } = structure(N, succs);
+  // Try the structured (scope-nesting) layout first — it yields tight wasm
+  // loops. If the CFG is irreducible / has improper block-loop overlap, fall
+  // back to a flat br_table dispatch loop (a relooper), which handles ANY CFG
+  // at the cost of an indirect branch per non-fallthrough edge. Either way the
+  // function compiles instead of poisoning the whole unit.
+  let mode = 'structured', open = null, closeAfter = null;
+  try { ({ open, closeAfter } = structure(N, succs)); }
+  catch (e) {
+    if (!/overlap|irreducible|unclosed|converge/.test(e.message)) throw e;
+    mode = 'dispatch';
+  }
+  const DISP = mode === 'dispatch';
 
   // Width inference. A register may live in an i32 local only when every
   // access is 32-bit-or-less AND it is written at least once here — a register
@@ -1082,19 +1093,32 @@ function emitUnitFunction(a0, fnAddr, ctx) {
         default: throw new Error('AOT: unhandled '+insn.mnem+' @ '+insn.rip.toString(16));
       }
     }
-    // terminator as label-based branches (RPO indices)
+    // terminator as label-based branches (RPO indices). In dispatch mode a
+    // non-fallthrough edge sets $pc and re-enters the dispatch loop instead of
+    // branching to a scope label; natural fall-through (j===i+1) is identical
+    // in both layouts since block i+1's body immediately follows block i's.
     const t = term[i];
     const last = blk.insns[blk.insns.length-1], lnext = last.next;
     const labelFor = (j) => j <= i ? '$loop_'+j : '$blk_'+j;
-    const brTo = (j) => { if (j < 0) throw new Error('AOT: branch into undecoded code'); return j === i+1 ? '' : `(br ${labelFor(j)})`; };
+    const goto = (j) => { if (j < 0) throw new Error('AOT: branch into undecoded code');
+      return DISP ? `(local.set $pc (i32.const ${j})) (br $L_disp)` : `(br ${labelFor(j)})`; };
+    const brTo = (j) => j === i+1 ? '' : goto(j);
     if (t.kind === 'jcc') {
       const c = cond(last.cond);
-      const lbl = (j) => { if (j < 0) throw new Error('AOT: jcc into undecoded code'); return labelFor(j); };
       const T = t.t, F = t.f;
-      if (T === i+1 && F === i+1) { /* both fall through */ }
-      else if (T !== i+1 && F === i+1) L.push(`(br_if ${lbl(T)} ${c})`);
-      else if (T === i+1 && F !== i+1) L.push(`(br_if ${lbl(F)} (i32.eqz ${c}))`);
-      else { L.push(`(br_if ${lbl(T)} ${c})`); L.push(`(br ${lbl(F)})`); }
+      if (T < 0 || F < 0) throw new Error('AOT: jcc into undecoded code');
+      if (DISP) {
+        if (T === i+1 && F === i+1) { /* both fall through */ }
+        else if (F === i+1) L.push(`(if ${c} (then ${goto(T)}))`);
+        else if (T === i+1) L.push(`(if (i32.eqz ${c}) (then ${goto(F)}))`);
+        else L.push(`(if ${c} (then ${goto(T)}) (else ${goto(F)}))`);
+      } else {
+        const lbl = (j) => labelFor(j);
+        if (T === i+1 && F === i+1) { /* both fall through */ }
+        else if (T !== i+1 && F === i+1) L.push(`(br_if ${lbl(T)} ${c})`);
+        else if (T === i+1 && F !== i+1) L.push(`(br_if ${lbl(F)} (i32.eqz ${c}))`);
+        else { L.push(`(br_if ${lbl(T)} ${c})`); L.push(`(br ${lbl(F)})`); }
+      }
     } else if (t.kind === 'jmp') {
       const b = brTo(t.t); if (b) L.push(b);
     } else if (t.kind === 'ret') {
@@ -1119,12 +1143,28 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   let wat = `  (func $${name} (export "${name}") (result i64)\n`;
   for (let r=0;r<16;r++) wat += `    (local $r${r} ${isI32(r)?'i32':'i64'})\n`;
   wat += '    (local $fa i64) (local $fb i64) (local $fr i64) (local $rsp0 i64) (local $rex i64)\n';
+  if (DISP) wat += '    (local $pc i32)\n';
   for (const r of xUsed) wat += `    (local ${xreg(r)} v128)\n`;
   for (const t of tmps) wat += `    (local ${t} i64)\n`;
   for (const t of vtmps) wat += `    (local ${t} v128)\n`;
   for (let r=0;r<16;r++) if (touched(r)) wat += '    ' + reloadR(r) + '\n';
   for (const r of xUsed) wat += '    ' + xReload(r) + '\n';
   wat += '    (local.set $rsp0 (local.get $r4))\n';
+  if (DISP) {
+    // flat br_table dispatch: $pc holds the current block's RPO index. Block
+    // bodies run in order; a non-fallthrough edge sets $pc and br's $L_disp.
+    wat += '    (block $exit_disp\n    (loop $L_disp\n';
+    for (let k = N-1; k >= 0; k--) wat += `      (block $b${k}\n`;
+    const tab = Array.from({length:N}, (_,k)=>'$b'+k).join(' ');
+    wat += `      (br_table ${tab} $exit_disp (local.get $pc)))\n`;   // closes $b0
+    for (let i=0;i<N;i++) {
+      wat += '      ' + bodies[i] + '\n';
+      if (i < N-1) wat += `      )\n`;                                 // close $b${i+1}
+    }
+    wat += '    ))\n';                                                 // close loop + exit block
+    wat += '    (unreachable)\n  )\n';
+    return wat;
+  }
   for (let i=0;i<N;i++) {
     for (const s of open[i]) wat += s.type==='loop' ? `      (loop ${s.label}\n` : `      (block ${s.label}\n`;
     wat += '      ' + bodies[i] + '\n';
