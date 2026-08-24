@@ -5,6 +5,14 @@
 import { decode } from './decode.mjs';
 
 const MASK = { 1: 0xFFn, 2: 0xFFFFn, 4: 0xFFFFFFFFn, 8: 0xFFFFFFFFFFFFFFFFn };
+// bit-accurate float <-> raw-bits conversion for the SSE lanes
+const FPB = new DataView(new ArrayBuffer(8));
+const FP = {
+  getF64: (b) => { FPB.setBigUint64(0, b, true); return FPB.getFloat64(0, true); },
+  putF64: (x) => { FPB.setFloat64(0, x, true); return FPB.getBigUint64(0, true); },
+  getF32: (b) => { FPB.setUint32(0, Number(b & 0xFFFFFFFFn), true); return FPB.getFloat32(0, true); },
+  putF32: (x) => { FPB.setFloat32(0, x, true); return BigInt(FPB.getUint32(0, true)); },
+};
 const SIGN = { 1: 0x80n, 2: 0x8000n, 4: 0x80000000n, 8: 0x8000000000000000n };
 
 export class Memory {
@@ -44,7 +52,7 @@ export class CPU {
     this.regs = new Array(16).fill(0n);
     this.rip = 0n;
     this.xmm = new Array(16).fill(0n);          // 128-bit values as BigInt
-    this.f = { cf: 0, pf: 0, zf: 0, sf: 0, of: 0, af: 0 };
+    this.f = { cf: 0, pf: 0, zf: 0, sf: 0, of: 0, af: 0, df: 0 };
   }
   flagsValue() {
     const f = this.f;
@@ -308,6 +316,70 @@ export class CPU {
             for (let k = 0n; k < n; k++) r |= sat((a  >> (k*eb)) & mask) << (k*ob);
             for (let k = 0n; k < n; k++) r |= sat((b2 >> (k*eb)) & mask) << ((n+k)*ob);
             this.xmm[insn.xr] = r; break; }
+          // ---- scalar + packed SSE float (bit-accurate via DataView) ----
+          case 0x54: this.xmm[insn.xr] = this.xmm[insn.xr] & rdRm(16); break;                    // andps/pd
+          case 0x55: this.xmm[insn.xr] = (~this.xmm[insn.xr] & rdRm(16)) & M128; break;          // andnps/pd
+          case 0x56: this.xmm[insn.xr] = (this.xmm[insn.xr] | rdRm(16)) & M128; break;           // orps/pd
+          case 0x57: this.xmm[insn.xr] = (this.xmm[insn.xr] ^ rdRm(16)) & M128; break;           // xorps/pd
+          case 0x2A: {                                 // cvtsi2ss/sd (F3/F2), src = r/m int
+            const iv = insn.rm.kind === 'xmm' ? this.regs[insn.rm.r] : this.mem.read(this.ea(insn.rm), insn.W ? 8n : 4n);
+            const sv = BigInt.asIntN(insn.W ? 64 : 32, iv);
+            if (insn.pF2) this.xmm[insn.xr] = (this.xmm[insn.xr] & ~0xFFFFFFFFFFFFFFFFn) | FP.putF64(Number(sv));
+            else this.xmm[insn.xr] = (this.xmm[insn.xr] & ~0xFFFFFFFFn) | FP.putF32(Number(sv));
+            break; }
+          case 0x2C: case 0x2D: {                      // cvt(t)ss/sd2si -> GPR (0x2C truncates, 0x2D rounds-nearest)
+            const x = insn.rm.kind === 'xmm' ? this.xmm[insn.rm.r] : this.mem.read(this.ea(insn.rm), insn.pF2 ? 8n : 4n);
+            const f = insn.pF2 ? FP.getF64(x & 0xFFFFFFFFFFFFFFFFn) : FP.getF32(x & 0xFFFFFFFFn);
+            const w = insn.W ? 64 : 32;
+            const g = insn.op === 0x2C ? Math.trunc(f) : Math.round(f);
+            const r = (!Number.isFinite(g) || g >= 2**(w-1) || g < -(2**(w-1)))
+              ? 1n << BigInt(w-1)                       // x86 "integer indefinite"
+              : BigInt.asUintN(w, BigInt(g));
+            this.setReg({kind:'reg', r: insn.xr, size: insn.W ? 8 : 4}, r); break; }
+          case 0x2E: case 0x2F: {                      // ucomis/comis: ZF/PF/CF
+            const bytes = insn.p66 ? 8 : 4;
+            const bx = insn.rm.kind === 'xmm' ? this.xmm[insn.rm.r] : this.mem.read(this.ea(insn.rm), BigInt(bytes));
+            const a = insn.p66 ? FP.getF64(this.xmm[insn.xr] & 0xFFFFFFFFFFFFFFFFn) : FP.getF32(this.xmm[insn.xr] & 0xFFFFFFFFn);
+            const b2 = insn.p66 ? FP.getF64(bx & 0xFFFFFFFFFFFFFFFFn) : FP.getF32(bx & 0xFFFFFFFFn);
+            if (Number.isNaN(a) || Number.isNaN(b2)) { this.f.zf = 1; this.f.pf = 1; this.f.cf = 1; }
+            else { this.f.zf = a === b2 ? 1 : 0; this.f.pf = 0; this.f.cf = a < b2 ? 1 : 0; }
+            this.f.sf = 0; this.f.of = 0; this.f.af = 0; break; }
+          case 0x51: case 0x58: case 0x59: case 0x5C: case 0x5D: case 0x5E: case 0x5F: {
+            // sqrt/add/mul/sub/min/max/div — scalar (F3 ss / F2 sd) or packed (ps / 66 pd)
+            const OP = { 0x51:(a,b)=>Math.sqrt(b), 0x58:(a,b)=>a+b, 0x59:(a,b)=>a*b,
+                         0x5C:(a,b)=>a-b, 0x5D:(a,b)=>Math.min(a,b), 0x5E:(a,b)=>a/b, 0x5F:(a,b)=>Math.max(a,b) }[insn.op];
+            const dbl = insn.pF2 || insn.p66, scalar = insn.pF3 || insn.pF2;
+            const lanes = scalar ? 1 : (dbl ? 2 : 4), eb = dbl ? 64n : 32n;
+            const src = insn.rm.kind === 'xmm' ? this.xmm[insn.rm.r]
+                       : this.mem.read(this.ea(insn.rm), scalar ? (dbl ? 8n : 4n) : 16n);
+            const mask = (1n << eb) - 1n;
+            let out = this.xmm[insn.xr];
+            for (let k = 0n; k < BigInt(lanes); k++) {
+              const av = dbl ? FP.getF64((out >> (k*eb)) & mask) : FP.getF32((out >> (k*eb)) & mask);
+              const bv = dbl ? FP.getF64((src >> (k*eb)) & mask) : FP.getF32((src >> (k*eb)) & mask);
+              const rv = OP(av, bv);
+              const bits = dbl ? FP.putF64(rv) : FP.putF32(rv);
+              out = (out & ~(mask << (k*eb))) | (bits << (k*eb));
+            }
+            this.xmm[insn.xr] = out & M128; break; }
+          case 0x5A: {                                 // cvtss2sd / cvtsd2ss / cvtps2pd / cvtpd2ps
+            const src = insn.rm.kind === 'xmm' ? this.xmm[insn.rm.r]
+                       : this.mem.read(this.ea(insn.rm), insn.pF3 ? 4n : insn.pF2 ? 8n : (insn.p66 ? 16n : 8n));
+            if (insn.pF3)      this.xmm[insn.xr] = (this.xmm[insn.xr] & ~0xFFFFFFFFFFFFFFFFn) | FP.putF64(FP.getF32(src & 0xFFFFFFFFn));
+            else if (insn.pF2) this.xmm[insn.xr] = (this.xmm[insn.xr] & ~0xFFFFFFFFn) | FP.putF32(FP.getF64(src & 0xFFFFFFFFFFFFFFFFn));
+            else if (insn.p66) this.xmm[insn.xr] = FP.putF32(FP.getF64(src & 0xFFFFFFFFFFFFFFFFn)) | (FP.putF32(FP.getF64(src >> 64n)) << 32n);
+            else this.xmm[insn.xr] = FP.putF64(FP.getF32(src & 0xFFFFFFFFn)) | (FP.putF64(FP.getF32((src >> 32n) & 0xFFFFFFFFn)) << 64n);
+            break; }
+          case 0x5B: {                                 // cvtdq2ps / cvtps2dq(66) / cvttps2dq(F3)
+            const src = insn.rm.kind === 'xmm' ? this.xmm[insn.rm.r] : this.mem.read(this.ea(insn.rm), 16n);
+            let out = 0n;
+            for (let k = 0n; k < 4n; k++) { const lane = (src >> (32n*k)) & 0xFFFFFFFFn;
+              if (!insn.p66 && !insn.pF3) out |= FP.putF32(Number(BigInt.asIntN(32, lane))) << (32n*k);
+              else { const f = FP.getF32(lane); const g = insn.pF3 ? Math.trunc(f) : Math.round(f);
+                const v = (!Number.isFinite(g) || g >= 2**31 || g < -(2**31)) ? 0x80000000n : BigInt.asUintN(32, BigInt(g));
+                out |= v << (32n*k); } }
+            this.xmm[insn.xr] = out; break; }
+          case 0x2B: wrRm(16, this.xmm[insn.xr]); break;   // movntps/pd: plain store
           case 0xC5: {                                 // pextrw r32 <- xmm[imm3]
             const src = this.xmm[insn.rm.kind === 'xmm' ? insn.rm.r : 0];
             this.regs[insn.xr] = (src >> (16n * BigInt(insn.imm8 & 7))) & 0xFFFFn; break; }
@@ -373,8 +445,22 @@ export class CPU {
         else throw new Error('sse shift sub ' + insn.sub);
         break; }
       case 'cpuid': this.regs[0] = 0n; this.regs[3] = 0n; this.regs[1] = 0n; this.regs[2] = 0n; break;
+      case 'cld': this.f.df = 0; break;
+      case 'std': this.f.df = 1; break;
+      case 'clc': this.f.cf = 0; break;
+      case 'stc': this.f.cf = 1; break;
       case 'movs': {
         const n = BigInt(S);
+        if (this.f.df) {                       // backward copy (memmove tail-first)
+          do {
+            if (insn.rep && this.regs[1] === 0n) break;
+            this.mem.write(this.regs[7], n, this.mem.read(this.regs[6], n));
+            this.regs[6] = (this.regs[6] - n) & MASK[8];
+            this.regs[7] = (this.regs[7] - n) & MASK[8];
+            if (insn.rep) this.regs[1] = (this.regs[1] - 1n) & MASK[8];
+          } while (insn.rep && this.regs[1] > 0n);
+          break;
+        }
         // bulk fast path (DF=0): one typed-array copy unless the ranges
         // overlap with dst above src, where x86's forward element copy differs
         // from memmove — fall back to the exact loop there.
@@ -400,6 +486,15 @@ export class CPU {
         break; }
       case 'stos': {
         const n = BigInt(S), v = this.regs[0] & MASK[S];
+        if (this.f.df) {
+          do {
+            if (insn.rep && this.regs[1] === 0n) break;
+            this.mem.write(this.regs[7], n, v);
+            this.regs[7] = (this.regs[7] - n) & MASK[8];
+            if (insn.rep) this.regs[1] = (this.regs[1] - 1n) & MASK[8];
+          } while (insn.rep && this.regs[1] > 0n);
+          break;
+        }
         if (insn.rep && this.regs[1] > 1n) {
           const len = this.regs[1] * n;
           const dst = this.mem.view(this.regs[7], len);

@@ -21,17 +21,26 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 RUNTIME = os.environ.get("OXWASM_RUNTIME", os.path.join(HERE, "runtime"))
 
-APPIMAGE_MSG = """\
-error: {name} is an x86-64 binary (AppImages are 64-bit ELF).
+def is_elf64_x86_64(path):
+    try:
+        with open(path, "rb") as f:
+            h = f.read(20)
+        return h[:4] == b"\x7fELF" and h[4] == 2 and h[18:20] == b"\x3e\x00"
+    except OSError:
+        return False
 
-oxwasm's current engine (v86) executes 32-bit x86. Running 64-bit desktop
-apps at usable speed needs the M3 engine — an x86-64 -> WASM JIT. Today you
-can package any 32-bit guest (kernel+initrd, bootable ISO, or disk image).
 
-  M1 (done)  kernel/initrd or ISO -> single-file HTML, boots offline
-  M2 (done)  32-bit graphical guest: X11 + any app via emulation (pack-app.sh)
-  M3         fast engine: x86-64 -> WASM JIT, AppImage in, usable app out
-"""
+def cmd_build_m3(target, args):
+    """x86-64 ELF or AppImage -> single HTML on the M3 engine (tier-0
+    interpreter + runtime x86-64 -> WebAssembly AOT, assembled in-page)."""
+    import subprocess
+    cmd = ["node", os.path.join(HERE, "tools", "m3pack.mjs"), target,
+           "-o", args.out, "--title", args.title if args.title != "oxwasm" else os.path.basename(target)]
+    for a in (args.app_arg or []):
+        cmd += ["--arg", a]
+    for fspec in (args.app_file or []):
+        cmd += ["--file", fspec]
+    subprocess.run(cmd, check=True)
 
 
 def gzb64(path_or_bytes, level=6):
@@ -87,10 +96,10 @@ def cmd_build(args):
     if args.target:
         t = args.target
         low = t.lower()
-        if low.endswith(".appimage"):
-            sys.exit(APPIMAGE_MSG.format(name=os.path.basename(t)))
         if not os.path.exists(t):
             sys.exit(f"error: no such file: {t}")
+        if low.endswith(".appimage") or is_elf64_x86_64(t):
+            return cmd_build_m3(t, args)          # M3 lane: x86-64 -> wasm JIT
         if low.endswith(".iso"):
             images["cdrom"] = t
         else:
@@ -129,6 +138,10 @@ def main():
                         "(streamed + DecompressionStream) instead of inlining it — "
                         "much faster load; needs the HTML hosted, not opened from disk")
     b.add_argument("--title", default="oxwasm", help="page title")
+    b.add_argument("--app-arg", action="append",
+                   help="argument passed to an M3-lane program (repeatable)")
+    b.add_argument("--app-file", action="append", metavar="GUEST=HOST",
+                   help="file preloaded into the M3-lane guest FS (repeatable)")
     b.add_argument("-o", "--out", default="out.html")
     b.set_defaults(func=cmd_build)
     args = p.parse_args()

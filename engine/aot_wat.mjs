@@ -547,7 +547,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     };
     const CLOBBER = new Set(['shl','shr','sar','rol','ror','imul2','imul3','mul1','imul1','div1','idiv1',
                              'bt','bts','btr','btc','shld','shrd','call','callind','syscall',
-                             'xadd','cmpxchg','bsf','bsr']);
+                             'xadd','cmpxchg','bsf','bsr','clc','stc']);
     const nearestProd = (from) => {
       for (let k = from; k >= 0; k--) {
         const insn = blk.insns[k];

@@ -9,9 +9,11 @@
 // The output is self-contained and offline: engine, wabt, the binary, and
 // any data files are inlined. Nothing about the packaged program is special-
 // cased — the engine sees only its bytes.
-import { readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, readdirSync, statSync, mkdtempSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { gzipSync } from 'node:zlib';
-import { dirname, join } from 'node:path';
+import { dirname, join, relative } from 'node:path';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -19,7 +21,7 @@ const ENGINE = join(HERE, '..', 'engine');
 
 const args = process.argv.slice(2);
 let elfPath = null, out = 'm3.html', title = 'oxwasm m3';
-const argv = [], files = {};
+let argv = [], files = {};
 for (let i = 0; i < args.length; i++) {
   const a = args[i];
   if (a === '-o') out = args[++i];
@@ -29,7 +31,30 @@ for (let i = 0; i < args.length; i++) {
   else if (!elfPath) elfPath = a;
   else { console.error('unknown arg', a); process.exit(1); }
 }
-if (!elfPath) { console.error('usage: m3pack ELF [-o out.html] [--arg A]... [--file guest=host]...'); process.exit(1); }
+if (!elfPath) { console.error('usage: m3pack ELF|AppImage [-o out.html] [--arg A]... [--file guest=host]...'); process.exit(1); }
+
+// An AppImage target is unpacked host-side (its runtime needs FUSE, which no
+// browser has): the payload files ride along in the guest FS under /app and
+// the resolved inner ELF becomes the program. The app's own bytes stay
+// unmodified — only the delivery changes.
+{
+  const head = readFileSync(elfPath).subarray(0, 12);
+  if (head[8] === 0x41 && head[9] === 0x49 && head[10] === 0x02) {
+    const dir = mkdtempSync(join(tmpdir(), 'oxai-'));
+    const entry = execFileSync('python3', [join(HERE, 'appimage-extract.py'), elfPath, dir]).toString().trim();
+    const walk = (d) => { for (const n of readdirSync(d)) {
+      const p = join(d, n); const st = statSync(p, { throwIfNoEntry: false });
+      if (!st) continue;
+      if (st.isDirectory()) walk(p);
+      else if (st.isFile()) files['/app/' + relative(dir, p)] = p;
+    } };
+    walk(dir);
+    const guestEntry = '/app/' + relative(dir, entry);
+    argv = [guestEntry, ...argv.slice(argv[0] === elfPath ? 1 : 0)];
+    console.log(`m3pack: AppImage payload — ${Object.keys(files).length} files, entry ${guestEntry}`);
+    elfPath = entry;
+  }
+}
 
 const gzb64 = (buf) => Buffer.from(gzipSync(buf, { level: 9 })).toString('base64');
 
