@@ -308,6 +308,7 @@ export function compileFunctionWat(mem, entry, opts = {}) {
   const bidx = new Map(blocks.map((b,i)=>[b.start.toString(), i]));
   const MASKl = { 1: 0xFFn, 2: 0xFFFFn, 4: 0xFFFFFFFFn, 8: 0xFFFFFFFFFFFFFFFFn };
   const SIGNl = { 1: 0x80n, 2: 0x8000n, 4: 0x80000000n, 8: 0x8000000000000000n };
+  const andmask = (e, S) => S === 8 ? e : `(i64.and ${e} (i64.const ${MASKl[S]}))`;   // truncate to width; full 64 is a no-op
 
   // terminator descriptor + successors, all in RPO index space
   const term = [], succs = [];
@@ -410,14 +411,17 @@ export function compileFunctionWat(mem, entry, opts = {}) {
   const FLAGSET = new Set(['add','sub','and','or','xor','inc','dec','cmp','test','neg']);
   function emitBlock(i) {
     const blk = blocks[i]; const L = [];
-    // Only the flag-setting op that a terminating jcc actually consumes needs
-    // its flags materialized; every earlier flag write in the block is dead.
-    let producer = -1;
-    if (term[i].kind === 'jcc')
-      for (let k = blk.insns.length - 1; k >= 0; k--) if (FLAGSET.has(blk.insns[k].mnem)) { producer = k; break; }
+    // A flag write is live only if some later consumer reads it before it is
+    // overwritten. Consumers are the terminating jcc and any mid-block cmov/setcc;
+    // each consumes the nearest preceding flag-setter. Everything else is dead.
+    const producers = new Set();
+    const nearestProd = (from) => { for (let k = from; k >= 0; k--) if (FLAGSET.has(blk.insns[k].mnem)) return k; return -1; };
+    for (let j = 0; j < blk.insns.length; j++)
+      if (blk.insns[j].mnem === 'cmov' || blk.insns[j].mnem === 'setcc') { const p = nearestProd(j - 1); if (p >= 0) producers.add(p); }
+    if (term[i].kind === 'jcc') { const p = nearestProd(blk.insns.length - 1); if (p >= 0) producers.add(p); }
     let flagState = null, ii = 0;
     const setFlags = (kind, size, aE, bE, rE) => {
-      if (ii !== producer) return;                 // dead flags: skip
+      if (!producers.has(ii)) return;              // dead flags: skip
       if (aE) L.push(`(local.set $fa ${aE})`); if (bE) L.push(`(local.set $fb ${bE})`); L.push(`(local.set $fr ${rE})`);
       flagState = { kind, size };
     };
@@ -443,7 +447,7 @@ export function compileFunctionWat(mem, entry, opts = {}) {
       const insn = blk.insns[ii];
       const S = insn.size || 8, m = MASKl[S], next = insn.next;
       // dead cmp/test (never consumed) can be dropped entirely
-      if ((insn.mnem === 'cmp' || insn.mnem === 'test') && ii !== producer) continue;
+      if ((insn.mnem === 'cmp' || insn.mnem === 'test') && !producers.has(ii)) continue;
       switch (insn.mnem) {
         case 'nop': break;
         case 'mov': L.push(wr(insn.dst,S,rd(insn.src,S,next),next)); break;
@@ -451,7 +455,7 @@ export function compileFunctionWat(mem, entry, opts = {}) {
         case 'movsx': L.push(wr(insn.dst,insn.size,sx(rd(insn.src,insn.src.size,next),insn.src.size),next)); break;
         case 'lea': L.push(`(local.set ${reg(insn.dst.r)} ${guestAddr(insn.src,next)})`); break;
         case 'add': case 'sub': case 'and': case 'or': case 'xor': {
-          const prod = (ii === producer);
+          const prod = (producers.has(ii));
           // sub/cmp flags need the ORIGINAL operands: capture before writing dst
           if (prod && insn.mnem === 'sub') { L.push(`(local.set $fa ${rd(insn.dst,S,next)})`, `(local.set $fb ${rd(insn.src,S,next)})`); }
           let expr;
@@ -468,7 +472,7 @@ export function compileFunctionWat(mem, entry, opts = {}) {
         case 'cmp': setFlags('sub',S,rd(insn.dst,S,next),rd(insn.src,S,next),`(i64.and (i64.sub ${rd(insn.dst,S,next)} ${rd(insn.src,S,next)}) (i64.const ${m}))`); break;
         case 'test': setFlags('logic',S,null,null,`(i64.and ${rd(insn.dst,S,next)} ${rd(insn.src,S,next)})`); break;
         case 'inc': case 'dec': {
-          const prod = (ii === producer);
+          const prod = (producers.has(ii));
           let expr;
           let i32e = null;
           if (S === 4 && insn.dst.kind === 'reg') { i32e = `(${insn.mnem==='inc'?'i32.add':'i32.sub'} ${rd32(insn.dst,next)} (i32.const 1))`; expr = `(i64.extend_i32_u ${i32e})`; }
@@ -496,6 +500,30 @@ export function compileFunctionWat(mem, entry, opts = {}) {
             L.push(`(local.set ${reg(insn.dst.r)} (i64.${insn.mnem==='rol'?'rotl':'rotr'} ${a} (i64.extend_i32_u ${c})))`); }
           else if (insn.dst.kind === 'reg') L.push(wr32reg(insn.dst.r, `(i32.${insn.mnem==='rol'?'rotl':'rotr'} ${rd32(insn.dst,next)} ${c})`));
           else L.push(wr(insn.dst,S,`(i64.and (i64.extend_i32_u (i32.${insn.mnem==='rol'?'rotl':'rotr'} ${rd32(insn.dst,next)} ${c})) (i64.const ${m}))`,next));
+          break; }
+        case 'cmov':   // dst = cond ? src : dst; cond() is an i32 boolean, exactly what select wants
+          L.push(wr(insn.dst, S, `(select ${rd(insn.src,S,next)} ${rd(insn.dst,S,next)} ${cond(insn.cond)})`, next)); break;
+        case 'setcc': L.push(wr(insn.dst, 1, `(i64.extend_i32_u ${cond(insn.cond)})`, next)); break;
+        case 'imul2': case 'imul3': {
+          // low-half product; identical bits for signed/unsigned, so a plain mul suffices.
+          const bExpr = insn.mnem === 'imul3' ? insn.src2 : insn.src;
+          if (S === 4 && insn.dst.kind === 'reg') {
+            const a = insn.mnem === 'imul3' ? rd32(insn.src,next) : rd32(insn.dst,next);
+            L.push(wr32reg(insn.dst.r, `(i32.mul ${a} ${rd32(bExpr,next)})`));
+          } else {
+            const a = insn.mnem === 'imul3' ? rd(insn.src,S,next) : rd(insn.dst,S,next);
+            L.push(wr(insn.dst,S,andmask(`(i64.mul ${a} ${rd(bExpr,S,next)})`,S),next));
+          }
+          break; }
+        case 'mul1': case 'imul1': {
+          // one-operand widening multiply: rdx:rax = rax * src. Handle widths <= 4 via i64.
+          if (S > 4) throw new Error('AOT: 128-bit '+insn.mnem+' @ '+insn.rip.toString(16));
+          const ext = insn.mnem === 'imul1' ? 'i64.extend_i32_s' : 'i64.extend_i32_u';
+          const a = `(${ext} ${rd32({kind:'reg',r:0,size:S},next)})`;
+          const b = `(${ext} ${rd32(insn.src,next)})`;
+          const t = T(); L.push(`(local.set ${t} (i64.mul ${a} ${b}))`);
+          L.push(wr32reg(0, `(i32.wrap_i64 ${andmask(`(local.get ${t})`,S)})`));       // rax = low
+          L.push(wr32reg(2, `(i32.wrap_i64 (i64.shr_u (local.get ${t}) (i64.const ${S*8})))`)); // rdx = high
           break; }
         case 'push': {
           // A callee-saved i32-working register keeps only its low 32 bits in its local;
