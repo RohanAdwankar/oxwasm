@@ -86,7 +86,7 @@ export function decode(fetch, rip) {
   if (op >= 0x58 && op <= 0x5F) return fin({ mnem: 'pop', dst: mkreg((op - 0x58) | (B << 3), 8), size: 8 });
   if (op === 0x68) return fin({ mnem: 'push', src: { kind: 'imm', v: imm(4) }, size: 8 });
   if (op === 0x6A) return fin({ mnem: 'push', src: { kind: 'imm', v: imm(1) }, size: 8 });
-  if (op === 0x69) { const [r, rm] = modrm(osz); return fin({ mnem: 'imul3', dst: r, src: rm, src2: { kind: 'imm', v: imm(4) }, size: osz }); }
+  if (op === 0x69) { const [r, rm] = modrm(osz); return fin({ mnem: 'imul3', dst: r, src: rm, src2: { kind: 'imm', v: imm(osz === 2 ? 2 : 4) }, size: osz }); }
   if (op === 0x6B) { const [r, rm] = modrm(osz); return fin({ mnem: 'imul3', dst: r, src: rm, src2: { kind: 'imm', v: imm(1) }, size: osz }); }
   if (op >= 0x70 && op <= 0x7F) return fin({ mnem: 'jcc', cond: COND[op - 0x70], rel: imm(1) });
   if (op === 0x80) { const [, rm, g] = modrm(1); const m = ALU[g & 7]; if (!m) throw new Error('grp1/8 ' + (g & 7)); return fin({ mnem: m, dst: rm, src: { kind: 'imm', v: imm(1) }, size: 1 }); }
@@ -95,7 +95,7 @@ export function decode(fetch, rip) {
   if (op >= 0xB0 && op <= 0xB7) return fin({ mnem: 'mov', dst: reg8((op - 0xB0) | (B << 3)), src: { kind: 'imm', v: immU(1) }, size: 1 });
   if (op >= 0xB8 && op <= 0xBF) { const r = (op - 0xB8) | (B << 3); return W ? fin({ mnem: 'mov', dst: mkreg(r, 8), src: { kind: 'imm', v: immU(8) }, size: 8 }) : fin({ mnem: 'mov', dst: mkreg(r, osz), src: { kind: 'imm', v: immU(osz) }, size: osz }); }
   if (op === 0xC6) { const [, rm] = modrm(1);   return fin({ mnem: 'mov', dst: rm, src: { kind: 'imm', v: immU(1) }, size: 1 }); }
-  if (op === 0xC7) { const [, rm] = modrm(osz); return fin({ mnem: 'mov', dst: rm, src: { kind: 'imm', v: imm(4) }, size: osz }); }
+  if (op === 0xC7) { const [, rm] = modrm(osz); return fin({ mnem: 'mov', dst: rm, src: { kind: 'imm', v: imm(osz === 2 ? 2 : 4) }, size: osz }); }
   if (op === 0xC0 || op === 0xC1 || op === 0xD0 || op === 0xD1 || op === 0xD2 || op === 0xD3) {
     const sz = (op === 0xC0 || op === 0xD0 || op === 0xD2) ? 1 : osz;
     const [, rm, g] = modrm(sz); const m = SHIFT[g & 7]; if (!m) throw new Error('grp2 ' + (g & 7));

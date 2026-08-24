@@ -36,10 +36,11 @@ for (const c of CASES) {
   const entry = symAddr(c.bin, c.sym);
   const mk = () => new LinuxEngine(elf, { argv:['k'], files:{}, memMB:1024 });
   const eng = mk();
-  const { wat } = compileFunctionWat(eng.mem, entry, { guestBase:eng.base, ramBase:eng.RAMOFF });
+  const { wat, entryName } = compileFunctionWat(eng.mem, entry, { guestBase:eng.base, ramBase:eng.RAMOFF });
   writeFileSync('/tmp/ba.wat', wat); execFileSync('wat2wasm',['/tmp/ba.wat','-o','/tmp/ba.wasm']);
   const mod = new WebAssembly.Module(readFileSync('/tmp/ba.wasm'));
   const buf = eng.brk, SENT = 0xdeadbee0n;
+  const envStubs = { syscall(){ throw new Error('escape'); }, callout(){ throw new Error('escape'); }, deopt(){ throw new Error('escape'); } };
   // oracle
   fill(eng, c.kind, c.oracleN, buf); const cpu = eng.cpu;
   for(let r=0;r<16;r++) cpu.regs[r]=0n; cpu.regs[RIDX.rsp]=(eng.base+BigInt(eng.ram.length)-4096n)&~0xFn;
@@ -47,15 +48,18 @@ for (const c of CASES) {
   let g=0; while(cpu.rip!==SENT){ cpu.step(); if(++g>5e10) throw new Error('runaway'); }
   const oracle = c.out ? rdOut(eng, c.out.addr(buf), c.out.len) : BigInt.asUintN(64, cpu.regs[0]).toString(16);
   // AOT
-  const eng2 = mk(); const inst = new WebAssembly.Instance(mod, { js:{ mem:eng2.wmem } });
-  const rsp = (eng2.base+BigInt(eng2.ram.length)-4096n)&~0xFn;
+  const eng2 = mk(); const inst = new WebAssembly.Instance(mod, { js:{ mem:eng2.wmem }, env: envStubs });
+  const runFn = inst.exports[entryName];
+  const rsp = ((eng2.base+BigInt(eng2.ram.length)-4096n)&~0xFn) - 8n;      // sentinel slot
+  new DataView(eng2.wmem.buffer).setBigUint64(eng2.RAMOFF+Number(rsp-eng2.base), SENT, true);
   const run = (n)=>{ fill(eng2,c.kind,n,buf); const r=[]; for(let i=0;i<16;i++)r[i]=0n; r[RIDX.rsp]=rsp; c.args(r,n,buf);
-    for(let i=0;i<16;i++) eng2.regview[i]=BigInt.asIntN(64,r[i]); inst.exports.run();
+    for(let i=0;i<16;i++) eng2.regview[i]=BigInt.asIntN(64,r[i]);
+    if (BigInt.asUintN(64, runFn()) !== SENT) throw new Error('bad exit rip');
     return { val: c.out ? rdOut(eng2,c.out.addr(buf),c.out.len) : BigInt.asUintN(64,eng2.regview[0]).toString(16), r }; };
   const aot = run(c.oracleN).val;
   const ok = oracle===aot;
   const { r } = run(c.N);
-  let best=1e18; for(let i=0;i<80;i++){ for(let k=0;k<16;k++) eng2.regview[k]=BigInt.asIntN(64,r[k]); const t=process.hrtime.bigint(); inst.exports.run(); const ns=Number(process.hrtime.bigint()-t); if(ns<best)best=ns; }
+  let best=1e18; for(let i=0;i<80;i++){ for(let k=0;k<16;k++) eng2.regview[k]=BigInt.asIntN(64,r[k]); const t=process.hrtime.bigint(); runFn(); const ns=Number(process.hrtime.bigint()-t); if(ns<best)best=ns; }
   const aotMs = best/1e6;
   console.log(`${c.sym.padEnd(15)} ${c.native.toFixed(2).padStart(9)} ${aotMs.toFixed(2).padStart(13)}   ${(aotMs/c.native).toFixed(2)}x   ${ok?'bit-exact ✓':'MISMATCH ✗'}`);
 }

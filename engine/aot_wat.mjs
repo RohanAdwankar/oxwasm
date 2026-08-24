@@ -208,19 +208,31 @@ export function compileFunctionWatDispatch(mem, entry, { guestBase, ramBase, max
 
 
 // ---- shared CFG analysis (decode reachable code, split into blocks) ----
+// One FUNCTION at a time: `call` is a mid-block instruction (fall-through
+// successor) whose target is recorded in `calls` for the unit driver;
+// `leave` is a plain epilogue instruction; ret/retn/jmpind end a block.
 function analyze(mem, entry, { maxInsns = 20000 } = {}) {
   const M = 0xFFFFFFFFFFFFFFFFn;
   const insnAt = new Map(); const work = [entry]; const seen = new Set(); let count = 0;
+  const calls = new Set();
   while (work.length) {
     const rip = work.pop(); const key = rip.toString();
     if (seen.has(key)) continue; seen.add(key);
     if (count++ > maxInsns) throw new Error('function too large');
-    const insn = decode((i) => Number(mem.read(rip + BigInt(i), 1n)), rip);
+    let insn;
+    try { insn = decode((i) => Number(mem.read(rip + BigInt(i), 1n)), rip); }
+    catch (e) {
+      // Undecodable bytes (padding, data, an unsupported encoding) become a
+      // deopt point: if control ever actually reaches it, the engine resumes
+      // in the interpreter and faults exactly as native would.
+      insnAt.set(key, { mnem: 'udec', rip, next: rip + 1n, len: 1 });
+      continue;
+    }
     insn.rip = rip; insn.next = rip + BigInt(insn.len); insnAt.set(key, insn);
-    if (insn.mnem === 'ret' || insn.mnem === 'retn' || insn.mnem === 'leave') continue;
+    if (insn.mnem === 'ret' || insn.mnem === 'retn' || insn.mnem === 'jmpind') continue;
     if (insn.mnem === 'jmp') { work.push((insn.next + insn.rel) & M); continue; }
     if (insn.mnem === 'jcc') { work.push((insn.next + insn.rel) & M); work.push(insn.next); continue; }
-    if (['jmpind','callind','call','syscall'].includes(insn.mnem)) throw new Error('AOT: control leaves function: ' + insn.mnem);
+    if (insn.mnem === 'call') calls.add(((insn.next + insn.rel) & M).toString());
     work.push(insn.next);
   }
   const addrs = [...insnAt.keys()].map(BigInt).sort((a,b)=>a<b?-1:1);
@@ -231,7 +243,7 @@ function analyze(mem, entry, { maxInsns = 20000 } = {}) {
   const blocks = []; let cur = null;
   for (const a of addrs) { if (leaders.has(a.toString())) { cur = { start: a, insns: [] }; blocks.push(cur); } cur.insns.push(insnAt.get(a.toString())); }
   const bidx = new Map(blocks.map((b,i)=>[b.start.toString(), i]));
-  return { blocks, bidx, M };
+  return { blocks, bidx, M, calls };
 }
 
 // ---- Stackifier: turn a reducible CFG into nested wasm loop/block scopes ----
@@ -281,9 +293,21 @@ function structure(N, succs) {
   return { open, closeAfter };
 }
 
-export function compileFunctionWat(mem, entry, opts = {}) {
-  const { guestBase, ramBase } = opts;
-  const a0 = analyze(mem, entry, opts);
+// ---- whole-program unit translator ----------------------------------------
+// A translation unit is the call-graph closure of an entry function. Every
+// guest function becomes one wasm function `(func $f_<hex> (result i64))`
+// returning the frame-exit rip. The 128-byte register file at offset 0 is the
+// inter-function ABI: a caller spills its locals before a call and reloads
+// after; a callee loads at entry and spills at exit. The guest stack stays
+// byte-exact (calls push return addresses, rets pop them), so the program
+// cannot observe the translation. Three escapes make it total over any code:
+//   env.syscall()              engine services a syscall from the regfile
+//   env.callout(target)->rip   run code outside the unit (indirect targets,
+//                              poisoned or over-budget callees) to completion
+//   env.deopt(rip,rsp0)->rip   resume interpretation inside this frame until
+//                              the frame exits (rsp rises above rsp0) — jmpind
+function emitUnitFunction(a0, fnAddr, ctx) {
+  const { guestBase, ramBase, canDirect } = ctx;
   const MM = a0.M;
   // successors (by address-order index) for each block
   const succAddrIdx = (i) => {
@@ -291,7 +315,7 @@ export function compileFunctionWat(mem, entry, opts = {}) {
     const idx = (addr) => a0.bidx.has(addr.toString()) ? a0.bidx.get(addr.toString()) : -1;
     if (last.mnem === 'jcc') return [idx((next+last.rel)&MM), idx(next)];
     if (last.mnem === 'jmp') return [idx((next+last.rel)&MM)];
-    if (['ret','retn','leave'].includes(last.mnem)) return [];
+    if (['ret','retn','jmpind'].includes(last.mnem)) return [];
     return [idx(next)];
   };
   // reverse postorder from entry (entry is address-order block 0)
@@ -313,34 +337,77 @@ export function compileFunctionWat(mem, entry, opts = {}) {
   // terminator descriptor + successors, all in RPO index space
   const term = [], succs = [];
   const idxOf = (addr) => bidx.has(addr.toString()) ? bidx.get(addr.toString()) : -1;
+  let hasDeopt = false;
   for (let i=0;i<N;i++) {
     const insns = blocks[i].insns, last = insns[insns.length-1], next = last.next;
     if (last.mnem === 'jcc') { const t = idxOf((next+last.rel)&MM), f = idxOf(next); term.push({kind:'jcc', t, f}); succs.push([t, f]); }
     else if (last.mnem === 'jmp') { const t = idxOf((next+last.rel)&MM); term.push({kind:'jmp', t}); succs.push([t]); }
-    else if (['ret','retn','leave'].includes(last.mnem)) { term.push({kind:'ret', leave:last.mnem==='leave'}); succs.push([]); }
+    else if (last.mnem === 'ret' || last.mnem === 'retn') { term.push({kind:'ret', pad: last.mnem==='retn' ? Number(last.n) : 0}); succs.push([]); }
+    else if (last.mnem === 'jmpind') { hasDeopt = true; term.push({kind:'deopt', src:last.src}); succs.push([]); }
+    else if (last.mnem === 'udec')   { hasDeopt = true; term.push({kind:'deopt', src:null, at:last.rip}); succs.push([]); }
     else { const t = idxOf(next); term.push({kind:'fall', t}); succs.push([t]); }
   }
   const { open, closeAfter } = structure(N, succs);
 
-  const use64 = new Array(16).fill(false);
-  use64[4] = true;
+  // Width inference. A register may live in an i32 local only when every
+  // access is 32-bit-or-less AND it is written at least once here — a register
+  // merely passed through (or only read) must keep its full caller value for
+  // spills at calls and at exit, so it stays i64. A frame containing a deopt
+  // point keeps everything i64: the interpreter needs exact 64-bit state and
+  // an unwritten-yet i32 local would have already dropped the caller's high
+  // half at entry.
+  const any64 = new Array(16).fill(false), w32 = new Array(16).fill(false), seenR = new Array(16).fill(false);
+  any64[4] = seenR[4] = true;                                        // rsp
+  const noteRW = (op, isWrite) => { if (!op) return;
+    if (op.kind === 'reg') { seenR[op.r] = true;
+      if ((op.size||8) === 8 || op.high) any64[op.r] = true; else if (isWrite) w32[op.r] = true; }
+    if (op.kind === 'mem') { if (op.base>=0) { seenR[op.base]=true; any64[op.base]=true; } if (op.index>=0) { seenR[op.index]=true; any64[op.index]=true; } } };
+  const WRITES_DST = new Set(['mov','movzx','movsx','add','sub','and','or','xor','inc','dec','not','neg','shl','shr','sar','rol','ror','cmov','setcc','imul2','imul3','xchg']);
   for (const b of blocks) for (const insn of b.insns) {
-    const note = (op) => { if (!op) return;
-      if (op.kind === 'reg') { if ((op.size||8) === 8 || op.high) use64[op.r] = true; }
-      if (op.kind === 'mem') { if (op.base>=0) use64[op.base]=true; if (op.index>=0) use64[op.index]=true; } };
-    if (insn.mnem !== 'push' && insn.mnem !== 'pop') { note(insn.dst); note(insn.src); note(insn.src2); }
-    else if (insn.mnem === 'pop' && insn.dst && insn.dst.kind === 'mem') note(insn.dst);  // pop to mem still needs base
-    if (insn.mnem === 'lea') use64[insn.dst.r] = true;
-    // push/pop handled with i32<->i64 conversion at stack boundary
-    if ((insn.mnem === 'movsx' || insn.mnem === 'movzx') && (insn.size||8)===8) use64[insn.dst.r]=true;
+    const S = insn.size || 8;
+    switch (insn.mnem) {
+      case 'push': noteRW(insn.src && insn.src.kind==='mem' ? insn.src : null, false); break;   // reg push/pop go via regfile
+      case 'pop':  noteRW(insn.dst && insn.dst.kind==='mem' ? insn.dst : null, true); break;
+      case 'lea':  seenR[insn.dst.r]=true; any64[insn.dst.r]=true; noteRW(insn.src, false); break;
+      case 'call': case 'leave': case 'ret': case 'retn': break;
+      case 'callind': case 'jmpind': noteRW(insn.src, false); break;
+      case 'syscall': for (const r of [0,7,6,2,10,8,9]) { seenR[r]=true; any64[r]=true; } break;
+      case 'div1': case 'idiv1': case 'mul1': case 'imul1':
+        for (const r of (S===1 ? [0] : [0,2])) { seenR[r]=true; if (S===8) any64[r]=true; else w32[r]=true; }
+        noteRW(insn.src, false); break;
+      case 'cwde': case 'cdq': { const r = insn.mnem==='cdq' ? 2 : 0; seenR[0]=true; seenR[r]=true;
+        if (S===8) { any64[0]=true; any64[r]=true; } else w32[r]=true; break; }
+      default:
+        noteRW(insn.dst, WRITES_DST.has(insn.mnem)); noteRW(insn.src, false); noteRW(insn.src2, false);
+    }
   }
-  const isI32 = (r) => !use64[r];
+  if (hasDeopt) any64.fill(true);
+  const isI32 = (r) => seenR[r] && !any64[r] && w32[r];
   const pushed = new Set();
   for (const b of blocks) for (const insn of b.insns) {
     if (insn.mnem === 'push' && insn.src && insn.src.kind === 'reg') pushed.add(insn.src.r);
     if (insn.mnem === 'pop' && insn.dst && insn.dst.kind === 'reg') pushed.add(insn.dst.r);
   }
   const savedI32 = (r) => isI32(r) && pushed.has(r);   // callee-saved, 32-bit working
+
+  // A register this function never touches keeps no local at all: its regfile
+  // slot is already the live value (ours at entry, a callee's after calls), so
+  // every sync — entry, call boundaries, exit — skips it. This keeps register
+  // pressure proportional to what the function actually uses.
+  const touched = (r) => r === 4 || seenR[r] || pushed.has(r);
+  // regfile <-> locals sync. Spill writes each register's CURRENT working
+  // value (an i32 local zero-extends). Reload refreshes locals from the
+  // regfile — after a call this picks up whatever the callee left/restored.
+  const spillR  = (r) => isI32(r) ? `(i64.store (i32.const ${r*8}) (i64.extend_i32_u (local.get $r${r})))`
+                                  : `(i64.store (i32.const ${r*8}) (local.get $r${r}))`;
+  const reloadR = (r) => isI32(r) ? `(local.set $r${r} (i32.load (i32.const ${r*8})))`
+                                  : `(local.set $r${r} (i64.load (i32.const ${r*8})))`;
+  const spillAll  = () => Array.from({length:16},(_,r)=>touched(r)?spillR(r):null).filter(Boolean);
+  const reloadAll = () => Array.from({length:16},(_,r)=>touched(r)?reloadR(r):null).filter(Boolean);
+  // Exit spill: savedI32 regs' slots were just refreshed by their epilogue
+  // pops (full 64-bit caller values) — do not clobber them with the truncated
+  // working value.
+  const spillExit = () => Array.from({length:16},(_,r)=>(touched(r)&&!savedI32(r))?spillR(r):null).filter(Boolean);
 
   // ---- operand / instruction emit (identical semantics to the dispatch version) ----
   const hexs = (v) => BigInt.asIntN(64, v).toString();
@@ -529,6 +596,70 @@ export function compileFunctionWat(mem, entry, opts = {}) {
           L.push(wr32reg(0, `(i32.wrap_i64 ${andmask(`(local.get ${t})`,S)})`));       // rax = low
           L.push(wr32reg(2, `(i32.wrap_i64 (i64.shr_u (local.get ${t}) (i64.const ${S*8})))`)); // rdx = high
           break; }
+        case 'cwde': {   // sign-extend the low half of rax into the full width (cbw/cwde/cdqe)
+          const half = S === 8 ? 4 : S === 4 ? 2 : 1;
+          L.push(wr({kind:'reg',r:0,size:S}, S, sx(rd({kind:'reg',r:0,size:half},half,next),half), next)); break; }
+        case 'cdq': {    // sign of rax fills rdx (cwd/cdq/cqo)
+          L.push(wr({kind:'reg',r:2,size:S}, S, andmask(`(i64.shr_s ${sx(rd({kind:'reg',r:0,size:S},S,next),S)} (i64.const 63))`,S), next)); break; }
+        case 'div1': case 'idiv1': {
+          const sgn = insn.mnem === 'idiv1';
+          const rax = {kind:'reg',r:0,size:S}, rdx = {kind:'reg',r:2,size:S};
+          let q, rm;
+          if (S === 8) {
+            // 128-bit dividend: only the compiler's own zero/sign-extended
+            // patterns are translatable — rdx zeroed right before (div) or
+            // cqo right before (idiv). Anything else deopts the function.
+            const prev = ii > 0 ? blk.insns[ii-1] : null;
+            const zeroed = prev && prev.mnem === 'xor' && prev.dst?.kind==='reg' && prev.dst.r===2 && prev.src?.kind==='reg' && prev.src.r===2;
+            const cqo = prev && prev.mnem === 'cdq' && (prev.size||8) === 8;
+            if (!sgn && !zeroed) throw new Error('AOT: unpatterned 64-bit div @ '+insn.rip.toString(16));
+            if (sgn && !cqo) throw new Error('AOT: unpatterned 64-bit idiv @ '+insn.rip.toString(16));
+            const d = rd(insn.src,8,next), n = rd(rax,8,next);
+            q = `(${sgn?'i64.div_s':'i64.div_u'} ${n} ${d})`; rm = `(${sgn?'i64.rem_s':'i64.rem_u'} ${n} ${d})`;
+          } else if (S === 1) {
+            // dividend is AX; quotient -> AL, remainder -> AH
+            const num0 = rd({kind:'reg',r:0,size:2},2,next);
+            const num = sgn ? sx(num0,2) : num0;
+            const d = sgn ? sx(rd(insn.src,1,next),1) : rd(insn.src,1,next);
+            q = `(${sgn?'i64.div_s':'i64.div_u'} ${num} ${d})`; rm = `(${sgn?'i64.rem_s':'i64.rem_u'} ${num} ${d})`;
+          } else {
+            // dividend = rdx:rax at 2S*8 bits, fits in i64
+            const num0 = `(i64.or (i64.shl ${rd(rdx,S,next)} (i64.const ${S*8})) ${rd(rax,S,next)})`;
+            const num = sgn ? sx(num0, S*2) : num0;
+            const d = sgn ? sx(rd(insn.src,S,next),S) : rd(insn.src,S,next);
+            q = `(${sgn?'i64.div_s':'i64.div_u'} ${num} ${d})`; rm = `(${sgn?'i64.rem_s':'i64.rem_u'} ${num} ${d})`;
+          }
+          const tq = T(), tr = T();          // capture both before any write clobbers rax/rdx
+          L.push(`(local.set ${tq} ${q})`, `(local.set ${tr} ${rm})`);
+          if (S === 1) { L.push(wr({kind:'reg',r:0,size:1},1,`(local.get ${tq})`,next)); L.push(wr({kind:'reg',r:0,size:1,high:true},1,`(local.get ${tr})`,next)); }
+          else { L.push(wr(rax,S,`(local.get ${tq})`,next)); L.push(wr(rdx,S,`(local.get ${tr})`,next)); }
+          break; }
+        case 'leave':    // mov rsp,rbp ; pop rbp
+          L.push(`(local.set $r4 ${rd({kind:'reg',r:5,size:8},8,next)})`);
+          if (savedI32(5)) L.push(`(i64.store (i32.const 40) (i64.load ${wasmAddr({base:4,index:-1,disp:0n},next)}))`);
+          else L.push(wr({kind:'reg',r:5,size:8},8,`(i64.load ${wasmAddr({base:4,index:-1,disp:0n},next)})`,next));
+          L.push(`(local.set $r4 (i64.add (local.get $r4) (i64.const 8)))`);
+          break;
+        case 'call': {   // push return address, spill, direct wasm call (or callout), reload
+          const target = (next + insn.rel) & MM;
+          L.push(`(local.set $r4 (i64.sub (local.get $r4) (i64.const 8)))`,
+                 `(i64.store ${wasmAddr({base:4,index:-1,disp:0n},next)} (i64.const ${hexs(next)}))`);
+          L.push(...spillAll());
+          L.push(canDirect(target.toString()) ? `(drop (call $f_${target.toString(16)}))`
+                                              : `(drop (call $x_callout (i64.const ${hexs(target)})))`);
+          L.push(...reloadAll());
+          break; }
+        case 'callind': {   // compute target BEFORE the push moves rsp
+          const t = T(); L.push(`(local.set ${t} ${rd(insn.src,8,next)})`);
+          L.push(`(local.set $r4 (i64.sub (local.get $r4) (i64.const 8)))`,
+                 `(i64.store ${wasmAddr({base:4,index:-1,disp:0n},next)} (i64.const ${hexs(next)}))`);
+          L.push(...spillAll());
+          L.push(`(drop (call $x_callout (local.get ${t})))`);
+          L.push(...reloadAll());
+          break; }
+        case 'syscall':
+          L.push(...spillAll(), `(call $x_syscall)`, ...reloadAll());
+          break;
         case 'push': {
           // A callee-saved i32-working register keeps only its low 32 bits in its local;
           // its full 64-bit caller value still lives in the register file at prologue time,
@@ -542,17 +673,18 @@ export function compileFunctionWat(mem, entry, opts = {}) {
           else
             L.push(wr(insn.dst,8,`(i64.load ${wasmAddr({base:4,index:-1,disp:0n},next)})`,next),`(local.set $r4 (i64.add (local.get $r4) (i64.const 8)))`);
           break; }
-        case 'jmp': case 'jcc': case 'ret': case 'retn': case 'leave': break;  // terminator handled below
+        case 'jmp': case 'jcc': case 'ret': case 'retn': case 'jmpind': case 'udec': break;  // terminator handled below
         default: throw new Error('AOT: unhandled '+insn.mnem+' @ '+insn.rip.toString(16));
       }
     }
     // terminator as label-based branches (RPO indices)
     const t = term[i];
+    const last = blk.insns[blk.insns.length-1], lnext = last.next;
     const labelFor = (j) => j <= i ? '$loop_'+j : '$blk_'+j;
-    const brTo = (j) => (j < 0) ? '(br $ret)' : (j === i+1 ? '' : `(br ${labelFor(j)})`);
+    const brTo = (j) => { if (j < 0) throw new Error('AOT: branch into undecoded code'); return j === i+1 ? '' : `(br ${labelFor(j)})`; };
     if (t.kind === 'jcc') {
-      const c = cond(blk.insns[blk.insns.length-1].cond);
-      const lbl = (j) => j < 0 ? '$ret' : labelFor(j);
+      const c = cond(last.cond);
+      const lbl = (j) => { if (j < 0) throw new Error('AOT: jcc into undecoded code'); return labelFor(j); };
       const T = t.t, F = t.f;
       if (T === i+1 && F === i+1) { /* both fall through */ }
       else if (T !== i+1 && F === i+1) L.push(`(br_if ${lbl(T)} ${c})`);
@@ -561,27 +693,87 @@ export function compileFunctionWat(mem, entry, opts = {}) {
     } else if (t.kind === 'jmp') {
       const b = brTo(t.t); if (b) L.push(b);
     } else if (t.kind === 'ret') {
-      if (t.leave) L.push(`(local.set $r4 (local.get $r5))`, `(local.set $r5 (i64.load ${wasmAddr({base:4,index:-1,disp:0n},blocks[i].insns[blocks[i].insns.length-1].next)})) (local.set $r4 (i64.add (local.get $r4) (i64.const 8)))`);
-      L.push('(br $ret)');
+      // pop the return address, retire the frame, hand the exit rip back
+      L.push(`(local.set $rex (i64.load ${wasmAddr({base:4,index:-1,disp:0n},lnext)}))`);
+      L.push(`(local.set $r4 (i64.add (local.get $r4) (i64.const ${8 + t.pad})))`);
+      L.push(...spillExit());
+      L.push(`(return (local.get $rex))`);
+    } else if (t.kind === 'deopt') {
+      // indirect jump (jump table / tail call) or undecodable byte:
+      // hand the frame to the engine at the computed target / that rip
+      L.push(`(local.set $rex ${t.src ? rd(t.src,8,lnext) : `(i64.const ${hexs(t.at)})`})`);
+      L.push(...spillAll());
+      L.push(`(return (call $x_deopt (local.get $rex) (local.get $rsp0)))`);
     } else { const b = brTo(t.t); if (b) L.push(b); }
     return L.join('\n      ');
   }
 
   const bodies = []; for (let i=0;i<N;i++) bodies.push(emitBlock(i));
 
-  let wat = '(module\n  (import "js" "mem" (memory 4096))\n  (func (export "run")\n';
+  const name = 'f_' + fnAddr.toString(16);
+  let wat = `  (func $${name} (export "${name}") (result i64)\n`;
   for (let r=0;r<16;r++) wat += `    (local $r${r} ${isI32(r)?'i32':'i64'})\n`;
-  wat += '    (local $fa i64) (local $fb i64) (local $fr i64)\n';
+  wat += '    (local $fa i64) (local $fb i64) (local $fr i64) (local $rsp0 i64) (local $rex i64)\n';
   for (const t of tmps) wat += `    (local ${t} i64)\n`;
-  for (let r=0;r<16;r++) wat += isI32(r) ? `    (local.set $r${r} (i32.load (i32.const ${r*8})))\n` : `    (local.set $r${r} (i64.load (i32.const ${r*8})))\n`;
-  wat += '    (block $ret\n';
+  for (let r=0;r<16;r++) if (touched(r)) wat += '    ' + reloadR(r) + '\n';
+  wat += '    (local.set $rsp0 (local.get $r4))\n';
   for (let i=0;i<N;i++) {
     for (const s of open[i]) wat += s.type==='loop' ? `      (loop ${s.label}\n` : `      (block ${s.label}\n`;
     wat += '      ' + bodies[i] + '\n';
     for (const _ of closeAfter[i]) wat += '      )\n';
   }
-  wat += '    )\n';
-  for (let r=0;r<16;r++) { if (savedI32(r)) continue; wat += isI32(r) ? `    (i64.store (i32.const ${r*8}) (i64.extend_i32_u (local.get $r${r})))\n` : `    (i64.store (i32.const ${r*8}) (local.get $r${r}))\n`; }
-  wat += '  )\n)\n';
-  return { wat, blocks: N };
+  wat += '    (unreachable)\n  )\n';        // every path leaves via ret/deopt
+  return wat;
+}
+
+// ---- unit driver -----------------------------------------------------------
+export function compileUnitWat(mem, entry, opts = {}) {
+  const { guestBase, ramBase, maxFuncs = 96, maxInsns = 20000 } = opts;
+  const funcs = new Map();                       // addrStr -> analysis
+  const poisoned = new Set();                    // addrStr -> engine-only (callout)
+  const pending = [entry];
+  while (pending.length && funcs.size < maxFuncs) {
+    const a = pending.shift(); const k = a.toString();
+    if (funcs.has(k) || poisoned.has(k)) continue;
+    try {
+      const an = analyze(mem, a, { maxInsns });
+      funcs.set(k, an);
+      for (const c of an.calls) if (!funcs.has(c) && !poisoned.has(c)) pending.push(BigInt(c));
+    } catch (e) { poisoned.add(k); if (k === entry.toString()) throw e; }
+  }
+  const canDirect = (k) => funcs.has(k) && !poisoned.has(k);
+  const ctx = { guestBase, ramBase, canDirect };
+  // emit; a failure poisons that function and re-emits — its callers switch
+  // from direct wasm calls to callout escapes
+  const texts = new Map();
+  for (let round = 0; ; round++) {
+    if (round > 16) throw new Error('AOT: poison did not converge');
+    texts.clear(); let repoison = false;
+    for (const [k, an] of funcs) {
+      if (poisoned.has(k)) continue;
+      try { texts.set(k, emitUnitFunction(an, BigInt(k), ctx)); }
+      catch (e) {
+        if (k === entry.toString()) throw e;
+        poisoned.add(k); repoison = true;
+      }
+    }
+    if (!repoison) break;
+  }
+  let wat = '(module\n  (import "js" "mem" (memory 4096))\n';
+  wat += '  (import "env" "syscall" (func $x_syscall))\n';
+  wat += '  (import "env" "callout" (func $x_callout (param i64) (result i64)))\n';
+  wat += '  (import "env" "deopt" (func $x_deopt (param i64 i64) (result i64)))\n';
+  let blocks = 0;
+  for (const [k, t] of texts) { wat += t; blocks += funcs.get(k).blocks.length; }
+  wat += ')\n';
+  return { wat,
+           entryName: 'f_' + entry.toString(16),
+           funcs: [...texts.keys()].map(k => BigInt(k)),
+           poisoned: [...poisoned].map(k => BigInt(k)),
+           blocks };
+}
+
+// Back-compat name: a single-entry compile is just a unit rooted there.
+export function compileFunctionWat(mem, entry, opts = {}) {
+  return compileUnitWat(mem, entry, opts);
 }
