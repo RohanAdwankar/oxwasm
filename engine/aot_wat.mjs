@@ -9,7 +9,7 @@ import { decode } from './decode.mjs';
 const MASK = { 1: 0xFFn, 2: 0xFFFFn, 4: 0xFFFFFFFFn, 8: 0xFFFFFFFFFFFFFFFFn };
 const SIGN = { 1: 0x80n, 2: 0x8000n, 4: 0x80000000n, 8: 0x8000000000000000n };
 
-export function compileFunctionWat(mem, entry, { guestBase, ramBase, maxInsns = 8000 } = {}) {
+export function compileFunctionWatDispatch(mem, entry, { guestBase, ramBase, maxInsns = 8000 } = {}) {
   // ---- decode reachable code ----
   const insnAt = new Map(); const work = [entry]; const seen = new Set(); let count = 0;
   while (work.length) {
@@ -67,6 +67,12 @@ export function compileFunctionWat(mem, entry, { guestBase, ramBase, maxInsns = 
   // write i64 expr to operand
   const wr = (op, size, expr, next) => {
     if (op.kind === 'reg') {
+      if (isI32(op.r)) {
+        if (size >= 4) return `(local.set ${reg(op.r)} (i32.wrap_i64 ${expr}))`;
+        const m = MASKl[size];
+        if (op.high) return `(local.set ${reg(op.r)} (i32.or (i32.and (local.get ${reg(op.r)}) (i32.const 0xFFFF00FF)) (i32.shl (i32.and (i32.wrap_i64 ${expr}) (i32.const 0xFF)) (i32.const 8))))`;
+        return `(local.set ${reg(op.r)} (i32.or (i32.and (local.get ${reg(op.r)}) (i32.const ${Number((~m)&0xFFFFFFFFn)})) (i32.and (i32.wrap_i64 ${expr}) (i32.const ${Number(m)}))))`;
+      }
       if (size === 8) return `(local.set ${reg(op.r)} ${expr})`;
       if (size === 4) return `(local.set ${reg(op.r)} (i64.and ${expr} (i64.const 0xFFFFFFFF)))`;
       const m = MASK[size];
@@ -77,6 +83,17 @@ export function compileFunctionWat(mem, entry, { guestBase, ramBase, maxInsns = 
   };
 
   const ALU = { add:'i64.add', sub:'i64.sub', and:'i64.and', or:'i64.or', xor:'i64.xor' };
+  const ALU32 = { add:'i32.add', sub:'i32.sub', and:'i32.and', or:'i32.or', xor:'i32.xor' };
+  const LD32 = { 1:'i32.load8_u', 2:'i32.load16_u', 4:'i32.load' };
+  // operand as an i32 value (for 32-bit arithmetic)
+  const rd32 = (op, next) => {
+    if (op.kind === 'imm') return `(i32.const ${Number(BigInt.asIntN(32, op.v))})`;
+    if (op.kind === 'reg') { if (isI32(op.r) && !op.high) return `(local.get ${reg(op.r)})`;
+      let e = `(local.get ${reg(op.r)})`; if (op.high) e = `(i64.shr_u ${e} (i64.const 8))`; return `(i32.wrap_i64 ${e})`; }
+    return `(${LD32[op.size]||'i32.load'} ${wasmAddr(op, next)})`;
+  };
+  // write an i32 expr to a register (zero-extends the full 64-bit local)
+  const wr32reg = (r, e32) => isI32(r) ? `(local.set ${reg(r)} ${e32})` : `(local.set ${reg(r)} (i64.extend_i32_u ${e32}))`;
   let flagState = null;   // {kind, size} — set at translate time per block
 
   function block(blk) {
@@ -114,7 +131,10 @@ export function compileFunctionWat(mem, entry, { guestBase, ramBase, maxInsns = 
       const S = insn.size || 8, m = MASK[S], next = insn.next;
       switch (insn.mnem) {
         case 'nop': break;
-        case 'mov': L.push(wr(insn.dst, S, rd(insn.src, S, next), next)); break;
+        case 'mov':
+          if (S === 4 && insn.dst.kind === 'reg') L.push(wr32reg(insn.dst.r, rd32(insn.src, next)));
+          else L.push(wr(insn.dst, S, rd(insn.src, S, next), next));
+          break;
         case 'movzx': L.push(wr(insn.dst, insn.size, rd(insn.src, insn.src.size, next), next)); break;
         case 'movsx': L.push(wr(insn.dst, insn.size, sx(rd(insn.src, insn.src.size, next), insn.src.size), next)); break;
         case 'lea': L.push(`(local.set ${reg(insn.dst.r)} ${guestAddr(insn.src, next)})`); break;
@@ -182,6 +202,337 @@ export function compileFunctionWat(mem, entry, { guestBase, ramBase, maxInsns = 
   for (let i = N-1; i >= 0; i--) wat += `        ) ;; end $B${i}\n      ${bodies[i]}\n`;
   wat += '      )\n    )\n';
   for (let r = 0; r < 16; r++) wat += `    (i64.store (i32.const ${r*8}) (local.get $r${r}))\n`;
+  wat += '  )\n)\n';
+  return { wat, blocks: N };
+}
+
+
+// ---- shared CFG analysis (decode reachable code, split into blocks) ----
+function analyze(mem, entry, { maxInsns = 20000 } = {}) {
+  const M = 0xFFFFFFFFFFFFFFFFn;
+  const insnAt = new Map(); const work = [entry]; const seen = new Set(); let count = 0;
+  while (work.length) {
+    const rip = work.pop(); const key = rip.toString();
+    if (seen.has(key)) continue; seen.add(key);
+    if (count++ > maxInsns) throw new Error('function too large');
+    const insn = decode((i) => Number(mem.read(rip + BigInt(i), 1n)), rip);
+    insn.rip = rip; insn.next = rip + BigInt(insn.len); insnAt.set(key, insn);
+    if (insn.mnem === 'ret' || insn.mnem === 'retn' || insn.mnem === 'leave') continue;
+    if (insn.mnem === 'jmp') { work.push((insn.next + insn.rel) & M); continue; }
+    if (insn.mnem === 'jcc') { work.push((insn.next + insn.rel) & M); work.push(insn.next); continue; }
+    if (['jmpind','callind','call','syscall'].includes(insn.mnem)) throw new Error('AOT: control leaves function: ' + insn.mnem);
+    work.push(insn.next);
+  }
+  const addrs = [...insnAt.keys()].map(BigInt).sort((a,b)=>a<b?-1:1);
+  const leaders = new Set([entry.toString()]);
+  for (const a of addrs) { const insn = insnAt.get(a.toString());
+    if (insn.mnem === 'jcc') { leaders.add(((insn.next+insn.rel)&M).toString()); leaders.add(insn.next.toString()); }
+    if (insn.mnem === 'jmp') leaders.add(((insn.next+insn.rel)&M).toString()); }
+  const blocks = []; let cur = null;
+  for (const a of addrs) { if (leaders.has(a.toString())) { cur = { start: a, insns: [] }; blocks.push(cur); } cur.insns.push(insnAt.get(a.toString())); }
+  const bidx = new Map(blocks.map((b,i)=>[b.start.toString(), i]));
+  return { blocks, bidx, M };
+}
+
+// ---- Stackifier: turn a reducible CFG into nested wasm loop/block scopes ----
+// Returns { open:[[scope,...] per block], closeAfter:[[label,...] per block] }
+// where scopes carry {type:'loop'|'block', label}. Throws on irreducible CFG.
+function structure(N, succs) {
+  // back edge i->j (j<=i): j is a loop header
+  const loopEnd = new Map();  // header -> exclusive end index
+  for (let i=0;i<N;i++) for (const j of succs[i]) if (j>=0 && j<=i)
+    loopEnd.set(j, Math.max(loopEnd.get(j)||0, i+1));
+  // forward branch to j (j>i+1, or j>i via jmp/jcc-taken not fallthrough): block scope ending at j
+  const blkBegin = new Map(); // target -> min predecessor index
+  for (let i=0;i<N;i++) for (const j of succs[i]) if (j>=0 && j>i+1)
+    blkBegin.set(j, Math.min(blkBegin.has(j)?blkBegin.get(j):i, i));
+  const scopes = [];
+  for (const [h,e] of loopEnd)  scopes.push({ type:'loop',  b:h, e, label:'$loop_'+h });
+  for (const [t,b] of blkBegin) scopes.push({ type:'block', b, e:t, label:'$blk_'+t });
+  // Fix improper overlaps b1<b2<e1<e2 into proper nesting. A block scope's
+  // END is its branch target (immovable); a loop scope's BEGIN is its header
+  // (immovable). So widen only the movable side: grow a loop's end, or grow a
+  // block's begin. If neither is movable, the CFG needs the dispatch fallback.
+  let changed = true, guard = 0;
+  while (changed) { changed = false;
+    if (guard++ > 10000) throw new Error('AOT: scope nesting did not converge');
+    for (const s of scopes) for (const t of scopes) {
+      if (!(s.b < t.b && t.b < s.e && s.e < t.e)) continue;
+      // Prefer growing a BLOCK's begin backward (always valid, and it never
+      // engulfs a loop-exit target the way growing a loop's end would).
+      if (t.type === 'block')      { t.b = s.b; changed = true; }    // grow later block's begin back
+      else if (s.type === 'loop')  { s.e = t.e; changed = true; }    // grow earlier loop's end fwd
+      else throw new Error('AOT: block/loop overlap needs dispatch fallback');
+    }
+  }
+  // opening order at a position: larger range (outer) first
+  const open = Array.from({length:N}, ()=>[]);
+  const closeAfter = Array.from({length:N}, ()=>[]);
+  const byBegin = Array.from({length:N}, ()=>[]);
+  for (const s of scopes) byBegin[s.b].push(s);
+  for (let i=0;i<N;i++) byBegin[i].sort((a,b)=> (b.e-a.e) || (a.type==='loop'?-1:1));
+  // simulate a scope stack to record close points and validate nesting
+  const stack = [];
+  for (let i=0;i<N;i++) {
+    for (const s of byBegin[i]) { open[i].push(s); stack.push(s); }
+    while (stack.length && stack[stack.length-1].e === i+1) { closeAfter[i].push(stack.pop().label); }
+  }
+  if (stack.length) throw new Error('AOT: irreducible/unclosed scopes');
+  return { open, closeAfter };
+}
+
+export function compileFunctionWat(mem, entry, opts = {}) {
+  const { guestBase, ramBase } = opts;
+  const a0 = analyze(mem, entry, opts);
+  const MM = a0.M;
+  // successors (by address-order index) for each block
+  const succAddrIdx = (i) => {
+    const insns = a0.blocks[i].insns, last = insns[insns.length-1], next = last.next;
+    const idx = (addr) => a0.bidx.has(addr.toString()) ? a0.bidx.get(addr.toString()) : -1;
+    if (last.mnem === 'jcc') return [idx((next+last.rel)&MM), idx(next)];
+    if (last.mnem === 'jmp') return [idx((next+last.rel)&MM)];
+    if (['ret','retn','leave'].includes(last.mnem)) return [];
+    return [idx(next)];
+  };
+  // reverse postorder from entry (entry is address-order block 0)
+  const An = a0.blocks.length; const order = []; const vis = new Uint8Array(An);
+  (function dfs(u) { vis[u] = 1;
+    for (const v of succAddrIdx(u)) if (v >= 0 && !vis[v]) dfs(v);
+    order.push(u);
+  })(0);
+  order.reverse();                                  // RPO in address-index space
+  const rpoOf = new Array(An).fill(-1);
+  order.forEach((addrIdx, r) => rpoOf[addrIdx] = r);
+  const blocks = order.map(ai => a0.blocks[ai]);    // blocks laid out in RPO
+  const N = blocks.length;
+  const bidx = new Map(blocks.map((b,i)=>[b.start.toString(), i]));
+  const MASKl = { 1: 0xFFn, 2: 0xFFFFn, 4: 0xFFFFFFFFn, 8: 0xFFFFFFFFFFFFFFFFn };
+  const SIGNl = { 1: 0x80n, 2: 0x8000n, 4: 0x80000000n, 8: 0x8000000000000000n };
+
+  // terminator descriptor + successors, all in RPO index space
+  const term = [], succs = [];
+  const idxOf = (addr) => bidx.has(addr.toString()) ? bidx.get(addr.toString()) : -1;
+  for (let i=0;i<N;i++) {
+    const insns = blocks[i].insns, last = insns[insns.length-1], next = last.next;
+    if (last.mnem === 'jcc') { const t = idxOf((next+last.rel)&MM), f = idxOf(next); term.push({kind:'jcc', t, f}); succs.push([t, f]); }
+    else if (last.mnem === 'jmp') { const t = idxOf((next+last.rel)&MM); term.push({kind:'jmp', t}); succs.push([t]); }
+    else if (['ret','retn','leave'].includes(last.mnem)) { term.push({kind:'ret', leave:last.mnem==='leave'}); succs.push([]); }
+    else { const t = idxOf(next); term.push({kind:'fall', t}); succs.push([t]); }
+  }
+  const { open, closeAfter } = structure(N, succs);
+
+  const use64 = new Array(16).fill(false);
+  use64[4] = true;
+  for (const b of blocks) for (const insn of b.insns) {
+    const note = (op) => { if (!op) return;
+      if (op.kind === 'reg') { if ((op.size||8) === 8 || op.high) use64[op.r] = true; }
+      if (op.kind === 'mem') { if (op.base>=0) use64[op.base]=true; if (op.index>=0) use64[op.index]=true; } };
+    note(insn.dst); note(insn.src); note(insn.src2);
+    if (insn.mnem === 'lea') use64[insn.dst.r] = true;
+    if (insn.mnem === 'push' && insn.src && insn.src.kind==='reg') use64[insn.src.r] = true;
+    if (insn.mnem === 'pop' && insn.dst && insn.dst.kind==='reg') use64[insn.dst.r] = true;
+    if ((insn.mnem === 'movsx' || insn.mnem === 'movzx') && (insn.size||8)===8) use64[insn.dst.r]=true;
+  }
+  const isI32 = (r) => !use64[r];
+
+  // ---- operand / instruction emit (identical semantics to the dispatch version) ----
+  const hexs = (v) => BigInt.asIntN(64, v).toString();
+  let tmpN = 0; const tmps = new Set();
+  const T = () => { const n = '$t' + (tmpN++); tmps.add(n); return n; };
+  const reg = (r) => '$r' + r;
+  const sx = (e, S) => S === 8 ? e : `(i64.shr_s (i64.shl ${e} (i64.const ${64-S*8})) (i64.const ${64-S*8}))`;
+  const guestAddr = (op, next) => {
+    if (op.ripRel) return `(i64.const ${hexs(next + op.disp)})`;
+    let e = `(i64.const ${hexs(op.disp)})`;
+    if (op.base >= 0) e = `(i64.add ${e} (local.get ${reg(op.base)}))`;
+    if (op.index >= 0) { let ix = `(local.get ${reg(op.index)})`;
+      if (op.scale > 1) ix = `(i64.shl ${ix} (i64.const ${Math.log2(op.scale)}))`;
+      e = `(i64.add ${e} ${ix})`; }
+    return e;
+  };
+  const woff = BigInt.asIntN(64, -guestBase + BigInt(ramBase));
+  // i32 wasm offset: fold (disp + woff) into one constant; wrap base/index once.
+  const wasmAddr = (op, next) => {
+    if (op.ripRel) return `(i32.const ${Number(BigInt.asIntN(32, next + op.disp + woff))})`;
+    const k = Number(BigInt.asIntN(32, op.disp + woff));
+    let e = op.base >= 0 ? `(i32.wrap_i64 (local.get ${reg(op.base)}))` : `(i32.const 0)`;
+    if (op.index >= 0) { let ix = `(i32.wrap_i64 (local.get ${reg(op.index)}))`;
+      if (op.scale > 1) ix = `(i32.shl ${ix} (i32.const ${Math.log2(op.scale)}))`;
+      e = `(i32.add ${e} ${ix})`; }
+    return k === 0 ? e : `(i32.add ${e} (i32.const ${k}))`;
+  };
+  const LD = { 1:'i64.load8_u', 2:'i64.load16_u', 4:'i64.load32_u', 8:'i64.load' };
+  const ST = { 1:'i64.store8', 2:'i64.store16', 4:'i64.store32', 8:'i64.store' };
+  const rd = (op, size, next) => {
+    if (op.kind === 'imm') return `(i64.const ${hexs(op.v)})`;
+    if (op.kind === 'reg') {
+      if (isI32(op.r) && !op.high) { const e = `(i64.extend_i32_u (local.get ${reg(op.r)}))`; return size >= 4 ? e : `(i64.and ${e} (i64.const ${MASKl[size]}))`; }
+      let e = `(local.get ${reg(op.r)})`;
+      if (op.high) e = `(i64.shr_u ${e} (i64.const 8))`;
+      return size === 8 && !op.high ? e : `(i64.and ${e} (i64.const ${MASKl[size]}))`; }
+    return `(${LD[size]} ${wasmAddr(op, next)})`;
+  };
+  const wr = (op, size, expr, next) => {
+    if (op.kind === 'reg') {
+      if (isI32(op.r)) {
+        if (size >= 4) return `(local.set ${reg(op.r)} (i32.wrap_i64 ${expr}))`;
+        const m = MASKl[size];
+        if (op.high) return `(local.set ${reg(op.r)} (i32.or (i32.and (local.get ${reg(op.r)}) (i32.const 0xFFFF00FF)) (i32.shl (i32.and (i32.wrap_i64 ${expr}) (i32.const 0xFF)) (i32.const 8))))`;
+        return `(local.set ${reg(op.r)} (i32.or (i32.and (local.get ${reg(op.r)}) (i32.const ${Number((~m)&0xFFFFFFFFn)})) (i32.and (i32.wrap_i64 ${expr}) (i32.const ${Number(m)}))))`;
+      }
+      if (size === 8) return `(local.set ${reg(op.r)} ${expr})`;
+      if (size === 4) return `(local.set ${reg(op.r)} (i64.and ${expr} (i64.const 0xFFFFFFFF)))`;
+      const m = MASKl[size];
+      if (op.high) return `(local.set ${reg(op.r)} (i64.or (i64.and (local.get ${reg(op.r)}) (i64.const ${(~0xFF00n)&MASKl[8]})) (i64.shl (i64.and ${expr} (i64.const 0xFF)) (i64.const 8))))`;
+      return `(local.set ${reg(op.r)} (i64.or (i64.and (local.get ${reg(op.r)}) (i64.const ${(~m)&MASKl[8]})) (i64.and ${expr} (i64.const ${m}))))`;
+    }
+    return `(${ST[size]} ${wasmAddr(op, next)} ${expr})`;
+  };
+  const ALU = { add:'i64.add', sub:'i64.sub', and:'i64.and', or:'i64.or', xor:'i64.xor' };
+  const ALU32 = { add:'i32.add', sub:'i32.sub', and:'i32.and', or:'i32.or', xor:'i32.xor' };
+  const LD32 = { 1:'i32.load8_u', 2:'i32.load16_u', 4:'i32.load' };
+  // operand as an i32 value (for 32-bit arithmetic)
+  const rd32 = (op, next) => {
+    if (op.kind === 'imm') return `(i32.const ${Number(BigInt.asIntN(32, op.v))})`;
+    if (op.kind === 'reg') { if (isI32(op.r) && !op.high) return `(local.get ${reg(op.r)})`;
+      let e = `(local.get ${reg(op.r)})`; if (op.high) e = `(i64.shr_u ${e} (i64.const 8))`; return `(i32.wrap_i64 ${e})`; }
+    return `(${LD32[op.size]||'i32.load'} ${wasmAddr(op, next)})`;
+  };
+  // write an i32 expr to a register (zero-extends the full 64-bit local)
+  const wr32reg = (r, e32) => isI32(r) ? `(local.set ${reg(r)} ${e32})` : `(local.set ${reg(r)} (i64.extend_i32_u ${e32}))`;
+
+  const FLAGSET = new Set(['add','sub','and','or','xor','inc','dec','cmp','test','neg']);
+  function emitBlock(i) {
+    const blk = blocks[i]; const L = [];
+    // Only the flag-setting op that a terminating jcc actually consumes needs
+    // its flags materialized; every earlier flag write in the block is dead.
+    let producer = -1;
+    if (term[i].kind === 'jcc')
+      for (let k = blk.insns.length - 1; k >= 0; k--) if (FLAGSET.has(blk.insns[k].mnem)) { producer = k; break; }
+    let flagState = null, ii = 0;
+    const setFlags = (kind, size, aE, bE, rE) => {
+      if (ii !== producer) return;                 // dead flags: skip
+      if (aE) L.push(`(local.set $fa ${aE})`); if (bE) L.push(`(local.set $fb ${bE})`); L.push(`(local.set $fr ${rE})`);
+      flagState = { kind, size };
+    };
+    const cond = (cc) => {
+      const fs = flagState, S = fs.size, sgn = SIGNl[S];
+      const a='(local.get $fa)', b='(local.get $fb)', r='(local.get $fr)';
+      const zf=`(i64.eqz ${r})`, nz=`(i64.ne ${r} (i64.const 0))`;
+      const sf=`(i64.ne (i64.and ${r} (i64.const ${sgn})) (i64.const 0))`, nsf=`(i64.eq (i64.and ${r} (i64.const ${sgn})) (i64.const 0))`;
+      if (fs.kind === 'sub') switch (cc) {
+        case 'e':return zf; case 'ne':return nz;
+        case 'b':return `(i64.lt_u ${a} ${b})`; case 'ae':return `(i64.ge_u ${a} ${b})`;
+        case 'be':return `(i64.le_u ${a} ${b})`; case 'a':return `(i64.gt_u ${a} ${b})`;
+        case 'l':return `(i64.lt_s ${sx(a,S)} ${sx(b,S)})`; case 'ge':return `(i64.ge_s ${sx(a,S)} ${sx(b,S)})`;
+        case 'le':return `(i64.le_s ${sx(a,S)} ${sx(b,S)})`; case 'g':return `(i64.gt_s ${sx(a,S)} ${sx(b,S)})`;
+        case 's':return sf; case 'ns':return nsf; }
+      else switch (cc) {
+        case 'e':return zf; case 'ne':return nz; case 's':return sf; case 'ns':return nsf;
+        case 'le':return `(i64.le_s ${sx(r,S)} (i64.const 0))`; case 'g':return `(i64.gt_s ${sx(r,S)} (i64.const 0))`;
+        case 'l':return `(i64.lt_s ${sx(r,S)} (i64.const 0))`; case 'ge':return `(i64.ge_s ${sx(r,S)} (i64.const 0))`; }
+      throw new Error('cond '+cc+'/'+fs.kind);
+    };
+    for (ii = 0; ii < blk.insns.length; ii++) {
+      const insn = blk.insns[ii];
+      const S = insn.size || 8, m = MASKl[S], next = insn.next;
+      // dead cmp/test (never consumed) can be dropped entirely
+      if ((insn.mnem === 'cmp' || insn.mnem === 'test') && ii !== producer) continue;
+      switch (insn.mnem) {
+        case 'nop': break;
+        case 'mov': L.push(wr(insn.dst,S,rd(insn.src,S,next),next)); break;
+        case 'movzx': L.push(wr(insn.dst,insn.size,rd(insn.src,insn.src.size,next),next)); break;
+        case 'movsx': L.push(wr(insn.dst,insn.size,sx(rd(insn.src,insn.src.size,next),insn.src.size),next)); break;
+        case 'lea': L.push(`(local.set ${reg(insn.dst.r)} ${guestAddr(insn.src,next)})`); break;
+        case 'add': case 'sub': case 'and': case 'or': case 'xor': {
+          const prod = (ii === producer);
+          // sub/cmp flags need the ORIGINAL operands: capture before writing dst
+          if (prod && insn.mnem === 'sub') { L.push(`(local.set $fa ${rd(insn.dst,S,next)})`, `(local.set $fb ${rd(insn.src,S,next)})`); }
+          let expr;
+          let i32expr = null;
+          if (S === 4 && insn.dst.kind === 'reg') { i32expr = `(${ALU32[insn.mnem]} ${rd32(insn.dst,next)} ${rd32(insn.src,next)})`; expr = `(i64.extend_i32_u ${i32expr})`; }
+          else if (S === 8) expr = `(${ALU[insn.mnem]} ${rd(insn.dst,8,next)} ${rd(insn.src,8,next)})`;
+          else expr = `(i64.and (${ALU[insn.mnem]} ${rd(insn.dst,S,next)} ${rd(insn.src,S,next)}) (i64.const ${m}))`;
+          if (insn.dst.kind === 'reg') {
+            L.push(i32expr && isI32(insn.dst.r) ? `(local.set ${reg(insn.dst.r)} ${i32expr})` : `(local.set ${reg(insn.dst.r)} ${expr})`);
+            if (prod) { L.push(`(local.set $fr ${rd(insn.dst,S,next)})`); flagState = { kind: insn.mnem==='sub'?'sub':'logic', size: S }; }
+          } else { const t=T(); L.push(`(local.set ${t} ${expr})`); L.push(wr(insn.dst,S,`(local.get ${t})`,next));
+            if (prod) { L.push(`(local.set $fr (local.get ${t}))`); flagState = { kind: insn.mnem==='sub'?'sub':'logic', size: S }; } }
+          break; }
+        case 'cmp': setFlags('sub',S,rd(insn.dst,S,next),rd(insn.src,S,next),`(i64.and (i64.sub ${rd(insn.dst,S,next)} ${rd(insn.src,S,next)}) (i64.const ${m}))`); break;
+        case 'test': setFlags('logic',S,null,null,`(i64.and ${rd(insn.dst,S,next)} ${rd(insn.src,S,next)})`); break;
+        case 'inc': case 'dec': {
+          const prod = (ii === producer);
+          let expr;
+          let i32e = null;
+          if (S === 4 && insn.dst.kind === 'reg') { i32e = `(${insn.mnem==='inc'?'i32.add':'i32.sub'} ${rd32(insn.dst,next)} (i32.const 1))`; expr = `(i64.extend_i32_u ${i32e})`; }
+          else expr = `(i64.and (${insn.mnem==='inc'?'i64.add':'i64.sub'} ${rd(insn.dst,S,next)} (i64.const 1)) (i64.const ${m}))`;
+          if (insn.dst.kind === 'reg') { L.push(i32e && isI32(insn.dst.r) ? `(local.set ${reg(insn.dst.r)} ${i32e})` : `(local.set ${reg(insn.dst.r)} ${expr})`);
+            if (prod) { L.push(`(local.set $fr ${rd(insn.dst,S,next)})`); flagState = { kind: insn.mnem, size: S }; } }
+          else { const t=T(); L.push(`(local.set ${t} ${expr})`); L.push(wr(insn.dst,S,`(local.get ${t})`,next));
+            if (prod) { L.push(`(local.set $fr (local.get ${t}))`); flagState = { kind: insn.mnem, size: S }; } }
+          break; }
+        case 'not': L.push(wr(insn.dst,S,`(i64.xor ${rd(insn.dst,S,next)} (i64.const ${m}))`,next)); break;
+        case 'neg': { const t=T(); L.push(`(local.set ${t} (i64.and (i64.sub (i64.const 0) ${rd(insn.dst,S,next)}) (i64.const ${m})))`);
+          L.push(wr(insn.dst,S,`(local.get ${t})`,next)); setFlags('sub',S,'(i64.const 0)',rd(insn.dst,S,next),`(local.get ${t})`); break; }
+        case 'shl': case 'shr': case 'sar': {
+          if (S === 4 && insn.dst.kind === 'reg') {
+            const c=`(i32.and ${rd32(insn.src,next)} (i32.const 31))`; const a=rd32(insn.dst,next); let e;
+            if (insn.mnem==='shl') e=`(i32.shl ${a} ${c})`; else if (insn.mnem==='shr') e=`(i32.shr_u ${a} ${c})`; else e=`(i32.shr_s ${a} ${c})`;
+            L.push(wr32reg(insn.dst.r, e)); break;
+          }
+          const c=`(i64.and ${rd(insn.src,1,next)} (i64.const ${S===8?63:31}))`; const a=rd(insn.dst,S,next); let e;
+          if (insn.mnem==='shl') e=`(i64.shl ${a} ${c})`; else if (insn.mnem==='shr') e=`(i64.shr_u ${a} ${c})`; else e=`(i64.shr_s ${sx(a,S)} ${c})`;
+          L.push(wr(insn.dst,S,`(i64.and ${e} (i64.const ${m}))`,next)); break; }
+        case 'rol': case 'ror': {
+          const c=`(i32.and ${rd32(insn.src,next)} (i32.const ${S===8?63:31}))`;
+          if (S===8) { const a=rd(insn.dst,8,next);
+            L.push(`(local.set ${reg(insn.dst.r)} (i64.${insn.mnem==='rol'?'rotl':'rotr'} ${a} (i64.extend_i32_u ${c})))`); }
+          else if (insn.dst.kind === 'reg') L.push(wr32reg(insn.dst.r, `(i32.${insn.mnem==='rol'?'rotl':'rotr'} ${rd32(insn.dst,next)} ${c})`));
+          else L.push(wr(insn.dst,S,`(i64.and (i64.extend_i32_u (i32.${insn.mnem==='rol'?'rotl':'rotr'} ${rd32(insn.dst,next)} ${c})) (i64.const ${m}))`,next));
+          break; }
+        case 'push': L.push(`(local.set $r4 (i64.sub (local.get $r4) (i64.const 8)))`,`(i64.store ${wasmAddr({base:4,index:-1,disp:0n},next)} ${rd(insn.src,8,next)})`); break;
+        case 'pop': L.push(wr(insn.dst,8,`(i64.load ${wasmAddr({base:4,index:-1,disp:0n},next)})`,next),`(local.set $r4 (i64.add (local.get $r4) (i64.const 8)))`); break;
+        case 'jmp': case 'jcc': case 'ret': case 'retn': case 'leave': break;  // terminator handled below
+        default: throw new Error('AOT: unhandled '+insn.mnem+' @ '+insn.rip.toString(16));
+      }
+    }
+    // terminator as label-based branches (RPO indices)
+    const t = term[i];
+    const labelFor = (j) => j <= i ? '$loop_'+j : '$blk_'+j;
+    const brTo = (j) => (j < 0) ? '(br $ret)' : (j === i+1 ? '' : `(br ${labelFor(j)})`);
+    if (t.kind === 'jcc') {
+      const c = cond(blk.insns[blk.insns.length-1].cond);
+      const lbl = (j) => j < 0 ? '$ret' : labelFor(j);
+      const T = t.t, F = t.f;
+      if (T === i+1 && F === i+1) { /* both fall through */ }
+      else if (T !== i+1 && F === i+1) L.push(`(br_if ${lbl(T)} ${c})`);
+      else if (T === i+1 && F !== i+1) L.push(`(br_if ${lbl(F)} (i32.eqz ${c}))`);
+      else { L.push(`(br_if ${lbl(T)} ${c})`); L.push(`(br ${lbl(F)})`); }
+    } else if (t.kind === 'jmp') {
+      const b = brTo(t.t); if (b) L.push(b);
+    } else if (t.kind === 'ret') {
+      if (t.leave) L.push(`(local.set $r4 (local.get $r5))`, `(local.set $r5 (i64.load ${wasmAddr({base:4,index:-1,disp:0n},blocks[i].insns[blocks[i].insns.length-1].next)})) (local.set $r4 (i64.add (local.get $r4) (i64.const 8)))`);
+      L.push('(br $ret)');
+    } else { const b = brTo(t.t); if (b) L.push(b); }
+    return L.join('\n      ');
+  }
+
+  const bodies = []; for (let i=0;i<N;i++) bodies.push(emitBlock(i));
+
+  let wat = '(module\n  (import "js" "mem" (memory 4096))\n  (func (export "run")\n';
+  for (let r=0;r<16;r++) wat += `    (local $r${r} ${isI32(r)?'i32':'i64'})\n`;
+  wat += '    (local $fa i64) (local $fb i64) (local $fr i64)\n';
+  for (const t of tmps) wat += `    (local ${t} i64)\n`;
+  for (let r=0;r<16;r++) wat += isI32(r) ? `    (local.set $r${r} (i32.load (i32.const ${r*8})))\n` : `    (local.set $r${r} (i64.load (i32.const ${r*8})))\n`;
+  wat += '    (block $ret\n';
+  for (let i=0;i<N;i++) {
+    for (const s of open[i]) wat += s.type==='loop' ? `      (loop ${s.label}\n` : `      (block ${s.label}\n`;
+    wat += '      ' + bodies[i] + '\n';
+    for (const _ of closeAfter[i]) wat += '      )\n';
+  }
+  wat += '    )\n';
+  for (let r=0;r<16;r++) wat += isI32(r) ? `    (i64.store (i32.const ${r*8}) (i64.extend_i32_u (local.get $r${r})))\n` : `    (i64.store (i32.const ${r*8}) (local.get $r${r}))\n`;
   wat += '  )\n)\n';
   return { wat, blocks: N };
 }

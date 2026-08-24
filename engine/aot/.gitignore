@@ -1,4 +1,5 @@
 gen_k
 md5-native
+md5-mn
 *.o
 md5-fromsrc.wasm
