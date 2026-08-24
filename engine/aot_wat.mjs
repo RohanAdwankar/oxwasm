@@ -395,7 +395,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     if (op.kind === 'reg') { seenR[op.r] = true;
       if ((op.size||8) === 8 || op.high) any64[op.r] = true; else if (isWrite) w32[op.r] = true; }
     if (op.kind === 'mem') { if (op.base>=0) { seenR[op.base]=true; any64[op.base]=true; } if (op.index>=0) { seenR[op.index]=true; any64[op.index]=true; } } };
-  const WRITES_DST = new Set(['mov','movzx','movsx','add','sub','and','or','xor','inc','dec','not','neg','shl','shr','sar','rol','ror','cmov','setcc','imul2','imul3','xchg','bswap','bts','btr','btc','shld','shrd']);
+  const WRITES_DST = new Set(['mov','movzx','movsx','add','sub','and','or','xor','adc','sbb','inc','dec','not','neg','shl','shr','sar','rol','ror','cmov','setcc','imul2','imul3','xchg','bswap','bts','btr','btc','shld','shrd']);
   // SSE ops that name a GPR (not xmm) via xr or rm — see sseXrIsGpr/sseRmIsGpr below
   const sseGprXr = (insn) => [0x2C, 0x2D, 0xD7, 0x50].includes(insn.op);
   const sseGprRm = (insn) => insn.op === 0x6E || insn.op === 0x2A || (insn.op === 0x7E && !insn.pF3);
@@ -775,6 +775,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   // A modeled flag producer is one whose flags we can reconstruct lazily.
   const modeled = (insn) => {
     if (FLAGSET.has(insn.mnem)) return true;
+    if (insn.mnem === 'adc' || insn.mnem === 'sbb') return true;   // produce CF/OF/SF/ZF via $cf + operands
     if ((insn.mnem === 'shl' || insn.mnem === 'shr' || insn.mnem === 'sar') &&
         insn.src.kind === 'imm' && (insn.src.v & (BigInt((insn.size||8)===8?63:31))) !== 0n) return true;
     if ((insn.mnem === 'bt' || insn.mnem === 'bts' || insn.mnem === 'btr' || insn.mnem === 'btc') &&
@@ -792,7 +793,10 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   const flagKind = (insn) => { const S = insn.size || 8;
     switch (insn.mnem) {
       case 'sub': case 'cmp': case 'neg': return { kind:'sub', size:S };
-      case 'add': case 'or': case 'and': case 'xor': case 'test':
+      case 'add': return { kind:'add', size:S };
+      case 'adc': return { kind:'adc', size:S };
+      case 'sbb': return { kind:'sbb', size:S };
+      case 'or': case 'and': case 'xor': case 'test':
       case 'shl': case 'shr': case 'sar': case 'bsf': case 'bsr': return { kind:'logic', size:S };
       case 'inc': return { kind:'inc', size:S };
       case 'dec': return { kind:'dec', size:S };
@@ -846,7 +850,8 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   const matProducers = new Set();                   // producer keys that must materialize
   for (let b = 0; b < N; b++) {
     const insns = blocks[b].insns, consumers = [];
-    for (let j = 0; j < insns.length; j++) if (insns[j].mnem === 'cmov' || insns[j].mnem === 'setcc') consumers.push(j);
+    // adc/sbb also CONSUME CF (from the nearest preceding flag producer)
+    for (let j = 0; j < insns.length; j++) if (['cmov','setcc','adc','sbb'].includes(insns[j].mnem)) consumers.push(j);
     if (term[b].kind === 'jcc') consumers.push(insns.length - 1);
     for (const j of consumers) {
       let p = -1, clob = null;
@@ -876,13 +881,35 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       const a='(local.get $fa)', b='(local.get $fb)', r='(local.get $fr)';
       const zf=`(i64.eqz ${r})`, nz=`(i64.ne ${r} (i64.const 0))`;
       const sf=`(i64.ne (i64.and ${r} (i64.const ${sgn})) (i64.const 0))`, nsf=`(i64.eq (i64.and ${r} (i64.const ${sgn})) (i64.const 0))`;
+      // OF for sub (a-b=r) and add (a+b=r), matching the interpreter's flag rules
+      const ofSub=`(i64.ne (i64.and (i64.and (i64.xor ${a} ${b}) (i64.xor ${a} ${r})) (i64.const ${sgn})) (i64.const 0))`;
+      const ofAdd=`(i64.ne (i64.and (i64.and (i64.xor ${a} ${r}) (i64.xor ${b} ${r})) (i64.const ${sgn})) (i64.const 0))`;
+      const cfAdd=`(i64.lt_u ${r} ${a})`;             // add carry: result wrapped below an operand
       if (fs.kind === 'sub') switch (cc) {
         case 'e':return zf; case 'ne':return nz;
         case 'b':return `(i64.lt_u ${a} ${b})`; case 'ae':return `(i64.ge_u ${a} ${b})`;
         case 'be':return `(i64.le_u ${a} ${b})`; case 'a':return `(i64.gt_u ${a} ${b})`;
         case 'l':return `(i64.lt_s ${sx(a,S)} ${sx(b,S)})`; case 'ge':return `(i64.ge_s ${sx(a,S)} ${sx(b,S)})`;
         case 'le':return `(i64.le_s ${sx(a,S)} ${sx(b,S)})`; case 'g':return `(i64.gt_s ${sx(a,S)} ${sx(b,S)})`;
+        case 'o':return ofSub; case 'no':return `(i32.eqz ${ofSub})`;
         case 's':return sf; case 'ns':return nsf; }
+      else if (fs.kind === 'add') switch (cc) {
+        case 'e':return zf; case 'ne':return nz; case 's':return sf; case 'ns':return nsf;
+        case 'b':return cfAdd; case 'ae':return `(i32.eqz ${cfAdd})`;
+        case 'be':return `(i32.or ${cfAdd} ${zf})`; case 'a':return `(i32.and (i32.eqz ${cfAdd}) (i32.eqz ${zf}))`;
+        case 'o':return ofAdd; case 'no':return `(i32.eqz ${ofAdd})`;
+        case 'l':return `(i32.ne ${sf} ${ofAdd})`; case 'ge':return `(i32.eq ${sf} ${ofAdd})`;
+        case 'le':return `(i32.or ${zf} (i32.ne ${sf} ${ofAdd}))`; case 'g':return `(i32.and (i32.eqz ${zf}) (i32.eq ${sf} ${ofAdd}))`; }
+      else if (fs.kind === 'adc' || fs.kind === 'sbb') {   // CF authoritative in $cf; OF from operands
+        const CF = `(i32.wrap_i64 (local.get $cf))`, OF = fs.kind === 'adc' ? ofAdd : ofSub;
+        switch (cc) {
+          case 'e':return zf; case 'ne':return nz; case 's':return sf; case 'ns':return nsf;
+          case 'b':return CF; case 'ae':return `(i32.eqz ${CF})`;
+          case 'be':return `(i32.or ${CF} ${zf})`; case 'a':return `(i32.and (i32.eqz ${CF}) (i32.eqz ${zf}))`;
+          case 'o':return OF; case 'no':return `(i32.eqz ${OF})`;
+          case 'l':return `(i32.ne ${sf} ${OF})`; case 'ge':return `(i32.eq ${sf} ${OF})`;
+          case 'le':return `(i32.or ${zf} (i32.ne ${sf} ${OF}))`; case 'g':return `(i32.and (i32.eqz ${zf}) (i32.eq ${sf} ${OF}))`; }
+      }
       else if (fs.kind === 'cf') switch (cc) {      // fr holds the CF bit (bt family)
         case 'b':return nz; case 'ae':return zf; }
       else switch (cc) {
@@ -890,6 +917,18 @@ function emitUnitFunction(a0, fnAddr, ctx) {
         case 'le':return `(i64.le_s ${sx(r,S)} (i64.const 0))`; case 'g':return `(i64.gt_s ${sx(r,S)} (i64.const 0))`;
         case 'l':return `(i64.lt_s ${sx(r,S)} (i64.const 0))`; case 'ge':return `(i64.ge_s ${sx(r,S)} (i64.const 0))`; }
       throw new Error('cond '+cc+'/'+fs.kind);
+    };
+    // CF-in for adc/sbb, reconstructed from the live flag producer (as an i64 0/1)
+    const getCF = () => {
+      const fs = flagState;
+      if (!fs) throw new Error('AOT: adc/sbb with no live flag producer');
+      const a='(local.get $fa)', b='(local.get $fb)', r='(local.get $fr)';
+      if (fs.kind === 'sub') return `(i64.extend_i32_u (i64.lt_u ${a} ${b}))`;
+      if (fs.kind === 'add') return `(i64.extend_i32_u (i64.lt_u ${r} ${a}))`;
+      if (fs.kind === 'adc' || fs.kind === 'sbb') return `(local.get $cf)`;
+      if (fs.kind === 'cf') return r;
+      if (fs.kind === 'logic') return `(i64.const 0)`;
+      throw new Error('AOT: adc/sbb CF-in from kind '+fs.kind);
     };
     for (ii = 0; ii < blk.insns.length; ii++) {
       const insn = blk.insns[ii];
@@ -907,8 +946,9 @@ function emitUnitFunction(a0, fnAddr, ctx) {
         case 'lea': L.push(`(local.set ${reg(insn.dst.r)} ${guestAddr(insn.src,next)})`); break;
         case 'add': case 'sub': case 'and': case 'or': case 'xor': {
           const prod = (producers.has(ii));
-          // sub/cmp flags need the ORIGINAL operands: capture before writing dst
-          if (prod && insn.mnem === 'sub') { L.push(`(local.set $fa ${rd(insn.dst,S,next)})`, `(local.set $fb ${rd(insn.src,S,next)})`); }
+          const akind = insn.mnem==='sub'?'sub':insn.mnem==='add'?'add':'logic';
+          // add/sub/cmp flags (CF/OF) need the ORIGINAL operands: capture before writing dst
+          if (prod && (insn.mnem === 'sub' || insn.mnem === 'add')) { L.push(`(local.set $fa ${rd(insn.dst,S,next)})`, `(local.set $fb ${rd(insn.src,S,next)})`); }
           let expr;
           let i32expr = null;
           if (S === 4 && insn.dst.kind === 'reg') { i32expr = `(${ALU32[insn.mnem]} ${rd32(insn.dst,next)} ${rd32(insn.src,next)})`; expr = `(i64.extend_i32_u ${i32expr})`; }
@@ -916,9 +956,47 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           else expr = `(i64.and (${ALU[insn.mnem]} ${rd(insn.dst,S,next)} ${rd(insn.src,S,next)}) (i64.const ${m}))`;
           if (insn.dst.kind === 'reg') {
             L.push(i32expr && isI32(insn.dst.r) ? `(local.set ${reg(insn.dst.r)} ${i32expr})` : `(local.set ${reg(insn.dst.r)} ${expr})`);
-            if (prod) { L.push(`(local.set $fr ${rd(insn.dst,S,next)})`); flagState = { kind: insn.mnem==='sub'?'sub':'logic', size: S }; }
+            if (prod) { L.push(`(local.set $fr ${rd(insn.dst,S,next)})`); flagState = { kind: akind, size: S }; }
           } else { const t=T(); L.push(`(local.set ${t} ${expr})`); L.push(wr(insn.dst,S,`(local.get ${t})`,next));
-            if (prod) { L.push(`(local.set $fr (local.get ${t}))`); flagState = { kind: insn.mnem==='sub'?'sub':'logic', size: S }; } }
+            if (prod) { L.push(`(local.set $fr (local.get ${t}))`); flagState = { kind: akind, size: S }; } }
+          break; }
+        case 'adc': case 'sbb': {
+          // add/sub with carry: read CF-in from the live producer, compute the
+          // result and the new carry-out, then (if consumed) materialize the
+          // full flags — $fa/$fb/$fr for OF/SF/ZF and $cf for the carry.
+          const prod = (producers.has(ii));
+          const isSub = insn.mnem === 'sbb';
+          const av = T(), bv = T(), cfv = T();
+          L.push(`(local.set ${av} ${rd(insn.dst,S,next)})`);
+          L.push(`(local.set ${bv} ${rd(insn.src,S,next)})`);
+          L.push(`(local.set ${cfv} ${getCF()})`);
+          const res = T(), cfout = T();
+          if (!isSub) {
+            if (S === 8) { const s1 = T();
+              L.push(`(local.set ${s1} (i64.add (local.get ${av}) (local.get ${bv})))`);
+              L.push(`(local.set ${res} (i64.add (local.get ${s1}) (local.get ${cfv})))`);
+              L.push(`(local.set ${cfout} (i64.extend_i32_u (i32.or (i64.lt_u (local.get ${s1}) (local.get ${av})) (i64.lt_u (local.get ${res}) (local.get ${s1})))))`);
+            } else { const sum = T();
+              L.push(`(local.set ${sum} (i64.add (i64.add (local.get ${av}) (local.get ${bv})) (local.get ${cfv})))`);
+              L.push(`(local.set ${res} (i64.and (local.get ${sum}) (i64.const ${m})))`);
+              L.push(`(local.set ${cfout} (i64.and (i64.shr_u (local.get ${sum}) (i64.const ${S*8})) (i64.const 1)))`);
+            }
+          } else {
+            if (S === 8) { const t = T();
+              L.push(`(local.set ${res} (i64.sub (i64.sub (local.get ${av}) (local.get ${bv})) (local.get ${cfv})))`);
+              L.push(`(local.set ${t} (i64.add (local.get ${bv}) (local.get ${cfv})))`);
+              L.push(`(local.set ${cfout} (i64.extend_i32_u (i32.or (i64.lt_u (local.get ${t}) (local.get ${bv})) (i64.gt_u (local.get ${t}) (local.get ${av})))))`);
+            } else {
+              L.push(`(local.set ${res} (i64.and (i64.sub (i64.sub (local.get ${av}) (local.get ${bv})) (local.get ${cfv})) (i64.const ${m})))`);
+              L.push(`(local.set ${cfout} (i64.extend_i32_u (i64.gt_u (i64.add (local.get ${bv}) (local.get ${cfv})) (local.get ${av}))))`);
+            }
+          }
+          L.push(wr(insn.dst, S, `(local.get ${res})`, next));
+          if (prod) {
+            L.push(`(local.set $fa (local.get ${av}))`, `(local.set $fb (local.get ${bv}))`,
+                   `(local.set $fr (local.get ${res}))`, `(local.set $cf (local.get ${cfout}))`);
+            flagState = { kind: isSub ? 'sbb' : 'adc', size: S };
+          }
           break; }
         case 'cmp': setFlags('sub',S,rd(insn.dst,S,next),rd(insn.src,S,next),`(i64.and (i64.sub ${rd(insn.dst,S,next)} ${rd(insn.src,S,next)}) (i64.const ${m}))`); break;
         case 'test': setFlags('logic',S,null,null,`(i64.and ${rd(insn.dst,S,next)} ${rd(insn.src,S,next)})`); break;
@@ -1240,7 +1318,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   const name = 'f_' + fnAddr.toString(16);
   let wat = `  (func $${name} (export "${name}") (result i64)\n`;
   for (let r=0;r<16;r++) wat += `    (local $r${r} ${isI32(r)?'i32':'i64'})\n`;
-  wat += '    (local $fa i64) (local $fb i64) (local $fr i64) (local $rsp0 i64) (local $rex i64)\n';
+  wat += '    (local $fa i64) (local $fb i64) (local $fr i64) (local $cf i64) (local $rsp0 i64) (local $rex i64)\n';
   if (DISP) wat += '    (local $pc i32)\n';
   for (const r of xUsed) wat += `    (local ${xreg(r)} v128)\n`;
   for (const t of tmps) wat += `    (local ${t} i64)\n`;
