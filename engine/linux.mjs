@@ -89,6 +89,7 @@ export class LinuxEngine {
     this.wmem = new WebAssembly.Memory({ initial: pages });
     this.regview = new BigInt64Array(this.wmem.buffer, 0, 16);
     this.fsview = new BigInt64Array(this.wmem.buffer, 128, 1);   // fs base for AOT TLS accesses
+    this.xmmview = new BigInt64Array(this.wmem.buffer, 256, 32); // 16 xmm regs (2 words each) for AOT SIMD
     this.ram = new Uint8Array(this.wmem.buffer, this.RAMOFF, Number(total));
     for (const s of main.loads)
       this.ram.set(elfBytes.subarray(s.off, s.off + s.filesz), Number(s.vaddr + mainBias - lo));
@@ -128,13 +129,37 @@ export class LinuxEngine {
     this.aotCalls = new Map();                // call-target profile
     this.aotCallThreshold = aotCallThreshold;
     this.aotLoopThreshold = aotLoopThreshold;
-    if (assembleWat) this.cpu.onCall = (t) => {
-      const k = t.toString();
-      if (this.aotFns.has(k) || this.aotFailed.has(k)) return;
-      const n = (this.aotCalls.get(k) || 0) + 1;
-      this.aotCalls.set(k, n);
-      if (n >= this.aotCallThreshold) this.tierUpAot(t);
-    };
+    if (assembleWat) {
+      this.cpu.onCall = (t) => this.profileTarget(t);
+      // a PLT stub reaches the real function via `jmp *GOT` — profile the
+      // indirect-jump landing so tail-called library functions (memcpy,
+      // strlen, ...) tier up like directly-called ones.
+      this.cpu.onJmp = (t) => { if (this.inExec(t)) this.profileTarget(t); };
+    }
+  }
+
+  profileTarget(t) {
+    const k = t.toString();
+    if (this.aotFns.has(k) || this.aotFailed.has(k)) return;
+    const n = (this.aotCalls.get(k) || 0) + 1;
+    this.aotCalls.set(k, n);
+    if (n >= this.aotCallThreshold) this.tierUpAot(t);
+  }
+
+  // A PLT/IFUNC stub is `endbr64?; jmp *GOT` — compiling it just deopts back
+  // to the real function AND, worse, once compiled its indirect jump runs in
+  // wasm so the interpreter never profiles the real target. Refuse it: keep it
+  // interpreted (2 instructions, trivial) so onJmp keeps profiling the callee.
+  isTrampoline(entry) {
+    try {
+      let rip = entry, n = 0;
+      for (;;) {
+        const insn = decode((i) => Number(this.mem.read(rip + BigInt(i), 1n)), rip);
+        if (insn.mnem === 'jmpind') return true;
+        if (insn.mnem === 'nop') { rip += BigInt(insn.len); if (++n > 3) return false; continue; }
+        return false;                                  // any real work -> compile it
+      }
+    } catch { return false; }
   }
 
   // Compile the call-graph closure rooted at `entry` (a function entry or a
@@ -143,6 +168,7 @@ export class LinuxEngine {
   tierUpAot(entry) {
     const k = entry.toString();
     if (this.aotFns.has(k) || this.aotFailed.has(k)) return;
+    if (this.isTrampoline(entry)) { this.aotFailed.add(k); return; }
     try {
       const unit = compileUnitWat(this.mem, entry, { guestBase: this.base, ramBase: this.RAMOFF });
       const bytes = this.assembleWat(unit.wat);
@@ -156,10 +182,17 @@ export class LinuxEngine {
     } catch (e) { this.aotFailed.add(k); }
   }
 
+  // GPRs at 0..127, fs base at 128, the 16 xmm registers at 256..511 (16B
+  // each, low 64 then high 64) — the AOT reads/writes v128 there directly.
   syncOut() { for (let r = 0; r < 16; r++) this.regview[r] = BigInt.asIntN(64, this.cpu.regs[r]);
-              this.fsview[0] = BigInt.asIntN(64, this.cpu.fsBase || 0n); }
+              this.fsview[0] = BigInt.asIntN(64, this.cpu.fsBase || 0n);
+              const x = this.xmmview; const M = (1n << 64n) - 1n;
+              for (let r = 0; r < 16; r++) { const v = this.cpu.xmm[r] || 0n;
+                x[r*2] = BigInt.asIntN(64, v & M); x[r*2+1] = BigInt.asIntN(64, (v >> 64n) & M); } }
   syncIn()  { for (let r = 0; r < 16; r++) this.cpu.regs[r] = BigInt.asUintN(64, this.regview[r]);
-              this.cpu.fsBase = BigInt.asUintN(64, this.fsview[0]); }
+              this.cpu.fsBase = BigInt.asUintN(64, this.fsview[0]);
+              const x = this.xmmview;
+              for (let r = 0; r < 16; r++) this.cpu.xmm[r] = BigInt.asUintN(64, x[r*2]) | (BigInt.asUintN(64, x[r*2+1]) << 64n); }
 
   // Run one compiled function; a deopt inside it (or its wasm callees)
   // unwinds here and execution state is already in the regfile/guest stack.
@@ -202,7 +235,10 @@ export class LinuxEngine {
         return BigInt.asIntN(64, retAddr);
       },
       // rsp0 is unused: the frames unwind, they are not interpreted under.
-      deopt: (rip, _rsp0) => { throw new DeoptUnwind(rip); },
+      // Profile the landing so an indirect jump that only runs inside AOT code
+      // (a compiled trampoline, a jump table) still tiers up its target.
+      deopt: (rip, _rsp0) => { const t = BigInt.asUintN(64, rip);
+        if (this.inExec(t)) this.profileTarget(t); throw new DeoptUnwind(t); },
     };
   }
 

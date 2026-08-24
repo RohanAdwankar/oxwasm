@@ -867,7 +867,7 @@ export class CPU {
       case 'push': this.push(this.get(insn.src)); break;
       case 'pop': this.set(insn.dst, this.pop()); break;
       case 'jmp': this.rip = (next + insn.rel) & MASK[8]; break;
-      case 'jmpind': this.rip = this.get(insn.src); break;
+      case 'jmpind': this.rip = this.get(insn.src); if (this.onJmp) this.onJmp(this.rip); break;
       case 'callind': this.push(next); this.rip = this.get(insn.src); if (this.onCall) this.onCall(this.rip); break;
       case 'jcc': if (this.cond(insn.cond)) this.rip = (next + insn.rel) & MASK[8]; break;
       case 'cmov': { const v = this.get(insn.src);

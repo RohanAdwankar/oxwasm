@@ -366,6 +366,9 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       if ((op.size||8) === 8 || op.high) any64[op.r] = true; else if (isWrite) w32[op.r] = true; }
     if (op.kind === 'mem') { if (op.base>=0) { seenR[op.base]=true; any64[op.base]=true; } if (op.index>=0) { seenR[op.index]=true; any64[op.index]=true; } } };
   const WRITES_DST = new Set(['mov','movzx','movsx','add','sub','and','or','xor','inc','dec','not','neg','shl','shr','sar','rol','ror','cmov','setcc','imul2','imul3','xchg','bswap','bts','btr','btc','shld','shrd']);
+  // SSE ops that name a GPR (not xmm) via xr or rm — see sseXrIsGpr/sseRmIsGpr below
+  const sseGprXr = (insn) => [0x2C, 0x2D, 0xD7, 0x50].includes(insn.op);
+  const sseGprRm = (insn) => insn.op === 0x6E || insn.op === 0x2A || (insn.op === 0x7E && !insn.pF3);
   for (const b of blocks) for (const insn of b.insns) {
     const S = insn.size || 8;
     switch (insn.mnem) {
@@ -380,11 +383,29 @@ function emitUnitFunction(a0, fnAddr, ctx) {
         noteRW(insn.src, false); break;
       case 'cwde': case 'cdq': { const r = insn.mnem==='cdq' ? 2 : 0; seenR[0]=true; seenR[r]=true;
         if (S===8) { any64[0]=true; any64[r]=true; } else w32[r]=true; break; }
+      case 'stos': { seenR[7]=true; any64[7]=true; seenR[0]=true; any64[0]=true;
+        if (insn.rep) { seenR[1]=true; any64[1]=true; } break; }
+      case 'movs': { seenR[6]=true; any64[6]=true; seenR[7]=true; any64[7]=true;
+        if (insn.rep) { seenR[1]=true; any64[1]=true; } break; }
+      case 'cld': case 'std': break;
+      case 'sse': {   // mark only the GPR side; xmm registers live in v128 locals
+        const mark = (r) => { seenR[r]=true; any64[r]=true; };
+        if (sseGprXr(insn)) mark(insn.xr);
+        if (insn.rm?.kind === 'xmm' && sseGprRm(insn)) mark(insn.rm.r);
+        if (insn.rm?.kind === 'mem') { if (insn.rm.base>=0) mark(insn.rm.base); if (insn.rm.index>=0) mark(insn.rm.index); }
+        break; }
+      case 'ssegrpshift': break;   // xmm only
       default:
         noteRW(insn.dst, WRITES_DST.has(insn.mnem)); noteRW(insn.src, false); noteRW(insn.src2, false);
     }
   }
   if (hasDeopt) any64.fill(true);
+  // `rep movs/stos` translate to forward bulk-memory ops, valid only when
+  // DF=0. The ABI keeps DF=0 except transiently around a std/cld pair; a
+  // function that never executes `std` has DF=0 throughout, so bulk ops are
+  // sound. If it does, poison (the interpreter honors DF exactly).
+  let hasStd = false;
+  for (const b of blocks) for (const insn of b.insns) if (insn.mnem === 'std') hasStd = true;
   const pushed = new Set();
   for (const b of blocks) for (const insn of b.insns) {
     if (insn.mnem === 'push' && insn.src && insn.src.kind === 'reg') pushed.add(insn.src.r);
@@ -452,6 +473,29 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   const isI32 = (r) => seenR[r] && !any64[r] && w32[r] && (!pushed.has(r) || savedOK.has(r));
   const savedI32 = (r) => savedOK.has(r);
 
+  // ---- xmm / SIMD: the 16 vector registers live in v128 locals, mirrored to
+  // the engine's xmm memory region (256..511) at entry/exit and call boundaries
+  // (all xmm are caller-saved in SysV). Only registers the function touches get
+  // a local and participate in sync.
+  const XMMOFF = 256;
+  // Some SSE ops name a GPR via the xr (reg) or rm field, not an xmm: movd/movq
+  // and cvtsi2sd read/write GPRs; pmovmskb/movmskps/cvt*2si write a GPR.
+  const sseXrIsGpr = (insn) => [0x2C, 0x2D, 0xD7, 0x50].includes(insn.op);
+  const sseRmIsGpr = (insn) => insn.op === 0x6E || insn.op === 0x2A || (insn.op === 0x7E && !insn.pF3);
+  const xUsed = new Set();
+  for (const b of blocks) for (const insn of b.insns) {
+    if (insn.mnem === 'sse') {
+      if (!sseXrIsGpr(insn)) xUsed.add(insn.xr);
+      if (insn.rm?.kind === 'xmm' && !sseRmIsGpr(insn)) xUsed.add(insn.rm.r);
+    }
+    if (insn.mnem === 'ssegrpshift') xUsed.add(insn.xrm);
+  }
+  const xreg = (r) => '$x' + r;
+  const xSpill  = (r) => `(v128.store (i32.const ${XMMOFF + r*16}) (local.get ${xreg(r)}))`;
+  const xReload = (r) => `(local.set ${xreg(r)} (v128.load (i32.const ${XMMOFF + r*16})))`;
+  const xSpillAll  = () => [...xUsed].map(xSpill);
+  const xReloadAll = () => [...xUsed].map(xReload);
+
   // A register this function never touches keeps no local at all: its regfile
   // slot is already the live value (ours at entry, a callee's after calls), so
   // every sync — entry, call boundaries, exit — skips it. This keeps register
@@ -464,17 +508,19 @@ function emitUnitFunction(a0, fnAddr, ctx) {
                                   : `(i64.store (i32.const ${r*8}) (local.get $r${r}))`;
   const reloadR = (r) => isI32(r) ? `(local.set $r${r} (i32.load (i32.const ${r*8})))`
                                   : `(local.set $r${r} (i64.load (i32.const ${r*8})))`;
-  const spillAll  = () => Array.from({length:16},(_,r)=>touched(r)?spillR(r):null).filter(Boolean);
-  const reloadAll = () => Array.from({length:16},(_,r)=>touched(r)?reloadR(r):null).filter(Boolean);
+  const spillAll  = () => [...Array.from({length:16},(_,r)=>touched(r)?spillR(r):null).filter(Boolean), ...xSpillAll()];
+  const reloadAll = () => [...Array.from({length:16},(_,r)=>touched(r)?reloadR(r):null).filter(Boolean), ...xReloadAll()];
   // Exit spill: a disciplined savedI32 reg's slot was just refreshed by its
   // epilogue pop (the full 64-bit caller value) — don't clobber it with the
-  // truncated working value.
-  const spillExit = () => Array.from({length:16},(_,r)=>(touched(r)&&!savedI32(r))?spillR(r):null).filter(Boolean);
+  // truncated working value. All xmm are caller-saved: always write back.
+  const spillExit = () => [...Array.from({length:16},(_,r)=>(touched(r)&&!savedI32(r))?spillR(r):null).filter(Boolean), ...xSpillAll()];
 
   // ---- operand / instruction emit (identical semantics to the dispatch version) ----
   const hexs = (v) => BigInt.asIntN(64, v).toString();
   let tmpN = 0; const tmps = new Set();
   const T = () => { const n = '$t' + (tmpN++); tmps.add(n); return n; };
+  let vtmpN = 0; const vtmps = new Set();
+  const VT = () => { const n = '$vt' + (vtmpN++); vtmps.add(n); return n; };
   const reg = (r) => '$r' + r;
   const sx = (e, S) => S === 8 ? e : `(i64.shr_s (i64.shl ${e} (i64.const ${64-S*8})) (i64.const ${64-S*8}))`;
   const guestAddr = (op, next) => {
@@ -541,6 +587,148 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   // write an i32 expr to a register (zero-extends the full 64-bit local)
   const wr32reg = (r, e32) => isI32(r) ? `(local.set ${reg(r)} ${e32})` : `(local.set ${reg(r)} (i64.extend_i32_u ${e32}))`;
 
+  // ---- SSE/SIMD -> wasm v128. xmm operands are v128 locals ($xN); memory
+  // operands load/store v128 directly. Semantics match the BigInt interpreter
+  // lane-for-lane; anything not handled throws, poisoning the function so the
+  // interpreter runs it faithfully.
+  const xv = (rm, next) => rm.kind === 'xmm' ? `(local.get ${xreg(rm.r)})` : `(v128.load ${wasmAddr(rm, next)})`;
+  const setx = (r, e) => `(local.set ${xreg(r)} ${e})`;
+  const ZERO = '(v128.const i64x2 0 0)';
+  // low 64 bits of an xmm value as an i64 expr
+  const xlo = (rm, next) => `(i64x2.extract_lane 0 ${xv(rm, next)})`;
+  const xlo32 = (rm, next) => `(i32x4.extract_lane 0 ${xv(rm, next)})`;
+  // punpck byte-shuffle indices (matches interp's interleave of low/high halves)
+  const unpckIdx = (EB, high) => { const n = 8 / EB, base = high ? 8 : 0, idx = [];
+    for (let k = 0; k < n; k++) { for (let bb = 0; bb < EB; bb++) idx.push(base + k*EB + bb);       // a elem k
+                                  for (let bb = 0; bb < EB; bb++) idx.push(16 + base + k*EB + bb); } // b elem k
+    return idx; };
+  const pshufdIdx = (imm) => { const idx = [];
+    for (let d = 0; d < 4; d++) { const sel = (imm >> (d*2)) & 3; for (let bb = 0; bb < 4; bb++) idx.push(sel*4 + bb); }
+    return idx; };
+  const LANE_BIN = {  // op -> wasm lane binary op applied to (dst, src)
+    0xFC:'i8x16.add', 0xFD:'i16x8.add', 0xFE:'i32x4.add', 0xD4:'i64x2.add',
+    0xF8:'i8x16.sub', 0xF9:'i16x8.sub', 0xFA:'i32x4.sub', 0xFB:'i64x2.sub',
+    0x74:'i8x16.eq',  0x75:'i16x8.eq',  0x76:'i32x4.eq',
+    0x64:'i8x16.gt_s',0x65:'i16x8.gt_s',0x66:'i32x4.gt_s',
+    0xDA:'i8x16.min_u',0xDE:'i8x16.max_u',0xEA:'i16x8.min_s',0xEE:'i16x8.max_s',
+    0xD8:'i8x16.sub_sat_u',0xD9:'i16x8.sub_sat_u',0xDC:'i8x16.add_sat_u',0xDD:'i16x8.add_sat_u',
+    0xE8:'i8x16.sub_sat_s',0xE9:'i16x8.sub_sat_s',0xEC:'i8x16.add_sat_s',0xED:'i16x8.add_sat_s',
+    0xE0:'i8x16.avgr_u',0xE3:'i16x8.avgr_u',0xD5:'i16x8.mul',
+    0xEF:'v128.xor',0xDB:'v128.and',0xEB:'v128.or',
+    0x57:'v128.xor',0x54:'v128.and',0x56:'v128.or',
+  };
+  function emitSSE(insn, next, L) {
+    const op = insn.op, xr = insn.xr, rm = insn.rm;
+    const dst = `(local.get ${xreg(xr)})`;
+    const put = (e) => L.push(setx(xr, e));
+    const storeRm = (bytes, e) => { if (rm.kind === 'xmm') L.push(setx(rm.r, e));
+      else if (bytes === 16) L.push(`(v128.store ${wasmAddr(rm, next)} ${e})`);
+      else L.push(`(${ {4:'v128.store32_lane',8:'v128.store64_lane'}[bytes] } ${wasmAddr(rm, next)} 0 ${e})`); };
+    if (LANE_BIN[op] && op !== 0xEF && op !== 0xDB && op !== 0xEB && op !== 0x57 && op !== 0x54 && op !== 0x56) {
+      put(`(${LANE_BIN[op]} ${dst} ${xv(rm, next)})`); return; }
+    switch (op) {
+      case 0xEF: case 0xDB: case 0xEB: case 0x57: case 0x54: case 0x56:
+        put(`(${LANE_BIN[op]} ${dst} ${xv(rm, next)})`); break;
+      case 0xDF: put(`(v128.andnot ${xv(rm, next)} ${dst})`); break;          // pandn: src & ~dst
+      case 0x55: put(`(v128.andnot ${xv(rm, next)} ${dst})`); break;          // andnps
+      case 0x6F: case 0x28:                                                    // movdqa/u, movaps (full 128 load/reg)
+        put(xv(rm, next)); break;
+      case 0x10:                                                              // movups / movss(F3) / movsd(F2)
+        if (insn.pF3) put(`(i32x4.replace_lane 0 ${dst} ${rm.kind==='xmm'?`(i32x4.extract_lane 0 ${xv(rm,next)})`:`(i32.load ${wasmAddr(rm,next)})`})`);
+        else if (insn.pF2) put(`(i64x2.replace_lane 0 ${dst} ${rm.kind==='xmm'?xlo(rm,next):`(i64.load ${wasmAddr(rm,next)})`})`);
+        else put(xv(rm, next));
+        break;
+      case 0x7F: case 0x29: storeRm(16, dst); break;                          // movdqa/u, movaps store
+      case 0x11:                                                              // movups/ss/sd store
+        if (insn.pF3) storeRm(4, dst); else if (insn.pF2) storeRm(8, dst); else storeRm(16, dst);
+        break;
+      case 0x12: put(`(i64x2.replace_lane 0 ${dst} ${rm.kind==='xmm'?xlo(rm,next):`(i64.load ${wasmAddr(rm,next)})`})`); break;  // movlps load low
+      case 0x13: storeRm(8, dst); break;                                      // movlps store low
+      case 0x16: put(`(i64x2.replace_lane 1 ${dst} ${rm.kind==='xmm'?xlo(rm,next):`(i64.load ${wasmAddr(rm,next)})`})`); break;  // movhps load high
+      case 0x17: L.push(`(v128.store64_lane ${wasmAddr(rm, next)} 1 ${dst})`); break;   // movhps store high
+      case 0x6E:                                                              // movd/movq gpr/mem -> xmm (zero upper)
+        if (insn.W) put(`(i64x2.replace_lane 0 ${ZERO} ${rm.kind==='xmm'?rd({kind:'reg',r:rm.r,size:8},8,next):`(i64.load ${wasmAddr(rm,next)})`})`);
+        else put(`(i32x4.replace_lane 0 ${ZERO} ${rm.kind==='xmm'?rd32({kind:'reg',r:rm.r,size:4},next):`(i32.load ${wasmAddr(rm,next)})`})`);
+        break;
+      case 0x7E:
+        if (insn.pF3) put(`(i64x2.replace_lane 0 ${ZERO} ${xlo(rm, next)})`); // movq xmm<-xmm/m64, zero upper
+        else if (rm.kind === 'xmm') L.push(insn.W ? wr({kind:'reg',r:rm.r,size:8},8,`(i64x2.extract_lane 0 ${dst})`,next)
+                                                  : wr32reg(rm.r, `(i32x4.extract_lane 0 ${dst})`));
+        else L.push(insn.W ? `(i64.store ${wasmAddr(rm,next)} (i64x2.extract_lane 0 ${dst}))`
+                           : `(i32.store ${wasmAddr(rm,next)} (i32x4.extract_lane 0 ${dst}))`);
+        break;
+      case 0xD6: storeRm(8, dst); break;                                      // movq store low 64
+      case 0xD7: L.push(wr32reg(xr, `(i8x16.bitmask ${xv(rm, next)})`)); break;   // pmovmskb -> GPR
+      case 0x50: L.push(wr32reg(xr, `(${insn.p66?'i64x2.bitmask':'i32x4.bitmask'} ${xv(rm, next)})`)); break;  // movmskps/pd
+      case 0x70: put(`(i8x16.shuffle ${pshufdIdx(insn.imm8).join(' ')} ${xv(rm, next)} ${xv(rm, next)})`); break;  // pshufd
+      case 0x60: case 0x61: case 0x62: case 0x68: case 0x69: case 0x6A: {     // punpck l/h bw/wd/dq
+        const EB = { 0x60:1,0x61:2,0x62:4,0x68:1,0x69:2,0x6A:4 }[op], high = op >= 0x68;
+        put(`(i8x16.shuffle ${unpckIdx(EB, high).join(' ')} ${dst} ${xv(rm, next)})`); break; }
+      case 0x6C: put(`(i8x16.shuffle 0 1 2 3 4 5 6 7 16 17 18 19 20 21 22 23 ${dst} ${xv(rm, next)})`); break;  // punpcklqdq
+      case 0x6D: put(`(i8x16.shuffle 8 9 10 11 12 13 14 15 24 25 26 27 28 29 30 31 ${dst} ${xv(rm, next)})`); break; // punpckhqdq
+      case 0xF4: {                                                            // pmuludq: lanes 0,2 u32 -> u64
+        const s = VT(); L.push(`(local.set ${s} ${xv(rm, next)})`);
+        put(`(i64x2.mul (v128.and ${dst} (v128.const i64x2 0xFFFFFFFF 0xFFFFFFFF)) (v128.and (local.get ${s}) (v128.const i64x2 0xFFFFFFFF 0xFFFFFFFF)))`);
+        break; }
+      // ---- scalar float (low lane); high lane of dst preserved as x86 requires
+      case 0x2A: {                                                            // cvtsi2sd/ss int -> float
+        const iv = rm.kind==='xmm' ? rd({kind:'reg',r:rm.r,size:insn.W?8:4}, insn.W?8:4, next) : `(${insn.W?'i64.load':'i64.load32_s'} ${wasmAddr(rm,next)})`;
+        const src = insn.W ? `(i64.and ${iv} (i64.const 0xFFFFFFFFFFFFFFFF))` : iv;
+        const conv = insn.W ? (insn.pF2?'f64.convert_i64_s':'f32.convert_i64_s') : (insn.pF2?'f64.convert_i32_s':'f32.convert_i32_s');
+        const arg = insn.W ? src : `(i32.wrap_i64 ${iv})`;
+        if (insn.pF2) put(`(f64x2.replace_lane 0 ${dst} (${conv} ${arg}))`);
+        else put(`(f32x4.replace_lane 0 ${dst} (${conv} ${arg}))`);
+        break; }
+      case 0x2C: case 0x2D: {                                                 // cvt(t)sd/ss2si -> GPR
+        const f = insn.pF2 ? `(f64x2.extract_lane 0 ${xv(rm,next)})` : `(f32x4.extract_lane 0 ${xv(rm,next)})`;
+        const trunc = insn.W ? (insn.pF2?'i64.trunc_sat_f64_s':'i64.trunc_sat_f32_s') : (insn.pF2?'i32.trunc_sat_f64_s':'i32.trunc_sat_f32_s');
+        // 0x2D rounds-to-nearest; wasm trunc_sat truncates. Add nearest rounding via f*.nearest.
+        const fr = insn.op===0x2D ? (insn.pF2?`(f64.nearest ${f})`:`(f32.nearest ${f})`) : f;
+        L.push(insn.W ? wr({kind:'reg',r:xr,size:8},8,`(${trunc} ${fr})`,next) : wr32reg(xr, `(${trunc} ${fr})`));
+        break; }
+      case 0x51: case 0x58: case 0x59: case 0x5C: case 0x5D: case 0x5E: case 0x5F: {   // sqrt/add/mul/sub/min/max/div
+        const F = insn.pF2 ? 'f64' : 'f32', LN = insn.pF2 ? 'f64x2' : 'f32x4';
+        const ext = (v) => `(${LN}.extract_lane 0 ${v})`;
+        const a = ext(dst), b = ext(xv(rm, next));
+        const scalar = insn.pF3 || insn.pF2;
+        if (!scalar) {  // packed
+          const P = { 0x51:`${LN}.sqrt`, 0x58:`${LN}.add`, 0x59:`${LN}.mul`, 0x5C:`${LN}.sub`, 0x5D:`${LN}.pmin`, 0x5E:`${LN}.div`, 0x5F:`${LN}.pmax` }[op];
+          put(op===0x51 ? `(${P} ${xv(rm,next)})` : `(${P} ${dst} ${xv(rm,next)})`); break;
+        }
+        const e = op===0x51 ? `(${F}.sqrt ${b})` : op===0x58 ? `(${F}.add ${a} ${b})` : op===0x59 ? `(${F}.mul ${a} ${b})`
+                : op===0x5C ? `(${F}.sub ${a} ${b})` : op===0x5D ? `(${F}.min ${a} ${b})` : op===0x5E ? `(${F}.div ${a} ${b})` : `(${F}.max ${a} ${b})`;
+        put(`(${LN}.replace_lane 0 ${dst} ${e})`); break; }
+      case 0x5A: {                                                            // cvtss2sd / cvtsd2ss (scalar low lane)
+        if (insn.pF3) put(`(f64x2.replace_lane 0 ${dst} (f64.promote_f32 (f32x4.extract_lane 0 ${xv(rm,next)})))`);
+        else if (insn.pF2) put(`(f32x4.replace_lane 0 ${dst} (f32.demote_f64 (f64x2.extract_lane 0 ${xv(rm,next)})))`);
+        else throw new Error('AOT sse 5a packed');
+        break; }
+      case 0x2B: storeRm(16, dst); break;                                     // movntps/pd
+      // comis/ucomis (0x2E/0x2F) write RFLAGS from a float compare; the
+      // lazy-flag machinery would need a float-compare producer kind. Not yet
+      // modeled -> poison so the interpreter runs the whole function.
+      default: throw new Error('AOT sse op ' + op.toString(16) + ' @ ' + insn.rip.toString(16));
+    }
+  }
+  function emitSSEShift(insn, L) {
+    // psll/psrl/psra by immediate (grpshift op 0x71/0x72/0x73)
+    const EB = insn.op === 0x71 ? 2 : insn.op === 0x72 ? 4 : 8;
+    const LN = { 2:'i16x8', 4:'i32x4', 8:'i64x2' }[EB];
+    const x = `(local.get ${xreg(insn.xrm)})`, c = insn.imm8 & 0xff;
+    let e;
+    if (insn.sub === 2) e = `(${LN}.shr_u ${x} (i32.const ${c}))`;            // psrl
+    else if (insn.sub === 6) e = `(${LN}.shl ${x} (i32.const ${c}))`;         // psll
+    else if (insn.sub === 4) e = `(${LN==='i64x2'?'i64x2.shr_s':LN+'.shr_s'} ${x} (i32.const ${c}))`;  // psra
+    else if (insn.sub === 3) {                                               // psrldq: whole-reg byte shift right
+      const idx = []; for (let k=0;k<16;k++){ const s=k+c; idx.push(s<16?s:16); }  // 16 -> zero lane
+      e = `(i8x16.shuffle ${idx.join(' ')} ${x} ${ZERO})`;
+    } else if (insn.sub === 7) {                                             // pslldq: byte shift left
+      const idx = []; for (let k=0;k<16;k++){ const s=k-c; idx.push(s>=0?s:16); }
+      e = `(i8x16.shuffle ${idx.join(' ')} ${x} ${ZERO})`;
+    } else throw new Error('AOT ssegrpshift sub ' + insn.sub);
+    L.push(setx(insn.xrm, e));
+  }
+
   const FLAGSET = new Set(['add','sub','and','or','xor','inc','dec','cmp','test','neg']);
   function emitBlock(i) {
     const blk = blocks[i]; const L = [];
@@ -557,11 +745,12 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           insn.src.kind === 'imm' && (insn.src.v & (BigInt((insn.size||8)===8?63:31))) !== 0n) return true;
       if ((insn.mnem === 'bt' || insn.mnem === 'bts' || insn.mnem === 'btr' || insn.mnem === 'btc') &&
           insn.dst.kind === 'reg') return true;
+      if (insn.mnem === 'bsf' || insn.mnem === 'bsr') return true;   // ZF <- (src==0)
       return false;
     };
     const CLOBBER = new Set(['shl','shr','sar','rol','ror','imul2','imul3','mul1','imul1','div1','idiv1',
                              'bt','bts','btr','btc','shld','shrd','call','callind','syscall',
-                             'xadd','cmpxchg','bsf','bsr','clc','stc','x87']);
+                             'xadd','cmpxchg','clc','stc','x87']);
     const nearestProd = (from) => {
       for (let k = from; k >= 0; k--) {
         const insn = blk.insns[k];
@@ -662,6 +851,18 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           if (insn.mnem==='shl') e=`(i64.shl ${a} ${c})`; else if (insn.mnem==='shr') e=`(i64.shr_u ${a} ${c})`; else e=`(i64.shr_s ${sx(a,S)} ${c})`;
           L.push(wr(insn.dst,S,`(i64.and ${e} (i64.const ${m}))`,next));
           setFlags('logic', S, null, null, rd(insn.dst,S,next));
+          break; }
+        case 'bsf': case 'bsr': {
+          // dst = index of lowest (bsf) / highest (bsr) set bit; ZF <- src==0.
+          // For src==0 the result is architecturally undefined — wasm ctz/clz
+          // give the width, harmless since the consumer branches on ZF.
+          const S8 = S === 8;
+          const s = rd(insn.src, S, next);
+          const e = insn.mnem === 'bsf'
+            ? (S8 ? `(i64.ctz ${s})` : `(i64.extend_i32_u (i32.ctz ${rd32(insn.src,next)}))`)
+            : (S8 ? `(i64.sub (i64.const 63) (i64.clz ${s}))` : `(i64.extend_i32_u (i32.sub (i32.const 31) (i32.clz ${rd32(insn.src,next)})))`);
+          if (producers.has(ii)) { L.push(`(local.set $fr ${s})`); flagState = { kind: 'logic', size: S }; }
+          L.push(wr(insn.dst, S, e, next));
           break; }
         case 'bswap': {
           const bs32 = (e) => `(i32.or (i32.or (i32.shl ${e} (i32.const 24)) (i32.and (i32.shl ${e} (i32.const 8)) (i32.const 16711680))) (i32.or (i32.and (i32.shr_u ${e} (i32.const 8)) (i32.const 65280)) (i32.shr_u ${e} (i32.const 24))))`;
@@ -785,6 +986,40 @@ function emitUnitFunction(a0, fnAddr, ctx) {
         case 'syscall':
           L.push(...spillAll(), `(call $x_syscall)`, ...reloadAll());
           break;
+        case 'cld': break;                                                    // DF stays 0 (bulk ops assume it)
+        case 'stos': {
+          const woffc = Number(BigInt.asIntN(32, woff));
+          const rdiOff = `(i32.add (i32.wrap_i64 (local.get $r7)) (i32.const ${woffc}))`;
+          if (insn.rep && hasStd) throw new Error('AOT: rep stos with std @ '+insn.rip.toString(16));
+          if (insn.rep && S === 1) {                                          // byte fill: one bulk op
+            L.push(`(memory.fill ${rdiOff} (i32.wrap_i64 (i64.and (local.get $r0) (i64.const 0xFF))) (i32.wrap_i64 (local.get $r1)))`);
+            L.push(`(local.set $r7 (i64.add (local.get $r7) (local.get $r1)))`, `(local.set $r1 (i64.const 0))`);
+          } else if (insn.rep) {                                             // strided: forward wasm loop
+            const e = '$se_'+insn.rip.toString(16), lp = '$sl_'+insn.rip.toString(16);
+            L.push(`(block ${e} (loop ${lp} (br_if ${e} (i64.eqz (local.get $r1)))`,
+                   `(${ST[S]} ${wasmAddr({base:7,index:-1,disp:0n},next)} ${rd({kind:'reg',r:0,size:S},S,next)})`,
+                   `(local.set $r7 (i64.add (local.get $r7) (i64.const ${S}))) (local.set $r1 (i64.sub (local.get $r1) (i64.const 1))) (br ${lp})))`);
+          } else {
+            L.push(`(${ST[S]} ${wasmAddr({base:7,index:-1,disp:0n},next)} ${rd({kind:'reg',r:0,size:S},S,next)})`,
+                   `(local.set $r7 (i64.add (local.get $r7) (i64.const ${S})))`);
+          }
+          break; }
+        case 'movs': {
+          const woffc = Number(BigInt.asIntN(32, woff));
+          if (insn.rep && hasStd) throw new Error('AOT: rep movs with std @ '+insn.rip.toString(16));
+          if (insn.rep && S === 1) {                                          // byte copy: one bulk op
+            L.push(`(memory.copy (i32.add (i32.wrap_i64 (local.get $r7)) (i32.const ${woffc})) (i32.add (i32.wrap_i64 (local.get $r6)) (i32.const ${woffc})) (i32.wrap_i64 (local.get $r1)))`);
+            L.push(`(local.set $r6 (i64.add (local.get $r6) (local.get $r1)))`, `(local.set $r7 (i64.add (local.get $r7) (local.get $r1)))`, `(local.set $r1 (i64.const 0))`);
+          } else if (insn.rep) {
+            const e = '$me_'+insn.rip.toString(16), lp = '$ml_'+insn.rip.toString(16);
+            L.push(`(block ${e} (loop ${lp} (br_if ${e} (i64.eqz (local.get $r1)))`,
+                   `(${ST[S]} ${wasmAddr({base:7,index:-1,disp:0n},next)} (${LD[S]} ${wasmAddr({base:6,index:-1,disp:0n},next)}))`,
+                   `(local.set $r6 (i64.add (local.get $r6) (i64.const ${S}))) (local.set $r7 (i64.add (local.get $r7) (i64.const ${S}))) (local.set $r1 (i64.sub (local.get $r1) (i64.const 1))) (br ${lp})))`);
+          } else {
+            L.push(`(${ST[S]} ${wasmAddr({base:7,index:-1,disp:0n},next)} (${LD[S]} ${wasmAddr({base:6,index:-1,disp:0n},next)}))`,
+                   `(local.set $r6 (i64.add (local.get $r6) (i64.const ${S})))`, `(local.set $r7 (i64.add (local.get $r7) (i64.const ${S})))`);
+          }
+          break; }
         case 'push': {
           // a disciplined savedI32 reg's prologue push reads its regfile slot,
           // which still holds the caller's full 64-bit value at that point
@@ -797,6 +1032,8 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           else
             L.push(wr(insn.dst,8,`(i64.load ${wasmAddr({base:4,index:-1,disp:0n},next)})`,next),`(local.set $r4 (i64.add (local.get $r4) (i64.const 8)))`);
           break; }
+        case 'sse':          emitSSE(insn, next, L); break;
+        case 'ssegrpshift':  emitSSEShift(insn, L); break;
         case 'jmp': case 'jcc': case 'ret': case 'retn': case 'jmpind': case 'udec': break;  // terminator handled below
         default: throw new Error('AOT: unhandled '+insn.mnem+' @ '+insn.rip.toString(16));
       }
@@ -838,8 +1075,11 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   let wat = `  (func $${name} (export "${name}") (result i64)\n`;
   for (let r=0;r<16;r++) wat += `    (local $r${r} ${isI32(r)?'i32':'i64'})\n`;
   wat += '    (local $fa i64) (local $fb i64) (local $fr i64) (local $rsp0 i64) (local $rex i64)\n';
+  for (const r of xUsed) wat += `    (local ${xreg(r)} v128)\n`;
   for (const t of tmps) wat += `    (local ${t} i64)\n`;
+  for (const t of vtmps) wat += `    (local ${t} v128)\n`;
   for (let r=0;r<16;r++) if (touched(r)) wat += '    ' + reloadR(r) + '\n';
+  for (const r of xUsed) wat += '    ' + xReload(r) + '\n';
   wat += '    (local.set $rsp0 (local.get $r4))\n';
   for (let i=0;i<N;i++) {
     for (const s of open[i]) wat += s.type==='loop' ? `      (loop ${s.label}\n` : `      (block ${s.label}\n`;
@@ -865,6 +1105,14 @@ export function compileUnitWat(mem, entry, opts = {}) {
       // useless: dispatching it can ping-pong with the engine. Poison instead
       // so control reaches the interpreter, which faults faithfully.
       if (an.blocks[0].insns[0].mnem === 'udec') throw new Error('entry undecodable');
+      // A PLT/IFUNC trampoline (endbr64/nops then `jmp *GOT`) must stay a
+      // callout, not a direct wasm call: a direct call would run its indirect
+      // jump in wasm, deopt, and unwind the CALLER's live frame every time.
+      // Poisoning it makes callers reach it via x_callout, which runs it to
+      // completion (dispatching the real target) and returns — frame intact.
+      { const b0 = an.blocks[0].insns; let tramp = false;
+        for (const insn of b0) { if (insn.mnem === 'nop') continue; tramp = insn.mnem === 'jmpind'; break; }
+        if (tramp && an.blocks.length === 1) throw new Error('trampoline -> callout'); }
       funcs.set(k, an);
       for (const c of an.calls) if (!funcs.has(c) && !poisoned.has(c)) pending.push(BigInt(c));
     } catch (e) { poisoned.add(k); if (k === entry.toString()) throw e; }
