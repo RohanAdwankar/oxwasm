@@ -15,4 +15,5 @@ node simdtest.mjs
 node simdbench.mjs
 node multest.mjs
 node disptest.mjs
+node xflagtest.mjs
 node enginetest.mjs

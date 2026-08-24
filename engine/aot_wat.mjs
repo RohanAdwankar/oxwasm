@@ -228,12 +228,16 @@ function analyze(mem, entry, { maxInsns = 20000 } = {}) {
       insnAt.set(key, { mnem: 'udec', rip, next: rip + 1n, len: 1 });
       continue;
     }
-    // Trap instructions (hlt/ud2/int3) are almost always unreachable padding
-    // the analyzer walks into after a noreturn call (e.g. the `hlt` after
-    // `call __libc_start_main` in _start). Treat them as deopt points rather
-    // than poisoning the whole function: if control ever truly reaches one,
-    // the engine resumes in the interpreter and traps exactly as native would.
-    if (insn.mnem === 'hlt' || insn.mnem === 'ud2' || insn.mnem === 'int3' || insn.mnem === 'int') {
+    // Two kinds of instruction escape to the interpreter via a deopt point
+    // rather than poisoning the whole function:
+    //  - trap padding (hlt/ud2/int3): almost always unreachable bytes the
+    //    analyzer walks into after a noreturn call (the `hlt` after
+    //    `call __libc_start_main` in _start); if truly reached, the
+    //    interpreter traps exactly as native would.
+    //  - rare, cold instructions we don't translate but the interpreter models
+    //    fully (cpuid — glibc's one-time ISA probe): deopt runs it and the
+    //    frame's remainder in the interpreter, then returns.
+    if (['hlt','ud2','int3','int','cpuid'].includes(insn.mnem)) {
       insnAt.set(key, { mnem: 'udec', rip, next: rip + BigInt(insn.len), len: insn.len });
       continue;
     }
@@ -401,6 +405,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       case 'div1': case 'idiv1': case 'mul1': case 'imul1':
         for (const r of (S===1 ? [0] : [0,2])) { seenR[r]=true; if (S===8) any64[r]=true; else w32[r]=true; }
         noteRW(insn.src, false); break;
+      case 'xchg': noteRW(insn.dst, true); noteRW(insn.src, true); break;   // both operands written
       case 'cwde': case 'cdq': { const r = insn.mnem==='cdq' ? 2 : 0; seenR[0]=true; seenR[r]=true;
         if (S===8) { any64[0]=true; any64[r]=true; } else w32[r]=true; break; }
       case 'stos': { seenR[7]=true; any64[7]=true; seenR[0]=true; any64[0]=true;
@@ -417,6 +422,17 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       case 'ssegrpshift': break;   // xmm only
       default:
         noteRW(insn.dst, WRITES_DST.has(insn.mnem)); noteRW(insn.src, false); noteRW(insn.src2, false);
+    }
+  }
+  // An unpatterned 64-bit div/idiv compiles to a runtime guard that can deopt;
+  // that deopt spills every register, so it must spill full 64-bit values.
+  for (const b of blocks) for (let ii = 0; ii < b.insns.length; ii++) {
+    const insn = b.insns[ii];
+    if ((insn.mnem === 'div1' || insn.mnem === 'idiv1') && (insn.size || 8) === 8) {
+      const prev = ii > 0 ? b.insns[ii-1] : null, sgn = insn.mnem === 'idiv1';
+      const zeroed = prev && prev.mnem === 'xor' && prev.dst?.kind==='reg' && prev.dst.r===2 && prev.src?.kind==='reg' && prev.src.r===2;
+      const cqo = prev && prev.mnem === 'cdq' && (prev.size||8) === 8;
+      if (!(sgn ? cqo : zeroed)) hasDeopt = true;
     }
   }
   if (hasDeopt) any64.fill(true);
@@ -643,7 +659,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     const put = (e) => L.push(setx(xr, e));
     const storeRm = (bytes, e) => { if (rm.kind === 'xmm') L.push(setx(rm.r, e));
       else if (bytes === 16) L.push(`(v128.store ${wasmAddr(rm, next)} ${e})`);
-      else L.push(`(${ {4:'v128.store32_lane',8:'v128.store64_lane'}[bytes] } ${wasmAddr(rm, next)} 0 ${e})`); };
+      else L.push(`(${ {4:'v128.store32_lane',8:'v128.store64_lane'}[bytes] } 0 ${wasmAddr(rm, next)} ${e})`); };   // (storeN_lane LANE addr value)
     if (LANE_BIN[op] && op !== 0xEF && op !== 0xDB && op !== 0xEB && op !== 0x57 && op !== 0x54 && op !== 0x56) {
       put(`(${LANE_BIN[op]} ${dst} ${xv(rm, next)})`); return; }
     switch (op) {
@@ -665,7 +681,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       case 0x12: put(`(i64x2.replace_lane 0 ${dst} ${rm.kind==='xmm'?xlo(rm,next):`(i64.load ${wasmAddr(rm,next)})`})`); break;  // movlps load low
       case 0x13: storeRm(8, dst); break;                                      // movlps store low
       case 0x16: put(`(i64x2.replace_lane 1 ${dst} ${rm.kind==='xmm'?xlo(rm,next):`(i64.load ${wasmAddr(rm,next)})`})`); break;  // movhps load high
-      case 0x17: L.push(`(v128.store64_lane ${wasmAddr(rm, next)} 1 ${dst})`); break;   // movhps store high
+      case 0x17: L.push(`(v128.store64_lane 1 ${wasmAddr(rm, next)} ${dst})`); break;   // movhps store high (lane, addr, value)
       case 0x6E:                                                              // movd/movq gpr/mem -> xmm (zero upper)
         if (insn.W) put(`(i64x2.replace_lane 0 ${ZERO} ${rm.kind==='xmm'?rd({kind:'reg',r:rm.r,size:8},8,next):`(i64.load ${wasmAddr(rm,next)})`})`);
         else put(`(i32x4.replace_lane 0 ${ZERO} ${rm.kind==='xmm'?rd32({kind:'reg',r:rm.r,size:4},next):`(i32.load ${wasmAddr(rm,next)})`})`);
@@ -750,39 +766,100 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   }
 
   const FLAGSET = new Set(['add','sub','and','or','xor','inc','dec','cmp','test','neg']);
+  // A modeled flag producer is one whose flags we can reconstruct lazily.
+  const modeled = (insn) => {
+    if (FLAGSET.has(insn.mnem)) return true;
+    if ((insn.mnem === 'shl' || insn.mnem === 'shr' || insn.mnem === 'sar') &&
+        insn.src.kind === 'imm' && (insn.src.v & (BigInt((insn.size||8)===8?63:31))) !== 0n) return true;
+    if ((insn.mnem === 'bt' || insn.mnem === 'bts' || insn.mnem === 'btr' || insn.mnem === 'btc') &&
+        insn.dst.kind === 'reg') return true;
+    if (insn.mnem === 'bsf' || insn.mnem === 'bsr') return true;   // ZF <- (src==0)
+    return false;
+  };
+  // Instructions that write flags in a way we DON'T model: a nearest such
+  // writer before a consumer means the lazy flags are unrecoverable.
+  const CLOBBER = new Set(['shl','shr','sar','rol','ror','imul2','imul3','mul1','imul1','div1','idiv1',
+                           'bt','bts','btr','btc','shld','shrd','call','callind','syscall',
+                           'xadd','cmpxchg','clc','stc','x87']);
+  // Static (kind,size) a modeled producer yields — MUST match the setFlags
+  // calls in emitBlock so cross-block consumers pick the right cond() form.
+  const flagKind = (insn) => { const S = insn.size || 8;
+    switch (insn.mnem) {
+      case 'sub': case 'cmp': case 'neg': return { kind:'sub', size:S };
+      case 'add': case 'or': case 'and': case 'xor': case 'test':
+      case 'shl': case 'shr': case 'sar': case 'bsf': case 'bsr': return { kind:'logic', size:S };
+      case 'inc': return { kind:'inc', size:S };
+      case 'dec': return { kind:'dec', size:S };
+      case 'bt': case 'bts': case 'btr': case 'btc': return { kind:'cf', size:S };
+      default: return null;
+    } };
+
+  // ---- lazy-flag liveness + cross-block reaching-definition analysis --------
+  // A flag write is live only if some consumer (a terminating jcc or a
+  // mid-block cmov/setcc) reads it before it is overwritten. The producer may
+  // live in a *predecessor* block, so we solve reaching-definitions over the
+  // CFG: each producer that reaches a consumer is materialized ($fa/$fb/$fr),
+  // and every block records the unique (kind,size) of flags flowing into it so
+  // a cross-block consumer knows which cond() form to emit. If the reaching
+  // producers disagree on (kind,size) — or an unmodeled writer sits between a
+  // producer and its consumer — the function is poisoned (interpreter runs it).
+  const defKind = new Map();                        // 'b:idx' -> {kind,size}
+  const localDef = new Array(N).fill(null);         // last modeled producer key per block (null if clobbered after / none)
+  const killsFlags = new Array(N).fill(false);      // block ends with flags clobbered
+  for (let b = 0; b < N; b++) {
+    const insns = blocks[b].insns; let cur = null;  // null=passthrough, {key}=def, 'kill'
+    for (let idx = 0; idx < insns.length; idx++) {
+      const insn = insns[idx];
+      if (modeled(insn)) { const key = b+':'+idx; defKind.set(key, flagKind(insn)); cur = { key }; }
+      else if (CLOBBER.has(insn.mnem)) cur = 'kill';
+    }
+    if (cur && cur !== 'kill') localDef[b] = cur.key;
+    if (cur === 'kill') killsFlags[b] = true;
+  }
+  const preds = Array.from({length:N}, ()=>[]);
+  for (let b = 0; b < N; b++) for (const s of succs[b]) if (s >= 0) preds[s].push(b);
+  const inDefs = Array.from({length:N}, ()=>new Set());
+  const outDefs = Array.from({length:N}, ()=>new Set());
+  { let changed = true, guard = 0;
+    while (changed) { changed = false;
+      if (++guard > 100000) throw new Error('AOT: flag dataflow diverged');
+      for (let b = 0; b < N; b++) {
+        const nin = new Set(); for (const p of preds[b]) for (const k of outDefs[p]) nin.add(k);
+        const nout = killsFlags[b] ? new Set() : localDef[b] ? new Set([localDef[b]]) : nin;
+        const diff = (a, c) => a.size !== c.size || [...c].some(k=>!a.has(k));
+        if (diff(inDefs[b], nin)) { inDefs[b] = nin; changed = true; }
+        if (diff(outDefs[b], nout)) { outDefs[b] = new Set(nout); changed = true; }
+      }
+    } }
+  const blkFlagIn = new Array(N).fill(null);        // uniform (kind,size) entering a block, or null
+  for (let b = 0; b < N; b++) {
+    let k = null, ok = true;
+    for (const key of inDefs[b]) { const dk = defKind.get(key); if (!k) k = dk; else if (k.kind!==dk.kind || k.size!==dk.size) { ok = false; break; } }
+    if (ok && k) blkFlagIn[b] = k;
+  }
+  const matProducers = new Set();                   // producer keys that must materialize
+  for (let b = 0; b < N; b++) {
+    const insns = blocks[b].insns, consumers = [];
+    for (let j = 0; j < insns.length; j++) if (insns[j].mnem === 'cmov' || insns[j].mnem === 'setcc') consumers.push(j);
+    if (term[b].kind === 'jcc') consumers.push(insns.length - 1);
+    for (const j of consumers) {
+      let p = -1, clob = null;
+      for (let kk = j - 1; kk >= 0; kk--) { const insn = insns[kk];
+        if (modeled(insn)) { p = kk; break; } if (CLOBBER.has(insn.mnem)) { clob = insn; p = -2; break; } }
+      if (p >= 0) matProducers.add(b+':'+p);
+      else if (p === -2) throw new Error('AOT: unmodeled flag producer '+clob.mnem+' @ '+clob.rip.toString(16));
+      else {                                        // producer is cross-block
+        if (!blkFlagIn[b]) throw new Error('AOT: cross-block flags for '+(insns[j].mnem==='jcc'?'jcc':insns[j].mnem)+' @ '+insns[j].rip.toString(16));
+        for (const key of inDefs[b]) matProducers.add(key);
+      }
+    }
+  }
+
   function emitBlock(i) {
     const blk = blocks[i]; const L = [];
-    // A flag write is live only if some later consumer reads it before it is
-    // overwritten. Consumers are the terminating jcc and any mid-block cmov/setcc;
-    // each consumes the nearest preceding flag-setter. Everything else is dead.
-    // If the nearest flag WRITER is one whose flags we don't model (a
-    // cl-count shift, multiply, bt on memory, ...), translating would silently
-    // use an older producer's flags — poison the function instead.
     const producers = new Set();
-    const modeled = (insn) => {
-      if (FLAGSET.has(insn.mnem)) return true;
-      if ((insn.mnem === 'shl' || insn.mnem === 'shr' || insn.mnem === 'sar') &&
-          insn.src.kind === 'imm' && (insn.src.v & (BigInt((insn.size||8)===8?63:31))) !== 0n) return true;
-      if ((insn.mnem === 'bt' || insn.mnem === 'bts' || insn.mnem === 'btr' || insn.mnem === 'btc') &&
-          insn.dst.kind === 'reg') return true;
-      if (insn.mnem === 'bsf' || insn.mnem === 'bsr') return true;   // ZF <- (src==0)
-      return false;
-    };
-    const CLOBBER = new Set(['shl','shr','sar','rol','ror','imul2','imul3','mul1','imul1','div1','idiv1',
-                             'bt','bts','btr','btc','shld','shrd','call','callind','syscall',
-                             'xadd','cmpxchg','clc','stc','x87']);
-    const nearestProd = (from) => {
-      for (let k = from; k >= 0; k--) {
-        const insn = blk.insns[k];
-        if (modeled(insn)) return k;
-        if (CLOBBER.has(insn.mnem)) throw new Error('AOT: unmodeled flag producer '+insn.mnem+' @ '+insn.rip.toString(16));
-      }
-      return -1;
-    };
-    for (let j = 0; j < blk.insns.length; j++)
-      if (blk.insns[j].mnem === 'cmov' || blk.insns[j].mnem === 'setcc') { const p = nearestProd(j - 1); if (p >= 0) producers.add(p); }
-    if (term[i].kind === 'jcc') { const p = nearestProd(blk.insns.length - 1); if (p >= 0) producers.add(p); }
-    let flagState = null, ii = 0;
+    for (let idx = 0; idx < blk.insns.length; idx++) if (matProducers.has(i+':'+idx)) producers.add(idx);
+    let flagState = blkFlagIn[i] || null, ii = 0;
     const setFlags = (kind, size, aE, bE, rE) => {
       if (!producers.has(ii)) return;              // dead flags: skip
       if (aE) L.push(`(local.set $fa ${aE})`); if (bE) L.push(`(local.set $fb ${bE})`); L.push(`(local.set $fr ${rE})`);
@@ -988,14 +1065,22 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           const rax = {kind:'reg',r:0,size:S}, rdx = {kind:'reg',r:2,size:S};
           let q, rm;
           if (S === 8) {
-            // 128-bit dividend: only the compiler's own zero/sign-extended
-            // patterns are translatable — rdx zeroed right before (div) or
-            // cqo right before (idiv). Anything else deopts the function.
+            // The dividend is the 128-bit rdx:rax, but it fits in 64 bits iff
+            // rdx is the zero/sign-extension of rax — the case every compiler
+            // actually emits. When the preceding insn provably sets that up
+            // (xor rdx,rdx / cqo) we skip the check; otherwise guard at
+            // runtime and deopt to the interpreter for a true 128-bit divide.
             const prev = ii > 0 ? blk.insns[ii-1] : null;
             const zeroed = prev && prev.mnem === 'xor' && prev.dst?.kind==='reg' && prev.dst.r===2 && prev.src?.kind==='reg' && prev.src.r===2;
             const cqo = prev && prev.mnem === 'cdq' && (prev.size||8) === 8;
-            if (!sgn && !zeroed) throw new Error('AOT: unpatterned 64-bit div @ '+insn.rip.toString(16));
-            if (sgn && !cqo) throw new Error('AOT: unpatterned 64-bit idiv @ '+insn.rip.toString(16));
+            const patterned = sgn ? cqo : zeroed;
+            if (!patterned) {
+              const bad = sgn
+                ? `(i64.ne ${rd(rdx,8,next)} (i64.shr_s ${rd(rax,8,next)} (i64.const 63)))`
+                : `(i64.ne ${rd(rdx,8,next)} (i64.const 0))`;
+              L.push(`(if ${bad} (then`, ...spillAll(),
+                     `(return (call $x_deopt (i64.const ${hexs(insn.rip)}) (local.get $rsp0)))))`);
+            }
             const d = rd(insn.src,8,next), n = rd(rax,8,next);
             q = `(${sgn?'i64.div_s':'i64.div_u'} ${n} ${d})`; rm = `(${sgn?'i64.rem_s':'i64.rem_u'} ${n} ${d})`;
           } else if (S === 1) {
@@ -1015,6 +1100,13 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           L.push(`(local.set ${tq} ${q})`, `(local.set ${tr} ${rm})`);
           if (S === 1) { L.push(wr({kind:'reg',r:0,size:1},1,`(local.get ${tq})`,next)); L.push(wr({kind:'reg',r:0,size:1,high:true},1,`(local.get ${tr})`,next)); }
           else { L.push(wr(rax,S,`(local.get ${tq})`,next)); L.push(wr(rdx,S,`(local.get ${tr})`,next)); }
+          break; }
+        case 'xchg': {   // swap dst and src (LOCK is a no-op single-threaded); no flags
+          const ta = T(), tb = T();
+          L.push(`(local.set ${ta} ${rd(insn.dst,S,next)})`);
+          L.push(`(local.set ${tb} ${rd(insn.src,S,next)})`);
+          L.push(wr(insn.dst,S,`(local.get ${tb})`,next));
+          L.push(wr(insn.src,S,`(local.get ${ta})`,next));
           break; }
         case 'leave':    // mov rsp,rbp ; pop rbp
           L.push(`(local.set $r4 ${rd({kind:'reg',r:5,size:8},8,next)})`);

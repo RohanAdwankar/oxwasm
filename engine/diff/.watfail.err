@@ -1,0 +1,6 @@
+/tmp/wf_25179_5.wat:6242:26: error: unexpected token "(", expected a natural number in range [0, 32).
+      (v128.store64_lane (i32.add (i32.wrap_i64 (local.get $r7)) (i32.const -...
+                         ^
+/tmp/wf_25179_5.wat:6242:88: error: unexpected token 0, expected ).
+...2.add (i32.wrap_i64 (local.get $r7)) (i32.const -3145672)) 0 (local.get $x3))
+                                                              ^
