@@ -369,6 +369,7 @@ export function compileFunctionWat(mem, entry, opts = {}) {
     return k === 0 ? e : `(i32.add ${e} (i32.const ${k}))`;
   };
   const LD = { 1:'i64.load8_u', 2:'i64.load16_u', 4:'i64.load32_u', 8:'i64.load' };
+  const LD_S = { 1:'i64.load8_s', 2:'i64.load16_s', 4:'i64.load32_s' };
   const ST = { 1:'i64.store8', 2:'i64.store16', 4:'i64.store32', 8:'i64.store' };
   const rd = (op, size, next) => {
     if (op.kind === 'imm') return `(i64.const ${hexs(op.v)})`;
@@ -452,7 +453,10 @@ export function compileFunctionWat(mem, entry, opts = {}) {
         case 'nop': break;
         case 'mov': L.push(wr(insn.dst,S,rd(insn.src,S,next),next)); break;
         case 'movzx': L.push(wr(insn.dst,insn.size,rd(insn.src,insn.src.size,next),next)); break;
-        case 'movsx': L.push(wr(insn.dst,insn.size,sx(rd(insn.src,insn.src.size,next),insn.src.size),next)); break;
+        case 'movsx': {   // sign-extend; for a memory source use a single sign-extending load
+          const e = insn.src.kind === 'mem' ? `(${LD_S[insn.src.size]} ${wasmAddr(insn.src,next)})`
+                                            : sx(rd(insn.src,insn.src.size,next), insn.src.size);
+          L.push(wr(insn.dst,insn.size,e,next)); break; }
         case 'lea': L.push(`(local.set ${reg(insn.dst.r)} ${guestAddr(insn.src,next)})`); break;
         case 'add': case 'sub': case 'and': case 'or': case 'xor': {
           const prod = (producers.has(ii));
