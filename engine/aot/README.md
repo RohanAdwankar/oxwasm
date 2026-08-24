@@ -26,6 +26,17 @@ Bit-exact digest vs native and busybox on multiple inputs (verified). 17
 basic blocks → 3155 bytes of wasm, assembled by wat2wasm, sharing the
 engine's linear memory.
 
+## The ceiling: wasm has no inherent penalty here (`src-ceiling.mjs`)
+
+The same `md5_blocks` compiled straight to wasm from source (clang
+`--target=wasm32 -O3`) runs **167 ms — 1.05x native**, bit-exact. That is
+the "perfect AOT" target for this code and it is essentially parity. So the
+whole 5.1x -> 1.05x gap is *my emitter*, not WebAssembly: the `br_table`
+dispatch loop routes every basic-block transition instead of using a direct
+branch, and MD5's tiny hot loop pays that ~64M times. Structured-loop
+reconstruction (guest loop -> real wasm `loop` + direct `br`), as Rosetta
+2 does, is the measured path from 5.1x toward that 1.05x.
+
 ## Why 5x, and the path to parity
 
 The remaining tax is the dispatch loop: every basic-block transition routes
