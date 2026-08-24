@@ -226,10 +226,31 @@ export class LinuxEngine {
       },
       callout: (target) => {
         target = BigInt.asUintN(64, target);
-        this.syncIn();
-        const retAddr = this.mem.read(this.cpu.regs[4], 8n);
-        const rspExit = BigInt.asUintN(64, this.cpu.regs[4] + 8n);
-        this.cpu.rip = target;
+        // The caller (compiled code) already spilled the whole register file to
+        // memory before the call, and the guest return address is on the guest
+        // stack. rsp lives in the regfile at slot 4.
+        const rsp0 = BigInt.asUintN(64, this.regview[4]);
+        const retAddr = this.mem.read(rsp0, 8n);
+        const rspExit = BigInt.asUintN(64, rsp0 + 8n);
+        const f = this.aotFns.get(target.toString());
+        if (f) {
+          // Target is compiled: run it wasm-to-wasm over the shared register
+          // file — NO BigInt cpu<->memory sync (the expensive part). It reads
+          // and writes the same regfile memory the caller will reload from.
+          try { this.stats.aotRuns++; return BigInt.asIntN(64, f()); }
+          catch (e) {
+            if (!(e instanceof DeoptUnwind)) throw e;
+            // Deopt inside the compiled callee: its state is spilled to the
+            // regfile; finish the frame by interpreting, contained here so the
+            // caller's wasm frame survives.
+            this.syncIn(); this.cpu.rip = e.rip;
+            this.interpUntil(() => this.cpu.rip === retAddr && this.cpu.regs[4] === rspExit);
+            this.syncOut();
+            return BigInt.asIntN(64, retAddr);
+          }
+        }
+        // Not compiled: fall back to interpreting the target to completion.
+        this.syncIn(); this.cpu.rip = target;
         this.interpUntil(() => this.cpu.rip === retAddr && this.cpu.regs[4] === rspExit);
         this.syncOut();
         return BigInt.asIntN(64, retAddr);
