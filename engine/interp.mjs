@@ -28,6 +28,14 @@ export class Memory {
       r.bytes[Number(addr + i - r.base)] = Number((v >> (8n * i)) & 0xFFn);
     }
   }
+  // a [addr, addr+len) range as one typed-array view, or null if it spans regions
+  view(addr, len) {
+    if (len <= 0n) return null;
+    const r = this.find(addr);
+    const off = Number(addr - r.base);
+    if (off + Number(len) > r.bytes.length) return null;
+    return r.bytes.subarray(off, off + Number(len));
+  }
 }
 
 export class CPU {
@@ -300,6 +308,21 @@ export class CPU {
       case 'cpuid': this.regs[0] = 0n; this.regs[3] = 0n; this.regs[1] = 0n; this.regs[2] = 0n; break;
       case 'movs': {
         const n = BigInt(S);
+        // bulk fast path (DF=0): one typed-array copy unless the ranges
+        // overlap with dst above src, where x86's forward element copy differs
+        // from memmove — fall back to the exact loop there.
+        if (insn.rep && this.regs[1] > 1n) {
+          const len = this.regs[1] * n;
+          const src = this.mem.view(this.regs[6], len), dst = this.mem.view(this.regs[7], len);
+          const overlapUp = this.regs[7] > this.regs[6] && this.regs[7] < this.regs[6] + len;
+          if (src && dst && !overlapUp) {
+            dst.set(src);
+            this.regs[6] = (this.regs[6] + len) & MASK[8];
+            this.regs[7] = (this.regs[7] + len) & MASK[8];
+            this.regs[1] = 0n;
+            break;
+          }
+        }
         do {
           if (insn.rep && this.regs[1] === 0n) break;
           this.mem.write(this.regs[7], n, this.mem.read(this.regs[6], n));
@@ -310,6 +333,18 @@ export class CPU {
         break; }
       case 'stos': {
         const n = BigInt(S), v = this.regs[0] & MASK[S];
+        if (insn.rep && this.regs[1] > 1n) {
+          const len = this.regs[1] * n;
+          const dst = this.mem.view(this.regs[7], len);
+          if (dst) {
+            if (S === 1) dst.fill(Number(v));
+            else { const b = []; for (let i = 0n; i < n; i++) b.push(Number((v >> (8n*i)) & 0xFFn));
+                   for (let o = 0; o < dst.length; o += S) for (let i = 0; i < S; i++) dst[o+i] = b[i]; }
+            this.regs[7] = (this.regs[7] + len) & MASK[8];
+            this.regs[1] = 0n;
+            break;
+          }
+        }
         do {
           if (insn.rep && this.regs[1] === 0n) break;
           this.mem.write(this.regs[7], n, v);
@@ -401,14 +436,14 @@ export class CPU {
       case 'pop': this.set(insn.dst, this.pop()); break;
       case 'jmp': this.rip = (next + insn.rel) & MASK[8]; break;
       case 'jmpind': this.rip = this.get(insn.src); break;
-      case 'callind': this.push(next); this.rip = this.get(insn.src); break;
+      case 'callind': this.push(next); this.rip = this.get(insn.src); if (this.onCall) this.onCall(this.rip); break;
       case 'jcc': if (this.cond(insn.cond)) this.rip = (next + insn.rel) & MASK[8]; break;
       case 'cmov': { const v = this.get(insn.src);
         if (this.cond(insn.cond)) this.setReg(insn.dst, v);
         else if (S === 4) this.setReg(insn.dst, this.getReg(insn.dst));  // 32-bit cmov zeroes upper even when not taken
         break; }
       case 'setcc': this.set(insn.dst, this.cond(insn.cond) ? 1n : 0n); break;
-      case 'call': this.push(next); this.rip = (next + insn.rel) & MASK[8]; break;
+      case 'call': this.push(next); this.rip = (next + insn.rel) & MASK[8]; if (this.onCall) this.onCall(this.rip); break;
       case 'ret': this.rip = this.pop(); break;
       case 'retn': this.rip = this.pop(); this.regs[4] = (this.regs[4] + insn.n) & MASK[8]; break;
       case 'leave': this.regs[4] = this.regs[5]; this.regs[5] = this.pop(); break;

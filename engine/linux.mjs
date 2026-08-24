@@ -7,13 +7,27 @@
 import { CPU, Memory } from './interp.mjs';
 import { compileLoop } from './jit2.mjs';
 import { compileVectorLoop } from './jitsimd.mjs';
+import { compileUnitWat } from './aot_wat.mjs';
 import { decode } from './decode.mjs';
 
 const PAGE = 4096n;
 const align = (v, a) => (v + a - 1n) & ~(a - 1n);
+const EXIT = Symbol('guest-exit');           // unwinds live wasm frames on exit()
+// A deopt DESTROYS the live wasm frames instead of interpreting under them:
+// at the escape point every register was spilled to the regfile and all
+// return addresses live on the guest stack, so the frames are pure execution
+// vehicles — the interpreter can continue from `rip` with zero retained JS
+// stack. This is what keeps escape handling O(1) in stack depth (a hot loop
+// containing a jump table would otherwise grow the stack on every trip).
+class DeoptUnwind { constructor(rip) { this.rip = rip; } }
 
 export class LinuxEngine {
-  constructor(elfBytes, { argv = ['prog'], memMB = 256, threshold = 8, files = {} } = {}) {
+  // threshold: legacy tier-1.5 loop JIT trigger. Defaults OFF — it miscompiles
+  // a vfprintf loop in glibc (wrong digits past the 22nd output byte) and the
+  // tier-2 whole-frame AOT subsumes it. Pass a finite value to re-enable for
+  // the tier's own test suites.
+  constructor(elfBytes, { argv = ['prog'], memMB = 256, threshold = Infinity, files = {},
+                          assembleWat = null, aotCallThreshold = 12, aotLoopThreshold = 40 } = {}) {
     this.files = files;                       // path -> Uint8Array (read-only)
     this.fds = new Map();                     // fd -> { bytes, pos } ; 0/1/2 reserved
     this.nextFd = 3;
@@ -47,6 +61,7 @@ export class LinuxEngine {
     const pages = Math.max(256, Math.ceil((this.RAMOFF + Number(total)) / 65536) + 16);
     this.wmem = new WebAssembly.Memory({ initial: pages });
     this.regview = new BigInt64Array(this.wmem.buffer, 0, 16);
+    this.fsview = new BigInt64Array(this.wmem.buffer, 128, 1);   // fs base for AOT TLS accesses
     this.ram = new Uint8Array(this.wmem.buffer, this.RAMOFF, Number(total));
     for (const s of loads)
       this.ram.set(elfBytes.subarray(s.off, s.off + s.filesz), Number(s.vaddr - lo));
@@ -61,9 +76,94 @@ export class LinuxEngine {
     this.cpu.rip = this.entry;
     this.profile = new Map(); this.compiled = new Map();
     this.threshold = threshold;
-    this.stats = { interpreted: 0, compiledRuns: 0, tiers: {}, syscalls: {} };
+    this.stats = { interpreted: 0, compiledRuns: 0, aotRuns: 0, tiers: {}, syscalls: {} };
     this.exitCode = null;
     this.stdout = [];
+    // ---- tier-2: runtime whole-function AOT ----
+    // assembleWat: (watText) -> Uint8Array of wasm; injected because the text
+    // assembler differs by host (wat2wasm CLI under node, wabt.js in a page).
+    this.assembleWat = assembleWat;
+    this.aotFns = new Map();                  // ripStr -> wasm export
+    this.aotFailed = new Set();
+    this.aotCalls = new Map();                // call-target profile
+    this.aotCallThreshold = aotCallThreshold;
+    this.aotLoopThreshold = aotLoopThreshold;
+    if (assembleWat) this.cpu.onCall = (t) => {
+      const k = t.toString();
+      if (this.aotFns.has(k) || this.aotFailed.has(k)) return;
+      const n = (this.aotCalls.get(k) || 0) + 1;
+      this.aotCalls.set(k, n);
+      if (n >= this.aotCallThreshold) this.tierUpAot(t);
+    };
+  }
+
+  // Compile the call-graph closure rooted at `entry` (a function entry or a
+  // loop head — the translator only needs "runs forward to this frame's ret")
+  // and register every function the unit produced for dispatch.
+  tierUpAot(entry) {
+    const k = entry.toString();
+    if (this.aotFns.has(k) || this.aotFailed.has(k)) return;
+    try {
+      const unit = compileUnitWat(this.mem, entry, { guestBase: this.base, ramBase: this.RAMOFF });
+      const bytes = this.assembleWat(unit.wat);
+      const inst = new WebAssembly.Instance(new WebAssembly.Module(bytes), { js: { mem: this.wmem }, env: this.aotEnv() });
+      for (const a of unit.funcs) {
+        const ak = a.toString();
+        if (!this.aotFns.has(ak)) this.aotFns.set(ak, inst.exports['f_' + a.toString(16)]);
+      }
+      if (!this.aotFns.has(k)) throw new Error('entry missing from unit');
+      this.stats.tiers.aot = (this.stats.tiers.aot || 0) + 1;
+    } catch (e) { this.aotFailed.add(k); }
+  }
+
+  syncOut() { for (let r = 0; r < 16; r++) this.regview[r] = BigInt.asIntN(64, this.cpu.regs[r]);
+              this.fsview[0] = BigInt.asIntN(64, this.cpu.fsBase || 0n); }
+  syncIn()  { for (let r = 0; r < 16; r++) this.cpu.regs[r] = BigInt.asUintN(64, this.regview[r]);
+              this.cpu.fsBase = BigInt.asUintN(64, this.fsview[0]); }
+
+  // Run one compiled function; a deopt inside it (or its wasm callees)
+  // unwinds here and execution state is already in the regfile/guest stack.
+  // Returns the rip to continue at.
+  dispatchAot(f) {
+    this.syncOut();
+    try { const exit = f(); this.syncIn(); this.stats.aotRuns++; return BigInt.asUintN(64, exit); }
+    catch (e) { if (e instanceof DeoptUnwind) { this.syncIn(); return BigInt.asUintN(64, e.rip); } throw e; }
+  }
+
+  // Interpret (dispatching into compiled functions when rip lands on one)
+  // until `done()` — used by the callout escape.
+  interpUntil(done) {
+    let guard = 0;
+    while (!done()) {
+      const f = this.aotFns.get(this.cpu.rip.toString());
+      if (f) { this.cpu.rip = this.dispatchAot(f); continue; }
+      this.cpu.step(); this.stats.interpreted++;
+      if (this.exitCode !== null) throw EXIT;
+      if (++guard > 5e9) throw new Error('escape runaway');
+    }
+  }
+
+  aotEnv() {
+    return {
+      syscall: () => {
+        this.syncIn();
+        this.syscall(this.cpu);
+        if (this.exitCode !== null) throw EXIT;
+        this.syncOut();
+      },
+      callout: (target) => {
+        target = BigInt.asUintN(64, target);
+        this.syncIn();
+        const retAddr = this.mem.read(this.cpu.regs[4], 8n);
+        const rspExit = BigInt.asUintN(64, this.cpu.regs[4] + 8n);
+        this.cpu.rip = target;
+        this.interpUntil(() => this.cpu.rip === retAddr && this.cpu.regs[4] === rspExit);
+        this.syncOut();
+        return BigInt.asIntN(64, retAddr);
+      },
+      // rsp0 is unused: the frames unwind, they are not interpreted under.
+      deopt: (rip, _rsp0) => { throw new DeoptUnwind(rip); },
+    };
   }
 
   setupStack(argv) {
@@ -194,29 +294,35 @@ export class LinuxEngine {
 
   run(maxSteps = 5e9) {
     let steps = 0;
-    while (steps++ < maxSteps && this.exitCode === null) {
-      const key = this.cpu.rip.toString();
-      const c = this.compiled.get(key);
-      if (c) {
-        for (let r = 0; r < 16; r++) this.regview[r] = BigInt.asIntN(64, this.cpu.regs[r]);
-        c.run();
-        for (let r = 0; r < 16; r++) this.cpu.regs[r] = BigInt.asUintN(64, this.regview[r]);
-        this.cpu.rip = c.exit; this.stats.compiledRuns++; continue;
-      }
-      const before = this.cpu.rip;
-      let insn;
-      try { insn = this.cpu.step(); }
-      catch (e) { e.rip = before; throw e; }
-      this.stats.interpreted++;
-      if (insn.mnem === 'jcc' && this.cpu.rip < before && this.inExec(this.cpu.rip)) {
-        const hk = this.cpu.rip.toString();
-        if (!this.compiled.has(hk)) {
+    try {
+      while (steps++ < maxSteps && this.exitCode === null) {
+        const key = this.cpu.rip.toString();
+        const f = this.aotFns.get(key);
+        if (f) { this.cpu.rip = this.dispatchAot(f); continue; }
+        const c = this.compiled.get(key);
+        if (c) {
+          for (let r = 0; r < 16; r++) this.regview[r] = BigInt.asIntN(64, this.cpu.regs[r]);
+          c.run();
+          for (let r = 0; r < 16; r++) this.cpu.regs[r] = BigInt.asUintN(64, this.regview[r]);
+          this.cpu.rip = c.exit; this.stats.compiledRuns++; continue;
+        }
+        const before = this.cpu.rip;
+        let insn;
+        try { insn = this.cpu.step(); }
+        catch (e) { if (e === EXIT) break; e.rip = before; throw e; }
+        this.stats.interpreted++;
+        if (insn.mnem === 'jcc' && this.cpu.rip < before && this.inExec(this.cpu.rip)) {
+          const hk = this.cpu.rip.toString();
           const n = (this.profile.get(hk) || 0) + 1;
           this.profile.set(hk, n);
-          if (n >= this.threshold) this.tryCompile(hk, this.cpu.rip);
+          // hot loop: first the cheap loop tiers, then whole-frame AOT from
+          // the loop head (the unit translator only needs "forward to ret")
+          if (n >= this.threshold && !this.compiled.has(hk)) this.tryCompile(hk, this.cpu.rip);
+          if (this.assembleWat && n >= this.aotLoopThreshold && !this.aotFns.has(hk) && !this.aotFailed.has(hk))
+            this.tierUpAot(this.cpu.rip);
         }
       }
-    }
+    } catch (e) { if (e !== EXIT) throw e; }
     return { exitCode: this.exitCode, stdout: this.stdout.join(''), stats: this.stats };
   }
 

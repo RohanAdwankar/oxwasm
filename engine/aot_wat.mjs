@@ -318,12 +318,15 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     if (['ret','retn','jmpind'].includes(last.mnem)) return [];
     return [idx(next)];
   };
-  // reverse postorder from entry (entry is address-order block 0)
+  // reverse postorder from the ENTRY block — which is NOT necessarily the
+  // lowest address: a unit rooted at a loop head can decode blocks below it.
   const An = a0.blocks.length; const order = []; const vis = new Uint8Array(An);
+  const entryIdx = a0.bidx.get(fnAddr.toString());
+  if (entryIdx === undefined) throw new Error('AOT: entry not a block leader');
   (function dfs(u) { vis[u] = 1;
     for (const v of succAddrIdx(u)) if (v >= 0 && !vis[v]) dfs(v);
     order.push(u);
-  })(0);
+  })(entryIdx);
   order.reverse();                                  // RPO in address-index space
   const rpoOf = new Array(An).fill(-1);
   order.forEach((addrIdx, r) => rpoOf[addrIdx] = r);
@@ -426,6 +429,8 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   };
   const woff = BigInt.asIntN(64, -guestBase + BigInt(ramBase));
   // i32 wasm offset: fold (disp + woff) into one constant; wrap base/index once.
+  // An fs-segment (TLS) access adds the live fs base, mirrored by the engine
+  // into regfile slot 16 (byte offset 128).
   const wasmAddr = (op, next) => {
     if (op.ripRel) return `(i32.const ${Number(BigInt.asIntN(32, next + op.disp + woff))})`;
     const k = Number(BigInt.asIntN(32, op.disp + woff));
@@ -433,6 +438,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     if (op.index >= 0) { let ix = `(i32.wrap_i64 (local.get ${reg(op.index)}))`;
       if (op.scale > 1) ix = `(i32.shl ${ix} (i32.const ${Math.log2(op.scale)}))`;
       e = `(i32.add ${e} ${ix})`; }
+    if (op.fs) e = `(i32.add ${e} (i32.wrap_i64 (i64.load (i32.const 128))))`;
     return k === 0 ? e : `(i32.add ${e} (i32.const ${k}))`;
   };
   const LD = { 1:'i64.load8_u', 2:'i64.load16_u', 4:'i64.load32_u', 8:'i64.load' };
@@ -737,6 +743,10 @@ export function compileUnitWat(mem, entry, opts = {}) {
     if (funcs.has(k) || poisoned.has(k)) continue;
     try {
       const an = analyze(mem, a, { maxInsns });
+      // a body that starts undecodable compiles to a pure deopt — worse than
+      // useless: dispatching it can ping-pong with the engine. Poison instead
+      // so control reaches the interpreter, which faults faithfully.
+      if (an.blocks[0].insns[0].mnem === 'udec') throw new Error('entry undecodable');
       funcs.set(k, an);
       for (const c of an.calls) if (!funcs.has(c) && !poisoned.has(c)) pending.push(BigInt(c));
     } catch (e) { poisoned.add(k); if (k === entry.toString()) throw e; }
