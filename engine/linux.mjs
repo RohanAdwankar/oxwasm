@@ -230,9 +230,19 @@ export class LinuxEngine {
                if (this.blocked) throw new BlockUnwind(this.cpu.rip);
                continue; }
       const before = this.cpu.rip;
-      this.cpu.step(); this.stats.interpreted++;
+      const insn = this.cpu.step(); this.stats.interpreted++;
       if (this.exitCode !== null) throw EXIT;
       if (this.blocked) { this.cpu.rip = before; throw new BlockUnwind(before); }
+      // profile back-edges here too: a callout can nest arbitrarily deep and
+      // run for millions of steps — without tier-up, everything under it
+      // would stay interpreted forever (GIMP's babl LUT init lives here)
+      if (insn.mnem === 'jcc' && this.cpu.rip < before && this.inExec(this.cpu.rip)) {
+        const hk = this.cpu.rip.toString();
+        const n = (this.profile.get(hk) || 0) + 1;
+        this.profile.set(hk, n);
+        if (this.assembleWat && n >= this.aotLoopThreshold && !this.aotFns.has(hk) && !this.aotFailed.has(hk))
+          this.tierUpAot(this.cpu.rip);
+      }
       if (++guard > 5e9) throw new Error('escape runaway');
     }
   }
@@ -645,6 +655,29 @@ export class LinuxEngine {
           off += reclen; h.pos++;
         }
         ret(BigInt(off)); break; }
+      case 78: {                                              // getdents (old layout: d_type is the LAST byte)
+        const h = this.fds.get(Number(a1));
+        if (!h?.isdir) { ret(-20n); break; }
+        const entries = h.entries ??= this.dirEntries(h.path);
+        const cap = Number(a3);
+        let off = 0;
+        const base = this.RAMOFF + Number(a2 - this.base);
+        const v = new DataView(this.wmem.buffer);
+        while (h.pos < entries.length) {
+          const [name, isdir] = entries[h.pos];
+          const nb = new TextEncoder().encode(name);
+          const reclen = (18 + nb.length + 1 + 1 + 7) & ~7;   // header + name + NUL + d_type
+          if (off + reclen > cap) break;
+          v.setBigUint64(base + off, BigInt(h.pos + 100), true);        // d_ino
+          v.setBigUint64(base + off + 8, BigInt(h.pos + 1), true);      // d_off
+          v.setUint16(base + off + 16, reclen, true);
+          new Uint8Array(this.wmem.buffer, base + off + 18, reclen - 18).fill(0);
+          new Uint8Array(this.wmem.buffer, base + off + 18, nb.length).set(nb);
+          v.setUint8(base + off + reclen - 1, isdir ? 4 : 8);           // DT_DIR / DT_REG
+          off += reclen; h.pos++;
+        }
+        ret(BigInt(off)); break; }
+      case 221: ret(0n); break;                               // fadvise64: hints are free
       case 72: {                                              // fcntl
         const h = this.fds.get(Number(a1)), cmd = Number(a2);
         if (cmd === 3) { ret(BigInt(2 | (h?.sock?.nonblock ? 0x800 : 0))); break; }   // F_GETFL: O_RDWR
