@@ -17,6 +17,7 @@ node multest.mjs
 node disptest.mjs
 node pushmemtest.mjs
 node callmemtest.mjs
+node packedtest.mjs
 node xflagtest.mjs
 node addflagtest.mjs
 node adctest.mjs

@@ -647,6 +647,12 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   const pshufdIdx = (imm) => { const idx = [];
     for (let d = 0; d < 4; d++) { const sel = (imm >> (d*2)) & 3; for (let bb = 0; bb < 4; bb++) idx.push(sel*4 + bb); }
     return idx; };
+  const pshufwIdx = (imm, high) => {   // pshuflw (high=0) / pshufhw (high=8): shuffle 4 words in one half, other half copied
+    const idx = [];
+    for (let b = 0; b < (high ? 8 : 0); b++) idx.push(b);
+    for (let w = 0; w < 4; w++) { const sel = (imm >> (w*2)) & 3; idx.push(high + sel*2, high + sel*2 + 1); }
+    for (let b = high + 8; b < 16; b++) idx.push(b);
+    return idx; };
   const LANE_BIN = {  // op -> wasm lane binary op applied to (dst, src)
     0xFC:'i8x16.add', 0xFD:'i16x8.add', 0xFE:'i32x4.add', 0xD4:'i64x2.add',
     0xF8:'i8x16.sub', 0xF9:'i16x8.sub', 0xFA:'i32x4.sub', 0xFB:'i64x2.sub',
@@ -702,12 +708,24 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       case 0xD6: storeRm(8, dst); break;                                      // movq store low 64
       case 0xD7: L.push(wr32reg(xr, `(i8x16.bitmask ${xv(rm, next)})`)); break;   // pmovmskb -> GPR
       case 0x50: L.push(wr32reg(xr, `(${insn.p66?'i64x2.bitmask':'i32x4.bitmask'} ${xv(rm, next)})`)); break;  // movmskps/pd
-      case 0x70: put(`(i8x16.shuffle ${pshufdIdx(insn.imm8).join(' ')} ${xv(rm, next)} ${xv(rm, next)})`); break;  // pshufd
+      case 0x70: {                                                            // pshufd (66) / pshuflw (F2) / pshufhw (F3)
+        const idx = insn.pF2 ? pshufwIdx(insn.imm8, 0) : insn.pF3 ? pshufwIdx(insn.imm8, 8) : pshufdIdx(insn.imm8);
+        put(`(i8x16.shuffle ${idx.join(' ')} ${xv(rm, next)} ${xv(rm, next)})`); break; }
       case 0x60: case 0x61: case 0x62: case 0x68: case 0x69: case 0x6A: {     // punpck l/h bw/wd/dq
         const EB = { 0x60:1,0x61:2,0x62:4,0x68:1,0x69:2,0x6A:4 }[op], high = op >= 0x68;
         put(`(i8x16.shuffle ${unpckIdx(EB, high).join(' ')} ${dst} ${xv(rm, next)})`); break; }
       case 0x6C: put(`(i8x16.shuffle 0 1 2 3 4 5 6 7 16 17 18 19 20 21 22 23 ${dst} ${xv(rm, next)})`); break;  // punpcklqdq
       case 0x6D: put(`(i8x16.shuffle 8 9 10 11 12 13 14 15 24 25 26 27 28 29 30 31 ${dst} ${xv(rm, next)})`); break; // punpckhqdq
+      case 0x67: put(`(i8x16.narrow_i16x8_u ${dst} ${xv(rm, next)})`); break; // packuswb
+      case 0x63: put(`(i8x16.narrow_i16x8_s ${dst} ${xv(rm, next)})`); break; // packsswb
+      case 0x6B: put(`(i16x8.narrow_i32x4_s ${dst} ${xv(rm, next)})`); break; // packssdw
+      case 0xE4: case 0xE5: {                                                 // pmulhuw/pmulhw: high 16 of widened products
+        const s = VT(); L.push(`(local.set ${s} ${xv(rm, next)})`);
+        const sg = op === 0xE5 ? 's' : 'u';
+        put(`(i8x16.shuffle 2 3 6 7 10 11 14 15 18 19 22 23 26 27 30 31 ` +
+            `(i32x4.extmul_low_i16x8_${sg} ${dst} (local.get ${s})) ` +
+            `(i32x4.extmul_high_i16x8_${sg} ${dst} (local.get ${s})))`);
+        break; }
       case 0xF4: {                                                            // pmuludq: lanes 0,2 u32 -> u64
         const s = VT(); L.push(`(local.set ${s} ${xv(rm, next)})`);
         put(`(i64x2.mul (v128.and ${dst} (v128.const i64x2 0xFFFFFFFF 0xFFFFFFFF)) (v128.and (local.get ${s}) (v128.const i64x2 0xFFFFFFFF 0xFFFFFFFF)))`);

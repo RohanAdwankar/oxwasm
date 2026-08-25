@@ -178,6 +178,31 @@ export class CPU {
           case 0xEF: this.xmm[insn.xr] = (this.xmm[insn.xr] ^ rdRm(16)) & M128; break;  // pxor
           case 0xDB: this.xmm[insn.xr] = this.xmm[insn.xr] & rdRm(16); break;           // pand
           case 0xEB: this.xmm[insn.xr] = (this.xmm[insn.xr] | rdRm(16)) & M128; break;  // por
+          case 0xDF: this.xmm[insn.xr] = (~this.xmm[insn.xr] & rdRm(16)) & M128; break; // pandn
+          case 0xE7: wrRm(16, this.xmm[insn.xr]); break;                                // movntdq (plain store)
+          case 0xF5: {  // pmaddwd: dword lanes = a2k*b2k + a2k+1*b2k+1 (signed words, wrapping i32)
+            const a = this.xmm[insn.xr], b2 = rdRm(16); let r = 0n;
+            for (let k = 0n; k < 4n; k++) {
+              const s = (i) => BigInt.asIntN(16, (a >> (32n*k + 16n*i)) & 0xFFFFn) *
+                              BigInt.asIntN(16, (b2 >> (32n*k + 16n*i)) & 0xFFFFn);
+              r |= (BigInt.asUintN(32, s(0n) + s(1n))) << (32n * k);
+            }
+            this.xmm[insn.xr] = r; break; }
+          case 0xD1: case 0xD2: case 0xD3: case 0xE1: case 0xE2: case 0xF1: case 0xF2: case 0xF3: {
+            // p{srl,sra,sll}{w,d,q} by-register: count = low 64 bits of src operand
+            const EB = { 0xD1:2, 0xE1:2, 0xF1:2, 0xD2:4, 0xE2:4, 0xF2:4, 0xD3:8, 0xF3:8 }[insn.op];
+            const kind = insn.op >= 0xF1 ? 'sll' : insn.op >= 0xE1 ? 'sra' : 'srl';
+            const cnt = rdRm(16) & 0xFFFFFFFFFFFFFFFFn;
+            const eb = BigInt(EB * 8), mask = (1n << eb) - 1n;
+            const a = this.xmm[insn.xr]; let r = 0n;
+            for (let k = 0n; k < BigInt(16 / EB); k++) {
+              let v = (a >> (k * eb)) & mask;
+              if (kind === 'sra') { v = BigInt.asIntN(EB * 8, v) >> (cnt < eb ? cnt : eb - 1n); v &= mask; }
+              else if (cnt >= eb) v = 0n;
+              else v = kind === 'sll' ? (v << cnt) & mask : v >> cnt;
+              r |= v << (k * eb);
+            }
+            this.xmm[insn.xr] = r; break; }
           case 0x74: {  // pcmpeqb
             const a = this.xmm[insn.xr], b2 = rdRm(16); let r = 0n;
             for (let k = 0n; k < 16n; k++)
@@ -218,11 +243,25 @@ export class CPU {
               r |= e2 << ((2n * k + 1n) * eb);
             }
             this.xmm[insn.xr] = r; break; }
-          case 0x70: {                                // pshufd (66) / pshuflw(F2)/hw(F3): implement 66 form
+          case 0x70: {                                // pshufd (66) / pshuflw (F2) / pshufhw (F3)
             const src = rdRm(16); let r = 0n;
-            for (let k = 0n; k < 4n; k++) {
-              const sel = BigInt((insn.imm8 >> Number(k) * 2) & 3);
-              r |= ((src >> (sel * 32n)) & 0xFFFFFFFFn) << (k * 32n);
+            if (insn.pF2) {                           // shuffle the low 4 words, high half copied
+              r = src & (0xFFFFFFFFFFFFFFFFn << 64n);
+              for (let k = 0n; k < 4n; k++) {
+                const sel = BigInt((insn.imm8 >> Number(k) * 2) & 3);
+                r |= ((src >> (sel * 16n)) & 0xFFFFn) << (k * 16n);
+              }
+            } else if (insn.pF3) {                    // shuffle the high 4 words, low half copied
+              r = src & 0xFFFFFFFFFFFFFFFFn;
+              for (let k = 0n; k < 4n; k++) {
+                const sel = BigInt((insn.imm8 >> Number(k) * 2) & 3);
+                r |= ((src >> (64n + sel * 16n)) & 0xFFFFn) << (64n + k * 16n);
+              }
+            } else {                                  // pshufd: dwords
+              for (let k = 0n; k < 4n; k++) {
+                const sel = BigInt((insn.imm8 >> Number(k) * 2) & 3);
+                r |= ((src >> (sel * 32n)) & 0xFFFFFFFFn) << (k * 32n);
+              }
             }
             this.xmm[insn.xr] = r; break; }
           case 0xFB: case 0xFA: case 0xF9: case 0xF8: {   // psubq/d/w/b
