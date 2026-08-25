@@ -27,27 +27,76 @@ for (let i = 0; i < args.length; i++) {
 if (!sysroot || !guestPath) { console.error('usage: xpack SYSROOT /usr/bin/app [-o out.html] [--title T] [--size WxH] [--fonts DIR]'); process.exit(1); }
 title ??= guestPath.split('/').pop();
 
-// ---- collect guest files: binary, libraries, X resources -------------------
-// prune the bulk we know the X stack never reads
-const SKIP = /\/usr\/share\/(man|doc|lintian|bug|groff|pixmaps|icons|info)\/|\/usr\/(games|sbin)\/|\.py$|perl|\/var\//;
-const KEEP = /(\.so[.\d]*$)|\/etc\/X11\/app-defaults\/|\/usr\/share\/X11\/|\/etc\/(ld\.so|fonts)|\/usr\/lib\/locale\//;
-const files = {};
+// ---- collect guest files: the binary, its DT_NEEDED closure, X resources ---
+const hostOf = {};                                       // guest path -> host path
 (function walk(dir, guest) {
   for (const name of readdirSync(dir)) {
     const p = join(dir, name), g = guest + '/' + name;
     let st; try { st = lstatSync(p); } catch { continue; }
     if (st.isSymbolicLink()) {
       try { const real = realpathSync(p);
-        if (lstatSync(real).isFile()) maybe(g, real);
+        if (lstatSync(real).isFile()) hostOf[g] = real;
         else if (lstatSync(real).isDirectory()) walk(real, g);
       } catch {}
     } else if (st.isDirectory()) walk(p, g);
-    else if (st.isFile()) maybe(g, p);
+    else if (st.isFile()) hostOf[g] = p;
   }
 })(sysroot, '');
-function maybe(g, host) {
-  if (g === guestPath || (KEEP.test(g) && !SKIP.test(g)))
-    files[g] = readFileSync(host);
+
+// DT_NEEDED sonames from an ELF's dynamic section (no host tools needed)
+function neededOf(bytes) {
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.length);
+  if (dv.getUint32(0, true) !== 0x464c457f) return [];
+  const phoff = Number(dv.getBigUint64(32, true));
+  const phent = dv.getUint16(54, true), phnum = dv.getUint16(56, true);
+  let dynOff = null, dynSz = 0;
+  const loads = [];
+  for (let i = 0; i < phnum; i++) {
+    const o = phoff + i * phent, type = dv.getUint32(o, true);
+    if (type === 2) { dynOff = Number(dv.getBigUint64(o + 8, true)); dynSz = Number(dv.getBigUint64(o + 32, true)); }
+    if (type === 1) loads.push({ off: Number(dv.getBigUint64(o + 8, true)), vaddr: Number(dv.getBigUint64(o + 16, true)), sz: Number(dv.getBigUint64(o + 32, true)) });
+  }
+  if (dynOff === null) return [];
+  const v2o = (v) => { for (const s of loads) if (v >= s.vaddr && v < s.vaddr + s.sz) return s.off + (v - s.vaddr); return null; };
+  let strtab = null; const needs = [];
+  for (let o = dynOff; o + 16 <= dynOff + dynSz; o += 16) {
+    const tag = Number(dv.getBigUint64(o, true)), val = Number(dv.getBigUint64(o + 8, true));
+    if (tag === 5) strtab = v2o(val);
+    if (tag === 1) needs.push(val);
+    if (tag === 0) break;
+  }
+  if (strtab === null) return [];
+  return needs.map(off => { let s = ''; for (let i = strtab + off; bytes[i]; i++) s += String.fromCharCode(bytes[i]); return s; });
+}
+const files = {};
+const libdirs = ['/usr/lib/x86_64-linux-gnu', '/lib/x86_64-linux-gnu'];
+const queue = [guestPath];
+while (queue.length) {
+  const g = queue.pop();
+  if (files[g] || !hostOf[g]) continue;
+  files[g] = readFileSync(hostOf[g]);
+  for (const so of neededOf(files[g]))
+    for (const d of libdirs) if (hostOf[d + '/' + so] && !files[d + '/' + so]) { queue.push(d + '/' + so); break; }
+}
+// libraries Xlib dlopens at runtime (not DT_NEEDED anywhere): the cursor-
+// theme path in particular crashes if libXcursor loads partially
+for (const so of ['libXcursor.so.1', 'libXfixes.so.3', 'libXrender.so.1']) {
+  for (const d of libdirs) {
+    const g = d + '/' + so;
+    if (hostOf[g] && !files[g]) { files[g] = readFileSync(hostOf[g]);
+      for (const dep of neededOf(files[g]))
+        for (const dd of libdirs) if (hostOf[dd + '/' + dep] && !files[dd + '/' + dep]) { files[dd + '/' + dep] = readFileSync(hostOf[dd + '/' + dep]); break; }
+      break; }
+  }
+}
+// the PT_INTERP dynamic linker (not a DT_NEEDED entry)
+for (const cand of ['/lib/x86_64-linux-gnu/ld-2.27.so', '/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2', '/lib64/ld-linux-x86-64.so.2'])
+  if (hostOf[cand]) { files[cand] = readFileSync(hostOf[cand]); break; }
+// X resources the client stack reads at runtime (skip heavyweight locale data)
+for (const [g, h] of Object.entries(hostOf)) {
+  if (g.startsWith('/etc/X11/app-defaults/') ||
+      (g.startsWith('/usr/share/X11/locale/') && /\/(C|locale\.alias|locale\.dir|compose\.dir)/.test(g)))
+    files[g] = readFileSync(h);
 }
 if (files['/lib/x86_64-linux-gnu/ld-2.27.so'] && !files['/lib64/ld-linux-x86-64.so.2'])
   files['/lib64/ld-linux-x86-64.so.2'] = files['/lib/x86_64-linux-gnu/ld-2.27.so'];
