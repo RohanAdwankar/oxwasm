@@ -272,6 +272,10 @@ export class LinuxEngine {
         // code must too): rcx = return rip, r11 = rflags
         this.cpu.regs[1] = BigInt.asUintN(64, (rip ?? 0n) + 2n);
         this.cpu.regs[11] = this.cpu.flagsValue ? this.cpu.flagsValue() : 0x246n;
+        // rip must be the post-syscall address BEFORE dispatch: clone() seeds
+        // the child thread from cpu.rip (a stale value sent a pthread into
+        // the weeds); the blocked path below rewinds it for re-execution
+        this.cpu.rip = BigInt.asUintN(64, (rip ?? 0n) + 2n);
         this.syscall(this.cpu);
         if (this.exitCode !== null) throw EXIT;
         if (this.blocked) {
