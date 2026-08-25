@@ -445,6 +445,10 @@ function emitUnitFunction(a0, fnAddr, ctx) {
         if (insn.rep) { seenR[1]=true; any64[1]=true; } break; }
       case 'movs': { seenR[6]=true; any64[6]=true; seenR[7]=true; any64[7]=true;
         if (insn.rep) { seenR[1]=true; any64[1]=true; } break; }
+      case 'cmps': case 'scas': {
+        if (insn.mnem === 'cmps') { seenR[6]=true; any64[6]=true; } else { seenR[0]=true; any64[0]=true; }
+        seenR[7]=true; any64[7]=true;
+        if (insn.rep || insn.rep2) { seenR[1]=true; any64[1]=true; } break; }
       case 'cld': case 'std': break;
       case 'sse': {   // mark only the GPR side; xmm registers live in v128 locals
         const mark = (r) => { seenR[r]=true; any64[r]=true; };
@@ -849,7 +853,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     L.push(setx(insn.xrm, e));
   }
 
-  const FLAGSET = new Set(['add','sub','and','or','xor','inc','dec','cmp','test','neg','cmpxchg','xadd']);
+  const FLAGSET = new Set(['add','sub','and','or','xor','inc','dec','cmp','test','neg','cmpxchg','xadd','cmps','scas']);
   // A modeled flag producer is one whose flags we can reconstruct lazily.
   const modeled = (insn) => {
     if (FLAGSET.has(insn.mnem)) return true;
@@ -872,7 +876,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   const flagKind = (insn) => { const S = insn.size || 8;
     switch (insn.mnem) {
       case 'sse': return (insn.op === 0x2E || insn.op === 0x2F) ? { kind:'fcmp', size:8 } : null;
-      case 'sub': case 'cmp': case 'neg': case 'cmpxchg': return { kind:'sub', size:S };
+      case 'sub': case 'cmp': case 'neg': case 'cmpxchg': case 'cmps': case 'scas': return { kind:'sub', size:S };
       case 'add': case 'xadd': return { kind:'add', size:S };
       case 'adc': return { kind:'adc', size:S };
       case 'sbb': return { kind:'sbb', size:S };
@@ -1385,6 +1389,32 @@ function emitUnitFunction(a0, fnAddr, ctx) {
             L.push(`(${ST[S]} ${wasmAddr({base:7,index:-1,disp:0n},next)} (${LD[S]} ${wasmAddr({base:6,index:-1,disp:0n},next)}))`,
                    `(local.set $r6 (i64.add (local.get $r6) (i64.const ${S})))`, `(local.set $r7 (i64.add (local.get $r7) (i64.const ${S})))`);
           }
+          break; }
+        case 'cmps': case 'scas': {
+          // repe/repne string compare; flags ('sub' kind) come from the LAST
+          // element pair, stored into $fa/$fb/$fr every iteration
+          if (hasStd) throw new Error('AOT: cmps/scas with std @ '+insn.rip.toString(16));
+          const isCmps = insn.mnem === 'cmps';
+          const ldA = isCmps ? `(${LD[S]} ${wasmAddr({base:6,index:-1,disp:0n},next)})`
+                             : (S === 8 ? `(local.get $r0)` : `(i64.and (local.get $r0) (i64.const ${m}))`);
+          const ldB = `(${LD[S]} ${wasmAddr({base:7,index:-1,disp:0n},next)})`;
+          const body = [
+            `(local.set $fa ${ldA})`,
+            `(local.set $fb ${ldB})`,
+            `(local.set $fr (i64.and (i64.sub (local.get $fa) (local.get $fb)) (i64.const ${m})))`,
+            ...(isCmps ? [`(local.set $r6 (i64.add (local.get $r6) (i64.const ${S})))`] : []),
+            `(local.set $r7 (i64.add (local.get $r7) (i64.const ${S})))`,
+          ];
+          if (insn.rep || insn.rep2) {
+            const e = '$ce_'+insn.rip.toString(16), lp = '$cl_'+insn.rip.toString(16);
+            // repe (rep): stop when fr != 0; repne (rep2): stop when fr == 0
+            const stop = insn.rep2 ? `(i64.eqz (local.get $fr))` : `(i64.ne (local.get $fr) (i64.const 0))`;
+            L.push(`(block ${e} (loop ${lp} (br_if ${e} (i64.eqz (local.get $r1)))`,
+                   ...body,
+                   `(local.set $r1 (i64.sub (local.get $r1) (i64.const 1)))`,
+                   `(br_if ${e} ${stop}) (br ${lp})))`);
+          } else L.push(...body);
+          flagState = { kind: 'sub', size: S };
           break; }
         case 'push': {
           // a disciplined savedI32 reg's prologue push reads its regfile slot,
