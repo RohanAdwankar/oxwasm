@@ -20,6 +20,13 @@ const EXIT = Symbol('guest-exit');           // unwinds live wasm frames on exit
 // stack. This is what keeps escape handling O(1) in stack depth (a hot loop
 // containing a jump table would otherwise grow the stack on every trip).
 class DeoptUnwind { constructor(rip) { this.rip = rip; } }
+// A blocking syscall (poll/select/read with nothing ready, nanosleep) suspends
+// the guest the same way a deopt escapes compiled code: every register is
+// already in the regfile / cpu and the syscall insn's rip is recorded, so ALL
+// wasm frames are destroyed and the engine returns to its caller with
+// `engine.blocked` set. Resuming just re-enters run(): the syscall RE-EXECUTES
+// (rax still holds the syscall number) and either completes or blocks again.
+class BlockUnwind { constructor(rip) { this.rip = rip; } }
 
 export class LinuxEngine {
   // threshold: legacy tier-1.5 loop JIT trigger. Defaults OFF — it miscompiles
@@ -27,9 +34,16 @@ export class LinuxEngine {
   // tier-2 whole-frame AOT subsumes it. Pass a finite value to re-enable for
   // the tier's own test suites.
   constructor(elfBytes, { argv = ['prog'], env = [], memMB = 256, threshold = Infinity, files = {},
-                          assembleWat = null, aotCallThreshold = 12, aotLoopThreshold = 40 } = {}) {
+                          assembleWat = null, aotCallThreshold = 12, aotLoopThreshold = 40,
+                          xserver = null } = {}) {
     this.files = files;                       // path -> Uint8Array (read-only)
     this.env = env;                           // "KEY=VALUE" strings
+    // display/input layer: an X11-protocol server object (see xserver.mjs).
+    // AF_UNIX connects to /tmp/.X11-unix/X* attach to it; its screen is the
+    // engine's framebuffer and its event queue is the engine's input.
+    this.xserver = xserver;
+    this.blocked = null;                      // {deadline: ms|null} while suspended on a blocking syscall
+    this._deadline = null;                    // survives re-execution of the same blocked poll/select/sleep
     // real fd table: 0 empty stdin, 1 stdout, 2 stderr. open() and dup()
     // allocate the LOWEST free fd, like Linux — busybox relies on
     // close(0); open(file) landing the file on fd 0.
@@ -200,7 +214,9 @@ export class LinuxEngine {
   dispatchAot(f) {
     this.syncOut();
     try { const exit = f(); this.syncIn(); this.stats.aotRuns++; return BigInt.asUintN(64, exit); }
-    catch (e) { if (e instanceof DeoptUnwind) { this.syncIn(); return BigInt.asUintN(64, e.rip); } throw e; }
+    catch (e) { if (e instanceof DeoptUnwind) { this.syncIn(); return BigInt.asUintN(64, e.rip); }
+                if (e instanceof BlockUnwind) { this.syncIn(); return BigInt.asUintN(64, e.rip); }
+                throw e; }
   }
 
   // Interpret (dispatching into compiled functions when rip lands on one)
@@ -209,19 +225,31 @@ export class LinuxEngine {
     let guard = 0;
     while (!done()) {
       const f = this.aotFns.get(this.cpu.rip.toString());
-      if (f) { this.cpu.rip = this.dispatchAot(f); continue; }
+      if (f) { this.cpu.rip = this.dispatchAot(f);
+               if (this.blocked) throw new BlockUnwind(this.cpu.rip);
+               continue; }
+      const before = this.cpu.rip;
       this.cpu.step(); this.stats.interpreted++;
       if (this.exitCode !== null) throw EXIT;
+      if (this.blocked) { this.cpu.rip = before; throw new BlockUnwind(before); }
       if (++guard > 5e9) throw new Error('escape runaway');
     }
   }
 
   aotEnv() {
     return {
-      syscall: () => {
+      // rip = guest address of the syscall instruction (an emit-time constant)
+      // so a blocking syscall can suspend: state is spilled, frames unwind,
+      // and resume re-executes the syscall at exactly this rip.
+      syscall: (rip) => {
         this.syncIn();
         this.syscall(this.cpu);
         if (this.exitCode !== null) throw EXIT;
+        if (this.blocked) {
+          this.cpu.rip = BigInt.asUintN(64, rip ?? 0n);
+          this.syncOut();
+          throw new BlockUnwind(this.cpu.rip);
+        }
         this.syncOut();
       },
       callout: (target) => {
@@ -298,6 +326,9 @@ export class LinuxEngine {
     return p; }
   lookup(p) { return this.files[p] ?? this.files[p.replace(/^\.\//, '')]; }
   allocFd() { let fd = 0; while (this.fds.has(fd)) fd++; return fd; }
+  nowMs() { return (typeof performance !== 'undefined') ? performance.now() : Date.now(); }
+  block(deadline) { this.blocked = { deadline: deadline ?? null }; }
+  wake() { this.blocked = null; }
 
   syscall(cpu) {
     const nr = Number(cpu.regs[0]);
@@ -310,6 +341,7 @@ export class LinuxEngine {
       if (len <= 0) return;
       const bytes = this.ram.slice(Number(addr - this.base), Number(addr - this.base) + len);
       const h = defSink(fd);
+      if (h?.sock?.conn) { h.sock.conn.write(bytes); return; }
       if (h?.pipe) { h.pipe.chunks.push(bytes); return; }
       const str = new TextDecoder().decode(bytes);
       if (h?.sink === 'err') { (this.stderr ||= []).push(str); (this.stderrBytes ||= []).push(bytes); }
@@ -390,13 +422,39 @@ export class LinuxEngine {
       case 218: ret(1n); break;                              // set_tid_address
       case 60: case 231:                                     // exit, exit_group
         this.exitCode = Number(a1 & 0xffn); cpu.halted = true; ret(0n); break;
-      case 228: ret(0n); break;                              // clock_gettime (zeros)
-      case 35: ret(0n); break;                               // nanosleep
+      case 228: {                                            // clock_gettime(clk, ts*)
+        const clk = Number(a1), o = this.RAMOFF + Number(a2 - this.base);
+        const v = new DataView(this.wmem.buffer);
+        const ms = (clk === 0 || clk === 5 || clk === 6) ? Date.now() : this.nowMs();
+        v.setBigUint64(o, BigInt(Math.floor(ms / 1000)), true);
+        v.setBigUint64(o + 8, BigInt(Math.floor((ms % 1000) * 1e6)), true);
+        ret(0n); break; }
+      case 201: ret(BigInt(Math.floor(Date.now() / 1000))); break;   // time
+      case 35: case 230: {                                   // nanosleep / clock_nanosleep
+        const req = nr === 35 ? a1 : cpu.regs[2];            // rdx for clock_nanosleep
+        const abs = nr === 230 && (Number(a2) & 1);          // TIMER_ABSTIME
+        if (req === 0n) { ret(0n); break; }
+        const o = this.RAMOFF + Number(req - this.base);
+        const v = new DataView(this.wmem.buffer);
+        const tms = Number(v.getBigUint64(o, true)) * 1000 + Number(v.getBigUint64(o + 8, true)) / 1e6;
+        const now = this.nowMs();
+        const deadline = this._deadline ??
+          (abs ? (Number(a1) === 0 ? tms - Date.now() + now : tms) : now + tms);
+        if (now >= deadline) { this._deadline = null; ret(0n); break; }
+        this._deadline = deadline; this.block(deadline); break; }
       case 39: ret(1n); break;                               // getpid
       case 102: case 104: case 107: case 108: ret(0n); break; // getuid/getgid/geteuid/getegid
       case 105: case 106: ret(0n); break;                     // setuid/setgid
       case 157: ret(0n); break;                               // prctl
-      case 96: ret(0n); break;                                // gettimeofday
+      case 96: {                                              // gettimeofday(tv*, tz)
+        if (a1 !== 0n) {
+          const o = this.RAMOFF + Number(a1 - this.base);
+          const v = new DataView(this.wmem.buffer);
+          const ms = Date.now();
+          v.setBigUint64(o, BigInt(Math.floor(ms / 1000)), true);
+          v.setBigUint64(o + 8, BigInt(Math.floor((ms % 1000) * 1000)), true);
+        }
+        ret(0n); break; }
       case 257: case 2: {                                     // openat(dirfd,path,flags) / open(path,flags)
         const p = this.readPath(nr === 257 ? a2 : a1);
         const f = this.lookup(p);
@@ -407,6 +465,14 @@ export class LinuxEngine {
       case 0: {                                               // read(fd, buf, len)
         const fd = Number(a1), h = this.fds.get(fd);
         if (!h) { ret(fd === 0 ? 0n : -9n); break; }          // stdin -> EOF
+        if (h.sock) {                                         // stream socket (X connection)
+          const c = h.sock.conn;
+          if (!c) { ret(-107n); break; }                      // ENOTCONN
+          const data = c.read(Number(a3));
+          if (data === null) { if (h.sock.nonblock) ret(-11n); else this.block(null); break; }
+          this.ram.set(data, Number(a2 - this.base));
+          ret(BigInt(data.length)); break;
+        }
         if (h.pipe) {                                         // drain the shared pipe buffer
           const want = Number(a3); let dst = Number(a2 - this.base), got = 0;
           while (got < want && h.pipe.chunks.length) {
@@ -446,6 +512,7 @@ export class LinuxEngine {
           const h = this.fds.get(Number(a1));
           if (h?.bytes) { size = h.bytes.length; mode = 0o100755; }        // regular file
           else if (h?.pipe) { size = 0; mode = 0o010600; }                 // FIFO
+          else if (h?.sock) { size = 0; mode = 0o140777; }                 // socket
           // sink/tty: leave mode as the char-device default
         }
         const buf = isAt ? cpu.regs[2] : a2;
@@ -459,6 +526,20 @@ export class LinuxEngine {
         v.setBigUint64(off + 48, BigInt(size ?? 0), true);    // st_size
         v.setBigUint64(off + 56, 4096n, true);                // st_blksize
         v.setBigUint64(off + 64, BigInt(Math.ceil((size ?? 0) / 512)), true);    // st_blocks
+        ret(0n); break; }
+      case 4: case 6: {                                       // stat / lstat (by path)
+        const f = this.lookup(this.readPath(a1));
+        if (f === undefined) { ret(-2n); break; }             // ENOENT
+        const off = this.RAMOFF + Number(a2 - this.base);
+        new Uint8Array(this.wmem.buffer, off, 144).fill(0);
+        const v = new DataView(this.wmem.buffer);
+        v.setBigUint64(off + 0, 8n, true);
+        v.setBigUint64(off + 8, BigInt((f.length % 1e6) + 3), true);
+        v.setBigUint64(off + 16, 1n, true);
+        v.setUint32(off + 24, 0o100755, true);
+        v.setBigUint64(off + 48, BigInt(f.length), true);
+        v.setBigUint64(off + 56, 4096n, true);
+        v.setBigUint64(off + 64, BigInt(Math.ceil(f.length / 512)), true);
         ret(0n); break; }
       case 17: {                                              // pread64(fd, buf, count, off)
         const h = this.fds.get(Number(a1));
@@ -497,11 +578,198 @@ export class LinuxEngine {
         this.ram.fill(0, Number(a1 - this.base), Number(a1 - this.base) + 112); ret(0n); break; }
       case 332: ret(-38n); break;                             // statx -> ENOSYS (glibc falls back)
       case 217: ret(-2n); break;                              // getdents64
-      case 72: ret(0n); break;                                // fcntl
+      case 72: {                                              // fcntl
+        const h = this.fds.get(Number(a1)), cmd = Number(a2);
+        if (cmd === 3) { ret(BigInt(2 | (h?.sock?.nonblock ? 0x800 : 0))); break; }   // F_GETFL: O_RDWR
+        if (cmd === 4) { if (h?.sock) h.sock.nonblock = !!(Number(a3) & 0x800); ret(0n); break; }  // F_SETFL
+        if (cmd === 0 || cmd === 1030) {                      // F_DUPFD / F_DUPFD_CLOEXEC
+          if (!h) { ret(-9n); break; }
+          let fd = Number(a3); while (this.fds.has(fd)) fd++;
+          this.fds.set(fd, h); ret(BigInt(fd)); break;
+        }
+        ret(0n); break; }                                     // F_GETFD/F_SETFD/...
       case 28: ret(0n); break;                                // madvise
       case 110: ret(0n); break;                               // getppid
       case 186: ret(1n); break;                               // gettid
       case 25: ret(-38n); break;                              // mremap -> ENOSYS
+
+      // ---- sockets: the display connection (AF_UNIX -> in-process X server) ----
+      case 41: {                                              // socket(domain, type, proto)
+        if (Number(a1) !== 1) { ret(-97n); break; }           // EAFNOSUPPORT: AF_UNIX only
+        const fd = this.allocFd();
+        this.fds.set(fd, { sock: { conn: null, nonblock: !!(Number(a2) & 0x800) } });
+        ret(BigInt(fd)); break; }
+      case 42: {                                              // connect(fd, sockaddr_un*, len)
+        const h = this.fds.get(Number(a1));
+        if (!h?.sock) { ret(-88n); break; }                   // ENOTSOCK
+        const len = Number(a3), b0 = Number(a2 - this.base);
+        const raw = this.ram.subarray(b0, b0 + len);
+        // filesystem ("/tmp/.X11-unix/X0\0") and abstract ("\0/tmp/...") forms
+        let path = '';
+        for (let i = 2; i < len; i++) { const c = raw[i]; if (c === 0 && path) break; if (c !== 0) path += String.fromCharCode(c); }
+        if (/^\/tmp\/\.X11-unix\/X\d+$/.test(path) && this.xserver) {
+          h.sock.conn = this.xserver.connect(); ret(0n); break;
+        }
+        ret(-111n); break; }                                  // ECONNREFUSED
+      case 44: {                                              // sendto (connected stream: == write)
+        const h = this.fds.get(Number(a1));
+        if (h?.sock?.conn) {
+          const b = this.ram.slice(Number(a2 - this.base), Number(a2 - this.base) + Number(a3));
+          h.sock.conn.write(b); ret(a3); break;
+        }
+        writeChunk(Number(a1), a2, Number(a3)); ret(a3); break; }
+      case 45: {                                              // recvfrom
+        const h = this.fds.get(Number(a1));
+        if (!h?.sock?.conn) { ret(-88n); break; }
+        const data = h.sock.conn.read(Number(a3));
+        if (data === null) { if (h.sock.nonblock) ret(-11n); else this.block(null); break; }
+        this.ram.set(data, Number(a2 - this.base)); ret(BigInt(data.length)); break; }
+      case 46: {                                              // sendmsg(fd, msghdr*, flags)
+        const h = this.fds.get(Number(a1));
+        const v = new DataView(this.wmem.buffer);
+        const mo = this.RAMOFF + Number(a2 - this.base);
+        const iovp = v.getBigUint64(mo + 16, true), iovn = Number(v.getBigUint64(mo + 24, true));
+        let total = 0; const parts = [];
+        for (let i = 0; i < iovn; i++) {
+          const o = this.RAMOFF + Number(iovp - this.base) + i * 16;
+          const p = v.getBigUint64(o, true), l = Number(v.getBigUint64(o + 8, true));
+          parts.push(this.ram.slice(Number(p - this.base), Number(p - this.base) + l)); total += l;
+        }
+        if (h?.sock?.conn) { for (const b of parts) h.sock.conn.write(b); }
+        else { let off = 0; for (let i = 0; i < iovn; i++) {
+                 const o = this.RAMOFF + Number(iovp - this.base) + i * 16;
+                 writeChunk(Number(a1), v.getBigUint64(o, true), Number(v.getBigUint64(o + 8, true))); } }
+        ret(BigInt(total)); break; }
+      case 47: {                                              // recvmsg(fd, msghdr*, flags)
+        const h = this.fds.get(Number(a1));
+        if (!h?.sock?.conn) { ret(-88n); break; }
+        const v = new DataView(this.wmem.buffer);
+        const mo = this.RAMOFF + Number(a2 - this.base);
+        const iovp = v.getBigUint64(mo + 16, true), iovn = Number(v.getBigUint64(mo + 24, true));
+        let want = 0; const list = [];
+        for (let i = 0; i < iovn; i++) {
+          const o = this.RAMOFF + Number(iovp - this.base) + i * 16;
+          const p = v.getBigUint64(o, true), l = Number(v.getBigUint64(o + 8, true));
+          list.push([p, l]); want += l;
+        }
+        const data = h.sock.conn.read(want);
+        if (data === null) { if (h.sock.nonblock) ret(-11n); else this.block(null); break; }
+        let off = 0;
+        for (const [p, l] of list) { if (off >= data.length) break;
+          const take = Math.min(l, data.length - off);
+          this.ram.set(data.subarray(off, off + take), Number(p - this.base)); off += take; }
+        v.setBigUint64(mo + 40, 0n, true);                    // msg_controllen: no ancillary data
+        v.setUint32(mo + 48, 0, true);                        // msg_flags
+        ret(BigInt(data.length)); break; }
+      case 19: {                                              // readv(fd, iov, cnt)
+        const h = this.fds.get(Number(a1));
+        if (!h) { ret(-9n); break; }
+        const v = new DataView(this.wmem.buffer);
+        const list = [];
+        for (let i = 0; i < Number(a3); i++) {
+          const o = this.RAMOFF + Number(a2 - this.base) + i * 16;
+          list.push([v.getBigUint64(o, true), Number(v.getBigUint64(o + 8, true))]);
+        }
+        if (h.sock) {
+          const c = h.sock.conn; if (!c) { ret(-107n); break; }
+          const want = list.reduce((s, [, l]) => s + l, 0);
+          const data = c.read(want);
+          if (data === null) { if (h.sock.nonblock) ret(-11n); else this.block(null); break; }
+          let off = 0;
+          for (const [p, l] of list) { if (off >= data.length) break;
+            const take = Math.min(l, data.length - off);
+            this.ram.set(data.subarray(off, off + take), Number(p - this.base)); off += take; }
+          ret(BigInt(data.length)); break;
+        }
+        if (!h.bytes) { ret(-9n); break; }
+        let got = 0;
+        for (const [p, l] of list) {
+          const n = Math.min(l, h.bytes.length - h.pos); if (n <= 0) break;
+          this.ram.set(h.bytes.subarray(h.pos, h.pos + n), Number(p - this.base));
+          h.pos += n; got += n;
+        }
+        ret(BigInt(got)); break; }
+      case 48: ret(0n); break;                                // shutdown
+      case 51: case 52: {                                     // getsockname / getpeername
+        const name = '/tmp/.X11-unix/X0';
+        const o = Number(a2 - this.base);
+        this.ram[o] = 1; this.ram[o + 1] = 0;                 // AF_UNIX
+        for (let i = 0; i < name.length; i++) this.ram[o + 2 + i] = name.charCodeAt(i);
+        this.ram[o + 2 + name.length] = 0;
+        const lo = this.RAMOFF + Number(cpu.regs[2] - this.base);   // rdx = addrlen*
+        new DataView(this.wmem.buffer).setUint32(lo, 2 + name.length + 1, true);
+        ret(0n); break; }
+      case 54: ret(0n); break;                                // setsockopt
+      case 55: {                                              // getsockopt: zero int
+        const vo = this.RAMOFF + Number(cpu.regs[10] - this.base);
+        const lo = this.RAMOFF + Number(cpu.regs[8] - this.base);
+        const v = new DataView(this.wmem.buffer);
+        v.setUint32(vo, 0, true); v.setUint32(lo, 4, true);
+        ret(0n); break; }
+
+      // ---- poll / select: the guest's event wait, mapped onto engine.blocked ----
+      case 7: case 271: {                                     // poll / ppoll
+        const nfds = Number(a2), v = new DataView(this.wmem.buffer);
+        let timeoutMs;
+        if (nr === 7) timeoutMs = Number(BigInt.asIntN(32, a3 & 0xFFFFFFFFn));
+        else if (a3 === 0n) timeoutMs = -1;
+        else { const o = this.RAMOFF + Number(a3 - this.base);
+               timeoutMs = Number(v.getBigUint64(o, true)) * 1000 + Number(v.getBigUint64(o + 8, true)) / 1e6; }
+        const readyR = (h) => !h ? false
+          : h.sock ? !!(h.sock.conn && h.sock.conn.readable())
+          : h.pipe ? h.pipe.chunks.length > 0
+          : !!h.bytes;                                        // regular file: always ready (EOF too)
+        const base = this.RAMOFF + Number(a1 - this.base);
+        let ready = 0;
+        for (let i = 0; i < nfds; i++) {
+          const o = base + i * 8;
+          const fd = v.getInt32(o, true), ev = v.getUint16(o + 4, true);
+          let re = 0;
+          if (fd >= 0) {
+            const h = this.fds.get(fd);
+            if (!h && fd > 2) re = 0x20;                      // POLLNVAL
+            else { if ((ev & 1) && readyR(h)) re |= 1;        // POLLIN
+                   if (ev & 4) re |= 4; }                     // POLLOUT: always writable
+          }
+          v.setUint16(o + 6, re, true); if (re) ready++;
+        }
+        const now = this.nowMs();
+        if (ready > 0 || timeoutMs === 0 || (this._deadline != null && now >= this._deadline)) {
+          this._deadline = null; ret(BigInt(ready)); break;
+        }
+        this._deadline ??= (timeoutMs < 0 ? Infinity : now + timeoutMs);
+        this.block(this._deadline === Infinity ? null : this._deadline); break; }
+      case 23: case 270: {                                    // select / pselect6
+        const nfds = Number(a1), v = new DataView(this.wmem.buffer);
+        const rp = a2, wp = a3, ep = cpu.regs[10], tp = cpu.regs[8];
+        let timeoutMs = -1;
+        if (tp !== 0n) {
+          const o = this.RAMOFF + Number(tp - this.base);
+          const sec = Number(v.getBigUint64(o, true)), sub = Number(v.getBigUint64(o + 8, true));
+          timeoutMs = nr === 23 ? sec * 1000 + sub / 1000 : sec * 1000 + sub / 1e6;
+        }
+        const readyR = (h) => !h ? false
+          : h.sock ? !!(h.sock.conn && h.sock.conn.readable())
+          : h.pipe ? h.pipe.chunks.length > 0
+          : !!h.bytes;
+        const scan = (ptr) => { if (ptr === 0n) return [];
+          const o = this.RAMOFF + Number(ptr - this.base); const out = [];
+          for (let fd = 0; fd < nfds; fd++) if (v.getUint8(o + (fd >> 3)) & (1 << (fd & 7))) out.push(fd);
+          return out; };
+        const rd = scan(rp).filter(fd => readyR(this.fds.get(fd)));
+        const wr = scan(wp);                                  // always writable
+        const now = this.nowMs();
+        if (rd.length + wr.length > 0 || timeoutMs === 0 || (this._deadline != null && now >= this._deadline)) {
+          this._deadline = null;
+          const store = (ptr, set) => { if (ptr === 0n) return;
+            const o = this.RAMOFF + Number(ptr - this.base);
+            new Uint8Array(this.wmem.buffer, o, 128).fill(0);
+            for (const fd of set) v.setUint8(o + (fd >> 3), v.getUint8(o + (fd >> 3)) | (1 << (fd & 7))); };
+          store(rp, rd); store(wp, wr); store(ep, []);
+          ret(BigInt(rd.length + wr.length)); break;
+        }
+        this._deadline ??= (timeoutMs < 0 ? Infinity : now + timeoutMs);
+        this.block(this._deadline === Infinity ? null : this._deadline); break; }
       default:
         ret(-38n);                                           // ENOSYS
         (this.unknown ||= new Set()).add(nr);
@@ -516,7 +784,9 @@ export class LinuxEngine {
       while (steps++ < maxSteps && this.exitCode === null) {
         const key = this.cpu.rip.toString();
         const f = this.aotFns.get(key);
-        if (f) { this.cpu.rip = this.dispatchAot(f); continue; }
+        if (f) { this.cpu.rip = this.dispatchAot(f);
+                 if (this.blocked) break;
+                 continue; }
         const c = this.compiled.get(key);
         if (c) {
           for (let r = 0; r < 16; r++) this.regview[r] = BigInt.asIntN(64, this.cpu.regs[r]);
@@ -529,6 +799,7 @@ export class LinuxEngine {
         try { insn = this.cpu.step(); }
         catch (e) { if (e === EXIT) break; e.rip = before; throw e; }
         this.stats.interpreted++;
+        if (this.blocked) { this.cpu.rip = before; break; }   // re-execute the syscall on resume
         if (insn.mnem === 'jcc' && this.cpu.rip < before && this.inExec(this.cpu.rip)) {
           const hk = this.cpu.rip.toString();
           const n = (this.profile.get(hk) || 0) + 1;

@@ -955,7 +955,9 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           else if (S === 8) expr = `(${ALU[insn.mnem]} ${rd(insn.dst,8,next)} ${rd(insn.src,8,next)})`;
           else expr = `(i64.and (${ALU[insn.mnem]} ${rd(insn.dst,S,next)} ${rd(insn.src,S,next)}) (i64.const ${m}))`;
           if (insn.dst.kind === 'reg') {
-            L.push(i32expr && isI32(insn.dst.r) ? `(local.set ${reg(insn.dst.r)} ${i32expr})` : `(local.set ${reg(insn.dst.r)} ${expr})`);
+            if (i32expr && isI32(insn.dst.r)) L.push(`(local.set ${reg(insn.dst.r)} ${i32expr})`);
+            else if (S >= 4 && !isI32(insn.dst.r)) L.push(`(local.set ${reg(insn.dst.r)} ${expr})`);
+            else L.push(wr(insn.dst, S, expr, next));    // sub-width or i32-local: partial write
             if (prod) { L.push(`(local.set $fr ${rd(insn.dst,S,next)})`); flagState = { kind: akind, size: S }; }
           } else { const t=T(); L.push(`(local.set ${t} ${expr})`); L.push(wr(insn.dst,S,`(local.get ${t})`,next));
             if (prod) { L.push(`(local.set $fr (local.get ${t}))`); flagState = { kind: akind, size: S }; } }
@@ -1006,7 +1008,10 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           let i32e = null;
           if (S === 4 && insn.dst.kind === 'reg') { i32e = `(${insn.mnem==='inc'?'i32.add':'i32.sub'} ${rd32(insn.dst,next)} (i32.const 1))`; expr = `(i64.extend_i32_u ${i32e})`; }
           else expr = `(i64.and (${insn.mnem==='inc'?'i64.add':'i64.sub'} ${rd(insn.dst,S,next)} (i64.const 1)) (i64.const ${m}))`;
-          if (insn.dst.kind === 'reg') { L.push(i32e && isI32(insn.dst.r) ? `(local.set ${reg(insn.dst.r)} ${i32e})` : `(local.set ${reg(insn.dst.r)} ${expr})`);
+          if (insn.dst.kind === 'reg') {
+            if (i32e && isI32(insn.dst.r)) L.push(`(local.set ${reg(insn.dst.r)} ${i32e})`);
+            else if (S >= 4 && !isI32(insn.dst.r)) L.push(`(local.set ${reg(insn.dst.r)} ${expr})`);
+            else L.push(wr(insn.dst, S, expr, next));    // sub-width or i32-local: partial write
             if (prod) { L.push(`(local.set $fr ${rd(insn.dst,S,next)})`); flagState = { kind: insn.mnem, size: S }; } }
           else { const t=T(); L.push(`(local.set ${t} ${expr})`); L.push(wr(insn.dst,S,`(local.get ${t})`,next));
             if (prod) { L.push(`(local.set $fr (local.get ${t}))`); flagState = { kind: insn.mnem, size: S }; } }
@@ -1215,7 +1220,10 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           L.push(...reloadAll());
           break; }
         case 'syscall':
-          L.push(...spillAll(), `(call $x_syscall)`, ...reloadAll());
+          // pass this syscall's guest rip: a BLOCKING syscall (poll/select/
+          // read) suspends the whole engine by unwinding the wasm frames and
+          // recording this rip so resume re-executes the syscall exactly here
+          L.push(...spillAll(), `(call $x_syscall (i64.const ${hexs(insn.rip)}))`, ...reloadAll());
           break;
         case 'cld': break;                                                    // DF stays 0 (bulk ops assume it)
         case 'stos': {
@@ -1396,7 +1404,7 @@ export function compileUnitWat(mem, entry, opts = {}) {
     if (!repoison) break;
   }
   let wat = '(module\n  (import "js" "mem" (memory 4096))\n';
-  wat += '  (import "env" "syscall" (func $x_syscall))\n';
+  wat += '  (import "env" "syscall" (func $x_syscall (param i64)))\n';
   wat += '  (import "env" "callout" (func $x_callout (param i64) (result i64)))\n';
   wat += '  (import "env" "deopt" (func $x_deopt (param i64 i64) (result i64)))\n';
   let blocks = 0;

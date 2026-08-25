@@ -710,6 +710,40 @@ export class CPU {
           if (insn.rep) this.regs[1] = (this.regs[1] - 1n) & MASK[8];
         } while (insn.rep && this.regs[1] > 0n);
         break; }
+      case 'cmps': case 'scas': {
+        // repe/repne string compare/scan; flags from the LAST comparison
+        const n = BigInt(S), step = this.f.df ? -n : n;
+        const repAny = insn.rep || insn.rep2;
+        for (;;) {
+          if (repAny && this.regs[1] === 0n) break;
+          let a, b2;
+          if (insn.mnem === 'cmps') {
+            a = this.mem.read(this.regs[6], n); b2 = this.mem.read(this.regs[7], n);
+            this.regs[6] = (this.regs[6] + step) & MASK[8];
+            this.regs[7] = (this.regs[7] + step) & MASK[8];
+          } else {
+            a = this.regs[0] & MASK[S]; b2 = this.mem.read(this.regs[7], n);
+            this.regs[7] = (this.regs[7] + step) & MASK[8];
+          }
+          const r = (a - b2) & MASK[S];
+          this.subFlags(a, b2, r, S);
+          if (!repAny) break;
+          this.regs[1] = (this.regs[1] - 1n) & MASK[8];
+          if (insn.rep && this.f.zf !== 1) break;          // repe: stop on mismatch
+          if (insn.rep2 && this.f.zf !== 0) break;         // repne: stop on match
+          if (this.regs[1] === 0n) break;
+        }
+        break; }
+      case 'lods': {
+        const n = BigInt(S), step = this.f.df ? -n : n;
+        do {
+          if (insn.rep && this.regs[1] === 0n) break;
+          const v = this.mem.read(this.regs[6], n);
+          this.setReg({ kind: 'reg', r: 0, size: S }, v);
+          this.regs[6] = (this.regs[6] + step) & MASK[8];
+          if (insn.rep) this.regs[1] = (this.regs[1] - 1n) & MASK[8];
+        } while (insn.rep && this.regs[1] > 0n);
+        break; }
       case 'stos': {
         const n = BigInt(S), v = this.regs[0] & MASK[S];
         if (this.f.df) {
@@ -750,6 +784,40 @@ export class CPU {
       case 'xadd': { const a = this.get(insn.dst), b2 = this.get(insn.src), r = (a + b2) & M;
         this.addFlags(a, b2, r, S, a + b2 > M ? 1 : 0);
         this.set(insn.src, a); this.set(insn.dst, r); break; }
+      case 'fxsave': case 'fxrstor': {
+        // 512-byte FP/SSE state area. Only this engine reads it back (the one
+        // real user is glibc's lazy-PLT resolver saving/restoring around
+        // _dl_fixup), so x87 regs round-trip in our own f64 form; xmm and
+        // mxcsr live at their architectural offsets.
+        const base = this.ea(insn.dst);
+        if (insn.mnem === 'fxsave') {
+          for (let i = 0n; i < 512n; i += 8n) this.mem.write(base + i, 8n, 0n);
+          this.mem.write(base, 2n, BigInt(this.fcw ?? 0x37f));
+          this.mem.write(base + 2n, 2n, BigInt((this.fsw ?? 0) | ((this.ftop ?? 0) << 11)));
+          this.mem.write(base + 24n, 4n, BigInt(this.mxcsr ?? 0x1f80));
+          for (let r = 0; r < 8; r++) {                   // ST regs as f64 bits in the 16-byte slots
+            const bits = this.fst ? FP.putF64(this.fst[r] ?? 0) : 0n;
+            this.mem.write(base + 32n + BigInt(r) * 16n, 8n, bits);
+          }
+          for (let r = 0; r < 16; r++) {
+            const v = this.xmm[r] ?? 0n;
+            this.mem.write(base + 160n + BigInt(r) * 16n, 8n, v & MASK[8]);
+            this.mem.write(base + 168n + BigInt(r) * 16n, 8n, (v >> 64n) & MASK[8]);
+          }
+        } else {
+          this.fcw = Number(this.mem.read(base, 2n));
+          const sw = Number(this.mem.read(base + 2n, 2n));
+          this.fsw = sw & 0xc7ff; this.ftop = (sw >> 11) & 7;
+          this.mxcsr = Number(this.mem.read(base + 24n, 4n));
+          if (this.fst) for (let r = 0; r < 8; r++)
+            this.fst[r] = FP.getF64(this.mem.read(base + 32n + BigInt(r) * 16n, 8n));
+          for (let r = 0; r < 16; r++)
+            this.xmm[r] = this.mem.read(base + 160n + BigInt(r) * 16n, 8n)
+                        | (this.mem.read(base + 168n + BigInt(r) * 16n, 8n) << 64n);
+        }
+        break; }
+      case 'ldmxcsr': this.mxcsr = Number(this.mem.read(this.ea(insn.dst), 4n)); break;
+      case 'stmxcsr': this.mem.write(this.ea(insn.dst), 4n, BigInt(this.mxcsr ?? 0x1f80)); break;
       case 'bswap': {
         const v = this.get(insn.dst); let r = 0n;
         for (let k = 0; k < S; k++) r |= ((v >> BigInt(8*k)) & 0xFFn) << BigInt(8*(S-1-k));

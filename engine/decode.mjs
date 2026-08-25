@@ -131,6 +131,12 @@ export function decode(fetch, rip) {
   if (op === 0xA5) return fin({ mnem: 'movs', size: osz, rep });
   if (op === 0xAA) return fin({ mnem: 'stos', size: 1, rep });
   if (op === 0xAB) return fin({ mnem: 'stos', size: osz, rep });
+  if (op === 0xA6) return fin({ mnem: 'cmps', size: 1, rep, rep2 });
+  if (op === 0xA7) return fin({ mnem: 'cmps', size: osz, rep, rep2 });
+  if (op === 0xAE) return fin({ mnem: 'scas', size: 1, rep, rep2 });
+  if (op === 0xAF) return fin({ mnem: 'scas', size: osz, rep, rep2 });
+  if (op === 0xAC) return fin({ mnem: 'lods', size: 1, rep });
+  if (op === 0xAD) return fin({ mnem: 'lods', size: osz, rep });
   if (op === 0x86) { const [r, rm] = modrm(1);   return fin({ mnem: 'xchg', dst: rm, src: r, size: 1 }); }
   if (op === 0x87) { const [r, rm] = modrm(osz); return fin({ mnem: 'xchg', dst: rm, src: r, size: osz }); }
   if (op === 0xF6 || op === 0xF7) {
@@ -217,6 +223,19 @@ export function decode(fetch, rip) {
     if (o2 === 0xBE) { const [r, rm] = modrm(osz); rm.size = 1; if (rm.kind === 'reg') Object.assign(rm, reg8(rm.r | (rm.high ? 4 : 0))); return fin({ mnem: 'movsx', dst: r, src: rm, size: osz, srcSize: 1 }); }
     if (o2 === 0xBF) { const [r, rm] = modrm(osz); rm.size = 2; return fin({ mnem: 'movsx', dst: r, src: rm, size: osz, srcSize: 2 }); }
     if (o2 === 0x1F) { modrm(osz); return fin({ mnem: 'nop' }); }
+    if (o2 === 0xAE) {                                    // fence / fxsave group
+      const peek = fetch(i);                              // peek modrm without consuming
+      if ((peek & 0xC0) === 0xC0) {                       // mod=3: lfence/mfence/sfence
+        i++;
+        const g = (peek >> 3) & 7;
+        if (g === 5 || g === 6 || g === 7) return fin({ mnem: 'nop' });
+        throw new Error('0f ae reg /' + g);
+      }
+      const [, rm, g] = modrm(osz);
+      const M2 = { 0: 'fxsave', 1: 'fxrstor', 2: 'ldmxcsr', 3: 'stmxcsr', 7: 'nop' }[g & 7];  // 7=clflush
+      if (!M2) throw new Error('0f ae /' + (g & 7));
+      return fin({ mnem: M2, dst: rm, src: rm, size: osz });
+    }
     throw new Error(`unsupported 0f ${o2.toString(16)}`);
   }
   throw new Error(`unsupported opcode ${op.toString(16)} at ${rip.toString(16)}`);
