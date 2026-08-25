@@ -725,6 +725,25 @@ function emitUnitFunction(a0, fnAddr, ctx) {
         else L.push(insn.W ? `(i64.store ${wasmAddr(rm,next)} (i64x2.extract_lane 0 ${dst}))`
                            : `(i32.store ${wasmAddr(rm,next)} (i32x4.extract_lane 0 ${dst}))`);
         break;
+      case 0xC2: {                                                            // cmpps/pd/ss/sd: predicate -> lane masks
+        const dbl = insn.pF2 || insn.p66, scalar = insn.pF3 || insn.pF2;
+        const LN = dbl ? 'f64x2' : 'f32x4';
+        const A = dst, B = xv(rm, next);
+        let mexp;
+        switch (Number(insn.imm8) & 7) {
+          case 0: mexp = `(${LN}.eq ${A} ${B})`; break;
+          case 1: mexp = `(${LN}.lt ${A} ${B})`; break;
+          case 2: mexp = `(${LN}.le ${A} ${B})`; break;
+          case 3: mexp = `(v128.or (${LN}.ne ${A} ${A}) (${LN}.ne ${B} ${B}))`; break;   // unord
+          case 4: mexp = `(${LN}.ne ${A} ${B})`; break;                                  // neq (true on NaN)
+          case 5: mexp = `(v128.not (${LN}.lt ${A} ${B}))`; break;                       // nlt
+          case 6: mexp = `(v128.not (${LN}.le ${A} ${B}))`; break;                       // nle
+          default: mexp = `(v128.and (${LN}.eq ${A} ${A}) (${LN}.eq ${B} ${B}))`; break; // ord
+        }
+        if (!scalar) { put(mexp); break; }
+        put(dbl ? `(i64x2.replace_lane 0 ${dst} (i64x2.extract_lane 0 ${mexp}))`
+                : `(i32x4.replace_lane 0 ${dst} (i32x4.extract_lane 0 ${mexp}))`);
+        break; }
       case 0x2E: case 0x2F: {                                                 // ucomiss/sd, comiss/sd -> fcmp flags
         const isD = insn.p66;
         const aBits = isD ? `(i64x2.extract_lane 0 ${dst})`
