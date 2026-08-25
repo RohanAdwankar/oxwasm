@@ -14,13 +14,14 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const ENGINE = join(HERE, '..', 'engine');
 
 const args = process.argv.slice(2);
-let sysroot = null, guestPath = null, out = 'x.html', title = null, W = 640, H = 480, fontDir = null;
+let sysroot = null, guestPath = null, out = 'x.html', title = null, W = 640, H = 480, fontDir = null, gtk = false;
 for (let i = 0; i < args.length; i++) {
   const a = args[i];
   if (a === '-o') out = args[++i];
   else if (a === '--title') title = args[++i];
   else if (a === '--size') { const [w, h] = args[++i].split('x').map(Number); W = w; H = h; }
   else if (a === '--fonts') fontDir = args[++i];
+  else if (a === '--gtk') gtk = true;
   else if (!sysroot) sysroot = a;
   else if (!guestPath) guestPath = a;
 }
@@ -29,7 +30,9 @@ title ??= guestPath.split('/').pop();
 
 // ---- collect guest files: the binary, its DT_NEEDED closure, X resources ---
 const hostOf = {};                                       // guest path -> host path
+const dirMtimes = {};
 (function walk(dir, guest) {
+  try { if (guest) dirMtimes[guest] = Math.floor(lstatSync(dir).mtimeMs / 1000); } catch {}
   for (const name of readdirSync(dir)) {
     const p = join(dir, name), g = guest + '/' + name;
     let st; try { st = lstatSync(p); } catch { continue; }
@@ -98,11 +101,36 @@ for (const [g, h] of Object.entries(hostOf)) {
       (g.startsWith('/usr/share/X11/locale/') && /\/(C|locale\.alias|locale\.dir|compose\.dir)/.test(g)))
     files[g] = readFileSync(h);
 }
+// --gtk: the GTK2/cairo/pango/fontconfig runtime files. Generate the caches
+// first by chrooting into the sysroot on the build host (same-arch binaries):
+//   chroot SYSROOT /usr/lib/x86_64-linux-gnu/gdk-pixbuf-2.0/gdk-pixbuf-query-loaders > .../loaders.cache
+//   chroot SYSROOT /usr/bin/fc-cache -f
+//   chroot SYSROOT .../gtk-query-immodules-2.0 > .../immodules.cache
+if (gtk) {
+  const GTKKEEP = [
+    /^\/etc\/fonts\//, /^\/var\/cache\/fontconfig\//,
+    /^\/usr\/share\/fonts\/truetype\/dejavu\/DejaVuSans(-Bold)?\.ttf$/,
+    /^\/usr\/share\/fonts\/truetype\/dejavu\/DejaVuSansMono\.ttf$/,
+    /^\/usr\/lib\/x86_64-linux-gnu\/gdk-pixbuf-2\.0\//,
+    /^\/usr\/lib\/x86_64-linux-gnu\/gtk-2\.0\//,
+    /^\/etc\/gtk-2\.0\//, /^\/usr\/share\/themes\/[^/]+\/gtk-2\.0\//,
+    /^\/usr\/share\/mime\/mime\.cache$/,
+  ];
+  for (const [g, h] of Object.entries(hostOf))
+    if (!files[g] && GTKKEEP.some(rx => rx.test(g))) {
+      files[g] = readFileSync(h);
+      if (g.endsWith('.so')) for (const dep of neededOf(files[g]))
+        for (const dd of libdirs) if (hostOf[dd + '/' + dep] && !files[dd + '/' + dep]) { files[dd + '/' + dep] = readFileSync(hostOf[dd + '/' + dep]); break; }
+    }
+}
 if (files['/lib/x86_64-linux-gnu/ld-2.27.so'] && !files['/lib64/ld-linux-x86-64.so.2'])
   files['/lib64/ld-linux-x86-64.so.2'] = files['/lib/x86_64-linux-gnu/ld-2.27.so'];
 for (const [g, b] of Object.entries(files))
   if (g.startsWith('/etc/X11/app-defaults/'))
     files['/usr/lib/X11/app-defaults/' + g.slice('/etc/X11/app-defaults/'.length)] = b;
+const mtimes = { ...dirMtimes };
+for (const g of Object.keys(files))
+  try { if (hostOf[g]) mtimes[g] = Math.floor(lstatSync(hostOf[g]).mtimeMs / 1000); } catch {}
 console.log(`xpack: ${Object.keys(files).length} guest files`);
 
 // ---- fonts (raw pcf.gz, parsed in-page) ------------------------------------
@@ -181,7 +209,7 @@ async function inflate(b64) {
     env: ['DISPLAY=:0','HOME=/root','USER=root',
           'XFILESEARCHPATH=/etc/X11/%T/%N%C:/etc/X11/%T/%N:/usr/lib/X11/%T/%N%C:/usr/lib/X11/%T/%N',
           'LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu'],
-    files, memMB: 512, assembleWat, xserver: xs });
+    files, mtimes: ${JSON.stringify(mtimes)}, memMB: 512, assembleWat, xserver: xs });
 
   // ---- screen blit ----
   const img = ctx.createImageData(${W}, ${H});
