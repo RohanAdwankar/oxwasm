@@ -1261,10 +1261,16 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           break; }
         case 'push': {
           // a disciplined savedI32 reg's prologue push reads its regfile slot,
-          // which still holds the caller's full 64-bit value at that point
+          // which still holds the caller's full 64-bit value at that point.
+          // The operand is read BEFORE rsp moves: `push 0x68(%rsp)` (stack
+          // argument forwarding — glib's g_signal_new_valist) must see the
+          // OLD rsp, so evaluate into a temp first.
           const srcExpr = (insn.src.kind === 'reg' && savedI32(insn.src.r))
             ? `(i64.load (i32.const ${insn.src.r*8}))` : rd(insn.src,8,next);
-          L.push(`(local.set $r4 (i64.sub (local.get $r4) (i64.const 8)))`,`(i64.store ${wasmAddr({base:4,index:-1,disp:0n},next)} ${srcExpr})`); break; }
+          const t = T();
+          L.push(`(local.set ${t} ${srcExpr})`,
+                 `(local.set $r4 (i64.sub (local.get $r4) (i64.const 8)))`,
+                 `(i64.store ${wasmAddr({base:4,index:-1,disp:0n},next)} (local.get ${t}))`); break; }
         case 'pop': {
           if (insn.dst.kind === 'reg' && savedI32(insn.dst.r))   // epilogue restore straight to the regfile
             L.push(`(i64.store (i32.const ${insn.dst.r*8}) (i64.load ${wasmAddr({base:4,index:-1,disp:0n},next)}))`, `(local.set $r4 (i64.add (local.get $r4) (i64.const 8)))`);

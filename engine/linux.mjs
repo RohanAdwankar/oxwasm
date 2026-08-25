@@ -35,13 +35,14 @@ export class LinuxEngine {
   // the tier's own test suites.
   constructor(elfBytes, { argv = ['prog'], env = [], memMB = 256, threshold = Infinity, files = {},
                           assembleWat = null, aotCallThreshold = 12, aotLoopThreshold = 40,
-                          xserver = null } = {}) {
+                          xserver = null, mtimes = {} } = {}) {
     this.files = files;                       // path -> Uint8Array (read-only)
     this.env = env;                           // "KEY=VALUE" strings
     // display/input layer: an X11-protocol server object (see xserver.mjs).
     // AF_UNIX connects to /tmp/.X11-unix/X* attach to it; its screen is the
     // engine's framebuffer and its event queue is the engine's input.
     this.xserver = xserver;
+    this.mtimes = mtimes;                     // guest path -> mtime seconds (fontconfig cache validation)
     this.blocked = null;                      // {deadline: ms|null} while suspended on a blocking syscall
     this._deadline = null;                    // survives re-execution of the same blocked poll/select/sleep
     // real fd table: 0 empty stdin, 1 stdout, 2 stderr. open() and dup()
@@ -325,6 +326,20 @@ export class LinuxEngine {
     for (;;) { const c = Number(this.mem.read(a, 1n)); if (!c) break; p += String.fromCharCode(c); a++; }
     return p; }
   lookup(p) { return this.files[p] ?? this.files[p.replace(/^\.\//, '')]; }
+  // a guest path is a directory iff some provided file lives under it
+  isDir(p) {
+    if (p === '/' ) return true;
+    const pre = p.endsWith('/') ? p : p + '/';
+    if (this._dirset === undefined) {
+      this._dirset = new Set();
+      for (const k of Object.keys(this.files)) {
+        let i = 0;
+        while ((i = k.indexOf('/', i + 1)) > 0) this._dirset.add(k.slice(0, i));
+      }
+    }
+    return this._dirset.has(pre.slice(0, -1));
+  }
+  mtimeOf(p) { return this.mtimes?.[p] ?? 0; }
   allocFd() { let fd = 0; while (this.fds.has(fd)) fd++; return fd; }
   nowMs() { return (typeof performance !== 'undefined') ? performance.now() : Date.now(); }
   block(deadline) { this.blocked = { deadline: deadline ?? null }; }
@@ -391,6 +406,7 @@ export class LinuxEngine {
           const fo = Number(cpu.regs[9]);
           const n = Math.min(Number(a2), Math.max(0, h.bytes.length - fo));
           if (n > 0) this.ram.set(h.bytes.subarray(fo, fo + n), off0);
+          (this.maps ??= []).push({ at, len, path: h.path ?? '?', fileOff: fo });
         }
         ret(at); break; }
       case 11: ret(0n); break;                               // munmap
@@ -460,7 +476,7 @@ export class LinuxEngine {
         const f = this.lookup(p);
         if (f === undefined) { ret(-2n); break; }             // ENOENT
         const fd = this.allocFd();
-        this.fds.set(fd, { bytes: f, pos: 0 });
+        this.fds.set(fd, { bytes: f, pos: 0, path: p });
         ret(BigInt(fd)); break; }
       case 0: {                                               // read(fd, buf, len)
         const fd = Number(a1), h = this.fds.get(fd);
@@ -497,7 +513,7 @@ export class LinuxEngine {
         ret(BigInt(h.pos)); break; }
       case 5: case 262: {                                     // fstat / newfstatat
         const isAt = nr === 262;
-        let size = null, mode = 0o020620;                     // default: char dev (tty)
+        let size = null, mode = 0o020620, statPath = null;    // default: char dev (tty)
         if (isAt) {
           const p = this.readPath(a2);
           if (p === '' && (cpu.regs[10] & 0x1000n)) {         // AT_EMPTY_PATH: stat the fd
@@ -505,8 +521,10 @@ export class LinuxEngine {
             if (h) { size = h.bytes.length; mode = 0o100755; }
           } else {
             const f = this.lookup(p);
-            if (f === undefined) { ret(-2n); break; }         // ENOENT
-            size = f.length; mode = 0o100755;
+            if (f !== undefined) { size = f.length; mode = 0o100755; }
+            else if (this.isDir(p)) { size = 4096; mode = 0o040755; }
+            else { ret(-2n); break; }                         // ENOENT
+            statPath = p;
           }
         } else {
           const h = this.fds.get(Number(a1));
@@ -526,20 +544,28 @@ export class LinuxEngine {
         v.setBigUint64(off + 48, BigInt(size ?? 0), true);    // st_size
         v.setBigUint64(off + 56, 4096n, true);                // st_blksize
         v.setBigUint64(off + 64, BigInt(Math.ceil((size ?? 0) / 512)), true);    // st_blocks
+        if (statPath) { const mt = BigInt(this.mtimeOf(statPath));
+          v.setBigUint64(off + 72, mt, true); v.setBigUint64(off + 88, mt, true); v.setBigUint64(off + 104, mt, true); }
         ret(0n); break; }
       case 4: case 6: {                                       // stat / lstat (by path)
-        const f = this.lookup(this.readPath(a1));
-        if (f === undefined) { ret(-2n); break; }             // ENOENT
+        const p = this.readPath(a1);
+        const f = this.lookup(p);
+        if (f === undefined && !this.isDir(p)) { ret(-2n); break; }   // ENOENT
         const off = this.RAMOFF + Number(a2 - this.base);
         new Uint8Array(this.wmem.buffer, off, 144).fill(0);
         const v = new DataView(this.wmem.buffer);
+        const size = f ? f.length : 4096;
         v.setBigUint64(off + 0, 8n, true);
-        v.setBigUint64(off + 8, BigInt((f.length % 1e6) + 3), true);
+        v.setBigUint64(off + 8, BigInt((size % 1e6) + 3), true);
         v.setBigUint64(off + 16, 1n, true);
-        v.setUint32(off + 24, 0o100755, true);
-        v.setBigUint64(off + 48, BigInt(f.length), true);
+        v.setUint32(off + 24, f ? 0o100755 : 0o040755, true);
+        v.setBigUint64(off + 48, BigInt(size), true);
         v.setBigUint64(off + 56, 4096n, true);
-        v.setBigUint64(off + 64, BigInt(Math.ceil(f.length / 512)), true);
+        v.setBigUint64(off + 64, BigInt(Math.ceil(size / 512)), true);
+        const mt = BigInt(this.mtimeOf(p));
+        v.setBigUint64(off + 72, mt, true);                   // st_atime
+        v.setBigUint64(off + 88, mt, true);                   // st_mtime
+        v.setBigUint64(off + 104, mt, true);                  // st_ctime
         ret(0n); break; }
       case 17: {                                              // pread64(fd, buf, count, off)
         const h = this.fds.get(Number(a1));
@@ -548,8 +574,8 @@ export class LinuxEngine {
         const n = Math.min(Number(a3), Math.max(0, h.bytes.length - fo));
         if (n > 0) this.ram.set(h.bytes.subarray(fo, fo + n), Number(a2 - this.base));
         ret(BigInt(n)); break; }
-      case 21: ret(this.lookup(this.readPath(a1)) !== undefined ? 0n : -2n); break;     // access
-      case 269: ret(this.lookup(this.readPath(a2)) !== undefined ? 0n : -2n); break;    // faccessat
+      case 21: { const p = this.readPath(a1); ret(this.lookup(p) !== undefined || this.isDir(p) ? 0n : -2n); break; }   // access
+      case 269: { const p = this.readPath(a2); ret(this.lookup(p) !== undefined || this.isDir(p) ? 0n : -2n); break; }  // faccessat
       case 63: {                                              // uname
         const put = (o, s) => { const b = new TextEncoder().encode(s + '\0');
           this.ram.set(b, Number(a1 - this.base) + o); };

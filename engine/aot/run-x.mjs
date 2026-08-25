@@ -15,18 +15,23 @@ import { join } from 'node:path';
 const [sysroot, guestPath, outPrefix, script = 'idle'] = process.argv.slice(2);
 
 // ---- files map: every regular file in the sysroot at its guest path --------
-const files = {};
+// mtimes carry the HOST's timestamps so caches validated by directory mtime
+// (fontconfig) see consistent values
+const files = {}, mtimes = {};
 (function walk(dir, guest) {
+  let dm = 0;
+  try { dm = Math.floor(lstatSync(dir).mtimeMs / 1000); } catch {}
+  if (guest) mtimes[guest] = dm;
   for (const name of readdirSync(dir)) {
     const p = join(dir, name), g = guest + '/' + name;
     let st; try { st = lstatSync(p); } catch { continue; }
     if (st.isSymbolicLink()) {
-      try { const real = realpathSync(p);
-        if (lstatSync(real).isFile()) files[g] = new Uint8Array(readFileSync(real));
-        else if (lstatSync(real).isDirectory()) walk(real, g);
+      try { const real = realpathSync(p); const rst = lstatSync(real);
+        if (rst.isFile()) { files[g] = new Uint8Array(readFileSync(real)); mtimes[g] = Math.floor(rst.mtimeMs / 1000); }
+        else if (rst.isDirectory()) walk(real, g);
       } catch {}
     } else if (st.isDirectory()) walk(p, g);
-    else if (st.isFile()) files[g] = new Uint8Array(readFileSync(p));
+    else if (st.isFile()) { files[g] = new Uint8Array(readFileSync(p)); mtimes[g] = Math.floor(st.mtimeMs / 1000); }
   }
 })(sysroot, '');
 // the dynamic loader path the ELF names
@@ -66,8 +71,41 @@ const eng = new LinuxEngine(elf, {
   env: ['DISPLAY=:0', 'HOME=/root', 'USER=root',
         'XFILESEARCHPATH=/etc/X11/%T/%N%C:/etc/X11/%T/%N:/usr/lib/X11/%T/%N%C:/usr/lib/X11/%T/%N',
         'LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu'],
-  files, memMB: 512, assembleWat, xserver: xs,
+  files, mtimes, memMB: 512, assembleWat, xserver: xs,
 });
+// fault localization: report which compiled unit a wasm trap came from
+if (process.env.DEBUG_FAULT) {
+  const fnRip = new Map();
+  const origTier = eng.tierUpAot.bind(eng);
+  eng.tierUpAot = (e) => { origTier(e); for (const [k, f] of eng.aotFns) if (!fnRip.has(f)) fnRip.set(f, k); };
+  const origDisp = eng.dispatchAot.bind(eng);
+  eng.dispatchAot = (f) => { try { return origDisp(f); } catch (err) {
+    if (err instanceof WebAssembly.RuntimeError) {
+      const rip = BigInt(fnRip.get(f) ?? 0);
+      let where = '?';
+      for (const m of eng.maps ?? []) if (rip >= m.at && rip < m.at + m.len)
+        where = `${m.path}+0x${(rip - m.at + BigInt(m.fileOff)).toString(16)}`;
+      console.error('WASM-FAULT entry=0x' + rip.toString(16), 'in', where, err.message);
+    }
+    throw err; } };
+}
+// bisect aid: never tier-up specific guest addresses (hex csv)
+if (process.env.SKIP_ADDRS) {
+  for (const h of process.env.SKIP_ADDRS.split(',')) eng.aotFailed.add(BigInt(h).toString());
+}
+// bisect aid: skip AOT tier-up for unit indexes listed in SKIP_UNITS (csv)
+if (process.env.SKIP_UNITS) {
+  const skip = new Set(process.env.SKIP_UNITS.split(',').map(Number));
+  let unitNo = 0;
+  const orig = eng.tierUpAot.bind(eng);
+  eng.tierUpAot = (entry) => {
+    const k = entry.toString();
+    if (eng.aotFns.has(k) || eng.aotFailed.has(k)) return;
+    const n = unitNo++;
+    if (skip.has(n)) { eng.aotFailed.add(k); console.error(`[skip unit ${n} @0x${entry.toString(16)}]`); return; }
+    orig(entry);
+  };
+}
 
 // ---- screenshots -----------------------------------------------------------
 function shoot(tag) {
