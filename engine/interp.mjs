@@ -344,6 +344,34 @@ export class CPU {
             if (Number.isNaN(a) || Number.isNaN(b2)) { this.f.zf = 1; this.f.pf = 1; this.f.cf = 1; }
             else { this.f.zf = a === b2 ? 1 : 0; this.f.pf = 0; this.f.cf = a < b2 ? 1 : 0; }
             this.f.sf = 0; this.f.of = 0; this.f.af = 0; break; }
+          case 0xC2: {                                 // cmpps/cmpss/cmpsd/cmppd (predicate imm8)
+            const dbl = insn.pF2 || insn.p66, scalar = insn.pF3 || insn.pF2;
+            const lanes = scalar ? 1 : (dbl ? 2 : 4), eb = dbl ? 64n : 32n;
+            const em = (1n << eb) - 1n;
+            const bx = insn.rm.kind === 'xmm' ? this.xmm[insn.rm.r]
+                     : this.mem.read(this.ea(insn.rm), scalar ? (dbl ? 8n : 4n) : 16n);
+            const pred = insn.imm8 & 7;
+            let out = this.xmm[insn.xr];
+            for (let l = 0; l < lanes; l++) {
+              const sh = BigInt(l) * eb;
+              const av = (this.xmm[insn.xr] >> sh) & em, bv = (bx >> sh) & em;
+              const a = dbl ? FP.getF64(av) : FP.getF32(av);
+              const b2 = dbl ? FP.getF64(bv) : FP.getF32(bv);
+              const un = Number.isNaN(a) || Number.isNaN(b2);
+              let t;
+              switch (pred) {
+                case 0: t = !un && a === b2; break;    // eq
+                case 1: t = !un && a < b2; break;      // lt
+                case 2: t = !un && a <= b2; break;     // le
+                case 3: t = un; break;                 // unord
+                case 4: t = un || a !== b2; break;     // neq
+                case 5: t = un || !(a < b2); break;    // nlt
+                case 6: t = un || !(a <= b2); break;   // nle
+                default: t = !un;                      // ord
+              }
+              out = (out & ~(em << sh)) | ((t ? em : 0n) << sh);
+            }
+            this.xmm[insn.xr] = out; break; }
           case 0x51: case 0x58: case 0x59: case 0x5C: case 0x5D: case 0x5E: case 0x5F: {
             // sqrt/add/mul/sub/min/max/div — scalar (F3 ss / F2 sd) or packed (ps / 66 pd)
             const OP = { 0x51:(a,b)=>Math.sqrt(b), 0x58:(a,b)=>a+b, 0x59:(a,b)=>a*b,

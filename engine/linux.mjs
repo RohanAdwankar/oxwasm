@@ -591,6 +591,21 @@ export class LinuxEngine {
       case 28: ret(0n); break;                                // madvise
       case 110: ret(0n); break;                               // getppid
       case 186: ret(1n); break;                               // gettid
+      case 83: ret(0n); break;                                // mkdir: pretend created
+      case 95: ret(0o022n); break;                            // umask
+      case 137: case 138: {                                   // statfs / fstatfs: tmpfs-ish dummy
+        const buf = a2, o = this.RAMOFF + Number(buf - this.base);
+        new Uint8Array(this.wmem.buffer, o, 120).fill(0);
+        const v = new DataView(this.wmem.buffer);
+        v.setBigUint64(o, 0x01021994n, true);                 // f_type: TMPFS_MAGIC
+        v.setBigUint64(o + 8, 4096n, true);                   // f_bsize
+        v.setBigUint64(o + 16, 1n << 20n, true);              // f_blocks
+        v.setBigUint64(o + 24, 1n << 19n, true);              // f_bfree
+        v.setBigUint64(o + 32, 1n << 19n, true);              // f_bavail
+        v.setBigUint64(o + 40, 1n << 16n, true);              // f_files
+        v.setBigUint64(o + 48, 1n << 15n, true);              // f_ffree
+        v.setBigUint64(o + 64, 255n, true);                   // f_namelen
+        ret(0n); break; }
       case 25: ret(-38n); break;                              // mremap -> ENOSYS
 
       // ---- sockets: the display connection (AF_UNIX -> in-process X server) ----
