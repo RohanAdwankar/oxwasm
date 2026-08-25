@@ -475,6 +475,16 @@ export class LinuxEngine {
         let v = 0n; for (let i = 7; i >= 0; i--) v = (v << 8n) | BigInt(bytes[i] ?? 0);
         h.ev.count += v; this.wakeAllBlk(); return;
       }
+      if (h && h.bytes !== undefined && h.writable) {        // regular file opened for writing
+        const end = h.pos + bytes.length;
+        if (end > h.bytes.length) {
+          const nb = new Uint8Array(end);
+          nb.set(h.bytes); h.bytes = nb;
+          this.files[h.path] = nb;                           // growable buffer: refresh the map ref
+        }
+        h.bytes.set(bytes, h.pos); h.pos = end;
+        return;
+      }
       const str = new TextDecoder().decode(bytes);
       if (h?.sink === 'err') { (this.stderr ||= []).push(str); (this.stderrBytes ||= []).push(bytes); }
       else { this.stdout.push(str); this.stdoutBytes.push(bytes); }
@@ -635,17 +645,26 @@ export class LinuxEngine {
         ret(0n); break; }
       case 257: case 2: {                                     // openat(dirfd,path,flags) / open(path,flags)
         const p = this.readPath(nr === 257 ? a2 : a1);
-        const f = this.lookup(p);
+        const flags = Number(nr === 257 ? a3 : a2);
+        let f = this.lookup(p);
         if (f === undefined) {
           if (this.isDir(p)) {                                // O_DIRECTORY / readdir scans
             const fd = this.allocFd();
             this.fds.set(fd, { isdir: true, path: this.norm(p), pos: 0 });
             ret(BigInt(fd)); break;
           }
-          ret(-2n); break;                                    // ENOENT
+          if (flags & 0x40) {                                 // O_CREAT: writable guest files
+            f = new Uint8Array(0);
+            this.files[this.norm(p)] = f;
+            if (this.mtimes) this.mtimes[this.norm(p)] = Math.floor(this.nowMs() / 1000);
+          } else { ret(-2n); break; }                         // ENOENT
+        } else if (flags & 0x200) {                           // O_TRUNC
+          f = new Uint8Array(0);
+          this.files[this.norm(p)] = f;
         }
         const fd = this.allocFd();
-        this.fds.set(fd, { bytes: f, pos: 0, path: this.norm(p) });
+        const wr = (flags & 3) !== 0;                         // O_WRONLY / O_RDWR
+        this.fds.set(fd, { bytes: f, pos: (flags & 0x400) ? f.length : 0, path: this.norm(p), writable: wr });
         ret(BigInt(fd)); break; }
       case 0: {                                               // read(fd, buf, len)
         const fd = Number(a1), h = this.fds.get(fd);
@@ -868,6 +887,22 @@ export class LinuxEngine {
       case 110: ret(0n); break;                               // getppid
       case 186: ret(BigInt(this.threads[this.ti].id)); break;  // gettid
       case 83: ret(0n); break;                                // mkdir: pretend created
+      case 87: case 263: {                                    // unlink / unlinkat (open fds keep their buffer)
+        const p = this.norm(this.readPath(nr === 87 ? a1 : a2));
+        if (this.files[p] === undefined) { ret(-2n); break; }
+        delete this.files[p]; ret(0n); break; }
+      case 77: {                                              // ftruncate(fd, len)
+        const h = this.fds.get(Number(a1));
+        if (!h || h.bytes === undefined) { ret(-9n); break; }
+        const len = Number(a2);
+        const nb = new Uint8Array(len);
+        nb.set(h.bytes.subarray(0, Math.min(len, h.bytes.length)));
+        h.bytes = nb; if (h.path && this.files[h.path] !== undefined) this.files[h.path] = nb;
+        ret(0n); break; }
+      case 82: {                                              // rename(old, new)
+        const po = this.norm(this.readPath(a1)), pn = this.norm(this.readPath(a2));
+        if (this.files[po] === undefined) { ret(-2n); break; }
+        this.files[pn] = this.files[po]; delete this.files[po]; ret(0n); break; }
       case 95: ret(0o022n); break;                            // umask
       case 137: case 138: {                                   // statfs / fstatfs: tmpfs-ish dummy
         const buf = a2, o = this.RAMOFF + Number(buf - this.base);
