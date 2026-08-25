@@ -127,6 +127,12 @@ export class LinuxEngine {
     this.cpu = new CPU(this.mem);
     this.cpu.fsBase = 0n;
     this.cpu.onSyscall = (cpu) => this.syscall(cpu);
+    // green threads: clone(CLONE_VM) adds a CPU context over the shared
+    // memory; the scheduler switches at block points (every blocking syscall
+    // already unwinds to run() and re-executes on resume, so a switch is
+    // always at a clean instruction boundary) and on a step quantum.
+    this.threads = [{ id: 1, cpu: this.cpu, state: 'run', dl: null, futex: null, ctid: 0n, _dl: null }];
+    this.ti = 0; this.nextTid = 2; this._futexAddr = null;
     this.argv0 = argv[0]; this.setupStack(argv);
     this.cpu.rip = this.entry;
     this.profile = new Map(); this.compiled = new Map();
@@ -214,7 +220,9 @@ export class LinuxEngine {
   // Returns the rip to continue at.
   dispatchAot(f) {
     this.syncOut();
-    try { const exit = f(); this.syncIn(); this.stats.aotRuns++; return BigInt.asUintN(64, exit); }
+    try { const exit = f(); this.syncIn(); this.stats.aotRuns++;
+      if (this.onProgress && this.stats.aotRuns % 4e6 === 0) this.onProgress('aot');
+      return BigInt.asUintN(64, exit); }
     catch (e) { if (e instanceof DeoptUnwind) { this.syncIn(); return BigInt.asUintN(64, e.rip); }
                 if (e instanceof BlockUnwind) { this.syncIn(); return BigInt.asUintN(64, e.rip); }
                 throw e; }
@@ -231,6 +239,7 @@ export class LinuxEngine {
                continue; }
       const before = this.cpu.rip;
       const insn = this.cpu.step(); this.stats.interpreted++;
+      if (this.onProgress && this.stats.interpreted % 2e7 === 0) this.onProgress('callout');
       if (this.exitCode !== null) throw EXIT;
       if (this.blocked) { this.cpu.rip = before; throw new BlockUnwind(before); }
       // profile back-edges here too: a callout can nest arbitrarily deep and
@@ -365,7 +374,57 @@ export class LinuxEngine {
   allocFd() { let fd = 0; while (this.fds.has(fd)) fd++; return fd; }
   nowMs() { return (typeof performance !== 'undefined') ? performance.now() : Date.now(); }
   block(deadline) { this.blocked = { deadline: deadline ?? null }; }
-  wake() { this.blocked = null; }
+  // host-side wake: mark every parked thread runnable. Safe because every
+  // blocking syscall re-executes and re-checks its condition — a spurious
+  // wake just re-blocks.
+  wake() { this.blocked = null;
+    for (const t of this.threads) if (t.state === 'blk') { t.state = 'run'; t.futex = null; }
+    if (this.threads[this.ti].state === 'dead') {
+      const i = this.threads.findIndex(t => t.state === 'run');
+      if (i >= 0) this.switchTo(i);
+    } }
+
+  switchTo(i) {
+    const c = this.threads[this.ti]; c._dl = this._deadline;
+    this.ti = i; const n = this.threads[i];
+    this.cpu = n.cpu; this._deadline = n._dl ?? null;
+  }
+  reapTimers() { const now = this.nowMs();
+    for (const t of this.threads)
+      if (t.state === 'blk' && t.dl != null && now >= t.dl) { t.state = 'run'; t.futex = null; } }
+  futexWake(addr, max) { let n = 0;
+    for (const t of this.threads)
+      if (t.state === 'blk' && t.futex === addr) { t.state = 'run'; t.futex = null; if (++n >= max) break; }
+    return n; }
+  wakeAllBlk() {   // a guest-side event (pipe/eventfd write, X data) may unblock a sibling
+    for (const t of this.threads) if (t.state === 'blk' && t.futex === null) t.state = 'run'; }
+  // current thread hit a blocking syscall (this.blocked set): park it and run
+  // another. Returns true if a switch happened; false = nobody runnable, so
+  // run() should surface this.blocked (earliest deadline) to the host.
+  park() {
+    const t = this.threads[this.ti];
+    if (t.state !== 'dead') {
+      t.state = 'blk'; t.dl = this.blocked?.deadline ?? null;
+      t.futex = this._futexAddr; t._dl = this._deadline;
+    }
+    this._futexAddr = null;
+    this.reapTimers();
+    for (let k = 1; k <= this.threads.length; k++) {
+      const i = (this.ti + k) % this.threads.length;
+      if (this.threads[i].state === 'run') { this.blocked = null; this.switchTo(i); return true; }
+    }
+    let dl = null;
+    for (const x of this.threads) if (x.state === 'blk' && x.dl != null) dl = dl == null ? x.dl : Math.min(dl, x.dl);
+    this.blocked = { deadline: dl };
+    return false;
+  }
+  rotate() {   // preemption at the run() quantum: round-robin among runnable threads
+    this.reapTimers();
+    for (let k = 1; k < this.threads.length; k++) {
+      const i = (this.ti + k) % this.threads.length;
+      if (this.threads[i].state === 'run') { this.switchTo(i); return; }
+    }
+  }
 
   syscall(cpu) {
     const nr = Number(cpu.regs[0]);
@@ -378,8 +437,12 @@ export class LinuxEngine {
       if (len <= 0) return;
       const bytes = this.ram.slice(Number(addr - this.base), Number(addr - this.base) + len);
       const h = defSink(fd);
-      if (h?.sock?.conn) { h.sock.conn.write(bytes); return; }
-      if (h?.pipe) { h.pipe.chunks.push(bytes); return; }
+      if (h?.sock?.conn) { h.sock.conn.write(bytes); this.wakeAllBlk(); return; }
+      if (h?.pipe) { h.pipe.chunks.push(bytes); this.wakeAllBlk(); return; }
+      if (h?.ev) {                                           // eventfd: add to the counter
+        let v = 0n; for (let i = 7; i >= 0; i--) v = (v << 8n) | BigInt(bytes[i] ?? 0);
+        h.ev.count += v; this.wakeAllBlk(); return;
+      }
       const str = new TextDecoder().decode(bytes);
       if (h?.sink === 'err') { (this.stderr ||= []).push(str); (this.stderrBytes ||= []).push(bytes); }
       else { this.stdout.push(str); this.stdoutBytes.push(bytes); }
@@ -457,8 +520,37 @@ export class LinuxEngine {
       case 158:                                              // arch_prctl
         if (Number(a1) === 0x1002) { cpu.fsBase = a2; ret(0n); } else ret(-22n);
         break;
-      case 218: ret(1n); break;                              // set_tid_address
-      case 60: case 231:                                     // exit, exit_group
+      case 218: { const t = this.threads[this.ti]; t.ctid = a1; ret(BigInt(t.id)); break; }  // set_tid_address
+      case 56: {                                             // clone: threads only (CLONE_VM)
+        const flags = Number(a1 & 0xffffffffn);
+        if (!(flags & 0x100)) { ret(-38n); break; }          // a real fork -> ENOSYS (callers fall back or fail)
+        const tid = this.nextTid++;
+        const c = new CPU(this.mem);
+        c.onSyscall = (cc) => this.syscall(cc);
+        for (let r = 0; r < 16; r++) c.regs[r] = cpu.regs[r];
+        for (let r = 0; r < 16; r++) c.xmm[r] = cpu.xmm[r] ?? 0n;
+        c.rip = cpu.rip;                                     // resumes after the syscall insn
+        c.regs[0] = 0n;                                      // child sees 0
+        c.regs[4] = a2;                                      // child stack
+        c.fsBase = (flags & 0x80000) ? cpu.regs[8] : cpu.fsBase;               // CLONE_SETTLS
+        const t = { id: tid, cpu: c, state: 'run', dl: null, futex: null,
+                    ctid: (flags & 0x200000) ? cpu.regs[10] : 0n, _dl: null }; // CLONE_CHILD_CLEARTID
+        this.threads.push(t);
+        if (flags & 0x100000) this.mem.write(a3, 4n, BigInt(tid));             // CLONE_PARENT_SETTID
+        if (flags & 0x1000000) this.mem.write(cpu.regs[10], 4n, BigInt(tid));  // CLONE_CHILD_SETTID
+        ret(BigInt(tid)); break; }
+      case 24: ret(0n); break;                               // sched_yield (quantum rotation covers fairness)
+      case 273: ret(0n); break;                              // set_robust_list
+      case 157: ret(0n); break;                              // prctl (PR_SET_NAME etc.)
+      case 60: {                                             // exit: THREAD exit
+        const t = this.threads[this.ti];
+        if (this.threads.filter(x => x.state !== 'dead').length <= 1) {
+          this.exitCode = Number(a1 & 0xffn); cpu.halted = true; ret(0n); break;
+        }
+        t.state = 'dead';
+        if (t.ctid) { this.mem.write(t.ctid, 4n, 0n); this.futexWake(t.ctid, 1 << 30); }
+        this.block(null); ret(0n); break; }                  // park() skips dead threads
+      case 231:                                              // exit_group: whole process
         this.exitCode = Number(a1 & 0xffn); cpu.halted = true; ret(0n); break;
       case 228: {                                            // clock_gettime(clk, ts*)
         const clk = Number(a1), o = this.RAMOFF + Number(a2 - this.base);
@@ -517,6 +609,15 @@ export class LinuxEngine {
           if (data === null) { if (h.sock.nonblock) ret(-11n); else this.block(null); break; }
           this.ram.set(data, Number(a2 - this.base));
           ret(BigInt(data.length)); break;
+        }
+        if (h.ev) {                                           // eventfd: 8-byte counter
+          if (h.ev.count > 0n) {
+            const val = h.ev.sem ? 1n : h.ev.count;
+            h.ev.count -= val;
+            this.mem.write(a2, 8n, val); ret(8n); break;
+          }
+          if (h.ev.nonblock) ret(-11n); else this.block(null);
+          break;
         }
         if (h.pipe) {                                         // drain the shared pipe buffer
           const want = Number(a3); let dst = Number(a2 - this.base), got = 0;
@@ -621,13 +722,33 @@ export class LinuxEngine {
       case 79: {                                              // getcwd
         const b = new TextEncoder().encode('/\0');
         this.ram.set(b, Number(a1 - this.base)); ret(2n); break; }
-      case 202: {                                             // futex (single-threaded)
+      case 202: {                                             // futex
         const op = Number(a2) & 0x7f;
-        if (op === 0) {                                       // WAIT: value check only
+        if (op === 0 || op === 9) {                           // WAIT / WAIT_BITSET
           const cur = Number(this.mem.read(a1, 4n));
-          ret(cur !== Number(a3 & 0xFFFFFFFFn) ? -11n : 0n);  // EAGAIN or "woken"
-        } else ret(0n);                                       // WAKE etc: nobody to wake
-        break; }
+          if (cur !== Number(a3 & 0xFFFFFFFFn)) { ret(-11n); break; }   // EAGAIN
+          let dl = null;
+          const tp = cpu.regs[10];                            // struct timespec*
+          if (tp) {
+            const o = this.RAMOFF + Number(tp - this.base);
+            const v = new DataView(this.wmem.buffer);
+            let ms = Number(v.getBigUint64(o, true)) * 1000 + Number(v.getBigUint64(o + 8, true)) / 1e6;
+            if (op === 9) {                                   // WAIT_BITSET: absolute time
+              if (ms > 1e11) ms = ms - Date.now() + this.nowMs();   // realtime epoch -> engine clock
+              dl = ms;
+            } else dl = this.nowMs() + ms;                    // WAIT: relative
+          }
+          this._futexAddr = a1;                               // park() records it on the thread
+          this.block(dl); break;                              // re-executes on wake; re-checks *addr
+        }
+        if (op === 1 || op === 10 || op === 3 || op === 4) {  // WAKE / WAKE_BITSET / REQUEUE / CMP_REQUEUE
+          ret(BigInt(this.futexWake(a1, Number(a3 & 0x7fffffffn) || 1))); break;
+        }
+        ret(0n); break; }
+      case 290: {                                             // eventfd2 (glib GWakeup)
+        const fd = this.allocFd();
+        this.fds.set(fd, { ev: { count: BigInt(Number(a1)), nonblock: !!(Number(a2) & 0x800), sem: !!(Number(a2) & 1) } });
+        ret(BigInt(fd)); break; }
       case 13: case 14: ret(0n); break;                       // rt_sigaction / rt_sigprocmask
       case 131: ret(0n); break;                               // sigaltstack
       case 99: {                                              // sysinfo: zeros
@@ -690,7 +811,7 @@ export class LinuxEngine {
         ret(0n); break; }                                     // F_GETFD/F_SETFD/...
       case 28: ret(0n); break;                                // madvise
       case 110: ret(0n); break;                               // getppid
-      case 186: ret(1n); break;                               // gettid
+      case 186: ret(BigInt(this.threads[this.ti].id)); break;  // gettid
       case 83: ret(0n); break;                                // mkdir: pretend created
       case 95: ret(0o022n); break;                            // umask
       case 137: case 138: {                                   // statfs / fstatfs: tmpfs-ish dummy
@@ -833,6 +954,7 @@ export class LinuxEngine {
         const readyR = (h) => !h ? false
           : h.sock ? !!(h.sock.conn && h.sock.conn.readable())
           : h.pipe ? h.pipe.chunks.length > 0
+          : h.ev ? h.ev.count > 0n
           : !!h.bytes;                                        // regular file: always ready (EOF too)
         const base = this.RAMOFF + Number(a1 - this.base);
         let ready = 0;
@@ -866,6 +988,7 @@ export class LinuxEngine {
         const readyR = (h) => !h ? false
           : h.sock ? !!(h.sock.conn && h.sock.conn.readable())
           : h.pipe ? h.pipe.chunks.length > 0
+          : h.ev ? h.ev.count > 0n
           : !!h.bytes;
         const scan = (ptr) => { if (ptr === 0n) return [];
           const o = this.RAMOFF + Number(ptr - this.base); const out = [];
@@ -897,10 +1020,11 @@ export class LinuxEngine {
     let steps = 0;
     try {
       while (steps++ < maxSteps && this.exitCode === null) {
+        if ((steps & 0x3FFFF) === 0 && this.threads.length > 1) this.rotate();   // preemption quantum
         const key = this.cpu.rip.toString();
         const f = this.aotFns.get(key);
         if (f) { this.cpu.rip = this.dispatchAot(f);
-                 if (this.blocked) break;
+                 if (this.blocked) { if (this.park()) continue; break; }
                  continue; }
         const c = this.compiled.get(key);
         if (c) {
@@ -914,7 +1038,9 @@ export class LinuxEngine {
         try { insn = this.cpu.step(); }
         catch (e) { if (e === EXIT) break; e.rip = before; throw e; }
         this.stats.interpreted++;
-        if (this.blocked) { this.cpu.rip = before; break; }   // re-execute the syscall on resume
+        if (this.onProgress && this.stats.interpreted % 2e7 === 0) this.onProgress('run');
+        if (this.blocked) { this.cpu.rip = before;            // re-execute the syscall on resume
+                            if (this.park()) continue; break; }
         if (insn.mnem === 'jcc' && this.cpu.rip < before && this.inExec(this.cpu.rip)) {
           const hk = this.cpu.rip.toString();
           const n = (this.profile.get(hk) || 0) + 1;
