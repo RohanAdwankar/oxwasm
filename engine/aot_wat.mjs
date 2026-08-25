@@ -423,6 +423,13 @@ function emitUnitFunction(a0, fnAddr, ctx) {
         for (const r of (S===1 ? [0] : [0,2])) { seenR[r]=true; if (S===8) any64[r]=true; else w32[r]=true; }
         noteRW(insn.src, false); break;
       case 'xchg': noteRW(insn.dst, true); noteRW(insn.src, true); break;   // both operands written
+      case 'cmpxchg': noteRW(insn.dst, false); noteRW(insn.src, false);
+        // dst is only written on SUCCESS — an unwritten 32-bit dst must still
+        // carry the caller's full value through, so it can't be an i32 local
+        if (insn.dst.kind === 'reg') { seenR[insn.dst.r] = true; any64[insn.dst.r] = true; }
+        seenR[0] = true; any64[0] = true; break;                            // implicit accumulator
+      case 'xadd': noteRW(insn.dst, true); noteRW(insn.src, true); break;
+      case 'rdtsc': seenR[0] = true; seenR[2] = true; any64[0] = true; any64[2] = true; break;
       case 'cwde': case 'cdq': { const r = insn.mnem==='cdq' ? 2 : 0; seenR[0]=true; seenR[r]=true;
         if (S===8) { any64[0]=true; any64[r]=true; } else w32[r]=true; break; }
       case 'stos': { seenR[7]=true; any64[7]=true; seenR[0]=true; any64[0]=true;
@@ -802,7 +809,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     L.push(setx(insn.xrm, e));
   }
 
-  const FLAGSET = new Set(['add','sub','and','or','xor','inc','dec','cmp','test','neg']);
+  const FLAGSET = new Set(['add','sub','and','or','xor','inc','dec','cmp','test','neg','cmpxchg','xadd']);
   // A modeled flag producer is one whose flags we can reconstruct lazily.
   const modeled = (insn) => {
     if (FLAGSET.has(insn.mnem)) return true;
@@ -818,13 +825,13 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   // writer before a consumer means the lazy flags are unrecoverable.
   const CLOBBER = new Set(['shl','shr','sar','rol','ror','imul2','imul3','mul1','imul1','div1','idiv1',
                            'bt','bts','btr','btc','shld','shrd','call','callind','syscall',
-                           'xadd','cmpxchg','clc','stc','x87']);
+                           'clc','stc','x87']);
   // Static (kind,size) a modeled producer yields — MUST match the setFlags
   // calls in emitBlock so cross-block consumers pick the right cond() form.
   const flagKind = (insn) => { const S = insn.size || 8;
     switch (insn.mnem) {
-      case 'sub': case 'cmp': case 'neg': return { kind:'sub', size:S };
-      case 'add': return { kind:'add', size:S };
+      case 'sub': case 'cmp': case 'neg': case 'cmpxchg': return { kind:'sub', size:S };
+      case 'add': case 'xadd': return { kind:'add', size:S };
       case 'adc': return { kind:'adc', size:S };
       case 'sbb': return { kind:'sbb', size:S };
       case 'or': case 'and': case 'xor': case 'test':
@@ -1228,6 +1235,28 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           L.push(wr(insn.dst,S,`(local.get ${tb})`,next));
           L.push(wr(insn.src,S,`(local.get ${ta})`,next));
           break; }
+        case 'cmpxchg': {   // glib atomics: threads never preempt inside a unit, so LOCK is free
+          const tv = T(), ta = T(), tr = T();
+          L.push(`(local.set ${tv} ${rd(insn.dst,S,next)})`);
+          L.push(`(local.set ${ta} ${rd({kind:'reg',r:0,size:S},S,next)})`);
+          L.push(`(local.set ${tr} (i64.and (i64.sub (local.get ${ta}) (local.get ${tv})) (i64.const ${m})))`);
+          setFlags('sub', S, `(local.get ${ta})`, `(local.get ${tv})`, `(local.get ${tr})`);
+          L.push(`(if (i64.eq (local.get ${ta}) (local.get ${tv}))`,
+                 `(then ${wr(insn.dst,S,rd(insn.src,S,next),next)})`,
+                 `(else ${wr({kind:'reg',r:0,size:S},S,`(local.get ${tv})`,next)}))`);
+          break; }
+        case 'xadd': {   // dst+src -> dst, old dst -> src; add flags
+          const ta = T(), tb = T(), tr = T();
+          L.push(`(local.set ${ta} ${rd(insn.dst,S,next)})`);
+          L.push(`(local.set ${tb} ${rd(insn.src,S,next)})`);
+          L.push(`(local.set ${tr} (i64.and (i64.add (local.get ${ta}) (local.get ${tb})) (i64.const ${m})))`);
+          setFlags('add', S, `(local.get ${ta})`, `(local.get ${tb})`, `(local.get ${tr})`);
+          L.push(wr(insn.src,S,`(local.get ${ta})`,next));
+          L.push(wr(insn.dst,S,`(local.get ${tr})`,next));
+          break; }
+        case 'rdtsc':   // synthetic timestamp lives in the interpreter: deopt to it
+          L.push(...spillAll(), `(return (call $x_deopt (i64.const ${hexs(insn.rip)}) (local.get $rsp0)))`);
+          break;
         case 'leave':    // mov rsp,rbp ; pop rbp
           L.push(`(local.set $r4 ${rd({kind:'reg',r:5,size:8},8,next)})`);
           L.push(wr({kind:'reg',r:5,size:8},8,`(i64.load ${wasmAddr({base:4,index:-1,disp:0n},next)})`,next));
