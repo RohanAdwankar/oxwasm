@@ -825,8 +825,16 @@ export class LinuxEngine {
         ret(BigInt(fd)); break; }
       case 13: case 14: ret(0n); break;                       // rt_sigaction / rt_sigprocmask
       case 131: ret(0n); break;                               // sigaltstack
-      case 99: {                                              // sysinfo: zeros
-        this.ram.fill(0, Number(a1 - this.base), Number(a1 - this.base) + 112); ret(0n); break; }
+      case 99: {                                              // sysinfo: modest plausible box
+        const o = this.RAMOFF + Number(a1 - this.base);
+        new Uint8Array(this.wmem.buffer, o, 112).fill(0);
+        const dv = new DataView(this.wmem.buffer);
+        dv.setBigUint64(o, 1000n, true);                      // uptime
+        dv.setBigUint64(o + 32, BigInt(512 << 20), true);     // totalram: 512MB keeps app cache heuristics small
+        dv.setBigUint64(o + 40, BigInt(256 << 20), true);     // freeram
+        dv.setUint16(o + 72, 8, true);                        // procs
+        dv.setUint32(o + 100, 1, true);                       // mem_unit
+        ret(0n); break; }
       case 332: ret(-38n); break;                             // statx -> ENOSYS (glibc falls back)
       case 217: {                                             // getdents64(fd, dirp, count)
         const h = this.fds.get(Number(a1));
