@@ -190,6 +190,8 @@ export class LinuxEngine {
     const k = entry.toString();
     if (this.aotFns.has(k) || this.aotFailed.has(k)) return;
     if (this.isTrampoline(entry)) { this.aotFailed.add(k); return; }
+    const un = (this._unitN = (this._unitN || 0) + 1);   // bisect aid: veto unit N -> stays interpreted
+    if (this.unitFilter && !this.unitFilter(un, entry)) { this.aotFailed.add(k); return; }
     try {
       const unit = compileUnitWat(this.mem, entry, { guestBase: this.base, ramBase: this.RAMOFF });
       const bytes = this.assembleWat(unit.wat);
@@ -200,7 +202,9 @@ export class LinuxEngine {
       }
       if (!this.aotFns.has(k)) throw new Error('entry missing from unit');
       this.stats.tiers.aot = (this.stats.tiers.aot || 0) + 1;
-    } catch (e) { this.aotFailed.add(k); }
+    } catch (e) { this.aotFailed.add(k);
+      if (this.onAotFail) this.onAotFail(entry, e.message);
+    }
   }
 
   // GPRs at 0..127, fs base at 128, the 16 xmm registers at 256..511 (16B
@@ -373,6 +377,14 @@ export class LinuxEngine {
   }
   allocFd() { let fd = 0; while (this.fds.has(fd)) fd++; return fd; }
   nowMs() { return (typeof performance !== 'undefined') ? performance.now() : Date.now(); }
+  // stable unique inode per path: ld.so dedups loaded objects by
+  // (st_dev, st_ino), so size-derived inodes made same-sized modules alias
+  // to one link_map — dlopen returned the WRONG module and dlsym missed
+  // (babl extensions, gegl ops). Anonymous fds get their own counter.
+  inoOf(p) { p = this.norm(p); this._inos ??= new Map(); let n = this._inos.get(p);
+    if (n === undefined) { n = this._inos.size + 1000; this._inos.set(p, n); }
+    return BigInt(n); }
+
   block(deadline) { this.blocked = { deadline: deadline ?? null }; }
   // host-side wake: mark every parked thread runnable. Safe because every
   // blocking syscall re-executes and re-checks its condition — a spurious
@@ -498,12 +510,22 @@ export class LinuxEngine {
       case 10: ret(0n); break;                               // mprotect (no page prot here)
       case 273: ret(0n); break;                              // set_robust_list
       case 334: ret(-38n); break;                            // rseq -> ENOSYS (glibc copes)
-      case 302: {                                            // prlimit64: report infinity
-        const oldp = cpu.regs[2];                            // rdx = old_limit
+      case 302: {                                            // prlimit64(pid, res, new, old)
+        const oldp = cpu.regs[10];                           // r10 = old_limit (rdx is new_limit!)
         if (oldp) { const v = new DataView(this.wmem.buffer);
           const off = this.RAMOFF + Number(oldp - this.base);
-          v.setBigUint64(off, 0xFFFFFFFFFFFFFFFFn, true);
+          // RLIMIT_STACK must be finite: glibc sizes every pthread stack from
+          // it — garbage/huge values made 516MB stacks and EAGAIN thread spawns
+          const cur = Number(a2) === 3 ? 0x800000n : 0xFFFFFFFFFFFFFFFFn;
+          v.setBigUint64(off, cur, true);
           v.setBigUint64(off + 8, 0xFFFFFFFFFFFFFFFFn, true); }
+        ret(0n); break; }
+      case 97: {                                             // getrlimit(res, rlim*)
+        const v = new DataView(this.wmem.buffer);
+        const off = this.RAMOFF + Number(a2 - this.base);
+        const cur = Number(a1) === 3 ? 0x800000n : 0xFFFFFFFFFFFFFFFFn;
+        v.setBigUint64(off, cur, true);
+        v.setBigUint64(off + 8, 0xFFFFFFFFFFFFFFFFn, true);
         ret(0n); break; }
       case 267: {                                            // readlinkat: /proc/self/exe -> argv0
         const buf = cpu.regs[2], sz = cpu.regs[10] ?? cpu.regs[8];
@@ -648,7 +670,7 @@ export class LinuxEngine {
           const p = this.readPath(a2);
           if (p === '' && (cpu.regs[10] & 0x1000n)) {         // AT_EMPTY_PATH: stat the fd
             const h = this.fds.get(Number(a1));
-            if (h) { size = h.bytes.length; mode = 0o100755; }
+            if (h) { size = h.bytes.length; mode = 0o100755; statPath = h.path ?? null; }
           } else {
             const f = this.lookup(p);
             if (f !== undefined) { size = f.length; mode = 0o100755; }
@@ -658,7 +680,7 @@ export class LinuxEngine {
           }
         } else {
           const h = this.fds.get(Number(a1));
-          if (h?.bytes) { size = h.bytes.length; mode = 0o100755; }        // regular file
+          if (h?.bytes) { size = h.bytes.length; mode = 0o100755; statPath = h.path ?? null; }  // regular file
           else if (h?.pipe) { size = 0; mode = 0o010600; }                 // FIFO
           else if (h?.sock) { size = 0; mode = 0o140777; }                 // socket
           else if (h?.isdir) { size = 4096; mode = 0o040755; statPath = h.path; }
@@ -669,7 +691,14 @@ export class LinuxEngine {
         new Uint8Array(this.wmem.buffer, off, 144).fill(0);
         const v = new DataView(this.wmem.buffer);
         v.setBigUint64(off + 0, 8n, true);                    // st_dev
-        v.setBigUint64(off + 8, BigInt((Math.abs(size ?? 7) % 1e6) + 2), true);  // st_ino (distinct-ish)
+        {
+          let ino;
+          if (statPath) ino = this.inoOf(statPath);
+          else { const h = this.fds.get(Number(a1));
+                 if (h) ino = (h._ino ??= this.inoOf('\0anon:' + (this._anonN = (this._anonN || 0) + 1)));
+                 else ino = 7n; }
+          v.setBigUint64(off + 8, ino, true);                 // st_ino
+        }
         v.setBigUint64(off + 16, 1n, true);                   // st_nlink
         v.setUint32(off + 24, mode, true);                    // st_mode (u32 at 24)
         v.setBigUint64(off + 48, BigInt(size ?? 0), true);    // st_size
@@ -687,7 +716,7 @@ export class LinuxEngine {
         const v = new DataView(this.wmem.buffer);
         const size = f ? f.length : 4096;
         v.setBigUint64(off + 0, 8n, true);
-        v.setBigUint64(off + 8, BigInt((size % 1e6) + 3), true);
+        v.setBigUint64(off + 8, this.inoOf(p), true);
         v.setBigUint64(off + 16, 1n, true);
         v.setUint32(off + 24, f ? 0o100755 : 0o040755, true);
         v.setBigUint64(off + 48, BigInt(size), true);

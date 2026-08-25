@@ -378,6 +378,10 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   try { ({ open, closeAfter } = structure(N, succs)); }
   catch (e) {
     if (!/overlap|irreducible|unclosed|converge/.test(e.message) || !globalThis.__enableDispatch) throw e;
+    // bisect aid: every dispatch-mode unit gets a global ordinal; a filter
+    // can veto (unit poisons instead — interpreted, correct, uncompiled)
+    const n = (globalThis.__dispN = (globalThis.__dispN || 0) + 1);
+    if (globalThis.__dispFilter && !globalThis.__dispFilter(n, entry)) throw e;
     mode = 'dispatch';
   }
   const DISP = mode === 'dispatch';
