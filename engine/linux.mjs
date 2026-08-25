@@ -325,9 +325,11 @@ export class LinuxEngine {
   readPath(addr) { let p = '', a = addr;
     for (;;) { const c = Number(this.mem.read(a, 1n)); if (!c) break; p += String.fromCharCode(c); a++; }
     return p; }
-  lookup(p) { return this.files[p] ?? this.files[p.replace(/^\.\//, '')]; }
+  norm(p) { return p.replace(/\/{2,}/g, '/').replace(/\/\.\//g, '/').replace(/^\.\//, ''); }
+  lookup(p) { p = this.norm(p); return this.files[p]; }
   // a guest path is a directory iff some provided file lives under it
   isDir(p) {
+    p = this.norm(p);
     if (p === '/' ) return true;
     const pre = p.endsWith('/') ? p : p + '/';
     if (this._dirset === undefined) {
@@ -339,7 +341,17 @@ export class LinuxEngine {
     }
     return this._dirset.has(pre.slice(0, -1));
   }
-  mtimeOf(p) { return this.mtimes?.[p] ?? 0; }
+  mtimeOf(p) { return this.mtimes?.[this.norm(p)] ?? 0; }
+  dirEntries(p) {
+    p = this.norm(p); const pre = p.endsWith('/') ? p : p + '/';
+    const names = new Map();                       // name -> isDir
+    for (const k of Object.keys(this.files)) {
+      if (!k.startsWith(pre)) continue;
+      const rest = k.slice(pre.length), i = rest.indexOf('/');
+      if (i < 0) names.set(rest, false); else names.set(rest.slice(0, i), true);
+    }
+    return [...names.entries()];
+  }
   allocFd() { let fd = 0; while (this.fds.has(fd)) fd++; return fd; }
   nowMs() { return (typeof performance !== 'undefined') ? performance.now() : Date.now(); }
   block(deadline) { this.blocked = { deadline: deadline ?? null }; }
@@ -474,9 +486,16 @@ export class LinuxEngine {
       case 257: case 2: {                                     // openat(dirfd,path,flags) / open(path,flags)
         const p = this.readPath(nr === 257 ? a2 : a1);
         const f = this.lookup(p);
-        if (f === undefined) { ret(-2n); break; }             // ENOENT
+        if (f === undefined) {
+          if (this.isDir(p)) {                                // O_DIRECTORY / readdir scans
+            const fd = this.allocFd();
+            this.fds.set(fd, { isdir: true, path: this.norm(p), pos: 0 });
+            ret(BigInt(fd)); break;
+          }
+          ret(-2n); break;                                    // ENOENT
+        }
         const fd = this.allocFd();
-        this.fds.set(fd, { bytes: f, pos: 0, path: p });
+        this.fds.set(fd, { bytes: f, pos: 0, path: this.norm(p) });
         ret(BigInt(fd)); break; }
       case 0: {                                               // read(fd, buf, len)
         const fd = Number(a1), h = this.fds.get(fd);
@@ -531,6 +550,7 @@ export class LinuxEngine {
           if (h?.bytes) { size = h.bytes.length; mode = 0o100755; }        // regular file
           else if (h?.pipe) { size = 0; mode = 0o010600; }                 // FIFO
           else if (h?.sock) { size = 0; mode = 0o140777; }                 // socket
+          else if (h?.isdir) { size = 4096; mode = 0o040755; statPath = h.path; }
           // sink/tty: leave mode as the char-device default
         }
         const buf = isAt ? cpu.regs[2] : a2;
@@ -603,7 +623,28 @@ export class LinuxEngine {
       case 99: {                                              // sysinfo: zeros
         this.ram.fill(0, Number(a1 - this.base), Number(a1 - this.base) + 112); ret(0n); break; }
       case 332: ret(-38n); break;                             // statx -> ENOSYS (glibc falls back)
-      case 217: ret(-2n); break;                              // getdents64
+      case 217: {                                             // getdents64(fd, dirp, count)
+        const h = this.fds.get(Number(a1));
+        if (!h?.isdir) { ret(-20n); break; }                  // ENOTDIR
+        const entries = h.entries ??= this.dirEntries(h.path);
+        const cap = Number(a3);
+        let off = 0;
+        const base = this.RAMOFF + Number(a2 - this.base);
+        const v = new DataView(this.wmem.buffer);
+        while (h.pos < entries.length) {
+          const [name, isdir] = entries[h.pos];
+          const nb = new TextEncoder().encode(name);
+          const reclen = (19 + nb.length + 1 + 7) & ~7;
+          if (off + reclen > cap) break;
+          v.setBigUint64(base + off, BigInt(h.pos + 100), true);        // d_ino
+          v.setBigUint64(base + off + 8, BigInt(h.pos + 1), true);      // d_off
+          v.setUint16(base + off + 16, reclen, true);
+          v.setUint8(base + off + 18, isdir ? 4 : 8);                   // DT_DIR / DT_REG
+          new Uint8Array(this.wmem.buffer, base + off + 19, nb.length + 1).fill(0);
+          new Uint8Array(this.wmem.buffer, base + off + 19, nb.length).set(nb);
+          off += reclen; h.pos++;
+        }
+        ret(BigInt(off)); break; }
       case 72: {                                              // fcntl
         const h = this.fds.get(Number(a1)), cmd = Number(a2);
         if (cmd === 3) { ret(BigInt(2 | (h?.sock?.nonblock ? 0x800 : 0))); break; }   // F_GETFL: O_RDWR
