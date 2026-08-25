@@ -993,12 +993,18 @@ export class CPU {
           this.f.cf = (a >> BigInt(c - 1)) & 1n ? 1 : 0;
           if (c === 1) this.f.of = 0;
           this.szp(r, S); this.set(insn.dst, r); } break; }
-      case 'rol': { const w = BigInt(S*8); const c = this.get(insn.src) % w;
-        if (c) { const a = this.get(insn.dst); const r = ((a << c) | (a >> (w - c))) & M;
-          this.f.cf = Number(r & 1n); this.set(insn.dst, r); } break; }
-      case 'ror': { const w = BigInt(S*8); const c = this.get(insn.src) % w;
-        if (c) { const a = this.get(insn.dst); const r = ((a >> c) | (a << (w - c))) & M;
-          this.f.cf = Number((r >> (w - 1n)) & 1n); this.set(insn.dst, r); } break; }
+      case 'rol': { const w = BigInt(S*8);
+        // the write ALWAYS happens (a zero-count 32-bit rotate still zeroes
+        // the upper half on hardware); flags only for a nonzero masked count
+        const raw = this.get(insn.src) & (S === 8 ? 63n : 31n); const c = raw % w;
+        const a = this.get(insn.dst); const r = c ? ((a << c) | (a >> (w - c))) & M : a & M;
+        if (raw) this.f.cf = Number(r & 1n);
+        this.set(insn.dst, r); break; }
+      case 'ror': { const w = BigInt(S*8);
+        const raw = this.get(insn.src) & (S === 8 ? 63n : 31n); const c = raw % w;
+        const a = this.get(insn.dst); const r = c ? ((a >> c) | (a << (w - c))) & M : a & M;
+        if (raw) this.f.cf = Number((r >> (w - 1n)) & 1n);
+        this.set(insn.dst, r); break; }
       case 'push': this.push(this.get(insn.src)); break;
       case 'pop': this.set(insn.dst, this.pop()); break;
       case 'jmp': this.rip = (next + insn.rel) & MASK[8]; break;

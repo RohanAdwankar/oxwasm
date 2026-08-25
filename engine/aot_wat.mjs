@@ -168,10 +168,19 @@ export function compileFunctionWatDispatch(mem, entry, { guestBase, ramBase, max
           else e = `(i64.shr_s ${sx(a,S)} ${c})`;
           L.push(wr(insn.dst, S, `(i64.and ${e} (i64.const ${m}))`, next)); break; }
         case 'rol': case 'ror': {
-          const a = rd(insn.dst,S,next); const c = `(i32.and ${rd(insn.src,1,next) === '(i64.const 1)' ? '(i32.const 1)' : `(i32.wrap_i64 ${rd(insn.src,1,next)})`} (i32.const ${S===8?63:31}))`;
+          // rotate WITHIN the operand width: i32.rotl only fits S=4; byte and
+          // word rotates need the manual (v<<c | v>>(W-c)) & mask form —
+          // i32-rotating a 16-bit value threw expat's BOM bytes into bits 16+
+          const a = rd(insn.dst,S,next);
+          const craw = `${rd(insn.src,1,next) === '(i64.const 1)' ? '(i32.const 1)' : `(i32.wrap_i64 ${rd(insn.src,1,next)})`}`;
+          const rot = insn.mnem === 'rol';
           let e;
-          if (S === 8) e = `(i64.${insn.mnem==='rol'?'rotl':'rotr'} ${a} (i64.extend_i32_u ${c}))`;
-          else e = `(i64.extend_i32_u (i32.${insn.mnem==='rol'?'rotl':'rotr'} (i32.wrap_i64 ${a}) ${c}))`;
+          if (S === 8) e = `(i64.${rot?'rotl':'rotr'} ${a} (i64.extend_i32_u (i32.and ${craw} (i32.const 63))))`;
+          else if (S === 4) e = `(i64.extend_i32_u (i32.${rot?'rotl':'rotr'} (i32.wrap_i64 ${a}) (i32.and ${craw} (i32.const 31))))`;
+          else { const W = S*8;
+            const v = `(i32.wrap_i64 ${a})`, cW = `(i32.and ${craw} (i32.const ${W-1}))`;
+            const fwd = rot ? 'i32.shl' : 'i32.shr_u', back = rot ? 'i32.shr_u' : 'i32.shl';
+            e = `(i64.extend_i32_u (i32.and (i32.or (${fwd} ${v} ${cW}) (${back} ${v} (i32.sub (i32.const ${W}) ${cW}))) (i32.const ${m})))`; }
           L.push(wr(insn.dst, S, S===8?e:`(i64.and ${e} (i64.const ${m}))`, next)); break; }
         case 'push': L.push(`(local.set $r4 (i64.sub (local.get $r4) (i64.const 8)))`,
                             `(i64.store ${wasmAddr({base:4,index:-1,disp:0n},next)} ${rd(insn.src,8,next)})`); break;
@@ -1166,11 +1175,20 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           L.push(wr(insn.dst,S,`(select ${andmask(e,S)} ${a} (i64.ne (local.get ${tc}) (i64.const 0)))`,next));
           break; }
         case 'rol': case 'ror': {
-          const c=`(i32.and ${rd32(insn.src,next)} (i32.const ${S===8?63:31}))`;
-          if (S===8) { const a=rd(insn.dst,8,next);
-            L.push(`(local.set ${reg(insn.dst.r)} (i64.${insn.mnem==='rol'?'rotl':'rotr'} ${a} (i64.extend_i32_u ${c})))`); }
-          else if (insn.dst.kind === 'reg') L.push(wr32reg(insn.dst.r, `(i32.${insn.mnem==='rol'?'rotl':'rotr'} ${rd32(insn.dst,next)} ${c})`));
-          else L.push(wr(insn.dst,S,`(i64.and (i64.extend_i32_u (i32.${insn.mnem==='rol'?'rotl':'rotr'} ${rd32(insn.dst,next)} ${c})) (i64.const ${m}))`,next));
+          // see the function-mode note: byte/word rotates must wrap within W bits
+          const rot = insn.mnem === 'rol';
+          if (S === 8) { const a=rd(insn.dst,8,next);
+            const c=`(i32.and ${rd32(insn.src,next)} (i32.const 63))`;
+            L.push(`(local.set ${reg(insn.dst.r)} (i64.${rot?'rotl':'rotr'} ${a} (i64.extend_i32_u ${c})))`); }
+          else if (S === 4) { const c=`(i32.and ${rd32(insn.src,next)} (i32.const 31))`;
+            if (insn.dst.kind === 'reg') L.push(wr32reg(insn.dst.r, `(i32.${rot?'rotl':'rotr'} ${rd32(insn.dst,next)} ${c})`));
+            else L.push(wr(insn.dst,4,`(i64.and (i64.extend_i32_u (i32.${rot?'rotl':'rotr'} ${rd32(insn.dst,next)} ${c})) (i64.const ${m}))`,next)); }
+          else { const W = S*8;
+            const v = `(i32.and ${rd32(insn.dst,next)} (i32.const ${m}))`;
+            const cW = `(i32.and ${rd32(insn.src,next)} (i32.const ${W-1}))`;
+            const fwd = rot ? 'i32.shl' : 'i32.shr_u', back = rot ? 'i32.shr_u' : 'i32.shl';
+            const e = `(i64.extend_i32_u (i32.and (i32.or (${fwd} ${v} ${cW}) (${back} ${v} (i32.sub (i32.const ${W}) ${cW}))) (i32.const ${m})))`;
+            L.push(wr(insn.dst,S,e,next)); }
           break; }
         case 'cmov':   // dst = cond ? src : dst; cond() is an i32 boolean, exactly what select wants
           L.push(wr(insn.dst, S, `(select ${rd(insn.src,S,next)} ${rd(insn.dst,S,next)} ${cond(insn.cond)})`, next)); break;
