@@ -685,7 +685,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     0xEF:'v128.xor',0xDB:'v128.and',0xEB:'v128.or',
     0x57:'v128.xor',0x54:'v128.and',0x56:'v128.or',
   };
-  function emitSSE(insn, next, L) {
+  function emitSSE(insn, next, L, setFlags) {
     const op = insn.op, xr = insn.xr, rm = insn.rm;
     const dst = `(local.get ${xreg(xr)})`;
     const put = (e) => L.push(setx(xr, e));
@@ -725,6 +725,18 @@ function emitUnitFunction(a0, fnAddr, ctx) {
         else L.push(insn.W ? `(i64.store ${wasmAddr(rm,next)} (i64x2.extract_lane 0 ${dst}))`
                            : `(i32.store ${wasmAddr(rm,next)} (i32x4.extract_lane 0 ${dst}))`);
         break;
+      case 0x2E: case 0x2F: {                                                 // ucomiss/sd, comiss/sd -> fcmp flags
+        const isD = insn.p66;
+        const aBits = isD ? `(i64x2.extract_lane 0 ${dst})`
+                          : `(i64.reinterpret_f64 (f64.promote_f32 (f32x4.extract_lane 0 ${dst})))`;
+        const bBits = rm.kind === 'xmm'
+          ? (isD ? `(i64x2.extract_lane 0 ${xv(rm, next)})`
+                 : `(i64.reinterpret_f64 (f64.promote_f32 (f32x4.extract_lane 0 ${xv(rm, next)})))`)
+          : (isD ? `(i64.load ${wasmAddr(rm, next)})`
+                 : `(i64.reinterpret_f64 (f64.promote_f32 (f32.load ${wasmAddr(rm, next)})))`);
+        if (!setFlags) throw new Error('AOT sse fcmp without flag sink');
+        setFlags('fcmp', 8, aBits, bBits, '(i64.const 0)');
+        break; }
       case 0xD6: storeRm(8, dst); break;                                      // movq store low 64
       case 0xD7: L.push(wr32reg(xr, `(i8x16.bitmask ${xv(rm, next)})`)); break;   // pmovmskb -> GPR
       case 0x50: L.push(wr32reg(xr, `(${insn.p66?'i64x2.bitmask':'i32x4.bitmask'} ${xv(rm, next)})`)); break;  // movmskps/pd
@@ -813,6 +825,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   // A modeled flag producer is one whose flags we can reconstruct lazily.
   const modeled = (insn) => {
     if (FLAGSET.has(insn.mnem)) return true;
+    if (insn.mnem === 'sse' && (insn.op === 0x2E || insn.op === 0x2F)) return true;   // ucomis/comis
     if (insn.mnem === 'adc' || insn.mnem === 'sbb') return true;   // produce CF/OF/SF/ZF via $cf + operands
     if ((insn.mnem === 'shl' || insn.mnem === 'shr' || insn.mnem === 'sar') &&
         insn.src.kind === 'imm' && (insn.src.v & (BigInt((insn.size||8)===8?63:31))) !== 0n) return true;
@@ -830,6 +843,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   // calls in emitBlock so cross-block consumers pick the right cond() form.
   const flagKind = (insn) => { const S = insn.size || 8;
     switch (insn.mnem) {
+      case 'sse': return (insn.op === 0x2E || insn.op === 0x2F) ? { kind:'fcmp', size:8 } : null;
       case 'sub': case 'cmp': case 'neg': case 'cmpxchg': return { kind:'sub', size:S };
       case 'add': case 'xadd': return { kind:'add', size:S };
       case 'adc': return { kind:'adc', size:S };
@@ -950,6 +964,22 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       }
       else if (fs.kind === 'cf') switch (cc) {      // fr holds the CF bit (bt family)
         case 'b':return nz; case 'ae':return zf; }
+      else if (fs.kind === 'fcmp') {                // ucomis: ZF/PF/CF from an f64 compare; OF/SF cleared
+        const A = `(f64.reinterpret_i64 ${a})`, B = `(f64.reinterpret_i64 ${b})`;
+        const unord = `(i32.or (f64.ne ${A} ${A}) (f64.ne ${B} ${B}))`;
+        switch (cc) {
+          case 'a': return `(f64.gt ${A} ${B})`;
+          case 'ae': return `(f64.ge ${A} ${B})`;
+          case 'b': return `(i32.eqz (f64.ge ${A} ${B}))`;
+          case 'be': return `(i32.eqz (f64.gt ${A} ${B}))`;
+          case 'e': case 'le': return `(i32.or (f64.eq ${A} ${B}) ${unord})`;
+          case 'ne': case 'g': return `(i32.and (i32.eqz (f64.eq ${A} ${B})) (i32.eqz ${unord}))`;
+          case 'p': return unord; case 'np': return `(i32.eqz ${unord})`;
+          case 's': case 'o': case 'l': return `(i32.const 0)`;
+          case 'ns': case 'no': case 'ge': return `(i32.const 1)`;
+        }
+      }
+
       else switch (cc) {
         case 'e':return zf; case 'ne':return nz; case 's':return sf; case 'ns':return nsf;
         case 'le':return `(i64.le_s ${sx(r,S)} (i64.const 0))`; case 'g':return `(i64.gt_s ${sx(r,S)} (i64.const 0))`;
@@ -1337,7 +1367,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           else
             L.push(wr(insn.dst,8,`(i64.load ${wasmAddr({base:4,index:-1,disp:0n},next)})`,next),`(local.set $r4 (i64.add (local.get $r4) (i64.const 8)))`);
           break; }
-        case 'sse':          emitSSE(insn, next, L); break;
+        case 'sse':          emitSSE(insn, next, L, setFlags); break;
         case 'ssegrpshift':  emitSSEShift(insn, L); break;
         case 'jmp': case 'jcc': case 'ret': case 'retn': case 'jmpind': case 'udec': break;  // terminator handled below
         default: throw new Error('AOT: unhandled '+insn.mnem+' @ '+insn.rip.toString(16));

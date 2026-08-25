@@ -25,3 +25,4 @@ node addflagtest.mjs
 node adctest.mjs
 node enginetest.mjs
 node atomictest.mjs
+node fcmptest.mjs
