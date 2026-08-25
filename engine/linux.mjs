@@ -237,7 +237,8 @@ export class LinuxEngine {
   interpUntil(done) {
     let guard = 0;
     while (!done()) {
-      const f = this.aotFns.get(this.cpu.rip.toString());
+      let f = this.aotFns.get(this.cpu.rip.toString());
+      if (f && this.aotBudget !== undefined && --this.aotBudget < 0) f = null;
       if (f) { this.cpu.rip = this.dispatchAot(f);
                if (this.blocked) throw new BlockUnwind(this.cpu.rip);
                continue; }
@@ -267,6 +268,10 @@ export class LinuxEngine {
       // and resume re-executes the syscall at exactly this rip.
       syscall: (rip) => {
         this.syncIn();
+        // arch behavior of the syscall insn (the interp models it; compiled
+        // code must too): rcx = return rip, r11 = rflags
+        this.cpu.regs[1] = BigInt.asUintN(64, (rip ?? 0n) + 2n);
+        this.cpu.regs[11] = this.cpu.flagsValue ? this.cpu.flagsValue() : 0x246n;
         this.syscall(this.cpu);
         if (this.exitCode !== null) throw EXIT;
         if (this.blocked) {
@@ -282,14 +287,29 @@ export class LinuxEngine {
         // memory before the call, and the guest return address is on the guest
         // stack. rsp lives in the regfile at slot 4.
         const rsp0 = BigInt.asUintN(64, this.regview[4]);
+        if (rsp0 < 0x10000n && this.onBadRsp) this.onBadRsp(target, rsp0);
         const retAddr = this.mem.read(rsp0, 8n);
         const rspExit = BigInt.asUintN(64, rsp0 + 8n);
-        const f = this.aotFns.get(target.toString());
+        let f = this.aotFns.get(target.toString());
+        if (f && this.aotBudget !== undefined && --this.aotBudget < 0) f = null;
         if (f) {
           // Target is compiled: run it wasm-to-wasm over the shared register
           // file — NO BigInt cpu<->memory sync (the expensive part). It reads
           // and writes the same regfile memory the caller will reload from.
-          try { this.stats.aotRuns++; return BigInt.asIntN(64, f()); }
+          try { this.stats.aotRuns++;
+            const exit = BigInt.asUintN(64, f());
+            if (this.onCalloutExit) this.onCalloutExit(target, exit, retAddr);
+            // The caller DROPS this return and resumes after its call, so we
+            // may only come back once the call really returned. A compiled
+            // callee that TAIL-JUMPS out of its unit exits at the jump target
+            // with the frame still open — finish the chain first.
+            if (exit === retAddr && BigInt.asUintN(64, this.regview[4]) === rspExit)
+              return BigInt.asIntN(64, exit);
+            this.syncIn(); this.cpu.rip = exit;
+            this.interpUntil(() => this.cpu.rip === retAddr && this.cpu.regs[4] === rspExit);
+            this.syncOut();
+            return BigInt.asIntN(64, retAddr);
+          }
           catch (e) {
             if (!(e instanceof DeoptUnwind)) throw e;
             // Deopt inside the compiled callee: its state is spilled to the
@@ -564,6 +584,12 @@ export class LinuxEngine {
       case 24: ret(0n); break;                               // sched_yield (quantum rotation covers fairness)
       case 273: ret(0n); break;                              // set_robust_list
       case 157: ret(0n); break;                              // prctl (PR_SET_NAME etc.)
+      case 204: {                                            // sched_getaffinity: one CPU
+        const n = Math.min(Number(a2), 8);
+        const o = this.RAMOFF + Number(a3 - this.base);
+        new Uint8Array(this.wmem.buffer, o, n).fill(0);
+        new DataView(this.wmem.buffer).setUint8(o, 1);
+        ret(8n); break; }
       case 60: {                                             // exit: THREAD exit
         const t = this.threads[this.ti];
         if (this.threads.filter(x => x.state !== 'dead').length <= 1) {
@@ -1051,7 +1077,8 @@ export class LinuxEngine {
       while (steps++ < maxSteps && this.exitCode === null) {
         if ((steps & 0x3FFFF) === 0 && this.threads.length > 1) this.rotate();   // preemption quantum
         const key = this.cpu.rip.toString();
-        const f = this.aotFns.get(key);
+        let f = this.aotFns.get(key);
+        if (f && this.aotBudget !== undefined && --this.aotBudget < 0) f = null;
         if (f) { this.cpu.rip = this.dispatchAot(f);
                  if (this.blocked) { if (this.park()) continue; break; }
                  continue; }

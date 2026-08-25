@@ -58,7 +58,10 @@ export function compileFunctionWatDispatch(mem, entry, { guestBase, ramBase, max
 
   // read operand -> i64 expr (zero-extended to size)
   const rd = (op, size, next) => {
-    if (op.kind === 'imm') return `(i64.const ${hexs(op.v)})`;
+    // immediates are decoded sign-extended; mask to the operand width like
+    // any other read — an unmasked 0xFF..86 poisons unsigned flag compares
+    // (cmp $0x86,%dl + ja indexed a jump table out of range)
+    if (op.kind === 'imm') return `(i64.const ${hexs(BigInt.asUintN((size || 8) * 8, op.v))})`;
     if (op.kind === 'reg') { let e = `(local.get ${reg(op.r)})`;
       if (op.high) e = `(i64.shr_u ${e} (i64.const 8))`;
       return size === 8 && !op.high ? e : `(i64.and ${e} (i64.const ${MASK[size]}))`; }
@@ -368,16 +371,17 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   // back to a flat br_table dispatch loop (a relooper), which handles ANY CFG
   // at the cost of an indirect branch per non-fallthrough edge. Either way the
   // function compiles instead of poisoning the whole unit.
-  // The dispatch fallback is EXPERIMENTAL and OFF by default: it still
-  // miscompiles some complex irreducible loops (a nested counted loop in
-  // glibc's ctype-table init hangs). Until that is fixed, an irreducible CFG
-  // poisons (the function is interpreted, exactly as before the fallback
-  // existed) — correct, just not compiled. Set globalThis.__enableDispatch to
-  // exercise the dispatch code path (see diff/disptest.mjs).
+  // The dispatch (br_table) fallback is ON by default. The historical
+  // miscompile that kept it gated (a counted loop in glibc's ctype init
+  // hanging) was the unmasked-immediate flag bug: cmp imm8 on a sub-width
+  // register compared against the sign-extended 64-bit value, so unsigned
+  // jcc took the wrong side — fixed in rd(), regression-tested by
+  // subwidthtest. Set globalThis.__disableDispatch to poison irreducible
+  // CFGs back to the interpreter (see diff/disptest.mjs).
   let mode = 'structured', open = null, closeAfter = null;
   try { ({ open, closeAfter } = structure(N, succs)); }
   catch (e) {
-    if (!/overlap|irreducible|unclosed|converge/.test(e.message) || !globalThis.__enableDispatch) throw e;
+    if (!/overlap|irreducible|unclosed|converge/.test(e.message) || globalThis.__disableDispatch) throw e;
     // bisect aid: every dispatch-mode unit gets a global ordinal; a filter
     // can veto (unit poisons instead — interpreted, correct, uncompiled)
     const n = (globalThis.__dispN = (globalThis.__dispN || 0) + 1);
@@ -397,7 +401,10 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   any64[4] = seenR[4] = true;                                        // rsp
   const noteRW = (op, isWrite) => { if (!op) return;
     if (op.kind === 'reg') { seenR[op.r] = true;
-      if ((op.size||8) === 8 || op.high) any64[op.r] = true; else if (isWrite) w32[op.r] = true; }
+      // sub-word (byte/word) access needs the full 64-bit value for the
+      // partial-write merge — an i32 local would drop the caller's high bits
+      if ((op.size||8) === 8 || op.high || (op.size||8) < 4) any64[op.r] = true;
+      else if (isWrite) w32[op.r] = true; }
     if (op.kind === 'mem') { if (op.base>=0) { seenR[op.base]=true; any64[op.base]=true; } if (op.index>=0) { seenR[op.index]=true; any64[op.index]=true; } } };
   const WRITES_DST = new Set(['mov','movzx','movsx','add','sub','and','or','xor','adc','sbb','inc','dec','not','neg','shl','shr','sar','rol','ror','cmov','setcc','imul2','imul3','xchg','bswap','bts','btr','btc','shld','shrd']);
   // SSE ops that name a GPR (not xmm) via xr or rm — see sseXrIsGpr/sseRmIsGpr below
@@ -596,7 +603,9 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   const LD_S = { 1:'i64.load8_s', 2:'i64.load16_s', 4:'i64.load32_s' };
   const ST = { 1:'i64.store8', 2:'i64.store16', 4:'i64.store32', 8:'i64.store' };
   const rd = (op, size, next) => {
-    if (op.kind === 'imm') return `(i64.const ${hexs(op.v)})`;
+    // mask immediates to the operand width (decoded sign-extended) — see the
+    // matching note in the function-mode rd() above
+    if (op.kind === 'imm') return `(i64.const ${hexs(BigInt.asUintN((size || 8) * 8, op.v))})`;
     if (op.kind === 'reg') {
       if (isI32(op.r) && !op.high) { const e = `(i64.extend_i32_u (local.get ${reg(op.r)}))`; return size >= 4 ? e : `(i64.and ${e} (i64.const ${MASKl[size]}))`; }
       let e = `(local.get ${reg(op.r)})`;
