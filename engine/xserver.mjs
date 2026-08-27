@@ -157,14 +157,22 @@ export class XServer {
       if (b.length < 4) return;
       const v = new DataView(b.buffer, b.byteOffset);
       const len = v.getUint16(2, true) * 4;
-      if (len === 0) { conn.inbuf = b.subarray(4); continue; }   // malformed; skip
+      if (len === 0) { conn.inbuf = b.subarray(4); conn.len0 = (conn.len0 || 0) + 1; continue; }   // malformed; skip
       if (b.length < len) return;
       const req = b.subarray(0, len);
       conn.inbuf = b.subarray(len);
       conn.seq = (conn.seq + 1) & 0xffff;
+      const rec = { op: req[0], seq: conn.seq, q: conn.out.length, sent: 0, err: 0 };
+      (conn.ring ??= []).push(rec); if (conn.ring.length > 16) conn.ring.shift();
       try { this.handle(conn, req); }
-      catch (e) { this.error(conn, 17, 0, req[0]); }            // BadImplementation
+      catch (e) { rec.err = 1; this.error(conn, 17, 0, req[0]); }            // BadImplementation
+      rec.sent = conn.out.length - rec.q;
     }
+  }
+  diag() {
+    return this.conns.map((c, i) =>
+      `conn${i} seq=${c.seq} inbuf=${c.inbuf.length} out=${c.out.length} len0=${c.len0 || 0} ring=` +
+      (c.ring ?? []).map(r => `${r.op}@${r.seq}${r.sent ? '+' + r.sent : ''}${r.err ? 'E' : ''}`).join(','));
   }
 
   setupReply(conn) {

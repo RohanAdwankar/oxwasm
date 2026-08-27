@@ -480,6 +480,7 @@ export class LinuxEngine {
         h.ev.count += v; this.wakeAllBlk(); return;
       }
       if (h && h.bytes !== undefined && h.writable) {        // regular file opened for writing
+        if (h.path) (this.dirtyFiles ??= new Set()).add(h.path);
         const end = h.pos + bytes.length;
         if (end > h.bytes.length) {
           const nb = new Uint8Array(end);
@@ -758,6 +759,9 @@ export class LinuxEngine {
         ret(0n); break; }
       case 4: case 6: {                                       // stat / lstat (by path)
         const p = this.readPath(a1);
+        if (this.debugPollAfter != null && this.nowMs() > this.debugPollAfter) {
+          if (this.nowMs() - (this._dbgStatLast ?? 0) > 5000) { this._dbgStatLast = this.nowMs();
+            console.error(`<statwd thr=${this.threads?.[this.ti]?.id} ${nr===6?'lstat':'stat'} ${p}>`); } }
         const f = this.lookup(p);
         if (f === undefined && !this.isDir(p)) { ret(-2n); break; }   // ENOENT
         const off = this.RAMOFF + Number(a2 - this.base);
@@ -1073,6 +1077,19 @@ export class LinuxEngine {
           v.setUint16(o + 6, re, true); if (re) ready++;
         }
         const now = this.nowMs();
+        if (this.debugPollAfter != null && now > this.debugPollAfter) {
+          if (now - (this._dbgPollLast ?? 0) > 10000) { this._dbgPollLast = now;
+            const ds = [];
+            for (let i = 0; i < nfds; i++) {
+              const fd = v.getInt32(base + i * 8, true), ev = v.getUint16(base + i * 8 + 4, true);
+              const h = this.fds.get(fd);
+              const kind = !h ? 'nofd' : h.sock ? (h.sock.conn ? 'xsock' : 'sock-unconn')
+                : h.pipe ? `pipe(${h.pipe.chunks.length})` : h.ev ? `evfd(${h.ev.count})` : h.path ?? 'file';
+              ds.push(`${fd}:${kind}:ev${ev}`);
+            }
+            console.error(`<pollwd thr=${this.threads?.[this.ti]?.id} t=${(now/1000)|0}s to=${timeoutMs} [${ds.join(' ')}]>`);
+          }
+        }
         if (ready > 0 || timeoutMs === 0 || (this._deadline != null && now >= this._deadline)) {
           this._deadline = null; ret(BigInt(ready)); break;
         }
