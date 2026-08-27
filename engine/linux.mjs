@@ -194,6 +194,7 @@ export class LinuxEngine {
     if (this.unitFilter && !this.unitFilter(un, entry)) { this.aotFailed.add(k); return; }
     try {
       const unit = compileUnitWat(this.mem, entry, { guestBase: this.base, ramBase: this.RAMOFF });
+      if (this.onUnitWat) this.onUnitWat(un, entry, unit);
       const bytes = this.assembleWat(unit.wat);
       const inst = new WebAssembly.Instance(new WebAssembly.Module(bytes), { js: { mem: this.wmem }, env: this.aotEnv() });
       for (const a of unit.funcs) {
