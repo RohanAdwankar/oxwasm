@@ -21,7 +21,10 @@ let id=0; const waiting=new Map();
 ws.onmessage=(ev)=>{const m=JSON.parse(ev.data); if(m.id&&waiting.has(m.id)){waiting.get(m.id)(m.result);waiting.delete(m.id);}};
 const cmd=(m2,p={})=>new Promise(res=>{const i=++id;waiting.set(i,res);ws.send(JSON.stringify({id:i,method:m2,params:p}))});
 await cmd('Page.enable'); await cmd('Runtime.enable'); await cmd('Network.enable');
-await cmd('Network.emulateNetworkConditions',{offline:false,latency:rtt,
+// mbps 0 = no CDP emulation (use serve.mjs's socket-level throttle instead:
+// Chrome's DevTools emulation caps large downloads well below the configured
+// throughput, so server pacing gives the trustworthy cold numbers)
+if (mbps > 0) await cmd('Network.emulateNetworkConditions',{offline:false,latency:rtt,
   downloadThroughput:mbps*125000,uploadThroughput:mbps*125000});
 const q=async(e)=>(await cmd('Runtime.evaluate',{expression:e,returnByValue:true})).result.value;
 
