@@ -258,6 +258,16 @@ process.on('SIGTERM', async () => {
     writeFileSync(outPpm, Buffer.concat([Buffer.from(`P6\n${W} ${H}\n255\n`), p]));
     console.error('shot written (SIGTERM):', outPpm);
   } catch {}
+  if (process.env.WINDUMP) { try {
+    for (const c of xs.root.children ?? []) {
+      if (!c.mapped || !c.buffer || c.w < 50) continue;
+      const p = Buffer.alloc(c.w * c.h * 3);
+      for (let i = 0; i < c.w * c.h; i++) { const v = c.buffer[i];
+        p[i*3] = (v >> 16) & 255; p[i*3+1] = (v >> 8) & 255; p[i*3+2] = v & 255; }
+      writeFileSync(`${outPpm}.win${c.id.toString(16)}.ppm`,
+        Buffer.concat([Buffer.from(`P6\n${c.w} ${c.h}\n255\n`), p]));
+      console.error(`<windump 0x${c.id.toString(16)} ${c.w}x${c.h}>`);
+    } } catch (e) { console.error('windump fail', e.message); } }
   process.exit(143); });
 let state = 'ran-out';
 const t0 = Date.now();
