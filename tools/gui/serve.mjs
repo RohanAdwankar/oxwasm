@@ -53,7 +53,8 @@ createServer((req, res) => {
   } else if (existsSync(fp)) {
     let b = readFileSync(fp);
     const h = { ...common, 'content-type': TYPES[extname(fp)] ?? 'application/octet-stream' };
-    if ((req.headers['accept-encoding'] ?? '').includes('gzip')) {
+    // .gz sidecars are inflated by the page itself — serve the bytes as-is
+    if (extname(fp) !== '.gz' && (req.headers['accept-encoding'] ?? '').includes('gzip')) {
       b = gzipSync(b, { level: 6 }); h['content-encoding'] = 'gzip';
     }
     send(res, 200, h, b);

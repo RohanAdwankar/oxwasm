@@ -15,7 +15,7 @@ const ENGINE = join(HERE, '..', 'engine');
 
 const args = process.argv.slice(2);
 let sysroot = null, guestPath = null, out = 'x.html', title = null, W = 640, H = 480, fontDir = null, gtk = false;
-let snapPath = null, memMB = 512, extraArgs = [], unitsPath = null, sidecarDir = null, brQ = 9, dedup = false;
+let snapPath = null, memMB = 512, extraArgs = [], unitsPath = null, sidecarDir = null, brQ = 9, dedup = false, brMode = false;
 for (let i = 0; i < args.length; i++) {
   const a = args[i];
   if (a === '-o') out = args[++i];
@@ -28,6 +28,7 @@ for (let i = 0; i < args.length; i++) {
   else if (a === '--sidecar') sidecarDir = args[++i];
   else if (a === '--brq') brQ = +args[++i];
   else if (a === '--dedup') dedup = true;
+  else if (a === '--br') brMode = true;
   else if (a === '--mem') memMB = +args[++i];
   else if (a === '--arg') extraArgs.push(args[++i]);
   else if (!sysroot) sysroot = a;
@@ -168,9 +169,12 @@ for (const m of MODS) {
 //                   after interactivity; until then tier-up is parked
 //                   (thresholds Infinity), so a hot function simply stays
 //                   interpreted instead of poisoning
-// Sidecars are stored brotli-compressed; a server (tools/gui/serve.mjs) sends
-// them with Content-Encoding: br and the browser decodes natively while
-// streaming. Everything inside the containers is stored raw for that reason.
+// By default the sidecars are plain gzip files that the PAGE inflates itself
+// (DecompressionStream), so the whole bundle is throw-on-any-static-host:
+// GitHub Pages, S3, nginx, python -m http.server — no headers, no server
+// config, nothing but files. --br stores brotli instead (~30% smaller wire,
+// units especially) for hosts that can send Content-Encoding: br, e.g.
+// tools/gui/serve.mjs. Everything inside the containers is stored raw.
 if (sidecarDir) {
   if (!snapPath) { console.error('xpack: --sidecar requires --snapshot'); process.exit(1); }
   mkdirSync(sidecarDir, { recursive: true });
@@ -384,6 +388,10 @@ P.moduleUp = performance.now();                    // engine modules parsed + ev
 const stat = document.getElementById('stat'), cv = document.getElementById('screen');
 let timer = null;
 const ctx = cv.getContext('2d');
+const EXT = ${brMode ? "''" : "'.gz'"};
+// brotli sidecars arrive pre-decoded (Content-Encoding: br); gzip sidecars
+// are plain files the page inflates itself — static-host-agnostic
+const debody = (resp) => ${brMode ? 'resp.body' : "resp.body.pipeThrough(new DecompressionStream('gzip'))"};
 const CFG = { W: ${W}, H: ${H}, memMB: ${memMB},
   argv: ${JSON.stringify([guestPath, ...extraArgs])},
   mtimes: ${JSON.stringify(mtimes)},
@@ -444,7 +452,7 @@ function sha1hex(str) {
   // Critical path is fetched SEQUENTIALLY (state, then mem): on a throttled
   // link, parallel fetches just split bandwidth and delay the first thing we
   // can act on. rom and units follow after interactivity.
-  const stateAB = await (await fetch('app.state')).arrayBuffer();
+  const stateAB = await new Response(debody(await fetch('app.state' + EXT))).arrayBuffer();
   P.stateBytes = performance.now();
   const state = parseContainer(new Uint8Array(stateAB));
   P.stateFetched = performance.now();
@@ -471,7 +479,7 @@ function sha1hex(str) {
   // ---- stream memory tiles straight into wasm memory ----
   {
     const all = new Uint8Array(eng.wmem.buffer);
-    const rd = (await fetch('app.mem')).body.getReader();
+    const rd = debody(await fetch('app.mem' + EXT)).getReader();
     const hdr = new Uint8Array(10), hv = new DataView(hdr.buffer);
     let magicSkip = 4, hdrFill = 0, remaining = 0, dst = 0, got = 0, lastStat = 0;
     for (;;) {
@@ -599,7 +607,7 @@ function sha1hex(str) {
       // streaming container parse over a chunk list: as soon as one file's
       // bytes are complete, replay its fills, clear its pending bits, and
       // poke the pump (the engine may be stalled on exactly those pages)
-      const rd = (await fetch('app.rom')).body.getReader();
+      const rd = debody(await fetch('app.rom' + EXT)).getReader();
       const chunks = []; let pos = 0, total = 0;
       const take = (start, len) => {
         const out = new Uint8Array(len);
@@ -648,7 +656,7 @@ function sha1hex(str) {
       poke();
     }
     try {
-      const ub = new Uint8Array(await (await fetch('app.units')).arrayBuffer());
+      const ub = new Uint8Array(await new Response(debody(await fetch('app.units' + EXT))).arrayBuffer());
       if (ub.length) {
         for (const [h, bytes] of parseContainer(ub)) unitCache.set(h, bytes);
         eng.aotCallThreshold = 4; eng.aotLoopThreshold = 12;
@@ -667,9 +675,11 @@ function sha1hex(str) {
 </html>`;
 
   writeFileSync(join(sidecarDir, 'index.html'), shell);
-  const w = (name, buf, q) => { const c = br(buf, q);
-    writeFileSync(join(sidecarDir, name + '.br'), c);
-    console.log(`xpack: ${name}.br ${(c.length / 1e6).toFixed(1)} MB (raw ${(buf.length / 1e6).toFixed(1)} MB, brotli q${q})`); };
+  const w = (name, buf, q) => {
+    const c = brMode ? br(buf, q) : gzipSync(buf, { level: 9 });
+    const ext = brMode ? '.br' : '.gz';
+    writeFileSync(join(sidecarDir, name + ext), c);
+    console.log(`xpack: ${name}${ext} ${(c.length / 1e6).toFixed(1)} MB (raw ${(buf.length / 1e6).toFixed(1)} MB, ${brMode ? 'brotli q' + q : 'gzip 9'})`); };
   console.log(`xpack: shell ${(shell.length / 1e6).toFixed(2)} MB, ${nUnits} units deferred`);
   w('app.state', stateBuf, 11);
   w('app.mem', memBuf, memBuf.length < (100 << 20) ? 11 : brQ);
