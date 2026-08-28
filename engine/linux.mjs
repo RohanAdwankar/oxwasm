@@ -297,6 +297,7 @@ export class LinuxEngine {
         const rspExit = BigInt.asUintN(64, rsp0 + 8n);
         let f = this.aotFns.get(target.toString());
         if (f && this.aotBudget !== undefined && --this.aotBudget < 0) f = null;
+        if (this.chainSlow) f = null;                       // diagnostic: disable wasm-to-wasm fastpath
         if (f) {
           // Target is compiled: run it wasm-to-wasm over the shared register
           // file — NO BigInt cpu<->memory sync (the expensive part). It reads
