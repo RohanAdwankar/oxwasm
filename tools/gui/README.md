@@ -69,3 +69,48 @@ The working-set manifest comes from a `SNAPLOAD` + `CLICK` script +
 tier-up actually requests). A unit missing from a pruned page poisons to
 the interpreter — still correct, just unaccelerated — so pruning trades
 only cold-path speed for 26 MB.
+
+## Near-native load: sidecar delivery (2026-08-28)
+
+`xpack --sidecar DIR --dedup` replaces the monolith with a load-time
+architecture:
+
+- **index.html** (0.6 MB): engine modules + the snapshot's framebuffer
+  inlined — the page opens showing the app's real screen before the
+  engine even parses.
+- **app.state.br** (11.7 MB) + **app.mem.br** (7.7 MB): the critical
+  path, fetched sequentially; memory tiles stream straight into wasm
+  memory. `--dedup` is what makes mem this small: 219 MB of pages
+  byte-identical to sysroot files (mapped library .text/.rodata, inside
+  non-writable PT_LOAD segments only) are dropped and reconstructed
+  from the files instead — verified bit-exact at pack time.
+- **app.rom.br** (30 MB) + **app.units.br** (1.8 MB): deferred. Rom
+  carries the file-clean pages' backing files; until each file lands its
+  pages are marked pending, and the engine's `Memory.pend` guard turns
+  any touch into rewind + short block + retry (interpreter-only window,
+  AOT thresholds parked at Infinity, re-armed when units apply). A click
+  issued while 40 MB of libraries were still streaming rendered the File
+  menu pixel-perfect (`cdp_stall.mjs`).
+
+Serve with `serve.mjs DIR PORT [Mbps]` — sidecars ship brotli with
+`Content-Encoding: br` (native streaming decode; gzip-of-base64 in the
+old monolith cost ~35% more wire). The optional Mbps arg paces all
+responses through one token bucket (50 ms burst) at the socket, because
+Chrome's DevTools network emulation caps large downloads at ~20-35 Mbps
+regardless of the configured profile. Repeat visits ride the plain HTTP
+cache; a cache-first service worker was tried and rejected (the Cache
+API stores decoded bodies — ~600 MB for this bundle — slower on both
+visits than re-decoding brotli).
+
+Measured with `cdp_load.mjs` (headless Chromium, server-paced link,
+fresh profile for cold; milestones are `performance.now()` marks the
+page records, cross-checked against resource timing):
+
+| link | first paint | click-to-interactive, cold | repeat visit | all sidecars done |
+|---|---|---|---|---|
+| 50 Mbps  | 112 ms | 3.90 s | 1.73 s | 9.1 s |
+| 100 Mbps | 127 ms | 2.68 s | 1.77 s | 5.4 s |
+| 300 Mbps | 104 ms | 1.64 s | 1.66 s | 2.7 s |
+
+After each cold visit the driver opens the File menu with a native click
+and screenshots it: correct at every profile, with 535+ AOT units live.
