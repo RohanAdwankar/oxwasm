@@ -317,13 +317,23 @@ if (sidecarDir) {
   for (const [n, b64] of fontEntries) stateSections.push(['font:' + n, Buffer.from(b64, 'base64')]);
   const stateBuf = container(stateSections);
   const romBuf = romSections.length ? container(romSections) : Buffer.alloc(0);
-  // mem: 'SPR2' + repeat [u48 wasm-mem offset][u32 len][raw tile bytes]
+  // mem: 'SPR2' + repeat [u48 wasm-mem offset][u32 len][raw bytes]. Runs are
+  // page-granular: only nonzero 4K pages are emitted (coalesced), so the
+  // decode cost on restore is proportional to real data, not to tiles that
+  // dedup mostly emptied. Fresh wasm memory is already zero.
   const memParts = [Buffer.from('SPR2')];
-  const wordsZero = (t) => { for (let i = 0; i < t.length; i += 8) if (t.readBigUInt64LE(i) !== 0n) return false; return true; };
+  const pageZero = (t, o) => { for (let i = 0; i < 4096; i += 8) if (t.readBigUInt64LE(o + i) !== 0n) return false; return true; };
+  let memRaw = 0;
   for (const [o, t] of tiles) {
-    if (dedup && wordsZero(t)) continue;                  // tile emptied by dedup
-    const hdr = Buffer.alloc(10); hdr.writeUIntLE(o, 0, 6); hdr.writeUInt32LE(t.length, 6);
-    memParts.push(hdr, t);
+    let run = -1;
+    for (let p = 0; p <= t.length; p += 4096) {
+      const z = p >= t.length || pageZero(t, p);
+      if (!z && run < 0) run = p;
+      else if (z && run >= 0) {
+        const hdr = Buffer.alloc(10); hdr.writeUIntLE(o + run, 0, 6); hdr.writeUInt32LE(p - run, 6);
+        memParts.push(hdr, t.subarray(run, p)); memRaw += p - run; run = -1;
+      }
+    }
   }
   const memBuf = Buffer.concat(memParts);
   let unitsBuf = Buffer.alloc(0), nUnits = 0;
