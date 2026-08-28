@@ -14,6 +14,7 @@ const PAGE = 4096n;
 const align = (v, a) => (v + a - 1n) & ~(a - 1n);
 const EXIT = Symbol('guest-exit');           // unwinds live wasm frames on exit()
 const SHADOW_ABORT = { shadowAbort: true };
+const BRANCHY = new Set(['jmp','jcc','call','ret','retn','jmpind','callind','syscall','leave','hlt','int3']);
 // A deopt DESTROYS the live wasm frames instead of interpreting under them:
 // at the escape point every register was spilled to the regfile and all
 // return addresses live on the guest stack, so the frames are pure execution
@@ -321,14 +322,16 @@ export class LinuxEngine {
   // until `done()` — used by the callout escape.
   interpUntil(done) {
     let guard = 0;
+    let branched = true;      // compiled entries are branch targets: only look up after a branch
     while (!done()) {
-      let f = this.aotFns.get(this.cpu.rip);
+      let f = branched ? this.aotFns.get(this.cpu.rip) : undefined;
       if (f && this.aotBudget !== undefined && --this.aotBudget < 0) f = null;
       if (f) { this.cpu.rip = this.dispatchMaybeShadow(f);
                if (this.blocked) throw new BlockUnwind(this.cpu.rip);
                continue; }
       const before = this.cpu.rip;
       const insn = this.cpu.step(); this.stats.interpreted++;
+      branched = BRANCHY.has(insn.mnem) || this.cpu.rip !== this.cpu.ripNext && this.cpu.rip !== before + BigInt(insn.len);
       if (this.onProgress && this.stats.interpreted % 2e7 === 0) this.onProgress('callout');
       if (this.exitCode !== null) throw EXIT;
       if (this.blocked) { this.cpu.rip = before; throw new BlockUnwind(before); }
@@ -1226,28 +1229,32 @@ export class LinuxEngine {
   run(maxSteps = 5e9) {
     let steps = 0;
     try {
+      let branched = true;    // compiled entries are branch targets: only look up after a branch
       while (steps++ < maxSteps && this.exitCode === null) {
-        if ((steps & 0x3FFFF) === 0 && this.threads.length > 1) this.rotate();   // preemption quantum
+        if ((steps & 0x3FFFF) === 0 && this.threads.length > 1) { this.rotate(); branched = true; }   // preemption quantum
         const key = this.cpu.rip;
-        let f = this.aotFns.get(key);
+        let f = branched ? this.aotFns.get(key) : undefined;
         if (f && this.aotBudget !== undefined && --this.aotBudget < 0) f = null;
         if (f) { this.cpu.rip = this.dispatchMaybeShadow(f);
+                 branched = true;
                  if (this.blocked) { if (this.park()) continue; break; }
                  continue; }
-        const c = this.compiled.get(key);
+        const c = branched ? this.compiled.get(key) : undefined;
         if (c) {
           for (let r = 0; r < 16; r++) this.regview[r] = BigInt.asIntN(64, this.cpu.regs[r]);
           c.run();
           for (let r = 0; r < 16; r++) this.cpu.regs[r] = BigInt.asUintN(64, this.regview[r]);
-          this.cpu.rip = c.exit; this.stats.compiledRuns++; continue;
+          this.cpu.rip = c.exit; this.stats.compiledRuns++; branched = true; continue;
         }
         const before = this.cpu.rip;
         let insn;
         try { insn = this.cpu.step(); }
         catch (e) { if (e === EXIT) break; e.rip = before; throw e; }
         this.stats.interpreted++;
+        branched = BRANCHY.has(insn.mnem) || this.cpu.rip !== before + BigInt(insn.len);
         if (this.onProgress && this.stats.interpreted % 2e7 === 0) this.onProgress('run');
         if (this.blocked) { this.cpu.rip = before;            // re-execute the syscall on resume
+                            branched = true;
                             if (this.park()) continue; break; }
         if (insn.mnem === 'jcc' && this.cpu.rip < before && this.inExec(this.cpu.rip)) {
           const hk = this.cpu.rip;
