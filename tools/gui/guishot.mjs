@@ -244,6 +244,9 @@ const persistDirty = () => {
   let n = 0;
   for (const gp of eng.dirtyFiles ?? []) {
     if (!gp.startsWith('/root/') && !gp.startsWith('/var/cache/')) continue;
+    if (/gimpswap|\.tmp$/.test(gp)) continue;   // never persist swap/temp files:
+    // a stale gimpswap.1 in the sysroot (guest pid is always 1) sends the
+    // next boot's tile cache into garbage and a null-pointer crash
     const f = eng.files[gp]; if (!f) continue;
     try { const hp = join(sysroot, gp); mkdirSync(dirname(hp), { recursive: true });
       writeFileSync(hp, f); n++; } catch {}
