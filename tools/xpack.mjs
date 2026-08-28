@@ -208,6 +208,7 @@ import { parsePCF } from 'ox/pcf';
 import { restoreEngineCore } from 'ox/snapshot_core';
 import { CPU } from 'ox/interp';
 const stat = document.getElementById('stat'), cv = document.getElementById('screen');
+let timer = null;
 const ctx = cv.getContext('2d');
 async function inflate(b64) {
   const bin = atob(b64), u = new Uint8Array(bin.length);
@@ -306,7 +307,10 @@ async function inflate(b64) {
   const pos = (e) => { const r = cv.getBoundingClientRect(); const s = scale();
     return [ (e.clientX - r.left) * s, (e.clientY - r.top) * s ]; };
   let pumping = false;
-  const poke = () => { if (window.__oxReady && !pumping) pump(); };
+  // defer: never run the engine synchronously inside an input handler — a
+  // long pump would delay the matching pointerup, and the guest would see
+  // press->release seconds apart (GTK menus treat that as press-hold-dismiss)
+  const poke = () => { if (window.__oxReady && !pumping && !timer) timer = setTimeout(pump, 0); };
   cv.addEventListener('pointermove', (e) => { const [x, y] = pos(e); xs.injectMotion(x, y); poke(); });
   cv.addEventListener('pointerdown', (e) => { cv.focus({ preventScroll: true }); const [x, y] = pos(e); xs.injectMotion(x, y);
     xs.injectButton(e.button === 2 ? 3 : e.button === 1 ? 2 : 1, true); e.preventDefault(); poke(); });
@@ -328,7 +332,6 @@ async function inflate(b64) {
 
   // ---- engine pump with blocking support ----
   const t0 = performance.now();
-  let timer = null;
   function pump() {
     pumping = true;
     if (timer) { clearTimeout(timer); timer = null; }
