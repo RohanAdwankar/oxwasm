@@ -919,6 +919,11 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       if (++guard > 100000) throw new Error('AOT: flag dataflow diverged');
       for (let b = 0; b < N; b++) {
         const nin = new Set(); for (const p of preds[b]) for (const k of outDefs[p]) nin.add(k);
+        // the unit's entry is also reachable from OUTSIDE (interp dispatch, a
+        // call, a loop-head slice's first iteration): flags there are unknown.
+        // Model that as a sentinel def so any consumer it can reach poisons
+        // the unit instead of silently reading uninitialized flag locals.
+        if (b === 0) nin.add('EXT');
         const nout = killsFlags[b] ? new Set() : localDef[b] ? new Set([localDef[b]]) : nin;
         const diff = (a, c) => a.size !== c.size || [...c].some(k=>!a.has(k));
         if (diff(inDefs[b], nin)) { inDefs[b] = nin; changed = true; }
@@ -928,7 +933,9 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   const blkFlagIn = new Array(N).fill(null);        // uniform (kind,size) entering a block, or null
   for (let b = 0; b < N; b++) {
     let k = null, ok = true;
-    for (const key of inDefs[b]) { const dk = defKind.get(key); if (!k) k = dk; else if (k.kind!==dk.kind || k.size!==dk.size) { ok = false; break; } }
+    for (const key of inDefs[b]) { const dk = defKind.get(key);
+      if (!dk) { ok = false; break; }               // 'EXT': external/unknown flags reach here
+      if (!k) k = dk; else if (k.kind!==dk.kind || k.size!==dk.size) { ok = false; break; } }
     if (ok && k) blkFlagIn[b] = k;
   }
   const matProducers = new Set();                   // producer keys that must materialize
@@ -945,7 +952,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       else if (p === -2) throw new Error('AOT: unmodeled flag producer '+clob.mnem+' @ '+clob.rip.toString(16));
       else {                                        // producer is cross-block
         if (!blkFlagIn[b]) throw new Error('AOT: cross-block flags for '+(insns[j].mnem==='jcc'?'jcc':insns[j].mnem)+' @ '+insns[j].rip.toString(16));
-        for (const key of inDefs[b]) matProducers.add(key);
+        for (const key of inDefs[b]) if (key !== 'EXT') matProducers.add(key);
       }
     }
   }
