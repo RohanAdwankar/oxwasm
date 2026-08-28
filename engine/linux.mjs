@@ -36,7 +36,7 @@ export class LinuxEngine {
   // tier-2 whole-frame AOT subsumes it. Pass a finite value to re-enable for
   // the tier's own test suites.
   constructor(elfBytes, { argv = ['prog'], env = [], memMB = 256, threshold = Infinity, files = {},
-                          assembleWat = null, aotCallThreshold = 12, aotLoopThreshold = 40,
+                          assembleWat = null, aotCallThreshold = 4, aotLoopThreshold = 12,
                           xserver = null, mtimes = {} } = {}) {
     this.files = files;                       // path -> Uint8Array (read-only)
     this.env = env;                           // "KEY=VALUE" strings
