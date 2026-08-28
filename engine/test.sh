@@ -21,6 +21,7 @@ node packedtest.mjs
 node threadtest.mjs
 node subwidthtest.mjs
 node xflagtest.mjs
+node entryflagtest.mjs
 node addflagtest.mjs
 node adctest.mjs
 node enginetest.mjs
