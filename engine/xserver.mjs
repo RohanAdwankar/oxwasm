@@ -404,6 +404,12 @@ export class XServer {
           if ((v.getUint32(o, true) & 0xffffff) !== 0xffffff) dark++;
         console.error(`<PutImage dst=0x${v.getUint32(4, true).toString(16)} ${wd}x${ht}@${v.getInt16(16, true)},${v.getInt16(18, true)} dark=${dark}>`);
       }
+      if (op === 62) {                                   // CopyArea: where do pixels flow?
+        const kind = (id) => { const r = this.res.get(id);
+          return !r ? '?' : r.children !== undefined ? 'win' : 'pix'; };
+        const s = v.getUint32(4, true), d = v.getUint32(8, true);
+        console.error(`<CopyArea 0x${s.toString(16)}(${kind(s)})@${v.getInt16(16, true)},${v.getInt16(18, true)} -> 0x${d.toString(16)}(${kind(d)})@${v.getInt16(20, true)},${v.getInt16(22, true)} ${v.getUint16(24, true)}x${v.getUint16(26, true)}>`);
+      }
     }
     const u8 = (o) => v.getUint8(o), u16 = (o) => v.getUint16(o, true),
           i16 = (o) => v.getInt16(o, true), u32 = (o) => v.getUint32(o, true),
