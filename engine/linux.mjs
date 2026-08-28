@@ -611,6 +611,7 @@ export class LinuxEngine {
         if (a1 > this.brk) this.brk = align(a1, PAGE);
         ret(this.brk); break;
       case 9: {                                              // mmap(addr,len,prot,flags,fd,off)
+        for (const t of this.threads) t.cpu.icache?.clear();  // new code may appear
         const len = align(a2, PAGE);
         const flags = cpu.regs[10], fdArg = Number(BigInt.asIntN(32, cpu.regs[8] & 0xFFFFFFFFn));
         const FIXED = 0x10n, ANON = 0x20n;

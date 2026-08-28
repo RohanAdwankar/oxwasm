@@ -127,7 +127,11 @@ export class CPU {
 
   step() {
     const rip = this.rip;
-    const insn = decode((i) => Number(this.mem.read(rip + BigInt(i), 1n)), rip);
+    let insn = (this.icache ??= new Map()).get(rip);
+    if (insn === undefined) {
+      insn = decode((i) => Number(this.mem.read(rip + BigInt(i), 1n)), rip);
+      this.icache.set(rip, insn);
+    }
     const next = rip + BigInt(insn.len);
     this.ripNext = next;
     this.rip = next;
