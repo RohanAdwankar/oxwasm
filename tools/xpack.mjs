@@ -155,7 +155,7 @@ for (const m of MODS) {
 
 // --snapshot: inline the sparse snapshot (json+blobs gzip'd; mem tiles are
 // already individually gzip'd, embedded as-is)
-let snapAssets = null;
+let snapAssets = null, unitsB64 = 'null';
 if (snapPath) {
   snapAssets = {
     json: gzipSync(readFileSync(snapPath + '.json')).toString('base64'),
@@ -163,6 +163,13 @@ if (snapPath) {
     mem: readFileSync(snapPath + '.mem').toString('base64'),
   };
   console.log(`xpack: snapshot inlined (${(snapAssets.mem.length / 1e6).toFixed(1)} MB mem b64)`);
+  // pre-compiled unit cache: sha1(wat) -> wasm bytes, from the snapshot run.
+  // In-page assembleWat serves these synchronously; wabt is only a fallback.
+  try {
+    const units = readFileSync(snapPath + '.units', 'utf8');
+    unitsB64 = JSON.stringify(gzipSync(units).toString('base64'));
+    console.log(`xpack: ${JSON.parse(units).length} pre-compiled units inlined`);
+  } catch { console.log('xpack: no .units manifest (browser tier-up will rely on wabt)'); }
 }
 
 const wabtJs = readFileSync('/tmp/package/index.js', 'utf8');
@@ -210,7 +217,41 @@ async function inflate(b64) {
 }
 (async () => {
   const wabt = await WabtModule();
+  // compact synchronous sha1 (matches node's crypto sha1 hex) for unit-cache keys
+  function sha1hex(str) {
+    const te = new TextEncoder().encode(str);
+    const ml = te.length, wl = ((ml + 8) >> 6) + 1, words = new Uint32Array(wl * 16);
+    for (let i = 0; i < ml; i++) words[i >> 2] |= te[i] << (24 - (i & 3) * 8);
+    words[ml >> 2] |= 0x80 << (24 - (ml & 3) * 8);
+    words[wl * 16 - 1] = ml * 8;
+    let h0 = 0x67452301, h1 = 0xEFCDAB89, h2 = 0x98BADCFE, h3 = 0x10325476, h4 = 0xC3D2E1F0;
+    const w = new Uint32Array(80), rl = (n, c) => (n << c) | (n >>> (32 - c));
+    for (let b = 0; b < wl * 16; b += 16) {
+      for (let i = 0; i < 16; i++) w[i] = words[b + i];
+      for (let i = 16; i < 80; i++) w[i] = rl(w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16], 1);
+      let a = h0, e = h4, c = h2, d = h3, bb = h1;
+      for (let i = 0; i < 80; i++) {
+        const f = i < 20 ? (bb & c) | (~bb & d) : i < 40 ? bb ^ c ^ d
+                : i < 60 ? (bb & c) | (bb & d) | (c & d) : bb ^ c ^ d;
+        const k = i < 20 ? 0x5A827999 : i < 40 ? 0x6ED9EBA1 : i < 60 ? 0x8F1BBCDC : 0xCA62C1D6;
+        const t = (rl(a, 5) + f + e + k + w[i]) | 0;
+        e = d; d = c; c = rl(bb, 30); bb = a; a = t;
+      }
+      h0 = (h0 + a) | 0; h1 = (h1 + bb) | 0; h2 = (h2 + c) | 0; h3 = (h3 + d) | 0; h4 = (h4 + e) | 0;
+    }
+    return [h0, h1, h2, h3, h4].map(x => (x >>> 0).toString(16).padStart(8, '0')).join('');
+  }
+  const unitCache = new Map();
+  { const ub = ${unitsB64};
+    if (ub) { const txt = new TextDecoder().decode(await inflate(ub));
+      for (const [h, b64] of JSON.parse(txt)) {
+        const bin = atob(b64), u = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+        unitCache.set(h, u);
+      } } }
   const assembleWat = (wat) => {
+    const hit = unitCache.get(sha1hex(wat));
+    if (hit) return hit;
     const m = wabt.parseWat('unit.wat', wat);
     const bin = m.toBinary({}).buffer; m.destroy();
     return new Uint8Array(bin);
@@ -247,6 +288,7 @@ async function inflate(b64) {
   }
 
   window.__ox = { eng, xs, pump: () => pump() };   // debug/testing handle
+  window.__oxReady = true;                         // input is live from here
   // ---- screen blit ----
   const img = ctx.createImageData(${W}, ${H});
   const px = new Uint8ClampedArray(img.data.buffer);
@@ -264,9 +306,9 @@ async function inflate(b64) {
   const pos = (e) => { const r = cv.getBoundingClientRect(); const s = scale();
     return [ (e.clientX - r.left) * s, (e.clientY - r.top) * s ]; };
   let pumping = false;
-  const poke = () => { if (!pumping) pump(); };
+  const poke = () => { if (window.__oxReady && !pumping) pump(); };
   cv.addEventListener('pointermove', (e) => { const [x, y] = pos(e); xs.injectMotion(x, y); poke(); });
-  cv.addEventListener('pointerdown', (e) => { cv.focus(); const [x, y] = pos(e); xs.injectMotion(x, y);
+  cv.addEventListener('pointerdown', (e) => { cv.focus({ preventScroll: true }); const [x, y] = pos(e); xs.injectMotion(x, y);
     xs.injectButton(e.button === 2 ? 3 : e.button === 1 ? 2 : 1, true); e.preventDefault(); poke(); });
   cv.addEventListener('pointerup', (e) => { xs.injectButton(e.button === 2 ? 3 : e.button === 1 ? 2 : 1, false); e.preventDefault(); poke(); });
   cv.addEventListener('contextmenu', (e) => e.preventDefault());
