@@ -300,6 +300,13 @@ export class LinuxEngine {
   }
 
   dispatchMaybeShadow(f) {
+    if (this.shadowLib && !this.shadowRange) {
+      for (const m of this.maps ?? []) if (m.path.includes(this.shadowLib)) {
+        this.shadowRange = [m.at, m.at + m.len];
+        console.error(`<shadow armed ${m.path} 0x${m.at.toString(16)}+0x${m.len.toString(16)}>`);
+        break;
+      }
+    }
     if (!this.shadowRange || this._shadowBusy ||
         this.cpu.rip < this.shadowRange[0] || this.cpu.rip >= this.shadowRange[1])
       return this.dispatchAot(f);
