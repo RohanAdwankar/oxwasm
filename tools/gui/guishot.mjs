@@ -356,6 +356,14 @@ try {
           console.error(`<drag start ${x1},${y1} -> ${x2},${y2}>`);
           eng.wakeAllBlk?.(); continue;
         }
+        const mm = items[ci].match(/^move:(\d+),(\d+)@(\d+)$/);   // hover only, no button
+        if (mm) {
+          if (Date.now() - t0 <= +mm[3]) continue;
+          globalThis._clickDone.add(ci);
+          xs.injectMotion(+mm[1], +mm[2]);
+          console.error(`<move injected ${mm[1]},${mm[2]}>`);
+          eng.wakeAllBlk?.(); continue;
+        }
         const km = items[ci].match(/^key:(\d+)\+(\d+)@(\d+)$/);   // modifier chord, e.g. key:37+59 = ctrl+comma
         if (km) {
           if (Date.now() - t0 <= +km[3]) continue;
