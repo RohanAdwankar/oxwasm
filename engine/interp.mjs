@@ -31,6 +31,7 @@ export class Memory {
     return v;
   }
   write(addr, n, v) {
+    if (this.jrnl) this.jrnl.push([addr, n, this.read(addr, n), null]);
     for (let i = 0n; i < n; i++) {
       const r = this.find(addr + i);
       r.bytes[Number(addr + i - r.base)] = Number((v >> (8n * i)) & 0xFFn);
@@ -762,6 +763,7 @@ export class CPU {
           const src = this.mem.view(this.regs[6], len), dst = this.mem.view(this.regs[7], len);
           const overlapUp = this.regs[7] > this.regs[6] && this.regs[7] < this.regs[6] + len;
           if (src && dst && !overlapUp) {
+            if (this.mem.jrnl) this.mem.jrnl.push([this.regs[7], 0n, null, dst.slice()]);
             dst.set(src);
             this.regs[6] = (this.regs[6] + len) & MASK[8];
             this.regs[7] = (this.regs[7] + len) & MASK[8];
@@ -826,6 +828,7 @@ export class CPU {
           const len = this.regs[1] * n;
           const dst = this.mem.view(this.regs[7], len);
           if (dst) {
+            if (this.mem.jrnl) this.mem.jrnl.push([this.regs[7], 0n, null, dst.slice()]);
             if (S === 1) dst.fill(Number(v));
             else { const b = []; for (let i = 0n; i < n; i++) b.push(Number((v >> (8n*i)) & 0xFFn));
                    for (let o = 0; o < dst.length; o += S) for (let i = 0; i < S; i++) dst[o+i] = b[i]; }

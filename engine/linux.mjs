@@ -13,6 +13,7 @@ import { decode } from './decode.mjs';
 const PAGE = 4096n;
 const align = (v, a) => (v + a - 1n) & ~(a - 1n);
 const EXIT = Symbol('guest-exit');           // unwinds live wasm frames on exit()
+const SHADOW_ABORT = { shadowAbort: true };
 // A deopt DESTROYS the live wasm frames instead of interpreting under them:
 // at the escape point every register was spilled to the regfile and all
 // return addresses live on the guest stack, so the frames are pure execution
@@ -233,6 +234,82 @@ export class LinuxEngine {
                 throw e; }
   }
 
+  // Differential shadow: run one compiled-function dispatch BOTH ways — first
+  // pure interp with a memory write-journal (side-effect free: any syscall
+  // aborts the attempt), undo the journal, then the compiled unit — and
+  // compare final registers and every journaled location. First divergence
+  // pinpoints the miscompiled frame and its input state.
+  shadowDispatch(f) {
+    const cpu = this.cpu;
+    const entryRip = cpu.rip, rsp0 = cpu.regs[4];
+    let retAddr;
+    try { retAddr = this.mem.read(rsp0, 8n); } catch { return this.dispatchAot(f); }
+    const rspExit = rsp0 + 8n;
+    const regs0 = cpu.regs.slice(), xmm0 = cpu.xmm.slice(), fs0 = cpu.fsBase, fl0 = { ...cpu.f };
+    this._shadowBusy = true; this._shadowInterp = true;
+    const savedBudget = this.aotBudget; this.aotBudget = 0;
+    this.mem.jrnl = [];
+    let ok = true, steps = 0;
+    try {
+      while (!(cpu.rip === retAddr && cpu.regs[4] === rspExit)) {
+        cpu.step();
+        if (this.exitCode !== null || this.blocked) { ok = false; break; }
+        if (++steps > 5e6) { ok = false; break; }
+      }
+    } catch (e) { ok = false; if (!(e === SHADOW_ABORT || e instanceof Error)) throw e; }
+    this._shadowInterp = false;
+    const jr = this.mem.jrnl; this.mem.jrnl = null;
+    this.aotBudget = savedBudget;
+    // capture interp outcome (before undo)
+    const iRegs = cpu.regs.slice(), iXmm = cpu.xmm.slice();
+    const iVals = ok ? jr.map(([a, n, _o, snap]) =>
+      snap ? this.mem.view(a, BigInt(snap.length)).slice() : this.mem.read(a, n)) : null;
+    // undo the journal in reverse
+    for (let i = jr.length - 1; i >= 0; i--) {
+      const [a, n, old, snap] = jr[i];
+      if (snap) this.mem.view(a, BigInt(snap.length)).set(snap);
+      else this.mem.write(a, n, old);
+    }
+    // restore entry state and run the compiled side for real
+    cpu.regs = regs0.slice(); cpu.xmm = xmm0.slice(); cpu.fsBase = fs0; cpu.f = { ...fl0 };
+    cpu.rip = entryRip;
+    const exitRip = this.dispatchAot(f);
+    if (ok && exitRip === retAddr && cpu.regs[4] === rspExit && (this._shadowDiverged ?? 0) < 12) {
+      const diffs = [];
+      for (let r = 0; r < 16; r++) if (cpu.regs[r] !== iRegs[r])
+        diffs.push(`r${r} aot=${cpu.regs[r].toString(16)} interp=${iRegs[r].toString(16)}`);
+      for (let r = 0; r < 16; r++) if (cpu.xmm[r] !== iXmm[r])
+        diffs.push(`xmm${r} aot=${cpu.xmm[r].toString(16)} interp=${iXmm[r].toString(16)}`);
+      for (let i = 0; i < jr.length; i++) {
+        const [a, n, _o, snap] = jr[i];
+        if (snap) { const cur = this.mem.view(a, BigInt(snap.length)).slice();
+          const iv = iVals[i];
+          for (let b = 0; b < cur.length; b++) if (cur[b] !== iv[b]) { diffs.push(`mem 0x${(a + BigInt(b)).toString(16)} aot=${cur[b].toString(16)} interp=${iv[b].toString(16)}`); break; }
+        } else { const cur = this.mem.read(a, n);
+          if (cur !== iVals[i]) diffs.push(`mem 0x${a.toString(16)}/${n} aot=${cur.toString(16)} interp=${iVals[i].toString(16)}`);
+        }
+      }
+      if (diffs.length) {
+        this._shadowDiverged = (this._shadowDiverged ?? 0) + 1;
+        console.error(`<SHADOW-DIVERGE fn=0x${entryRip.toString(16)} steps=${steps} entry=[${regs0.map(v=>v.toString(16)).join(',')}]>`);
+        for (const d of diffs.slice(0, 20)) console.error('  ' + d);
+      }
+    }
+    this._shadowBusy = false;
+    return exitRip;
+  }
+
+  dispatchMaybeShadow(f) {
+    if (!this.shadowRange || this._shadowBusy ||
+        this.cpu.rip < this.shadowRange[0] || this.cpu.rip >= this.shadowRange[1])
+      return this.dispatchAot(f);
+    const k = this.cpu.rip.toString();
+    const n = (this._shadowClean ??= new Map()).get(k) ?? 0;
+    if (n >= 50) return this.dispatchAot(f);            // exonerated after 50 clean passes
+    this._shadowClean.set(k, n + 1);
+    return this.shadowDispatch(f);
+  }
+
   // Interpret (dispatching into compiled functions when rip lands on one)
   // until `done()` — used by the callout escape.
   interpUntil(done) {
@@ -240,7 +317,7 @@ export class LinuxEngine {
     while (!done()) {
       let f = this.aotFns.get(this.cpu.rip.toString());
       if (f && this.aotBudget !== undefined && --this.aotBudget < 0) f = null;
-      if (f) { this.cpu.rip = this.dispatchAot(f);
+      if (f) { this.cpu.rip = this.dispatchMaybeShadow(f);
                if (this.blocked) throw new BlockUnwind(this.cpu.rip);
                continue; }
       const before = this.cpu.rip;
@@ -465,6 +542,7 @@ export class LinuxEngine {
   }
 
   syscall(cpu) {
+    if (this._shadowInterp) throw SHADOW_ABORT;   // shadow interp must stay side-effect free
     const nr = Number(cpu.regs[0]);
     const [a1, a2, a3] = [cpu.regs[7], cpu.regs[6], cpu.regs[2]];   // rdi rsi rdx
     this.stats.syscalls[nr] = (this.stats.syscalls[nr] || 0) + 1;
@@ -1145,7 +1223,7 @@ export class LinuxEngine {
         const key = this.cpu.rip.toString();
         let f = this.aotFns.get(key);
         if (f && this.aotBudget !== undefined && --this.aotBudget < 0) f = null;
-        if (f) { this.cpu.rip = this.dispatchAot(f);
+        if (f) { this.cpu.rip = this.dispatchMaybeShadow(f);
                  if (this.blocked) { if (this.park()) continue; break; }
                  continue; }
         const c = this.compiled.get(key);
