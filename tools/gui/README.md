@@ -92,15 +92,28 @@ architecture:
   issued while 40 MB of libraries were still streaming rendered the File
   menu pixel-perfect (`cdp_stall.mjs`).
 
-Serve with `serve.mjs DIR PORT [Mbps]` — sidecars ship brotli with
-`Content-Encoding: br` (native streaming decode; gzip-of-base64 in the
-old monolith cost ~35% more wire). The optional Mbps arg paces all
-responses through one token bucket (50 ms burst) at the socket, because
-Chrome's DevTools network emulation caps large downloads at ~20-35 Mbps
-regardless of the configured profile. Repeat visits ride the plain HTTP
-cache; a cache-first service worker was tried and rejected (the Cache
-API stores decoded bodies — ~600 MB for this bundle — slower on both
-visits than re-decoding brotli).
+**The bundle is static-host-agnostic by default**: sidecars are plain
+gzip files the page inflates itself (`DecompressionStream`), so any file
+server works with zero configuration — GitHub Pages, S3, nginx,
+`python3 -m http.server`. `--br` opts into brotli sidecars instead
+(~30% less wire; the 101 MB of unit wasm compresses 56:1 under brotli's
+16 MB window vs ~10:1 under gzip's 32 KB) for hosts that can send
+`Content-Encoding: br`. Memory runs are page-granular, so restore decode
+cost tracks real data (48.8 MB raw), not tile padding.
+
+`serve.mjs DIR PORT [Mbps]` serves either variant; the optional Mbps arg
+paces all responses through one token bucket (50 ms burst) at the
+socket, because Chrome's DevTools network emulation caps large downloads
+at ~20-35 Mbps regardless of the configured profile. Repeat visits ride
+the plain HTTP cache; a cache-first service worker was tried and
+rejected (the Cache API stores decoded bodies — ~600 MB for this
+bundle — slower on both visits than re-decoding).
+
+Static-bundle numbers (gzip sidecars, same driver): cold interactive
+**1.12 s** on an unthrottled stock `python3 -m http.server`, **2.53 s**
+at a socket-paced 100 Mbps, repeat 1.3–1.6 s; File menu pixel-correct
+after each run. The brotli table below predates page-granular memory
+runs and reads slightly worse than the current bundle.
 
 Measured with `cdp_load.mjs` (headless Chromium, server-paced link,
 fresh profile for cold; milestones are `performance.now()` marks the
