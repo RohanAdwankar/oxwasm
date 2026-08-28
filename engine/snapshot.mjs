@@ -116,12 +116,23 @@ export function snapshotEngine(eng, xs, path) {
   };
   writeFileSync(path + '.json', j(state));
   writeFileSync(path + '.blobs', bw.bytes());
-  // memory, gzipped per-chunk so we never materialize a >2GB buffer
+  // memory: sparse 1MB tiles — all-zero tiles are skipped entirely, so restore
+  // into fresh (zero) wasm memory only touches pages that held data.
+  const TILE = 1 << 20;
   const ws = createWriteStream(path + '.mem');
+  ws.write(Buffer.from('SPRS'));
   const all = new Uint8Array(eng.wmem.buffer);
-  for (let o = 0; o < all.length; o += CHUNK) {
-    const gz = gzipSync(Buffer.from(all.buffer, o, Math.min(CHUNK, all.length - o)), { level: 1 });
-    const hdr = Buffer.alloc(8); hdr.writeUInt32LE(gz.length, 0); hdr.writeUInt32LE(Math.min(CHUNK, all.length - o), 4);
+  const words = new BigUint64Array(eng.wmem.buffer);
+  const wordsPerTile = TILE / 8;
+  for (let o = 0; o < all.length; o += TILE) {
+    const w0 = o / 8, w1 = Math.min(w0 + wordsPerTile, words.length);
+    let nz = false;
+    for (let w = w0; w < w1; w++) if (words[w] !== 0n) { nz = true; break; }
+    if (!nz) continue;
+    const len = Math.min(TILE, all.length - o);
+    const gz = gzipSync(Buffer.from(all.buffer, o, len), { level: 1 });
+    const hdr = Buffer.alloc(16);
+    hdr.writeUIntLE(o, 0, 6); hdr.writeUInt32LE(len, 6); hdr.writeUInt32LE(gz.length, 10);
     ws.write(hdr); ws.write(gz);
   }
   return new Promise(res => ws.end(() => res({ blobs: bw.off })));
@@ -138,11 +149,19 @@ export function restoreEngine(eng, xs, path, CPUctor) {
   {
     const all = new Uint8Array(eng.wmem.buffer);
     const f = readFileSync(path + '.mem');
-    let fo = 0, mo = 0;
-    while (fo < f.length) {
-      const gzLen = f.readUInt32LE(fo), rawLen = f.readUInt32LE(fo + 4); fo += 8;
-      const raw = gunzipSync(f.subarray(fo, fo + gzLen)); fo += gzLen;
-      all.set(raw, mo); mo += rawLen;
+    if (f.subarray(0, 4).toString() === 'SPRS') {           // sparse tile format
+      let fo = 4;
+      while (fo < f.length) {
+        const o = f.readUIntLE(fo, 6), rawLen = f.readUInt32LE(fo + 6), gzLen = f.readUInt32LE(fo + 10); fo += 16;
+        all.set(gunzipSync(f.subarray(fo, fo + gzLen)), o); fo += gzLen;
+      }
+    } else {                                                // legacy contiguous chunks
+      let fo = 0, mo = 0;
+      while (fo < f.length) {
+        const gzLen = f.readUInt32LE(fo), rawLen = f.readUInt32LE(fo + 4); fo += 8;
+        const raw = gunzipSync(f.subarray(fo, fo + gzLen)); fo += gzLen;
+        all.set(raw, mo); mo += rawLen;
+      }
     }
   }
 
