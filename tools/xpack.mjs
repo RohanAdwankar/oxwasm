@@ -15,7 +15,7 @@ const ENGINE = join(HERE, '..', 'engine');
 
 const args = process.argv.slice(2);
 let sysroot = null, guestPath = null, out = 'x.html', title = null, W = 640, H = 480, fontDir = null, gtk = false;
-let snapPath = null, memMB = 512, extraArgs = [];
+let snapPath = null, memMB = 512, extraArgs = [], unitsPath = null;
 for (let i = 0; i < args.length; i++) {
   const a = args[i];
   if (a === '-o') out = args[++i];
@@ -24,6 +24,7 @@ for (let i = 0; i < args.length; i++) {
   else if (a === '--fonts') fontDir = args[++i];
   else if (a === '--gtk') gtk = true;
   else if (a === '--snapshot') snapPath = args[++i];
+  else if (a === '--units') unitsPath = args[++i];
   else if (a === '--mem') memMB = +args[++i];
   else if (a === '--arg') extraArgs.push(args[++i]);
   else if (!sysroot) sysroot = a;
@@ -180,10 +181,25 @@ if (snapPath) {
   console.log(`xpack: snapshot inlined (${(snapAssets.mem.length / 1e6).toFixed(1)} MB mem b64)`);
   // pre-compiled unit cache: sha1(wat) -> wasm bytes, from the snapshot run.
   // In-page assembleWat serves these synchronously; wabt is only a fallback.
+  // Packed as a binary container — u32le index length, JSON index of
+  // [sha1, offset, len], then the raw wasm bytes concatenated — gzipped
+  // once. gzip over raw bytes beats gzip over the old base64-in-JSON text
+  // by ~25%, and the page serves each unit as a zero-copy subarray slice
+  // instead of materializing a giant JSON string at restore.
+  // --units PATH substitutes a different manifest (same format), e.g. one
+  // recorded by a post-restore exercise run (guishot UNITSOUT) so only the
+  // working set ships; a missed unit falls back to interp, still correct.
   try {
-    const units = readFileSync(snapPath + '.units', 'utf8');
-    unitsB64 = JSON.stringify(gzipSync(units).toString('base64'));
-    console.log(`xpack: ${JSON.parse(units).length} pre-compiled units inlined`);
+    const units = JSON.parse(readFileSync((unitsPath ?? snapPath) + '.units', 'utf8'));
+    const idx = [], parts = []; let uo = 0;
+    for (const [h, b64] of units) {
+      const b = Buffer.from(b64, 'base64');
+      idx.push([h, uo, b.length]); uo += b.length; parts.push(b);
+    }
+    const idxBuf = Buffer.from(JSON.stringify(idx));
+    const hdr = Buffer.alloc(4); hdr.writeUInt32LE(idxBuf.length, 0);
+    unitsB64 = JSON.stringify(gzipSync(Buffer.concat([hdr, idxBuf, ...parts]), { level: 9 }).toString('base64'));
+    console.log(`xpack: ${units.length} pre-compiled units inlined (${(uo / 1e6).toFixed(1)} MB wasm${unitsPath ? ', pruned manifest' : ''})`);
   } catch { console.log('xpack: no .units manifest (browser tier-up will rely on wabt)'); }
 }
 
@@ -257,14 +273,16 @@ async function inflate(b64) {
     }
     return [h0, h1, h2, h3, h4].map(x => (x >>> 0).toString(16).padStart(8, '0')).join('');
   }
+  // binary unit container: u32le index length, JSON index [sha1, off, len],
+  // raw wasm bytes — units are zero-copy subarray views into one buffer
   const unitCache = new Map();
   { const ub = ${unitsB64};
-    if (ub) { const txt = new TextDecoder().decode(await inflate(ub));
-      for (const [h, b64] of JSON.parse(txt)) {
-        const bin = atob(b64), u = new Uint8Array(bin.length);
-        for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
-        unitCache.set(h, u);
-      } } }
+    if (ub) { const bin = await inflate(ub);
+      const ilen = new DataView(bin.buffer, bin.byteOffset, 4).getUint32(0, true);
+      const idx = JSON.parse(new TextDecoder().decode(bin.subarray(4, 4 + ilen)));
+      const body = bin.subarray(4 + ilen);
+      for (const [h, o, n] of idx) unitCache.set(h, body.subarray(o, o + n));
+    } }
   const assembleWat = (wat) => {
     const hit = unitCache.get(sha1hex(wat));
     if (hit) return hit;

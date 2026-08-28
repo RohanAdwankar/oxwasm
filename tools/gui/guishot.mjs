@@ -247,6 +247,7 @@ process.on('SIGTERM', async () => {
   if (process.env.SNAPSAVE) { try { await snapshotEngine(eng, xs, process.env.SNAPSAVE);
     writeUnits(process.env.SNAPSAVE);
     console.error(`<snapshot saved to ${process.env.SNAPSAVE} (SIGTERM)>`); } catch (e) { console.error('snap fail', e.message); } }
+  if (process.env.UNITSOUT) { try { writeUnits(process.env.UNITSOUT); } catch {} }
   try { persistDirty(); } catch {}
   try { console.error('stderr:', (eng.stderr??[]).join('').slice(-4000)); } catch {}
   try { xs.flush();
@@ -314,15 +315,22 @@ try {
       wdMark = [Date.now(), eng.stats.interpreted];
     }
     shadowPoll();
-    // CLICK="x,y@ms": inject a left click at (x,y) once, ms after start
-    if (process.env.CLICK && !globalThis._clicked) {
-      const m = process.env.CLICK.match(/^(\d+),(\d+)@(\d+)$/);
-      if (m && Date.now() - t0 > +m[3]) {
-        globalThis._clicked = true;
-        xs.injectMotion(+m[1], +m[2]);
-        xs.injectButton(1, true); xs.injectButton(1, false);
+    // CLICK: ';'-separated script — "x,y@ms" injects a left click, "esc@ms"
+    // an Escape press; each item fires once when its time arrives. Used to
+    // exercise a restored app (menus etc.) so UNITSOUT captures the units a
+    // real interactive session actually requests.
+    if (process.env.CLICK) {
+      globalThis._clickDone ??= new Set();
+      const items = process.env.CLICK.split(';');
+      for (let ci = 0; ci < items.length; ci++) {
+        if (globalThis._clickDone.has(ci)) continue;
+        const m = items[ci].match(/^(?:(\d+),(\d+)|(esc))@(\d+)$/);
+        if (!m || Date.now() - t0 <= +m[4]) continue;
+        globalThis._clickDone.add(ci);
+        if (m[3]) { xs.injectKey(9, true); xs.injectKey(9, false); console.error('<esc injected>'); }
+        else { xs.injectMotion(+m[1], +m[2]); xs.injectButton(1, true); xs.injectButton(1, false);
+               console.error(`<click injected at ${m[1]},${m[2]}>`); }
         eng.wakeAllBlk?.();
-        console.error(`<click injected at ${m[1]},${m[2]}>`);
       }
     }
     {
@@ -382,3 +390,7 @@ console.error('aotfail summary (reason -> units):');
 for (const [k, n] of [...failCount.entries()].sort((a, b) => b[1] - a[1]).slice(0, 20))
   console.error(`  ${n}\t${k}`);
 persistDirty();
+// UNITSOUT=path: write the units THIS run requested (path.units). With
+// SNAPLOAD + a CLICK script this captures the post-restore working set —
+// a much smaller manifest for xpack --units than the full boot's.
+if (process.env.UNITSOUT) writeUnits(process.env.UNITSOUT);
