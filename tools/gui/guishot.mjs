@@ -306,7 +306,12 @@ const wedgeDump = () => {
   try { persistDirty(); } catch {}
 };
 try {
-  for (let i=0;i<+maxChunks;i++){ eng.run(1e6); if (eng.exitCode!==null){state='exit '+eng.exitCode;break;}
+  // with hot AOT one 1e6-step chunk can take ~30 wall-seconds (a step can be
+  // a whole compiled-function run), which would quantize CLICK/drag injection
+  // to that granularity — run fine chunks while scripted input is pending
+  const inputPending = () => process.env.CLICK &&
+    (globalThis._drag || (globalThis._clickDone?.size ?? 0) < process.env.CLICK.split(';').length);
+  for (let i=0;i<+maxChunks;i++){ eng.run(inputPending() ? 5e4 : 1e6); if (eng.exitCode!==null){state='exit '+eng.exitCode;break;}
     if (Date.now() - lastLog > 15000) { lastLog = Date.now();
       const rip = eng.cpu.rip; let where = '?';
       for (const m of eng.maps ?? []) if (rip >= m.at && rip < m.at + m.len) where = `${m.path.split('/').pop()}+0x${(rip-m.at+BigInt(m.fileOff)).toString(16)}`;
