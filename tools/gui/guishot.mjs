@@ -340,6 +340,7 @@ try {
             while (ww) { chain.push(`0x${ww.id.toString(16)}/m0x${(ww.eventMask ?? 0).toString(16)}/${ww.cls === 2 ? 'io' : 'iw'}${ww.mapped ? '' : '/unmapped'}`);
               ww = ww.parent ? xs.win(ww.parent) : null; }
             console.error('<drag chain: ' + chain.join(' < ') + '>'); }
+          xs.countOps = true; xs.opCount = {};       // request histogram from here
           xs.injectMotion(x1, y1); xs.injectButton(1, true);
           globalThis._drag = { x1, y1, x2, y2, step: 0 };
           console.error(`<drag start ${x1},${y1} -> ${x2},${y2}>`);
@@ -406,6 +407,7 @@ try {
   console.error('  regs:', [...Array(16)].map((_, i) => 'r' + i + '=0x' + BigInt.asUintN(64, eng.cpu.regs[i]).toString(16)).join(' '));
   } catch (e2) { console.error('  walk failed:', e2.message); }
 }
+if (xs.opCount) console.error('<ops since drag: ' + JSON.stringify(xs.opCount) + '>');
 console.error('state:', state, 'steps:', eng.stats.interpreted, 'wall:', ((Date.now()-t0)/1000).toFixed(0)+'s');
 console.error('stderr:', (eng.stderr??[]).join('').slice(-3000));
 console.error('stdout:', (eng.stdout??[]).join('').slice(-500));

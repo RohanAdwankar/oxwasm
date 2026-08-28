@@ -395,6 +395,7 @@ export class XServer {
   handle(conn, req) {
     const v = new DataView(req.buffer, req.byteOffset, req.length);
     const op = req[0], d1 = req[1];
+    if (this.countOps) this.opCount[op] = (this.opCount[op] || 0) + 1;
     const u8 = (o) => v.getUint8(o), u16 = (o) => v.getUint16(o, true),
           i16 = (o) => v.getInt16(o, true), u32 = (o) => v.getUint32(o, true),
           i32 = (o) => v.getInt32(o, true);
