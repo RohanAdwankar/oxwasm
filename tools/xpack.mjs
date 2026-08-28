@@ -246,6 +246,7 @@ async function inflate(b64) {
     stat.textContent = 'restored in ' + ((performance.now() - t0r) / 1000).toFixed(1) + 's';
   }
 
+  window.__ox = { eng, xs, pump: () => pump() };   // debug/testing handle
   // ---- screen blit ----
   const img = ctx.createImageData(${W}, ${H});
   const px = new Uint8ClampedArray(img.data.buffer);
