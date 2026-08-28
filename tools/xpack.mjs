@@ -15,6 +15,7 @@ const ENGINE = join(HERE, '..', 'engine');
 
 const args = process.argv.slice(2);
 let sysroot = null, guestPath = null, out = 'x.html', title = null, W = 640, H = 480, fontDir = null, gtk = false;
+let snapPath = null, memMB = 512, extraArgs = [];
 for (let i = 0; i < args.length; i++) {
   const a = args[i];
   if (a === '-o') out = args[++i];
@@ -22,6 +23,9 @@ for (let i = 0; i < args.length; i++) {
   else if (a === '--size') { const [w, h] = args[++i].split('x').map(Number); W = w; H = h; }
   else if (a === '--fonts') fontDir = args[++i];
   else if (a === '--gtk') gtk = true;
+  else if (a === '--snapshot') snapPath = args[++i];
+  else if (a === '--mem') memMB = +args[++i];
+  else if (a === '--arg') extraArgs.push(args[++i]);
   else if (!sysroot) sysroot = a;
   else if (!guestPath) guestPath = a;
 }
@@ -142,11 +146,23 @@ for (const name of ['6x13', '6x13B', '9x15', '9x15B', '6x10']) {
 }
 
 // ---- engine modules as import-map data: URLs -------------------------------
-const MODS = ['interp', 'decode', 'jit2', 'jitsimd', 'aot_wat', 'linux', 'xserver', 'pcf'];
+const MODS = ['interp', 'decode', 'jit2', 'jitsimd', 'aot_wat', 'linux', 'xserver', 'pcf', 'snapshot_core'];
 const importMap = { imports: {} };
 for (const m of MODS) {
   const src = readFileSync(join(ENGINE, m + '.mjs'), 'utf8').replace(/from '\.\/(\w+)\.mjs'/g, "from 'ox/$1'");
   importMap.imports['ox/' + m] = 'data:text/javascript;base64,' + Buffer.from(src).toString('base64');
+}
+
+// --snapshot: inline the sparse snapshot (json+blobs gzip'd; mem tiles are
+// already individually gzip'd, embedded as-is)
+let snapAssets = null;
+if (snapPath) {
+  snapAssets = {
+    json: gzipSync(readFileSync(snapPath + '.json')).toString('base64'),
+    blobs: gzipSync(readFileSync(snapPath + '.blobs')).toString('base64'),
+    mem: readFileSync(snapPath + '.mem').toString('base64'),
+  };
+  console.log(`xpack: snapshot inlined (${(snapAssets.mem.length / 1e6).toFixed(1)} MB mem b64)`);
 }
 
 const wabtJs = readFileSync('/tmp/package/index.js', 'utf8');
@@ -182,6 +198,8 @@ const html = `<!doctype html>
 import { LinuxEngine } from 'ox/linux';
 import { XServer } from 'ox/xserver';
 import { parsePCF } from 'ox/pcf';
+import { restoreEngineCore } from 'ox/snapshot_core';
+import { CPU } from 'ox/interp';
 const stat = document.getElementById('stat'), cv = document.getElementById('screen');
 const ctx = cv.getContext('2d');
 async function inflate(b64) {
@@ -205,11 +223,28 @@ async function inflate(b64) {
   const elf = await inflate(${JSON.stringify(elfB64)});
   stat.textContent = 'starting…';
   const eng = new LinuxEngine(elf, {
-    argv: [${JSON.stringify(guestPath)}],
+    argv: ${JSON.stringify([guestPath, ...extraArgs])},
     env: ['DISPLAY=:0','HOME=/root','USER=root',
           'XFILESEARCHPATH=/etc/X11/%T/%N%C:/etc/X11/%T/%N:/usr/lib/X11/%T/%N%C:/usr/lib/X11/%T/%N',
           'LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu'],
-    files, mtimes: ${JSON.stringify(mtimes)}, memMB: 512, assembleWat, xserver: xs });
+    files, mtimes: ${JSON.stringify(mtimes)}, memMB: ${memMB}, assembleWat, xserver: xs });
+  const SNAP = ${snapAssets ? JSON.stringify(snapAssets) : 'null'};
+  if (SNAP) {
+    stat.textContent = 'restoring snapshot…';
+    const raw = (b64) => { const bin = atob(b64), u = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return u; };
+    const inflateBytes = async (u) => {
+      const r = new Response(new Blob([u]).stream().pipeThrough(new DecompressionStream('gzip')));
+      return new Uint8Array(await r.arrayBuffer());
+    };
+    const t0r = performance.now();
+    await restoreEngineCore(eng, xs, {
+      json: await inflateBytes(raw(SNAP.json)),
+      blobs: await inflateBytes(raw(SNAP.blobs)),
+      mem: raw(SNAP.mem),
+    }, CPU, inflateBytes);
+    stat.textContent = 'restored in ' + ((performance.now() - t0r) / 1000).toFixed(1) + 's';
+  }
 
   // ---- screen blit ----
   const img = ctx.createImageData(${W}, ${H});
