@@ -313,7 +313,9 @@ export class XServer {
         const a = this.absPos(ww); ax = a.x; ay = a.y;
       }
     }
-    if (!ww || !ww.conn) return;
+    if (!ww || !ww.conn) { if (this.dbgInput) console.error(`<xev code=${code} DROPPED (no window/conn)>`); return; }
+    if (this.dbgInput && code !== 6) console.error(`<xev code=${code} det=${detail} -> win=0x${ww.id.toString(16)} mask=0x${(ww.eventMask ?? 0).toString(16)} grab=${this.grab ? (this.grab.implicit ? 'impl' : 'act') + ':0x' + this.grab.win.id.toString(16) + '/m0x' + this.grab.mask.toString(16) + (this.grab.ownerEvents ? '/oe' : '') : 'no'}>`);
+    if (this.dbgInput === 2 && code === 6) console.error(`<xev motion -> win=0x${ww.id.toString(16)}>`);
     const w32 = new W(32);
     w32.u8(0, code); w32.u8(1, detail); w32.u16(2, ww.conn.seq);
     w32.u32(4, this.now()); w32.u32(8, this.rootId); w32.u32(12, ww.id);
@@ -566,9 +568,10 @@ export class XServer {
       case 26: {                                         // GrabPointer
         const w = this.win(u32(4));
         if (w) this.grab = { win: w, mask: u16(8), ownerEvents: !!d1, implicit: false };
+        if (this.dbgInput) console.error(`<GrabPointer win=0x${u32(4).toString(16)} mask=0x${u16(8).toString(16)} oe=${d1}>`);
         this.reply(conn, 0, 0, 0, () => {});             // status: Success
         break; }
-      case 27: this.grab = null; break;                  // UngrabPointer
+      case 27: if (this.dbgInput) console.error('<UngrabPointer>'); this.grab = null; break;
       case 28: case 29: case 30: break;                  // Grab/UngrabButton, ChangeActivePointerGrab
       case 31: this.reply(conn, 0, 0, 0, () => {}); break;             // GrabKeyboard: Success
       case 32: case 33: case 34: case 35: case 36: case 37: break;     // grabs/AllowEvents/GrabServer

@@ -181,6 +181,7 @@ eng.onProgress = (src) => {
   console.error(`<hb ${src} ${((Date.now()-hbT0)/1000)|0}s> interp=${eng.stats.interpreted} aot=${eng.stats.tiers?.aot||0} aotRuns=${eng.stats.aotRuns||0} failed=${eng.aotFailed?.size||0} @${where}`);
 };
 if (process.env.POLLWD) eng.debugPollAfter = +process.env.POLLWD;
+if (process.env.XSDBG) xs.dbgInput = +process.env.XSDBG;
 if (process.env.CHAINSLOW) eng.chainSlow = true;
 if (process.env.SHADOW) eng.shadowLib = process.env.SHADOW;
 import { snapshotEngine, restoreEngine } from '../../engine/snapshot.mjs';
