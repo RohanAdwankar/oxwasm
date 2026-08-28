@@ -16,7 +16,12 @@ const FP = {
 const SIGN = { 1: 0x80n, 2: 0x8000n, 4: 0x80000000n, 8: 0x8000000000000000n };
 
 export class Memory {
-  constructor(regions) { this.regions = regions; }   // [{base, bytes}]
+  // pend: optional guard hook (addr: BigInt, n: BigInt|number) -> throws an
+  // Error with .pending=true when [addr, addr+n) touches a page whose bytes
+  // have not arrived yet (streamed sidecar restore). null = disarmed (no cost
+  // beyond the null check). The engine converts the throw into a short
+  // blocked state and re-executes the instruction once the page lands.
+  constructor(regions) { this.regions = regions; this.pend = null; }   // [{base, bytes}]
   find(addr) {
     const l = this._last;
     if (l !== undefined && addr >= l.base && addr < l.end) return l;
@@ -26,6 +31,7 @@ export class Memory {
   }
   dv(r) { return r.dv ??= new DataView(r.bytes.buffer, r.bytes.byteOffset, r.bytes.byteLength); }
   read(addr, n) {
+    if (this.pend !== null) this.pend(addr, n);
     const r = this.find(addr);
     const o = Number(addr - r.base);
     if (o + Number(n) <= r.bytes.length) {                 // contained fast path
@@ -43,6 +49,7 @@ export class Memory {
     return v;
   }
   write(addr, n, v) {
+    if (this.pend !== null) this.pend(addr, n);
     if (this.jrnl) this.jrnl.push([addr, n, this.read(addr, n), null]);
     const r = this.find(addr);
     const o = Number(addr - r.base);
@@ -61,6 +68,7 @@ export class Memory {
   // a [addr, addr+len) range as one typed-array view, or null if it spans regions
   view(addr, len) {
     if (len <= 0n) return null;
+    if (this.pend !== null) this.pend(addr, len);
     const r = this.find(addr);
     const off = Number(addr - r.base);
     if (off + Number(len) > r.bytes.length) return null;

@@ -19,7 +19,9 @@ export function restoreEngineCore(eng, xs, assets, CPUctor, inflate) {
   if (eng.wmem.buffer.byteLength !== Number(state.memLen))
     throw new Error(`snapshot memMB mismatch: have ${eng.wmem.buffer.byteLength}, snap ${state.memLen}`);
   let pending = null;                                       // promise chain for async inflate
-  {
+  // assets.mem === null: the caller streams memory tiles into eng.wmem itself
+  // (sidecar loader); only the engine/X state is restored here.
+  if (assets.mem) {
     const all = new Uint8Array(eng.wmem.buffer);
     const f = assets.mem, fv = dv(f);
     const isSparse = f[0] === 0x53 && f[1] === 0x50 && f[2] === 0x52 && f[3] === 0x53;   // 'SPRS'

@@ -457,7 +457,12 @@ export class LinuxEngine {
     this.cpu.regs[4] = sp;
   }
 
-  readCStrMem(addr, len) { return new TextDecoder().decode(this.ram.subarray(Number(addr - this.base), Number(addr - this.base) + len)); }
+  // syscall paths that read guest memory via this.ram bypass Memory's pend
+  // guard; the ones that can plausibly source read-only file pages (path
+  // strings, write/writev payloads) call this explicitly.
+  guardRange(addr, len) { if (this.mem.pend !== null && len > 0) this.mem.pend(addr, BigInt(len)); }
+  readCStrMem(addr, len) { this.guardRange(addr, len);
+    return new TextDecoder().decode(this.ram.subarray(Number(addr - this.base), Number(addr - this.base) + len)); }
   readPath(addr) { let p = '', a = addr;
     for (;;) { const c = Number(this.mem.read(a, 1n)); if (!c) break; p += String.fromCharCode(c); a++; }
     return p; }
@@ -561,6 +566,7 @@ export class LinuxEngine {
     const defSink = (fd) => this.fds.get(fd) ?? (fd === 1 ? { sink: 'out' } : fd === 2 ? { sink: 'err' } : undefined);
     const writeChunk = (fd, addr, len) => {
       if (len <= 0) return;
+      this.guardRange(addr, len);                          // payload may be .rodata
       const bytes = this.ram.slice(Number(addr - this.base), Number(addr - this.base) + len);
       const h = defSink(fd);
       if (h?.sock?.conn) { h.sock.conn.write(bytes); this.wakeAllBlk(); return; }
@@ -1249,7 +1255,13 @@ export class LinuxEngine {
         const before = this.cpu.rip;
         let insn;
         try { insn = this.cpu.step(); }
-        catch (e) { if (e === EXIT) break; e.rip = before; throw e; }
+        catch (e) { if (e === EXIT) break;
+          if (e.pending) {                 // streamed page not here yet: rewind
+            this.cpu.rip = before;         // and retry the instruction shortly
+            this.blocked = { deadline: this.nowMs() + 40 };
+            break;
+          }
+          e.rip = before; throw e; }
         this.stats.interpreted++;
         branched = BRANCHY.has(insn.mnem) || this.cpu.rip !== before + BigInt(insn.len);
         if (this.onProgress && this.stats.interpreted % 2e7 === 0) this.onProgress('run');
