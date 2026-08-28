@@ -161,7 +161,7 @@ export class LinuxEngine {
   }
 
   profileTarget(t) {
-    const k = t.toString();
+    const k = t;
     if (this.aotFns.has(k) || this.aotFailed.has(k)) return;
     const n = (this.aotCalls.get(k) || 0) + 1;
     this.aotCalls.set(k, n);
@@ -188,7 +188,7 @@ export class LinuxEngine {
   // loop head — the translator only needs "runs forward to this frame's ret")
   // and register every function the unit produced for dispatch.
   tierUpAot(entry) {
-    const k = entry.toString();
+    const k = entry;
     if (this.aotFns.has(k) || this.aotFailed.has(k)) return;
     if (this.isTrampoline(entry)) { this.aotFailed.add(k); return; }
     const un = (this._unitN = (this._unitN || 0) + 1);   // bisect aid: veto unit N -> stays interpreted
@@ -199,7 +199,7 @@ export class LinuxEngine {
       const bytes = this.assembleWat(unit.wat);
       const inst = new WebAssembly.Instance(new WebAssembly.Module(bytes), { js: { mem: this.wmem }, env: this.aotEnv() });
       for (const a of unit.funcs) {
-        const ak = a.toString();
+        const ak = a;
         if (!this.aotFns.has(ak)) this.aotFns.set(ak, inst.exports['f_' + a.toString(16)]);
       }
       if (!this.aotFns.has(k)) throw new Error('entry missing from unit');
@@ -310,7 +310,7 @@ export class LinuxEngine {
     if (!this.shadowRange || this._shadowBusy ||
         this.cpu.rip < this.shadowRange[0] || this.cpu.rip >= this.shadowRange[1])
       return this.dispatchAot(f);
-    const k = this.cpu.rip.toString();
+    const k = this.cpu.rip;
     const n = (this._shadowClean ??= new Map()).get(k) ?? 0;
     if (n >= 50) return this.dispatchAot(f);            // exonerated after 50 clean passes
     this._shadowClean.set(k, n + 1);
@@ -322,7 +322,7 @@ export class LinuxEngine {
   interpUntil(done) {
     let guard = 0;
     while (!done()) {
-      let f = this.aotFns.get(this.cpu.rip.toString());
+      let f = this.aotFns.get(this.cpu.rip);
       if (f && this.aotBudget !== undefined && --this.aotBudget < 0) f = null;
       if (f) { this.cpu.rip = this.dispatchMaybeShadow(f);
                if (this.blocked) throw new BlockUnwind(this.cpu.rip);
@@ -336,7 +336,7 @@ export class LinuxEngine {
       // run for millions of steps — without tier-up, everything under it
       // would stay interpreted forever (GIMP's babl LUT init lives here)
       if (insn.mnem === 'jcc' && this.cpu.rip < before && this.inExec(this.cpu.rip)) {
-        const hk = this.cpu.rip.toString();
+        const hk = this.cpu.rip;
         const n = (this.profile.get(hk) || 0) + 1;
         this.profile.set(hk, n);
         if (this.assembleWat && n >= this.aotLoopThreshold && !this.aotFns.has(hk) && !this.aotFailed.has(hk))
@@ -379,7 +379,7 @@ export class LinuxEngine {
         if (rsp0 < 0x10000n && this.onBadRsp) this.onBadRsp(target, rsp0);
         const retAddr = this.mem.read(rsp0, 8n);
         const rspExit = BigInt.asUintN(64, rsp0 + 8n);
-        let f = this.aotFns.get(target.toString());
+        let f = this.aotFns.get(target);
         if (f && this.aotBudget !== undefined && --this.aotBudget < 0) f = null;
         if (this.chainSlow) f = null;                       // diagnostic: disable wasm-to-wasm fastpath
         if (f) {
@@ -1228,7 +1228,7 @@ export class LinuxEngine {
     try {
       while (steps++ < maxSteps && this.exitCode === null) {
         if ((steps & 0x3FFFF) === 0 && this.threads.length > 1) this.rotate();   // preemption quantum
-        const key = this.cpu.rip.toString();
+        const key = this.cpu.rip;
         let f = this.aotFns.get(key);
         if (f && this.aotBudget !== undefined && --this.aotBudget < 0) f = null;
         if (f) { this.cpu.rip = this.dispatchMaybeShadow(f);
@@ -1250,7 +1250,7 @@ export class LinuxEngine {
         if (this.blocked) { this.cpu.rip = before;            // re-execute the syscall on resume
                             if (this.park()) continue; break; }
         if (insn.mnem === 'jcc' && this.cpu.rip < before && this.inExec(this.cpu.rip)) {
-          const hk = this.cpu.rip.toString();
+          const hk = this.cpu.rip;
           const n = (this.profile.get(hk) || 0) + 1;
           this.profile.set(hk, n);
           // hot loop: first the cheap loop tiers, then whole-frame AOT from

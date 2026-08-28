@@ -18,23 +18,44 @@ const SIGN = { 1: 0x80n, 2: 0x8000n, 4: 0x80000000n, 8: 0x8000000000000000n };
 export class Memory {
   constructor(regions) { this.regions = regions; }   // [{base, bytes}]
   find(addr) {
+    const l = this._last;
+    if (l !== undefined && addr >= l.base && addr < l.end) return l;
     for (const r of this.regions)
-      if (addr >= r.base && addr < r.base + BigInt(r.bytes.length)) return r;
+      if (addr >= r.base && addr < (r.end ??= r.base + BigInt(r.bytes.length))) return this._last = r;
     throw new Error(`fault: ${addr.toString(16)}`);
   }
+  dv(r) { return r.dv ??= new DataView(r.bytes.buffer, r.bytes.byteOffset, r.bytes.byteLength); }
   read(addr, n) {
+    const r = this.find(addr);
+    const o = Number(addr - r.base);
+    if (o + Number(n) <= r.bytes.length) {                 // contained fast path
+      const dv = this.dv(r);
+      if (n === 8n) return dv.getBigUint64(o, true);
+      if (n === 4n) return BigInt(dv.getUint32(o, true));
+      if (n === 1n) return BigInt(r.bytes[o]);
+      if (n === 2n) return BigInt(dv.getUint16(o, true));
+    }
     let v = 0n;
     for (let i = 0n; i < n; i++) {
-      const r = this.find(addr + i);
-      v |= BigInt(r.bytes[Number(addr + i - r.base)]) << (8n * i);
+      const rr = this.find(addr + i);
+      v |= BigInt(rr.bytes[Number(addr + i - rr.base)]) << (8n * i);
     }
     return v;
   }
   write(addr, n, v) {
     if (this.jrnl) this.jrnl.push([addr, n, this.read(addr, n), null]);
+    const r = this.find(addr);
+    const o = Number(addr - r.base);
+    if (o + Number(n) <= r.bytes.length) {                 // contained fast path
+      const dv = this.dv(r);
+      if (n === 8n) { dv.setBigUint64(o, BigInt.asUintN(64, v), true); return; }
+      if (n === 4n) { dv.setUint32(o, Number(v & 0xFFFFFFFFn), true); return; }
+      if (n === 1n) { r.bytes[o] = Number(v & 0xFFn); return; }
+      if (n === 2n) { dv.setUint16(o, Number(v & 0xFFFFn), true); return; }
+    }
     for (let i = 0n; i < n; i++) {
-      const r = this.find(addr + i);
-      r.bytes[Number(addr + i - r.base)] = Number((v >> (8n * i)) & 0xFFn);
+      const rr = this.find(addr + i);
+      rr.bytes[Number(addr + i - rr.base)] = Number((v >> (8n * i)) & 0xFFn);
     }
   }
   // a [addr, addr+len) range as one typed-array view, or null if it spans regions
