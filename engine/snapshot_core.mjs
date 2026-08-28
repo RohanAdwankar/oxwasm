@@ -122,6 +122,9 @@ export function restoreEngineCore(eng, xs, assets, CPUctor, inflate) {
     }
     xs.root = byId.get(xs.rootId);
     xs.grabWindow = sx.grabWindow != null ? byId.get(sx.grabWindow) ?? null : null;
+    xs.grab = sx.grab && byId.get(sx.grab.win)
+      ? { win: byId.get(sx.grab.win), mask: sx.grab.mask,
+          ownerEvents: sx.grab.ownerEvents, implicit: sx.grab.implicit } : null;
   }
 
   // ---- fd table -------------------------------------------------------------

@@ -106,7 +106,8 @@ export class XServer {
     this.ptr = { x: width >> 1, y: height >> 1, buttons: 0, state: 0 };
     this.keysDown = new Set();
     this.focus = this.rootId;                            // PointerRoot-ish: we route by pointer
-    this.grabWindow = null;                              // implicit grab during button hold
+    this.grabWindow = null;                              // (legacy snapshot field)
+    this.grab = null;                                    // pointer grab: { win, mask, ownerEvents, implicit }
   }
 
   now() { return (Date.now() - this.timeBase) & 0x7fffffff; }
@@ -294,6 +295,24 @@ export class XServer {
       ww = ww.parent ? this.win(ww.parent) : null;
       if (ww) { const a = this.absPos(ww); ax = a.x; ay = a.y; }
     }
+    // pointer grab (active via GrabPointer, or implicit while a button is
+    // held): pointer events route to the grab window under the GRAB's event
+    // mask — GIMP's canvas drag depends on this, since the canvas window
+    // itself doesn't select motion outside the grab. owner-events: normal
+    // delivery wins when it lands in one of the grabbing client's windows.
+    const g = code >= 4 && code <= 6 ? this.grab : null;
+    if (g && this.win(g.win.id)) {
+      if (!(g.ownerEvents && ww && ww.conn === g.win.conn)) {
+        const m = g.mask;
+        const wants = code === 4 ? (m & 4) || true       // press: always reported
+          : code === 5 ? (m & 8)
+          : (m & 0x40) || (this.ptr.buttons && (m & 0x2000)) ||
+            (m & (this.ptr.buttons << 8));               // ButtonN-motion masks
+        if (!wants) return;
+        ww = g.win;
+        const a = this.absPos(ww); ax = a.x; ay = a.y;
+      }
+    }
     if (!ww || !ww.conn) return;
     const w32 = new W(32);
     w32.u8(0, code); w32.u8(1, detail); w32.u16(2, ww.conn.seq);
@@ -330,10 +349,19 @@ export class XServer {
   }
   injectButton(button, down) {
     const bit = 0x100 << (button - 1);
-    const target = this.grabWindow && this.ptr.buttons ? undefined : undefined;
-    if (down) { this.ptr.buttons |= 1 << (button - 1); }
+    if (down) {
+      this.ptr.buttons |= 1 << (button - 1);
+      if (!this.grab) {                                  // implicit grab: press window + its mask
+        let ww = this.windowAt(this.ptr.x, this.ptr.y).w;
+        while (ww && !(ww.eventMask & 4)) ww = ww.parent ? this.win(ww.parent) : null;
+        if (ww && ww.conn) this.grab = { win: ww, mask: ww.eventMask, ownerEvents: false, implicit: true };
+      }
+    }
     this.inputEvent(down ? 4 : 5, button);
-    if (down) this.ptr.state |= bit; else { this.ptr.state &= ~bit; this.ptr.buttons &= ~(1 << (button - 1)); }
+    if (down) this.ptr.state |= bit; else {
+      this.ptr.state &= ~bit; this.ptr.buttons &= ~(1 << (button - 1));
+      if (!this.ptr.buttons && this.grab?.implicit) this.grab = null;
+    }
   }
   injectKey(keycode, down) {
     if (down) this.keysDown.add(keycode); else this.keysDown.delete(keycode);
@@ -535,8 +563,12 @@ export class XServer {
           if (mask === 0 || (w.eventMask & mask)) this.event(w.conn, e);
         }
         break; }
-      case 26: this.reply(conn, 0, 0, 0, () => {}); break;             // GrabPointer: Success
-      case 27: break;                                    // UngrabPointer
+      case 26: {                                         // GrabPointer
+        const w = this.win(u32(4));
+        if (w) this.grab = { win: w, mask: u16(8), ownerEvents: !!d1, implicit: false };
+        this.reply(conn, 0, 0, 0, () => {});             // status: Success
+        break; }
+      case 27: this.grab = null; break;                  // UngrabPointer
       case 28: case 29: case 30: break;                  // Grab/UngrabButton, ChangeActivePointerGrab
       case 31: this.reply(conn, 0, 0, 0, () => {}); break;             // GrabKeyboard: Success
       case 32: case 33: case 34: case 35: case 36: case 37: break;     // grabs/AllowEvents/GrabServer

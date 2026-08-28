@@ -96,6 +96,8 @@ export function snapshotEngine(eng, xs, path) {
     x = { res: resl, atoms: xs.atoms, rootId: xs.rootId,
           ptr: { ...xs.ptr }, focus: xs.focus,
           grabWindow: xs.grabWindow ? xs.grabWindow.id : null,
+          grab: xs.grab ? { win: xs.grab.win.id, mask: xs.grab.mask,
+                            ownerEvents: xs.grab.ownerEvents, implicit: xs.grab.implicit } : null,
           fb: bw.add(new Uint8Array(xs.fb.buffer, xs.fb.byteOffset, xs.fb.byteLength)),
           timeBase: xs.timeBase,
           conns: conns.map(c => ({ seq: c.seq, setupDone: c.setupDone, ridBase: c.ridBase,
