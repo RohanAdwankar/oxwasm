@@ -331,6 +331,10 @@ try {
           if (Date.now() - t0 <= +dm[5]) continue;
           globalThis._clickDone.add(ci);
           const [x1, y1, x2, y2] = [+dm[1], +dm[2], +dm[3], +dm[4]];
+          { let ww = xs.windowAt(x1, y1).w; const chain = [];
+            while (ww) { chain.push(`0x${ww.id.toString(16)}/m0x${(ww.eventMask ?? 0).toString(16)}/${ww.cls === 2 ? 'io' : 'iw'}${ww.mapped ? '' : '/unmapped'}`);
+              ww = ww.parent ? xs.win(ww.parent) : null; }
+            console.error('<drag chain: ' + chain.join(' < ') + '>'); }
           xs.injectMotion(x1, y1); xs.injectButton(1, true);
           globalThis._drag = { x1, y1, x2, y2, step: 0 };
           console.error(`<drag start ${x1},${y1} -> ${x2},${y2}>`);
