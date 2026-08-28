@@ -417,6 +417,19 @@ try {
   } catch (e2) { console.error('  walk failed:', e2.message); }
 }
 if (xs.opCount) console.error('<ops since drag: ' + JSON.stringify(xs.opCount) + '>');
+// WINDUMP=1: write every toplevel's full backing buffer (windows can extend
+// beyond the screen — GIMP's statusbar with its error messages often does)
+if (process.env.WINDUMP) {
+  for (const c of xs.root.children ?? []) {
+    if (!c.mapped || !c.buffer || c.w < 50) continue;
+    const p = Buffer.alloc(c.w * c.h * 3);
+    for (let i = 0; i < c.w * c.h; i++) { const v = c.buffer[i];
+      p[i*3] = (v >> 16) & 255; p[i*3+1] = (v >> 8) & 255; p[i*3+2] = v & 255; }
+    writeFileSync(`${outPpm}.win${c.id.toString(16)}.ppm`,
+      Buffer.concat([Buffer.from(`P6\n${c.w} ${c.h}\n255\n`), p]));
+    console.error(`<windump 0x${c.id.toString(16)} ${c.w}x${c.h}>`);
+  }
+}
 console.error('state:', state, 'steps:', eng.stats.interpreted, 'wall:', ((Date.now()-t0)/1000).toFixed(0)+'s');
 console.error('stderr:', (eng.stderr??[]).join('').slice(-3000));
 console.error('stdout:', (eng.stdout??[]).join('').slice(-500));
