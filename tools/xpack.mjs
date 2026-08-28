@@ -380,6 +380,7 @@ import { parsePCF } from 'ox/pcf';
 import { restoreEngineCore } from 'ox/snapshot_core';
 import { CPU } from 'ox/interp';
 const P = window.__oxPerf;                         // load-time milestones (ms since nav)
+P.moduleUp = performance.now();                    // engine modules parsed + evaluated
 const stat = document.getElementById('stat'), cv = document.getElementById('screen');
 let timer = null;
 const ctx = cv.getContext('2d');
@@ -443,7 +444,9 @@ function sha1hex(str) {
   // Critical path is fetched SEQUENTIALLY (state, then mem): on a throttled
   // link, parallel fetches just split bandwidth and delay the first thing we
   // can act on. rom and units follow after interactivity.
-  const state = parseContainer(new Uint8Array(await (await fetch('app.state')).arrayBuffer()));
+  const stateAB = await (await fetch('app.state')).arrayBuffer();
+  P.stateBytes = performance.now();
+  const state = parseContainer(new Uint8Array(stateAB));
   P.stateFetched = performance.now();
   const files = {}, fonts = {};
   for (const [name, bytes] of state) {

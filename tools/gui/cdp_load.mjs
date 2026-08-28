@@ -34,6 +34,9 @@ const visit = async (label) => {
     if (await q('window.__oxPerf&&window.__oxPerf.unitsApplied!==undefined')) break; }
   const perf = await q('JSON.stringify(window.__oxPerf)');
   console.log(`${label} @ ${mbps}Mbps/${rtt}ms:`, perf);
+  console.log(' resources:', await q(`JSON.stringify(performance.getEntriesByType('resource')
+    .filter(r=>r.name.includes('app.'))
+    .map(r=>({n:r.name.split('/').pop(),start:r.startTime|0,end:r.responseEnd|0,xfer:r.transferSize})))`));
   return JSON.parse(perf);
 };
 
