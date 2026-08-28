@@ -182,6 +182,7 @@ eng.onProgress = (src) => {
 };
 if (process.env.POLLWD) eng.debugPollAfter = +process.env.POLLWD;
 if (process.env.XSDBG) xs.dbgInput = +process.env.XSDBG;
+if (process.env.XSNOGRAB) xs.disableGrabs = true;
 if (process.env.CHAINSLOW) eng.chainSlow = true;
 if (process.env.SHADOW) eng.shadowLib = process.env.SHADOW;
 import { snapshotEngine, restoreEngine } from '../../engine/snapshot.mjs';

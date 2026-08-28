@@ -300,7 +300,7 @@ export class XServer {
     // mask — GIMP's canvas drag depends on this, since the canvas window
     // itself doesn't select motion outside the grab. owner-events: normal
     // delivery wins when it lands in one of the grabbing client's windows.
-    const g = code >= 4 && code <= 6 ? this.grab : null;
+    const g = code >= 4 && code <= 6 && !this.disableGrabs ? this.grab : null;
     if (g && this.win(g.win.id)) {
       if (!(g.ownerEvents && ww && ww.conn === g.win.conn)) {
         const m = g.mask;
