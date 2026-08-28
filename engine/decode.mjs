@@ -224,7 +224,9 @@ export function decode(fetch, rip) {
     if (o2 === 0xB7) { const [r, rm] = modrm(osz); rm.size = 2; return fin({ mnem: 'movzx', dst: r, src: rm, size: osz, srcSize: 2 }); }
     if (o2 === 0xBE) { const [r, rm] = modrm(osz); rm.size = 1; if (rm.kind === 'reg') Object.assign(rm, reg8(rm.r | (rm.high ? 4 : 0))); return fin({ mnem: 'movsx', dst: r, src: rm, size: osz, srcSize: 1 }); }
     if (o2 === 0xBF) { const [r, rm] = modrm(osz); rm.size = 2; return fin({ mnem: 'movsx', dst: r, src: rm, size: osz, srcSize: 2 }); }
-    if (o2 === 0x1F) { modrm(osz); return fin({ mnem: 'nop' }); }
+    // 0F 18-1F: hint-nop family (prefetcht0/1/2/nta, reserved hints, long
+    // nop) — architectural no-ops with a full modrm. 0F 0D is prefetchw.
+    if ((o2 >= 0x18 && o2 <= 0x1F) || o2 === 0x0D) { modrm(osz); return fin({ mnem: 'nop' }); }
     if (o2 === 0xAE) {                                    // fence / fxsave group
       const peek = fetch(i);                              // peek modrm without consuming
       if ((peek & 0xC0) === 0xC0) {                       // mod=3: lfence/mfence/sfence

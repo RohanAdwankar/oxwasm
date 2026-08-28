@@ -324,6 +324,16 @@ try {
       const items = process.env.CLICK.split(';');
       for (let ci = 0; ci < items.length; ci++) {
         if (globalThis._clickDone.has(ci)) continue;
+        const dm = items[ci].match(/^drag:(\d+),(\d+),(\d+),(\d+)@(\d+)$/);
+        if (dm) {                                   // press, 20 motion steps, release
+          if (Date.now() - t0 <= +dm[5]) continue;
+          globalThis._clickDone.add(ci);
+          const [x1, y1, x2, y2] = [+dm[1], +dm[2], +dm[3], +dm[4]];
+          xs.injectMotion(x1, y1); xs.injectButton(1, true);
+          globalThis._drag = { x1, y1, x2, y2, step: 0 };
+          console.error(`<drag start ${x1},${y1} -> ${x2},${y2}>`);
+          eng.wakeAllBlk?.(); continue;
+        }
         const m = items[ci].match(/^(?:(\d+),(\d+)|(esc))@(\d+)$/);
         if (!m || Date.now() - t0 <= +m[4]) continue;
         globalThis._clickDone.add(ci);
@@ -332,6 +342,14 @@ try {
                console.error(`<click injected at ${m[1]},${m[2]}>`); }
         eng.wakeAllBlk?.();
       }
+    }
+    if (globalThis._drag) {                          // one motion step per chunk
+      const d = globalThis._drag;
+      d.step++;
+      const t = d.step / 20;
+      xs.injectMotion(Math.round(d.x1 + (d.x2 - d.x1) * t), Math.round(d.y1 + (d.y2 - d.y1) * t));
+      if (d.step >= 20) { xs.injectButton(1, false); globalThis._drag = null; console.error('<drag end>'); }
+      eng.wakeAllBlk?.();
     }
     {
       const seqNow = (() => { try { return xs.conns?.[0]?.seq ?? 0 } catch { return 0 } })();
