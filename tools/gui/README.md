@@ -52,3 +52,20 @@ Restore ~2s, then five interactions: File menu opened and stayed open,
 Escape dismissed it cleanly, Windows menu rendered all items, tool click
 landed; engine advanced 861.9M → 886.3M interp instrs while in-page AOT
 grew 1 → 487 units. All four screenshots pixel-correct.
+
+## Bundle slimming (2026-08-28)
+
+Same snapshot, three packagings of the GIMP page, each passing the
+identical CDP soak with pixel-correct screenshots:
+
+| page | units inlined | size |
+|---|---|---|
+| base64-JSON unit cache (old format) | 2673 (full boot) | 225.1 MB |
+| binary unit container | 2673 (full boot) | 204.4 MB |
+| binary container + `--units` prune | 668 (post-restore working set) | 178.2 MB |
+
+The working-set manifest comes from a `SNAPLOAD` + `CLICK` script +
+`UNITSOUT` guishot run (restore, drive the menus, record which units
+tier-up actually requests). A unit missing from a pruned page poisons to
+the interpreter — still correct, just unaccelerated — so pruning trades
+only cold-path speed for 26 MB.
