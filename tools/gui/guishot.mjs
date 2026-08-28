@@ -194,6 +194,11 @@ if (process.env.SNAPLOAD) {
 }
 const shadowPoll = () => {
   if (!process.env.SHADOW || eng.shadowRange) return;
+  if (process.env.SHADOW === '*') {                   // shadow every compiled frame
+    eng.shadowRange = [0n, 1n << 48n];
+    console.error('<shadow armed: entire address space>');
+    return;
+  }
   if (!globalThis._spDbg) { globalThis._spDbg = 1;
     console.error(`<shadowPoll maps=${(eng.maps??[]).length} sample=${(eng.maps??[]).slice(0,3).map(m=>m.path.split('/').pop()).join(',')}>`); }
   for (const m of eng.maps ?? []) if (m.path.includes(process.env.SHADOW)) {
