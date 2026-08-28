@@ -440,9 +440,9 @@ function sha1hex(str) {
     ctx.putImageData(img, 0, 0);
   };
   stat.textContent = 'loading\\u2026';
-  // ---- all fetches start now, in parallel ----
-  const unitsResp = fetch('app.units');
-  const memResp = fetch('app.mem');
+  // Critical path is fetched SEQUENTIALLY (state, then mem): on a throttled
+  // link, parallel fetches just split bandwidth and delay the first thing we
+  // can act on. rom and units follow after interactivity.
   const state = parseContainer(new Uint8Array(await (await fetch('app.state')).arrayBuffer()));
   P.stateFetched = performance.now();
   const files = {}, fonts = {};
@@ -468,7 +468,7 @@ function sha1hex(str) {
   // ---- stream memory tiles straight into wasm memory ----
   {
     const all = new Uint8Array(eng.wmem.buffer);
-    const rd = (await memResp).body.getReader();
+    const rd = (await fetch('app.mem')).body.getReader();
     const hdr = new Uint8Array(10), hv = new DataView(hdr.buffer);
     let magicSkip = 4, hdrFill = 0, remaining = 0, dst = 0, got = 0, lastStat = 0;
     for (;;) {
@@ -645,7 +645,7 @@ function sha1hex(str) {
       poke();
     }
     try {
-      const ub = new Uint8Array(await (await unitsResp).arrayBuffer());
+      const ub = new Uint8Array(await (await fetch('app.units')).arrayBuffer());
       if (ub.length) {
         for (const [h, bytes] of parseContainer(ub)) unitCache.set(h, bytes);
         eng.aotCallThreshold = 4; eng.aotLoopThreshold = 12;
@@ -654,10 +654,10 @@ function sha1hex(str) {
       }
     } catch (e) { console.warn('units sidecar failed; staying interpreted', e); }
   })();
-  // repeat visits come from the Cache API: a tiny service worker caches the
-  // shell and sidecars on first use (works offline afterwards, and sidesteps
-  // the browser HTTP cache's per-entry size limits)
-  if (navigator.serviceWorker) navigator.serviceWorker.register('sw.js').catch(() => {});
+  // Repeat visits ride the plain HTTP cache (max-age from the server). A
+  // service worker was tried and rejected: the Cache API stores DECODED
+  // bodies, so it writes ~600MB during the first visit and reads it back on
+  // the second — both slower than just re-decoding the brotli sidecars.
 })().catch(e => { stat.innerHTML = '<span class="err">' + e.message + '</span>'; console.error(e); });
 </script>
 </body>
@@ -672,25 +672,6 @@ function sha1hex(str) {
   w('app.mem', memBuf, memBuf.length < (100 << 20) ? 11 : brQ);
   w('app.units', unitsBuf, brQ);
   if (romBuf.length) w('app.rom', romBuf, brQ);
-  writeFileSync(join(sidecarDir, 'sw.js'), `// cache-first for the app bundle: repeat visits load from the Cache API
-const C = 'oxwasm-v1';
-self.addEventListener('install', () => self.skipWaiting());
-self.addEventListener('activate', (e) => e.waitUntil(clients.claim()));
-self.addEventListener('fetch', (e) => {
-  const u = new URL(e.request.url);
-  const name = u.pathname.split('/').pop() || 'index.html';
-  if (e.request.method !== 'GET' ||
-      !(name === 'index.html' || name === 'sw.js' || name.startsWith('app.'))) return;
-  e.respondWith((async () => {
-    const c = await caches.open(C);
-    const hit = await c.match(e.request);
-    if (hit) return hit;
-    const resp = await fetch(e.request);
-    if (resp.ok) c.put(e.request, resp.clone());
-    return resp;
-  })());
-});
-`);
   process.exit(0);
 }
 
