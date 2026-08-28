@@ -598,6 +598,7 @@ export class XServer {
         const maxn = u16(4), n = u16(6);
         const pat = str(8, n);
         const names = this.listFonts(pat).slice(0, maxn);
+        if (process?.env?.XFONTDBG) console.error(`<ListFonts "${pat}" -> ${JSON.stringify(names.slice(0,2))}>`);
         let total = 0; for (const nm of names) total += 1 + nm.length;
         this.reply(conn, 0, 0, total, (r) => {
           r.u16(8, names.length);
@@ -950,7 +951,19 @@ export class XServer {
     const rx = new RegExp('^' + pattern.toLowerCase().replace(/[.+^${}()|[\]]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.') + '$');
     const out = [];
     for (const e of this.fonts) for (const n of e.names) if (rx.test(n)) { out.push(n); break; }
-    if (!out.length && this.fonts.length) out.push(this.fonts[0].names[0]);
+    if (!out.length) {
+      // XLFD pattern with no concrete match: reflect it back with every
+      // wildcard field filled by a plausible default. XCreateFontSet probes
+      // one pattern per charset and needs a well-formed parseable name for
+      // each; OpenFont on the synthesized name lands on the bitmap font via
+      // matchFont's heuristics.
+      const parts = pattern.toLowerCase().split('-');
+      if (parts.length === 15 && parts[0] === '') {
+        const DEF = ['misc', 'fixed', 'medium', 'r', 'normal', '', '13', '120', '75', '75', 'c', '60', 'iso8859', '1'];
+        const syn = parts.slice(1).map((f, i) => (f === '*' || f === '?') ? DEF[i] : f);
+        out.push('-' + syn.join('-'));
+      } else if (this.fonts.length) out.push(this.fonts[0].names[0]);
+    }
     return out;
   }
   queryFontReply(conn, f) {
