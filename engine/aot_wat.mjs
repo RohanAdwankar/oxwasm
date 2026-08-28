@@ -547,6 +547,52 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     }
     return true;
   };
+  // An i32-classified register's entry reload truncates the incoming 64-bit
+  // value. That is sound only if every path from entry writes the register
+  // before any point that spills it back (a call/syscall boundary or a unit
+  // exit) — otherwise the truncated entry value leaks into the regfile.
+  // Units can be mid-function loop-head slices, so ABI scratch-register
+  // reasoning does not apply: verify by dataflow and demote violators.
+  {
+    const predsL = Array.from({length:N}, ()=>[]);
+    for (let b = 0; b < N; b++) for (const sx of succs[b]) if (sx >= 0) predsL[sx].push(b);
+    const isWrite = (insn, X) => {
+      if (insn.dst && insn.dst.kind === 'reg' && insn.dst.r === X &&
+          !['cmp','test','push'].includes(insn.mnem)) return true;
+      if (insn.mnem === 'pop' && insn.dst?.kind === 'reg' && insn.dst.r === X) return true;
+      if ((insn.mnem === 'div1' || insn.mnem === 'idiv1' || insn.mnem === 'mul1' || insn.mnem === 'imul1') && (X === 0 || X === 2)) return true;
+      if ((insn.mnem === 'cwde' || insn.mnem === 'cdq') && (X === 0 || X === 2)) return true;
+      return false;
+    };
+    for (let r = 0; r < 16; r++) {
+      const outW = new Array(N).fill(null);
+      if (!(seenR[r] && !any64[r] && w32[r])) continue;
+      // per-block: does the block write r before its first spill point, does it
+      // contain a spill point before any write, does it write r at all
+      let bad = false;
+      // iterate to fixpoint over written-on-entry; entry block starts unwritten
+      for (let pass = 0; pass < N + 2 && !bad; pass++) {
+        let changed = false;
+        for (let b = 0; b < N && !bad; b++) {
+          const inW = b === 0 ? false : predsL[b].length > 0 && predsL[b].every(pb => outW[pb] ?? false);
+          if (b !== 0 && predsL[b].length === 0) continue;      // unreachable
+          let w = inW;
+          for (const insn of blocks[b].insns) {
+            if (CALLS.has(insn.mnem)) {
+              if (!w) { bad = true; break; }
+              w = false;                      // post-call reload re-truncates the slot
+            }
+            if (isWrite(insn, r)) w = true;
+          }
+          // any exit edge (ret, external jmp/jcc target, indirect jmp) spills
+          if (!bad && !w && (term[b].kind === 'ret' || succs[b].some(x => x < 0))) bad = true;
+          if ((outW[b] ?? null) !== w) { outW[b] = w; changed = true; }
+        }
+        if (!changed) break;
+      }
+      if (bad) any64[r] = true;
+    }
+  }
   const savedOK = new Set([...pushed].filter(r => seenR[r] && !any64[r] && w32[r] && disciplined(r)));
   const isI32 = (r) => seenR[r] && !any64[r] && w32[r] && (!pushed.has(r) || savedOK.has(r));
   const savedI32 = (r) => savedOK.has(r);
