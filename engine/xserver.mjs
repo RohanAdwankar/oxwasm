@@ -315,6 +315,11 @@ export class XServer {
     }
     if (!ww || !ww.conn) { if (this.dbgInput) console.error(`<xev code=${code} DROPPED (no window/conn)>`); return; }
     if (this.dbgInput && code !== 6) console.error(`<xev code=${code} det=${detail} -> win=0x${ww.id.toString(16)} mask=0x${(ww.eventMask ?? 0).toString(16)} grab=${this.grab ? (this.grab.implicit ? 'impl' : 'act') + ':0x' + this.grab.win.id.toString(16) + '/m0x' + this.grab.mask.toString(16) + (this.grab.ownerEvents ? '/oe' : '') : 'no'}>`);
+    if (this.dbgInput === 3 && code === 4) {
+      const a0 = this.absPos(ww);
+      console.error(`<press@${this.ptr.x},${this.ptr.y} on 0x${ww.id.toString(16)} abs=${a0.x},${a0.y} ${ww.w}x${ww.h}; children:`);
+      for (const c of ww.children) console.error(`  0x${c.id.toString(16)} @${c.x},${c.y} ${c.w}x${c.h} cls=${c.cls} mapped=${c.mapped} mask=0x${(c.eventMask ?? 0).toString(16)} kids=${c.children.length}>`);
+    }
     if (this.dbgInput === 2 && code === 6) console.error(`<xev motion -> win=0x${ww.id.toString(16)}>`);
     const w32 = new W(32);
     w32.u8(0, code); w32.u8(1, detail); w32.u16(2, ww.conn.seq);
