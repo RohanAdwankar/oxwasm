@@ -307,12 +307,6 @@ if (snapPath) {
     }
   }
 
-  const stateSections = [['json', jsonRaw], ['blobs', blobsRaw]];
-  stateSections.push(['fills', Buffer.from(JSON.stringify(fills))]);
-  for (const [g, b] of Object.entries(files)) stateSections.push(['file:' + g, b]);
-  for (const [n, b64] of fontEntries) stateSections.push(['font:' + n, Buffer.from(b64, 'base64')]);
-  const stateBuf = container(stateSections);
-  const romBuf = romSections.length ? container(romSections) : Buffer.alloc(0);
   // mem: 'SPR2' + repeat [u48 wasm-mem offset][u32 len][raw bytes]. Runs are
   // page-granular: only nonzero 4K pages are emitted (coalesced), so the
   // decode cost on restore is proportional to real data, not to tiles that
@@ -345,6 +339,12 @@ if (sidecarDir) {
   const br = (b, q) => brotliCompressSync(b, { params: {
     [zc.BROTLI_PARAM_QUALITY]: q, [zc.BROTLI_PARAM_LGWIN]: 24,
     [zc.BROTLI_PARAM_SIZE_HINT]: b.length } });
+  const stateSections = [['json', jsonRaw], ['blobs', blobsRaw]];
+  stateSections.push(['fills', Buffer.from(JSON.stringify(fills))]);
+  for (const [g, b] of Object.entries(files)) stateSections.push(['file:' + g, b]);
+  for (const [n, b64] of fontEntries) stateSections.push(['font:' + n, Buffer.from(b64, 'base64')]);
+  const stateBuf = container(stateSections);
+  const romBuf = romSections.length ? container(romSections) : Buffer.alloc(0);
 
   const shell = `<!doctype html>
 <html>
