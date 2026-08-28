@@ -395,7 +395,16 @@ export class XServer {
   handle(conn, req) {
     const v = new DataView(req.buffer, req.byteOffset, req.length);
     const op = req[0], d1 = req[1];
-    if (this.countOps) this.opCount[op] = (this.opCount[op] || 0) + 1;
+    if (this.countOps) {
+      this.opCount[op] = (this.opCount[op] || 0) + 1;
+      if (op === 72) {                                   // PutImage: any non-white pixels?
+        const wd = v.getUint16(12, true), ht = v.getUint16(14, true);
+        let dark = 0;
+        for (let o = 24; o + 4 <= req.length; o += 4)
+          if ((v.getUint32(o, true) & 0xffffff) !== 0xffffff) dark++;
+        console.error(`<PutImage dst=0x${v.getUint32(4, true).toString(16)} ${wd}x${ht}@${v.getInt16(16, true)},${v.getInt16(18, true)} dark=${dark}>`);
+      }
+    }
     const u8 = (o) => v.getUint8(o), u16 = (o) => v.getUint16(o, true),
           i16 = (o) => v.getInt16(o, true), u32 = (o) => v.getUint32(o, true),
           i32 = (o) => v.getInt32(o, true);
