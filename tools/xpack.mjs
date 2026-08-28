@@ -175,26 +175,24 @@ for (const m of MODS) {
 // config, nothing but files. --br stores brotli instead (~30% smaller wire,
 // units especially) for hosts that can send Content-Encoding: br, e.g.
 // tools/gui/serve.mjs. Everything inside the containers is stored raw.
-if (sidecarDir) {
-  if (!snapPath) { console.error('xpack: --sidecar requires --snapshot'); process.exit(1); }
-  mkdirSync(sidecarDir, { recursive: true });
-  const br = (b, q) => brotliCompressSync(b, { params: {
-    [zc.BROTLI_PARAM_QUALITY]: q, [zc.BROTLI_PARAM_LGWIN]: 24,
-    [zc.BROTLI_PARAM_SIZE_HINT]: b.length } });
-  // container: [u32 idxLen][JSON [[name,off,len],...]][payload]
-  const container = (sections) => {
-    const idx = [], parts = []; let off = 0;
-    for (const [name, buf] of sections) { idx.push([name, off, buf.length]); off += buf.length; parts.push(buf); }
-    const ib = Buffer.from(JSON.stringify(idx));
-    const hdr = Buffer.alloc(4); hdr.writeUInt32LE(ib.length, 0);
-    return Buffer.concat([hdr, ib, ...parts]);
-  };
-  const jsonRaw = readFileSync(snapPath + '.json');
-  const blobsRaw = readFileSync(snapPath + '.blobs');
+// ---- shared snapshot processing (both output modes) ------------------------
+// container: [u32 idxLen][JSON [[name,off,len],...]][payload]
+const container = (sections) => {
+  const idx = [], parts = []; let off = 0;
+  for (const [name, buf] of sections) { idx.push([name, off, buf.length]); off += buf.length; parts.push(buf); }
+  const ib = Buffer.from(JSON.stringify(idx));
+  const hdr = Buffer.alloc(4); hdr.writeUInt32LE(ib.length, 0);
+  return Buffer.concat([hdr, ib, ...parts]);
+};
+let jsonRaw = null, blobsRaw = null, fbGzB64 = null, memBuf = null, nUnits = 0;
+let fills = [], romSections = [], unitsBuf = Buffer.alloc(0);
+if (snapPath) {
+  jsonRaw = readFileSync(snapPath + '.json');
+  blobsRaw = readFileSync(snapPath + '.blobs');
   // framebuffer preview: pull xs.fb straight out of the snapshot blobs
   const stJ = JSON.parse(jsonRaw.toString('utf8'));
   const fbRef = stJ.x && stJ.x.fb;
-  const fbGzB64 = fbRef ? gzipSync(blobsRaw.subarray(fbRef.o, fbRef.o + fbRef.n), { level: 9 }).toString('base64') : null;
+  fbGzB64 = fbRef ? gzipSync(blobsRaw.subarray(fbRef.o, fbRef.o + fbRef.n), { level: 9 }).toString('base64') : null;
   // decode the sparse tiles (wasm-memory offset -> raw 1MB tile)
   const memF = readFileSync(snapPath + '.mem');
   const tiles = new Map();
@@ -215,8 +213,6 @@ if (sidecarDir) {
   // until the rom stream delivers that file. Only pages inside non-writable
   // PT_LOAD segments (or non-ELF mmap sources) are deduped, so syscalls that
   // write into guest buffers can never target a pending page.
-  const fills = [];                          // [path, inState, [[wOff,fOff,len],...]]
-  const romSections = [];
   if (dedup) {
     const RAMOFF = 1 << 20;                  // LinuxEngine's ram offset in wasm memory
     const TILE = 1 << 20;
@@ -335,13 +331,20 @@ if (sidecarDir) {
       }
     }
   }
-  const memBuf = Buffer.concat(memParts);
-  let unitsBuf = Buffer.alloc(0), nUnits = 0;
+  memBuf = Buffer.concat(memParts);
   try {
     const units = JSON.parse(readFileSync((unitsPath ?? snapPath) + '.units', 'utf8'));
     unitsBuf = container(units.map(([h, b64]) => [h, Buffer.from(b64, 'base64')]));
     nUnits = units.length;
   } catch {}
+}
+
+if (sidecarDir) {
+  if (!snapPath) { console.error('xpack: --sidecar requires --snapshot'); process.exit(1); }
+  mkdirSync(sidecarDir, { recursive: true });
+  const br = (b, q) => brotliCompressSync(b, { params: {
+    [zc.BROTLI_PARAM_QUALITY]: q, [zc.BROTLI_PARAM_LGWIN]: 24,
+    [zc.BROTLI_PARAM_SIZE_HINT]: b.length } });
 
   const shell = `<!doctype html>
 <html>
@@ -698,53 +701,28 @@ function sha1hex(str) {
   process.exit(0);
 }
 
-// --snapshot: inline the sparse snapshot (json+blobs gzip'd; mem tiles are
-// already individually gzip'd, embedded as-is)
+// --snapshot (monolith): inline the shared snapshot artifacts. Memory is the
+// dedup'd SPR2 page-run buffer; the source files whose pages were dropped
+// merge into the inline file set (a monolith ships everything anyway) and
+// the page reconstructs those pages from them at load via `fills`. With
+// --dedup this removes ~100MB of memory duplicated against library files.
 let snapAssets = null, unitsB64 = 'null';
 if (snapPath) {
-  // recompress the sparse tiles at max level: snapshot saves use level 1 for
-  // speed; the pack is offline and can afford level 9 (~30% smaller page)
-  const recompress = (f) => {
-    if (f.subarray(0, 4).toString() !== 'SPRS') return f;
-    const parts = [Buffer.from('SPRS')];
-    let fo = 4;
-    while (fo < f.length) {
-      const o = f.readUIntLE(fo, 6), rawLen = f.readUInt32LE(fo + 6), gzLen = f.readUInt32LE(fo + 10); fo += 16;
-      const gz = gzipSync(gunzipSync(f.subarray(fo, fo + gzLen)), { level: 9 }); fo += gzLen;
-      const hdr = Buffer.alloc(16);
-      hdr.writeUIntLE(o, 0, 6); hdr.writeUInt32LE(rawLen, 6); hdr.writeUInt32LE(gz.length, 10);
-      parts.push(hdr, gz);
-    }
-    return Buffer.concat(parts);
-  };
+  for (const [name, b] of romSections) files[name.slice(5)] ??= b;
   snapAssets = {
-    json: gzipSync(readFileSync(snapPath + '.json'), { level: 9 }).toString('base64'),
-    blobs: gzipSync(readFileSync(snapPath + '.blobs'), { level: 9 }).toString('base64'),
-    mem: recompress(readFileSync(snapPath + '.mem')).toString('base64'),
+    json: gzipSync(jsonRaw, { level: 9 }).toString('base64'),
+    blobs: gzipSync(blobsRaw, { level: 9 }).toString('base64'),
+    mem: gzipSync(memBuf, { level: 9 }).toString('base64'),
+    fills,
   };
-  console.log(`xpack: snapshot inlined (${(snapAssets.mem.length / 1e6).toFixed(1)} MB mem b64)`);
-  // pre-compiled unit cache: sha1(wat) -> wasm bytes, from the snapshot run.
-  // In-page assembleWat serves these synchronously; wabt is only a fallback.
-  // Packed as a binary container — u32le index length, JSON index of
-  // [sha1, offset, len], then the raw wasm bytes concatenated — gzipped
-  // once. gzip over raw bytes beats gzip over the old base64-in-JSON text
-  // by ~25%, and the page serves each unit as a zero-copy subarray slice
-  // instead of materializing a giant JSON string at restore.
-  // --units PATH substitutes a different manifest (same format), e.g. one
-  // recorded by a post-restore exercise run (guishot UNITSOUT) so only the
-  // working set ships; a missed unit falls back to interp, still correct.
-  try {
-    const units = JSON.parse(readFileSync((unitsPath ?? snapPath) + '.units', 'utf8'));
-    const idx = [], parts = []; let uo = 0;
-    for (const [h, b64] of units) {
-      const b = Buffer.from(b64, 'base64');
-      idx.push([h, uo, b.length]); uo += b.length; parts.push(b);
-    }
-    const idxBuf = Buffer.from(JSON.stringify(idx));
-    const hdr = Buffer.alloc(4); hdr.writeUInt32LE(idxBuf.length, 0);
-    unitsB64 = JSON.stringify(gzipSync(Buffer.concat([hdr, idxBuf, ...parts]), { level: 9 }).toString('base64'));
-    console.log(`xpack: ${units.length} pre-compiled units inlined (${(uo / 1e6).toFixed(1)} MB wasm${unitsPath ? ', pruned manifest' : ''})`);
-  } catch { console.log('xpack: no .units manifest (browser tier-up will rely on wabt)'); }
+  console.log(`xpack: snapshot inlined (${(snapAssets.mem.length / 1e6).toFixed(1)} MB mem b64, ${fills.length} fill files)`);
+  // pre-compiled unit cache: sha1(wat) -> wasm bytes (binary container from
+  // the shared build). In-page assembleWat serves these synchronously; wabt
+  // is only a fallback. A missing unit falls back to interp, still correct.
+  if (unitsBuf.length) {
+    unitsB64 = JSON.stringify(gzipSync(unitsBuf, { level: 9 }).toString('base64'));
+    console.log(`xpack: ${nUnits} pre-compiled units inlined${unitsPath ? ' (pruned manifest)' : ''}`);
+  } else console.log('xpack: no .units manifest (browser tier-up will rely on wabt)');
 }
 
 const wabtJs = readFileSync('/tmp/package/index.js', 'utf8');
@@ -774,6 +752,24 @@ const html = `<!doctype html>
   <canvas id="screen" width="${W}" height="${H}" tabindex="0"></canvas>
   <div id="stat">loading…</div>
 </div>
+<script>
+// first paint, before wabt/engine even parse: the snapshot's framebuffer
+(async () => {
+  const FB = ${JSON.stringify(fbGzB64)};
+  if (!FB) return;
+  const cv0 = document.getElementById('screen'), c0 = cv0.getContext('2d');
+  const bin = atob(FB), u = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+  const r = new Response(new Blob([u]).stream().pipeThrough(new DecompressionStream('gzip')));
+  const fbb = new Uint8Array(await r.arrayBuffer());
+  const fb = new Uint32Array(fbb.buffer, 0, ${W * H});
+  const img = c0.createImageData(${W}, ${H});
+  const px = new Uint8ClampedArray(img.data.buffer);
+  for (let i = 0; i < fb.length; i++) { const p = fb[i], o = i * 4;
+    px[o] = (p >> 16) & 255; px[o+1] = (p >> 8) & 255; px[o+2] = p & 255; px[o+3] = 255; }
+  c0.putImageData(img, 0, 0);
+})();
+</script>
 <script>${wabtJs}</script>
 <script type="importmap">${JSON.stringify(importMap)}</script>
 <script type="module">
@@ -857,10 +853,30 @@ async function inflate(b64) {
       return new Uint8Array(await r.arrayBuffer());
     };
     const t0r = performance.now();
+    // memory: gzip'd 'SPR2' page-runs written straight into wasm memory, then
+    // fills reconstruct the pages that are byte-identical to inlined files
+    {
+      const m = await inflateBytes(raw(SNAP.mem));
+      const dv = new DataView(m.buffer, m.byteOffset, m.byteLength);
+      const all = new Uint8Array(eng.wmem.buffer);
+      let o = 4;
+      while (o < m.length) {
+        const dst = dv.getUint32(o, true) + dv.getUint16(o + 4, true) * 0x100000000;
+        const len = dv.getUint32(o + 6, true); o += 10;
+        all.set(m.subarray(o, o + len), dst); o += len;
+      }
+      for (const [p, , runs] of SNAP.fills ?? []) {
+        const fb = files[p]; if (!fb) continue;
+        for (const [wOff, fOff, rlen] of runs) {
+          const n = Math.max(0, Math.min(rlen, fb.length - fOff));
+          if (n > 0) all.set(fb.subarray(fOff, fOff + n), wOff);
+        }
+      }
+    }
     await restoreEngineCore(eng, xs, {
       json: await inflateBytes(raw(SNAP.json)),
       blobs: await inflateBytes(raw(SNAP.blobs)),
-      mem: raw(SNAP.mem),
+      mem: null,
     }, CPU, inflateBytes);
     stat.textContent = 'restored in ' + ((performance.now() - t0r) / 1000).toFixed(1) + 's';
   }
