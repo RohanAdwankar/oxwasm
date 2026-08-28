@@ -346,6 +346,15 @@ try {
           console.error(`<drag start ${x1},${y1} -> ${x2},${y2}>`);
           eng.wakeAllBlk?.(); continue;
         }
+        const km = items[ci].match(/^key:(\d+)\+(\d+)@(\d+)$/);   // modifier chord, e.g. key:37+59 = ctrl+comma
+        if (km) {
+          if (Date.now() - t0 <= +km[3]) continue;
+          globalThis._clickDone.add(ci);
+          xs.injectKey(+km[1], true); xs.injectKey(+km[2], true);
+          xs.injectKey(+km[2], false); xs.injectKey(+km[1], false);
+          console.error(`<key chord ${km[1]}+${km[2]} injected>`);
+          eng.wakeAllBlk?.(); continue;
+        }
         const m = items[ci].match(/^(?:(\d+),(\d+)|(esc))@(\d+)$/);
         if (!m || Date.now() - t0 <= +m[4]) continue;
         globalThis._clickDone.add(ci);
