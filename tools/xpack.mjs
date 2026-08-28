@@ -6,7 +6,7 @@
 //
 //   node tools/xpack.mjs SYSROOT /usr/bin/xcalc -o xcalc.html --title xcalc
 import { readFileSync, writeFileSync, readdirSync, lstatSync, realpathSync } from 'node:fs';
-import { gzipSync } from 'node:zlib';
+import { gzipSync, gunzipSync } from 'node:zlib';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -157,10 +157,25 @@ for (const m of MODS) {
 // already individually gzip'd, embedded as-is)
 let snapAssets = null, unitsB64 = 'null';
 if (snapPath) {
+  // recompress the sparse tiles at max level: snapshot saves use level 1 for
+  // speed; the pack is offline and can afford level 9 (~30% smaller page)
+  const recompress = (f) => {
+    if (f.subarray(0, 4).toString() !== 'SPRS') return f;
+    const parts = [Buffer.from('SPRS')];
+    let fo = 4;
+    while (fo < f.length) {
+      const o = f.readUIntLE(fo, 6), rawLen = f.readUInt32LE(fo + 6), gzLen = f.readUInt32LE(fo + 10); fo += 16;
+      const gz = gzipSync(gunzipSync(f.subarray(fo, fo + gzLen)), { level: 9 }); fo += gzLen;
+      const hdr = Buffer.alloc(16);
+      hdr.writeUIntLE(o, 0, 6); hdr.writeUInt32LE(rawLen, 6); hdr.writeUInt32LE(gz.length, 10);
+      parts.push(hdr, gz);
+    }
+    return Buffer.concat(parts);
+  };
   snapAssets = {
-    json: gzipSync(readFileSync(snapPath + '.json')).toString('base64'),
-    blobs: gzipSync(readFileSync(snapPath + '.blobs')).toString('base64'),
-    mem: readFileSync(snapPath + '.mem').toString('base64'),
+    json: gzipSync(readFileSync(snapPath + '.json'), { level: 9 }).toString('base64'),
+    blobs: gzipSync(readFileSync(snapPath + '.blobs'), { level: 9 }).toString('base64'),
+    mem: recompress(readFileSync(snapPath + '.mem')).toString('base64'),
   };
   console.log(`xpack: snapshot inlined (${(snapAssets.mem.length / 1e6).toFixed(1)} MB mem b64)`);
   // pre-compiled unit cache: sha1(wat) -> wasm bytes, from the snapshot run.
