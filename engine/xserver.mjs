@@ -93,6 +93,9 @@ export class XServer {
     this.defaultFont = this.fonts[0]?.font ?? null;
     const alias = (pat, key) => { const e = this.fonts.find(e => e.names.includes(key)); if (e) e.names.push(pat); };
     alias('fixed', '6x13'); alias('variable', '6x13'); alias('cursor', 'cursor');
+    // a well-formed XLFD name so XCreateFontSet (Xt/Xaw fontsets) can parse
+    // charset fields out of what ListFonts returns
+    alias('-misc-fixed-medium-r-normal--13-120-75-75-c-60-iso8859-1', '6x13');
     // window tree
     this.rootId = 0x266;
     this.root = { id: this.rootId, parent: null, x: 0, y: 0, w: width, h: height, bw: 0,
