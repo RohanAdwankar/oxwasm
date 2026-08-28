@@ -912,8 +912,8 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     if (insn.mnem === 'adc' || insn.mnem === 'sbb') return true;   // produce CF/OF/SF/ZF via $cf + operands
     if ((insn.mnem === 'shl' || insn.mnem === 'shr' || insn.mnem === 'sar') &&
         insn.src.kind === 'imm' && (insn.src.v & (BigInt((insn.size||8)===8?63:31))) !== 0n) return true;
-    if ((insn.mnem === 'bt' || insn.mnem === 'bts' || insn.mnem === 'btr' || insn.mnem === 'btc') &&
-        insn.dst.kind === 'reg') return true;
+    if (insn.mnem === 'bt' || insn.mnem === 'bts' || insn.mnem === 'btr' || insn.mnem === 'btc') return true;
+    if (insn.mnem === 'mul1' || insn.mnem === 'imul1') return true;   // CF=OF = widening overflow, in $fr
     if (insn.mnem === 'bsf' || insn.mnem === 'bsr') return true;   // ZF <- (src==0)
     return false;
   };
@@ -936,6 +936,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       case 'inc': return { kind:'inc', size:S };
       case 'dec': return { kind:'dec', size:S };
       case 'bt': case 'bts': case 'btr': case 'btc': return { kind:'cf', size:S };
+      case 'mul1': case 'imul1': return { kind:'cf', size:S };
       default: return null;
     } };
 
@@ -1052,8 +1053,8 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           case 'l':return `(i32.ne ${sf} ${OF})`; case 'ge':return `(i32.eq ${sf} ${OF})`;
           case 'le':return `(i32.or ${zf} (i32.ne ${sf} ${OF}))`; case 'g':return `(i32.and (i32.eqz ${zf}) (i32.eq ${sf} ${OF}))`; }
       }
-      else if (fs.kind === 'cf') switch (cc) {      // fr holds the CF bit (bt family)
-        case 'b':return nz; case 'ae':return zf; }
+      else if (fs.kind === 'cf') switch (cc) {      // fr holds the CF bit (bt family, mul overflow: CF==OF)
+        case 'b': case 'o': return nz; case 'ae': case 'no': return zf; }
       else if (fs.kind === 'fcmp') {                // ucomis: ZF/PF/CF from an f64 compare; OF/SF cleared
         const A = `(f64.reinterpret_i64 ${a})`, B = `(f64.reinterpret_i64 ${b})`;
         const unord = `(i32.or (f64.ne ${A} ${A}) (f64.ne ${B} ${B}))`;
@@ -1220,15 +1221,40 @@ function emitUnitFunction(a0, fnAddr, ctx) {
             L.push(`(local.set ${reg(insn.dst.r)} (i64.or (i64.shl (i64.extend_i32_u ${bs32(`(i32.wrap_i64 (local.get ${t}))`)}) (i64.const 32)) (i64.extend_i32_u ${bs32(`(i32.wrap_i64 (i64.shr_u (local.get ${t}) (i64.const 32)))`)})))`); }
           break; }
         case 'bt': case 'bts': case 'btr': case 'btc': {
-          if (insn.dst.kind !== 'reg') throw new Error('AOT: bt on memory @ '+insn.rip.toString(16));
-          const b = insn.src.kind === 'imm'
-            ? `(i64.const ${(insn.src.v % BigInt(S*8)).toString()})`
-            : `(i64.and ${rd(insn.src,S,next)} (i64.const ${S*8-1}))`;
-          const tb = T(); L.push(`(local.set ${tb} ${b})`);
-          setFlags('cf', S, null, null, `(i64.and (i64.shr_u ${rd(insn.dst,S,next)} (local.get ${tb})) (i64.const 1))`);
-          if (insn.mnem === 'bts') L.push(wr(insn.dst,S,`(i64.or ${rd(insn.dst,S,next)} (i64.shl (i64.const 1) (local.get ${tb})))`,next));
-          else if (insn.mnem === 'btr') L.push(wr(insn.dst,S,`(i64.and ${rd(insn.dst,S,next)} (i64.xor (i64.shl (i64.const 1) (local.get ${tb})) (i64.const -1)))`,next));
-          else if (insn.mnem === 'btc') L.push(wr(insn.dst,S,`(i64.xor ${rd(insn.dst,S,next)} (i64.shl (i64.const 1) (local.get ${tb})))`,next));
+          if (insn.dst.kind === 'reg') {
+            const b = insn.src.kind === 'imm'
+              ? `(i64.const ${(insn.src.v % BigInt(S*8)).toString()})`
+              : `(i64.and ${rd(insn.src,S,next)} (i64.const ${S*8-1}))`;
+            const tb = T(); L.push(`(local.set ${tb} ${b})`);
+            setFlags('cf', S, null, null, `(i64.and (i64.shr_u ${rd(insn.dst,S,next)} (local.get ${tb})) (i64.const 1))`);
+            if (insn.mnem === 'bts') L.push(wr(insn.dst,S,`(i64.or ${rd(insn.dst,S,next)} (i64.shl (i64.const 1) (local.get ${tb})))`,next));
+            else if (insn.mnem === 'btr') L.push(wr(insn.dst,S,`(i64.and ${rd(insn.dst,S,next)} (i64.xor (i64.shl (i64.const 1) (local.get ${tb})) (i64.const -1)))`,next));
+            else if (insn.mnem === 'btc') L.push(wr(insn.dst,S,`(i64.xor ${rd(insn.dst,S,next)} (i64.shl (i64.const 1) (local.get ${tb})))`,next));
+            break;
+          }
+          // memory bit base: bit-string addressing — a register offset selects
+          // the word S*(bitoff div S*8) beyond the effective address (signed,
+          // flooring: arithmetic shift); an imm8 offset is just masked.
+          const w = BigInt(S*8), lg = Math.log2(S*8);
+          const ta = T(), tb = T();
+          if (insn.src.kind === 'imm') {
+            L.push(`(local.set ${tb} (i64.const ${(insn.src.v % w).toString()}))`);
+            L.push(`(local.set ${ta} (i64.extend_i32_u ${wasmAddr(insn.dst, next)}))`);
+          } else {
+            const to = T();
+            L.push(`(local.set ${to} ${sx(rd(insn.src,S,next),S)})`);
+            L.push(`(local.set ${tb} (i64.and (local.get ${to}) (i64.const ${S*8-1})))`);
+            L.push(`(local.set ${ta} (i64.extend_i32_u (i32.add ${wasmAddr(insn.dst, next)} ` +
+                   `(i32.wrap_i64 (i64.mul (i64.shr_s (local.get ${to}) (i64.const ${lg})) (i64.const ${S}))))))`);
+          }
+          const A = `(i32.wrap_i64 (local.get ${ta}))`;
+          const tv = T();
+          L.push(`(local.set ${tv} (${LD[S]} ${A}))`);
+          setFlags('cf', S, null, null, `(i64.and (i64.shr_u (local.get ${tv}) (local.get ${tb})) (i64.const 1))`);
+          const bitm = `(i64.shl (i64.const 1) (local.get ${tb}))`;
+          if (insn.mnem === 'bts') L.push(`(${ST[S]} ${A} (i64.or (local.get ${tv}) ${bitm}))`);
+          else if (insn.mnem === 'btr') L.push(`(${ST[S]} ${A} (i64.and (local.get ${tv}) (i64.xor ${bitm} (i64.const -1))))`);
+          else if (insn.mnem === 'btc') L.push(`(${ST[S]} ${A} (i64.xor (local.get ${tv}) ${bitm}))`);
           break; }
         case 'shld': case 'shrd': {
           // double shift; a zero count must leave dst untouched, so route
@@ -1281,6 +1307,10 @@ function emitUnitFunction(a0, fnAddr, ctx) {
             const t = T(); L.push(`(local.set ${t} (i64.mul ${a} ${b}))`);
             L.push(wr32reg(0, `(i32.wrap_i64 ${andmask(`(local.get ${t})`,S)})`));       // rax = low
             L.push(wr32reg(2, `(i32.wrap_i64 (i64.shr_u (local.get ${t}) (i64.const ${S*8})))`)); // rdx = high
+            // CF=OF: product does not fit the low half
+            setFlags('cf', S, null, null, sgn
+              ? `(i64.extend_i32_u (i64.ne (local.get ${t}) ${sx(andmask(`(local.get ${t})`,S),S)}))`
+              : `(i64.extend_i32_u (i64.ne (i64.shr_u (local.get ${t}) (i64.const ${S*8})) (i64.const 0)))`);
             break;
           }
           // 64x64 -> 128. WASM has no mulhi, so build the high word from the
@@ -1315,6 +1345,10 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           }
           L.push(wr({kind:'reg',r:0,size:8},8,`(local.get ${lo})`,next));   // rax = low 64
           L.push(wr({kind:'reg',r:2,size:8},8,`(local.get ${hi})`,next));   // rdx = high 64
+          // CF=OF: high half is not the zero/sign extension of the low half
+          setFlags('cf', 8, null, null, sgn
+            ? `(i64.extend_i32_u (i64.ne (local.get ${hi}) (i64.shr_s (local.get ${lo}) (i64.const 63))))`
+            : `(i64.extend_i32_u (i64.ne (local.get ${hi}) (i64.const 0)))`);
           break; }
         case 'cwde': {   // sign-extend the low half of rax into the full width (cbw/cwde/cdqe)
           const half = S === 8 ? 4 : S === 4 ? 2 : 1;

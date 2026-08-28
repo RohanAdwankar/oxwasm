@@ -22,6 +22,7 @@ node threadtest.mjs
 node subwidthtest.mjs
 node xflagtest.mjs
 node leatest.mjs
+node mulbtftest.mjs
 node entryflagtest.mjs
 node addflagtest.mjs
 node adctest.mjs

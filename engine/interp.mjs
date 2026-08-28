@@ -933,7 +933,7 @@ export class CPU {
         } else {
           // bit-string form: the bit index (signed for the register form)
           // selects a byte relative to the effective address
-          const raw = insn.src.kind === 'imm' ? (insn.src.v % width) : BigInt.asIntN(64, this.get(insn.src));
+          const raw = insn.src.kind === 'imm' ? (insn.src.v % width) : BigInt.asIntN(S * 8, this.get(insn.src));
           addr = this.ea(insn.dst) + (raw >> 3n);
           bit = ((raw % 8n) + 8n) % 8n;
           cur = this.mem.read(addr, 1n);
