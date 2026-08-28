@@ -1055,7 +1055,12 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           const e = insn.src.kind === 'mem' ? `(${LD_S[insn.src.size]} ${wasmAddr(insn.src,next)})`
                                             : sx(rd(insn.src,insn.src.size,next), insn.src.size);
           L.push(wr(insn.dst,insn.size,e,next)); break; }
-        case 'lea': L.push(`(local.set ${reg(insn.dst.r)} ${guestAddr(insn.src,next)})`); break;
+        case 'lea': {  // operand-size semantics: 32-bit lea zero-extends, 16-bit merges
+          const a = guestAddr(insn.src, next);
+          if (insn.size === 8) L.push(`(local.set ${reg(insn.dst.r)} ${a})`);
+          else L.push(wr({ kind: 'reg', r: insn.dst.r, size: insn.size }, insn.size,
+                         `(i64.and ${a} (i64.const ${(1n << BigInt(insn.size*8)) - 1n}))`, next));
+          break; }
         case 'add': case 'sub': case 'and': case 'or': case 'xor': {
           const prod = (producers.has(ii));
           const akind = insn.mnem==='sub'?'sub':insn.mnem==='add'?'add':'logic';
