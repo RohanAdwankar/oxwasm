@@ -513,18 +513,21 @@ function sha1hex(str) {
     if (inState) applyFill(files[p], runs);
     else romFills.set(p, runs);
   }
+  // NB: wasm-memory byte offsets exceed 2^31, so page math must use division,
+  // never 32-bit bitwise shifts
+  const pgOf = (o) => (o / 4096) | 0;
   let bitmap = null;
   if (romFills.size) {
-    bitmap = new Uint8Array((eng.wmem.buffer.byteLength >> 15) + 1);   // 1 bit per 4K page
+    bitmap = new Uint8Array(Math.ceil(eng.wmem.buffer.byteLength / 32768) + 1);   // 1 bit per 4K page
     for (const runs of romFills.values())
       for (const [wOff, , rlen] of runs)
-        for (let p = wOff >> 12; p <= (wOff + rlen - 1) >> 12; p++) bitmap[p >> 3] |= 1 << (p & 7);
+        for (let p = pgOf(wOff); p <= pgOf(wOff + rlen - 1); p++) bitmap[p >> 3] |= 1 << (p & 7);
     const RAMOFF = 1 << 20;
     eng.mem.pend = (addr, n) => {
       const off = RAMOFF + Number(addr - eng.base);
       if (off < 0) return;
-      const p1 = (off + Number(n) - 1) >> 12;
-      for (let p = off >> 12; p <= p1; p++)
+      const p1 = pgOf(off + Number(n) - 1);
+      for (let p = pgOf(off); p <= p1; p++)
         if (bitmap[p >> 3] & (1 << (p & 7))) { const e = new Error('page pending'); e.pending = true; throw e; }
     };
   }
@@ -628,7 +631,7 @@ function sha1hex(str) {
           if (runs) {
             applyFill(bytes, runs);
             for (const [wOff, , rlen] of runs)
-              for (let pg = wOff >> 12; pg <= (wOff + rlen - 1) >> 12; pg++) bitmap[pg >> 3] &= ~(1 << (pg & 7));
+              for (let pg = pgOf(wOff); pg <= pgOf(wOff + rlen - 1); pg++) bitmap[pg >> 3] &= ~(1 << (pg & 7));
             files[p] ??= bytes;                       // late open() fallback
           }
           next++;
