@@ -22,7 +22,7 @@ const bps = +mbpsS * 125000;                     // Mbit/s -> bytes/s
 let tokens = 0, lastRefill = Date.now();
 const take = (want) => {
   const now = Date.now();
-  tokens = Math.min(bps / 4, tokens + bps * (now - lastRefill) / 1000);   // ≤250ms burst
+  tokens = Math.min(bps / 20, tokens + bps * (now - lastRefill) / 1000);  // ≤50ms burst
   lastRefill = now;
   const n = Math.min(want, Math.floor(tokens));
   tokens -= n; return n;
