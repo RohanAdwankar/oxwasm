@@ -189,6 +189,26 @@ export class LinuxEngine {
     } catch { return false; }
   }
 
+  // For a `jmp *[GOT]` stub with a register-free address, read where it
+  // points right now. Post-boot GOT slots are resolved and stable, so the
+  // stub can alias its callee's compiled function outright.
+  trampolineTarget(entry) {
+    try {
+      let rip = entry;
+      for (let n = 0; n <= 4; n++) {
+        const insn = decode((i) => Number(this.mem.read(rip + BigInt(i), 1n)), rip);
+        if (insn.mnem === 'nop') { rip += BigInt(insn.len); continue; }
+        if (insn.mnem !== 'jmpind') return null;
+        const op = insn.src;
+        if (!op || op.kind === 'reg' || op.base >= 0 || op.index >= 0 || op.fs) return null;
+        let a = op.disp;
+        if (op.ripRel) a += rip + BigInt(insn.len);
+        return this.mem.read(BigInt.asUintN(64, a), 8n);
+      }
+      return null;
+    } catch { return null; }
+  }
+
   // Compile the call-graph closure rooted at `entry` (a function entry or a
   // loop head — the translator only needs "runs forward to this frame's ret")
   // and register every function the unit produced for dispatch.
@@ -220,7 +240,17 @@ export class LinuxEngine {
       }
       if (this.cacheOnly) { this.aotFailed.add(k); return; }   // no assembler here: skip translation too
     }
-    if (this.isTrampoline(entry)) { this.aotFailed.add(k); return; }
+    if (this.isTrampoline(entry)) {
+      // PLT alias: a resolved stub whose callee is compiled dispatches
+      // straight into the callee's unit (the jmp is architecturally
+      // transparent — identical register state at stub and target). NOTE:
+      // assumes the GOT slot stays stable (true post-boot; dlopen rebinding
+      // would need invalidation).
+      const tgt = this.trampolineTarget(entry);
+      const tf = tgt !== null ? this.aotFns.get(tgt) : undefined;
+      if (tf) { this.aotFns.set(k, tf); return; }
+      this.aotFailed.add(k); return;
+    }
     // bound the synchronous translation cost per host slice: the host zeroes
     // tierMs each pump and deferred entries re-trigger on their next call
     if (this.tierMsMax !== undefined && this.tierMs >= this.tierMsMax) return;
