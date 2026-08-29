@@ -183,15 +183,20 @@ eng.onProgress = (src) => {
 if (process.env.POLLWD) eng.debugPollAfter = +process.env.POLLWD;
 if (process.env.XSDBG) xs.dbgInput = +process.env.XSDBG;
 if (process.env.RIPTRACE) { eng.ripTrace = new Array(1024).fill(0n); eng.ripTraceI = 0; }
-// UNITVETO=libc.so.6+0x11bbb0,... : poison specific units to interp (bisect aid)
+// UNITVETO=libc.so.6+0x11bbb0,... : poison to interp any unit CONTAINING one
+// of the named functions (a unit's tier-up entry is just one of its exports,
+// so vetoing must match against all of them). Implemented via onUnitWat,
+// whose throw lands in tierUpAot's catch and poisons the unit.
 if (process.env.UNITVETO) {
   const vetoes = process.env.UNITVETO.split(',');
-  eng.unitFilter = (un, entry) => {
-    let s = null;
-    for (const m of eng.maps ?? []) if (entry >= m.at && entry < m.at + m.len)
-      { s = `${m.path.split('/').pop()}+0x${(entry - m.at + BigInt(m.fileOff)).toString(16)}`; break; }
-    if (s && vetoes.includes(s)) { console.error(`<unit vetoed: ${s}>`); return false; }
-    return true;
+  const symOf = (a) => { for (const m of eng.maps ?? []) if (a >= m.at && a < m.at + m.len)
+    return `${m.path.split('/').pop()}+0x${(a - m.at + BigInt(m.fileOff)).toString(16)}`; return null; };
+  const prev = eng.onUnitWat;
+  eng.onUnitWat = (un, entry, unit) => {
+    for (const a of unit.funcs ?? []) { const s = symOf(a);
+      if (s && vetoes.includes(s)) { console.error(`<unit vetoed: contains ${s} (entry ${symOf(entry) ?? entry.toString(16)})>`);
+        throw new Error('unit vetoed'); } }
+    prev?.(un, entry, unit);
   };
 }
 if (process.env.XSNOGRAB) xs.disableGrabs = true;
