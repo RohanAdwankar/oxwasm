@@ -16,6 +16,7 @@ const ENGINE = join(HERE, '..', 'engine');
 const args = process.argv.slice(2);
 let sysroot = null, guestPath = null, out = 'x.html', title = null, W = 640, H = 480, fontDir = null, gtk = false;
 let snapPath = null, memMB = 512, extraArgs = [], unitsPath = null, sidecarDir = null, brQ = 9, dedup = false, brMode = false;
+let vetoList = [];
 for (let i = 0; i < args.length; i++) {
   const a = args[i];
   if (a === '-o') out = args[++i];
@@ -26,6 +27,7 @@ for (let i = 0; i < args.length; i++) {
   else if (a === '--snapshot') snapPath = args[++i];
   else if (a === '--units') unitsPath = args[++i];
   else if (a === '--sidecar') sidecarDir = args[++i];
+  else if (a === '--veto') vetoList = args[++i].split(',');
   else if (a === '--brq') brQ = +args[++i];
   else if (a === '--dedup') dedup = true;
   else if (a === '--br') brMode = true;
@@ -351,6 +353,7 @@ if (snapPath) {
 }
 
 if (sidecarDir) {
+  const wabtSrc = (() => { try { return readFileSync('/tmp/package/index.js', 'utf8'); } catch { return null; } })();
   if (!snapPath) { console.error('xpack: --sidecar requires --snapshot'); process.exit(1); }
   mkdirSync(sidecarDir, { recursive: true });
   const br = (b, q) => brotliCompressSync(b, { params: {
@@ -426,6 +429,7 @@ const CFG = { W: ${W}, H: ${H}, memMB: ${memMB},
   argv: ${JSON.stringify([guestPath, ...extraArgs])},
   mtimes: ${JSON.stringify(mtimes)},
   hasRom: ${romSections.length > 0},
+  hasWabt: ${!!wabtSrc}, veto: ${JSON.stringify(vetoList)},
   sizes: { state: ${stateBuf.length}, mem: ${memBuf.length}, units: ${unitsBuf.length}, rom: ${romBuf.length} } };
 async function inflate(b64) {
   const bin = atob(b64), u = new Uint8Array(bin.length);
@@ -509,6 +513,7 @@ function sha1hex(str) {
   eng.unitBytes = (k) => unitCache.get(k.toString(16));
   eng.cacheOnly = true;
   eng.tierMsMax = 8;                              // never let sync tier work eat a slice
+  if (CFG.veto.length) eng.unitFilter = (un, entry) => !CFG.veto.includes(entry.toString(16));
   P.engineUp = performance.now();
   // ---- stream memory tiles straight into wasm memory ----
   {
@@ -683,6 +688,7 @@ function sha1hex(str) {
     if (timer) { clearTimeout(timer); timer = null; }
     const start = performance.now();
     eng.tierMs = 0;                                  // fresh sync-translation budget per slice
+    eng.tierMsMax = xs.ptr.buttons ? 2 : 8;          // trickle-compile mid-gesture: strokes stay fluid but the paint path still tiers
     eng.sliceDeadline = start + 12;                  // honored INSIDE run(): deep callouts preempt too
     let mode = 'ran', deadline = null;
     do {
@@ -801,6 +807,25 @@ function sha1hex(str) {
         poke();
       }
     } catch (e) { console.warn('units sidecar failed; staying interpreted', e); }
+    // ---- lazy self-optimization: in-page assembler for whatever the
+    // capture missed (deopt landings and loop heads a user's unique path
+    // makes hot). Loaded after everything else; per-slice compile time is
+    // bounded by eng.tierMsMax, instantiation is off-thread.
+    try {
+      if (CFG.hasWabt) {
+        const src = await new Response(debody(await fetch('app.wabt' + EXT))).text();
+        const WabtModule = new Function(src + '\\n;return (typeof WabtModule !== "undefined" ? WabtModule : wabt);')();
+        const wabt = await WabtModule();
+        eng.assembleWat = (wat) => {
+          const m = wabt.parseWat('unit.wat', wat);
+          const bin = m.toBinary({}).buffer; m.destroy();
+          return new Uint8Array(bin);
+        };
+        eng.cacheOnly = false;
+        eng.aotFailed.clear();                        // cache-miss poisons get a real shot
+        P.wabtReady = performance.now();
+      }
+    } catch (e) { console.warn('lazy assembler unavailable; capture-only units', e); }
   })();
   // Repeat visits ride the plain HTTP cache (max-age from the server). A
   // service worker was tried and rejected: the Cache API stores DECODED
@@ -822,6 +847,7 @@ function sha1hex(str) {
   w('app.mem', memBuf, memBuf.length < (100 << 20) ? 11 : brQ);
   w('app.units', unitsBuf, brQ);
   if (romBuf.length) w('app.rom', romBuf, brQ);
+  if (wabtSrc) w('app.wabt', Buffer.from(wabtSrc, 'utf8'), brQ);
   process.exit(0);
 }
 
@@ -1102,6 +1128,7 @@ async function inflate(b64) {
     if (timer) { clearTimeout(timer); timer = null; }
     const start = performance.now();
     eng.tierMs = 0;                                  // fresh sync-translation budget per slice
+    eng.tierMsMax = xs.ptr.buttons ? 2 : 8;          // trickle-compile mid-gesture: strokes stay fluid but the paint path still tiers
     eng.sliceDeadline = start + 12;                  // honored INSIDE run(): deep callouts preempt too
     let mode = 'ran', deadline = null;
     do {
