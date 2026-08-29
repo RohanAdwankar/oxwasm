@@ -1545,7 +1545,12 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     const last = blk.insns[blk.insns.length-1], lnext = last.next;
     const labelFor = (j) => j <= i ? '$loop_'+j : '$blk_'+j;
     const goto = (j) => { if (j < 0) throw new Error('AOT: branch into undecoded code');
-      return DISP ? `(local.set $pc (i32.const ${j})) (br $L_disp)` : `(br ${labelFor(j)})`; };
+      // forward edges break straight to the target block ($b{j} closes just
+      // before body j, so `br $b{j}` lands at its start); only backward
+      // edges pay the $pc + br_table dispatcher round-trip. Measured before:
+      // 3044 of 3248 edges in a hot unit went through the dispatcher.
+      if (DISP) return j > i ? `(br $b${j})` : `(local.set $pc (i32.const ${j})) (br $L_disp)`;
+      return `(br ${labelFor(j)})`; };
     const brTo = (j) => j === i+1 ? '' : goto(j);
     if (t.kind === 'jcc') {
       const c = cond(last.cond);
