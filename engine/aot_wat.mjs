@@ -280,9 +280,10 @@ function analyze(mem, entry, { maxInsns = 20000, noJtab = false } = {}) {
     //    `call __libc_start_main` in _start); if truly reached, the
     //    interpreter traps exactly as native would.
     //  - rare, cold instructions we don't translate but the interpreter models
-    //    fully (cpuid — glibc's one-time ISA probe): deopt runs it and the
-    //    frame's remainder in the interpreter, then returns.
-    if (['hlt','ud2','int3','int','cpuid'].includes(insn.mnem)) {
+    //    fully (cpuid — glibc's one-time ISA probe; fxsave/fxrstor and the
+    //    mxcsr accesses — signal/setjmp-adjacent state save paths): deopt
+    //    runs them and the frame's remainder in the interpreter, then returns.
+    if (['hlt','ud2','int3','int','cpuid','fxsave','fxrstor','stmxcsr','ldmxcsr'].includes(insn.mnem)) {
       insnAt.set(key, { mnem: 'udec', rip, next: rip + BigInt(insn.len), len: insn.len });
       continue;
     }
@@ -474,14 +475,19 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   let hasDeopt = false;
   for (let i=0;i<N;i++) {
     const insns = blocks[i].insns, last = insns[insns.length-1], next = last.next;
-    if (last.mnem === 'jcc') { const t = idxOf((next+last.rel)&MM), f = idxOf(next); term.push({kind:'jcc', t, f}); succs.push([t, f]); }
-    else if (last.mnem === 'jmp') { const t = idxOf((next+last.rel)&MM); term.push({kind:'jmp', t}); succs.push([t]); }
+    if (last.mnem === 'jcc') { const ta = (next+last.rel)&MM, fa = next, t = idxOf(ta), f = idxOf(fa);
+      if (t < 0 || f < 0) hasDeopt = true;
+      term.push({kind:'jcc', t, f, ta, fa}); succs.push([t, f]); }
+    else if (last.mnem === 'jmp') { const ta = (next+last.rel)&MM, t = idxOf(ta);
+      if (t < 0) hasDeopt = true;
+      term.push({kind:'jmp', t, ta}); succs.push([t]); }
     else if (last.mnem === 'ret' || last.mnem === 'retn') { term.push({kind:'ret', pad: last.mnem==='retn' ? Number(last.n) : 0}); succs.push([]); }
     else if (last.mnem === 'jmpind') { hasDeopt = true;
       if (hasJtab && a0.jtabs.has(last.rip.toString())) { term.push({kind:'jtab', src:last.src}); succs.push([...jtabUnion]); }
       else { term.push({kind:'deopt', src:last.src}); succs.push([]); } }
     else if (last.mnem === 'udec')   { hasDeopt = true; term.push({kind:'deopt', src:null, at:last.rip}); succs.push([]); }
-    else { const t = idxOf(next); term.push({kind:'fall', t}); succs.push([t]); }
+    else { const t = idxOf(next); if (t < 0) hasDeopt = true;
+      term.push({kind:'fall', t, ta: next}); succs.push([t]); }
   }
   // Try the structured (scope-nesting) layout first — it yields tight wasm
   // loops. If the CFG is irreducible / has improper block-loop overlap, fall
@@ -1710,11 +1716,21 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       if (DISP) return j > i ? `(br $b${j})` : j === i ? `(br $l${i})` : `(local.set $pc (i32.const ${j})) (br $L_disp)`;
       return `(br ${labelFor(j)})`; };
     const brTo = (j) => j === i+1 ? '' : goto(j);
+    // A branch TARGET the analyzer couldn't decode (an address past a decode
+    // failure, a cut-off jump-table row) becomes a cold deopt edge instead of
+    // poisoning the function: if control actually goes there, the engine
+    // resumes in the interpreter at that address, which faults exactly as
+    // native would if the bytes are truly garbage.
+    const deoptTo = (addr) => [`(local.set $rex (i64.const ${hexs(addr)}))`,
+      ...spillAll(), `(return (call $x_deopt (local.get $rex) (local.get $rsp0)))`];
     if (t.kind === 'jcc') {
       const c = cond(last.cond);
       const T = t.t, F = t.f;
-      if (T < 0 || F < 0) throw new Error('AOT: jcc into undecoded code');
-      if (DISP) {
+      if (T < 0 || F < 0) {
+        if (T < 0 && F < 0) { L.push(`(if ${c} (then ${deoptTo(t.ta).join('\n')}))`); L.push(...deoptTo(t.fa)); }
+        else if (T < 0) { L.push(`(if ${c} (then ${deoptTo(t.ta).join('\n')}))`); const b = brTo(F); if (b) L.push(b); }
+        else { L.push(`(if (i32.eqz ${c}) (then ${deoptTo(t.fa).join('\n')}))`); const b = brTo(T); if (b) L.push(b); }
+      } else if (DISP) {
         if (T === i+1 && F === i+1) { /* both fall through */ }
         else if (F === i+1) L.push(`(if ${c} (then ${goto(T)}))`);
         else if (T === i+1) L.push(`(if (i32.eqz ${c}) (then ${goto(F)}))`);
@@ -1727,7 +1743,8 @@ function emitUnitFunction(a0, fnAddr, ctx) {
         else { L.push(`(br_if ${lbl(T)} ${c})`); L.push(`(br ${lbl(F)})`); }
       }
     } else if (t.kind === 'jmp') {
-      const b = brTo(t.t); if (b) L.push(b);
+      if (t.t < 0) L.push(...deoptTo(t.ta));
+      else { const b = brTo(t.t); if (b) L.push(b); }
     } else if (t.kind === 'ret') {
       // pop the return address, retire the frame, hand the exit rip back
       L.push(`(local.set $rex (i64.load ${wasmAddr({base:4,index:-1,disp:0n},lnext)}))`);
@@ -1753,7 +1770,10 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       L.push(...spillAll());
       if (t.src) L.push(...tailJmp());
       L.push(`(return (call $x_deopt (local.get $rex) (local.get $rsp0)))`);
-    } else { const b = brTo(t.t); if (b) L.push(b); }
+    } else {                                              // fall-through
+      if (t.t < 0) L.push(...deoptTo(t.ta));
+      else { const b = brTo(t.t); if (b) L.push(b); }
+    }
     return L.join('\n      ');
   }
 
