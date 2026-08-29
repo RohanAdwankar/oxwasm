@@ -57,6 +57,13 @@ for (let c = 1; c <= N; c++) {
   console.log(`cycle ${c}: open ${open}ms · close ${close}ms`);
   await new Promise(r=>setTimeout(r,500));
 }
+{
+  const med=(a)=>{const s2=[...a].sort((x,y)=>x-y);return s2[s2.length>>1];};
+  const p=(a,f)=>{const s2=[...a].sort((x,y)=>x-y);return s2[Math.floor(s2.length*f)];};
+  const warm=rows.slice(2);
+  const opens=warm.map(r=>r[1]).filter(v=>v>=0), closes=warm.map(r=>r[2]).filter(v=>v>=0);
+  if (opens.length) console.log(`SUMMARY warm open med=${med(opens)}ms p25=${p(opens,.25)} p75=${p(opens,.75)} · close med=${med(closes)}ms p25=${p(closes,.25)} p75=${p(closes,.75)} (n=${opens.length})`);
+}
 console.log('lat:', await q('JSON.stringify(window.__oxLat)'));
 console.log('perf:', await q('JSON.stringify(window.__oxPerf)'));
 console.log('stat:', await q("document.getElementById('stat').textContent"));

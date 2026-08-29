@@ -624,6 +624,18 @@ function sha1hex(str) {
       };
     }
     if (qs.has('pumplog')) window.__oxPump = [];   // per-slice {t,dur,mode,di,da}: where a cycle's time goes
+    if (qs.has('unitprof')) {                      // sampled inclusive time per dispatched unit entry
+      const od = eng.dispatchAot.bind(eng);
+      const T = window.__oxUnitMs = new Map();
+      let n = 0;
+      eng.dispatchAot = (f) => {
+        if ((++n & 63) !== 0) return od(f);
+        const k = eng.cpu.rip, t0 = performance.now();
+        try { return od(f); }
+        finally { const dt = performance.now() - t0;
+          const e = T.get(k); if (e) { e[0] += dt; e[1]++; } else T.set(k, [dt, 1]); }
+      };
+    }
   }
   // ---- input ----
   const scale = () => cv.width / cv.getBoundingClientRect().width;
