@@ -599,6 +599,9 @@ function sha1hex(str) {
     if (qs.has('noasync')) eng.asyncCompile = false;
     if (qs.has('nounits')) eng.aotBudget = 0;
     if (qs.has('nowm')) xs.noWM = true;
+    if (qs.has('nowabt')) CFG.hasWabt = false;         // manifest units only: no in-browser compiles
+    if (qs.has('nojtab')) globalThis.__noJtab = true;  // organic compiles without jump tables
+    if (qs.has('noftab')) globalThis.__noFtab = true;  // no wasm-to-wasm chaining
     if (qs.has('trap')) {
       const od = eng.dispatchAot.bind(eng);
       let n = 0, last = 0;
@@ -676,7 +679,7 @@ function sha1hex(str) {
   // so Nth-interaction latency is a measured number, not a feeling.
   const t0 = performance.now();
   const LAT = window.__oxLat = { samples: 0, sumMs: 0, maxMs: 0, hist: new Array(12).fill(0), pumpMaxMs: 0 };
-  const inputQ = [];
+  const inputQ = []; let lastInputT = 0;
   let blitPending = false;
   // zero-delay re-arm: nested setTimeout(0) is clamped to ~4ms by the
   // browser, which cost ~1s of idle gaps per interaction across ~200 12ms
@@ -705,9 +708,17 @@ function sha1hex(str) {
     if (timer) { clearTimeout(timer); timer = null; }
     const start = performance.now();
     eng.tierMs = 0;                                  // fresh sync-translation budget per slice
-    eng.tierMsMax = xs.ptr.buttons ? 2 : 8;          // trickle-compile mid-gesture: strokes stay fluid but the paint path still tiers
+    // Organic tiering only while IDLE: jmp-back-edge profiling widened the
+    // tier-up candidate set enough that in-browser wabt compiles during an
+    // interaction ate every slice's budget for tens of seconds (menu opens
+    // 0.5s -> 30s+). No input for 2s = self-optimize freely; otherwise the
+    // whole slice belongs to the guest.
+    { if (inputQ.length) lastInputT = inputQ[inputQ.length - 1];
+      const busy = (typeof pendingMove !== 'undefined' && pendingMove != null) || start - lastInputT < 2000;
+      eng.tierMsMax = busy ? 0 : (xs.ptr.buttons ? 2 : 8); }
     if (typeof pendingMove !== 'undefined' && pendingMove) { xs.injectMotion(pendingMove[0], pendingMove[1]); pendingMove = null; }
     eng.sliceDeadline = start + 12;                  // honored INSIDE run(): deep callouts preempt too
+    eng.chainFuel = 2048;                            // in-wasm chains re-check the clock every ~2k calls
     let mode = 'ran', deadline = null;
     do {
       eng.run(1e5);
@@ -1146,7 +1157,7 @@ async function inflate(b64) {
   // window.__oxLat measures per-event input->paint latency)
   const t0 = performance.now();
   const LAT = window.__oxLat = { samples: 0, sumMs: 0, maxMs: 0, hist: new Array(12).fill(0), pumpMaxMs: 0 };
-  const inputQ = [];
+  const inputQ = []; let lastInputT = 0;
   let blitPending = false;
   // zero-delay re-arm: nested setTimeout(0) is clamped to ~4ms by the
   // browser, which cost ~1s of idle gaps per interaction across ~200 12ms
@@ -1175,9 +1186,17 @@ async function inflate(b64) {
     if (timer) { clearTimeout(timer); timer = null; }
     const start = performance.now();
     eng.tierMs = 0;                                  // fresh sync-translation budget per slice
-    eng.tierMsMax = xs.ptr.buttons ? 2 : 8;          // trickle-compile mid-gesture: strokes stay fluid but the paint path still tiers
+    // Organic tiering only while IDLE: jmp-back-edge profiling widened the
+    // tier-up candidate set enough that in-browser wabt compiles during an
+    // interaction ate every slice's budget for tens of seconds (menu opens
+    // 0.5s -> 30s+). No input for 2s = self-optimize freely; otherwise the
+    // whole slice belongs to the guest.
+    { if (inputQ.length) lastInputT = inputQ[inputQ.length - 1];
+      const busy = (typeof pendingMove !== 'undefined' && pendingMove != null) || start - lastInputT < 2000;
+      eng.tierMsMax = busy ? 0 : (xs.ptr.buttons ? 2 : 8); }
     if (typeof pendingMove !== 'undefined' && pendingMove) { xs.injectMotion(pendingMove[0], pendingMove[1]); pendingMove = null; }
     eng.sliceDeadline = start + 12;                  // honored INSIDE run(): deep callouts preempt too
+    eng.chainFuel = 2048;                            // in-wasm chains re-check the clock every ~2k calls
     let mode = 'ran', deadline = null;
     do {
       eng.run(1e5);

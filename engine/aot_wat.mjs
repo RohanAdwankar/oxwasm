@@ -32,6 +32,15 @@ export const FTMAP_MAX = 61000;      // entries: stays well below RAMOFF
 // callout then INTERPRETS the callee (thin JS frames, any depth), so the
 // worst case is the pre-chaining regime, bounded. Exported for linux.mjs.
 export const FTDEPTH = FTMAP + 8, FTDLIMIT = 1200;
+// Chain fuel (u32 at FTMAP+12): in-wasm chains bypass the JS callout's
+// slice-deadline check, so a browser pump's 12ms slice could disappear into
+// one unpreemptible multi-second wasm block. Every in-wasm chain site burns
+// one fuel; at zero the site takes its x_callout fallback, whose entry
+// checks the wall clock (unwinding the slice if it's over) and re-arms the
+// fuel — so hot chains pay one JS hop per tankful, and a deadline is never
+// more than a tankful away. dispatchAot fills the tank per dispatch from
+// eng.chainFuel (hosts without deadlines leave it effectively unlimited).
+export const FTFUEL = FTMAP + 12;
 
 export function compileFunctionWatDispatch(mem, entry, { guestBase, ramBase, maxInsns = 8000 } = {}) {
   // ---- decode reachable code ----
@@ -1146,8 +1155,9 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   // under their successor, so a counted dec there would let mutual tail
   // recursion pile real frames at net-zero depth — the bug this replaces).
   const ftW = Math.min(96, Math.max(1, blocks.reduce((s, b) => s + b.insns.length, 0) >> 9));
-  const ftOk  = `(i32.lt_u (i32.load (i32.const ${FTDEPTH})) (i32.const ${FTDLIMIT}))`;
+  const ftOk  = `(i32.and (i32.lt_u (i32.load (i32.const ${FTDEPTH})) (i32.const ${FTDLIMIT})) (i32.ne (i32.load (i32.const ${FTFUEL})) (i32.const 0)))`;
   const ftHit = `(i32.and (i32.ge_s (local.get $fti) (i32.const 0)) ${ftOk})`;
+  const ftBurn = `(i32.store (i32.const ${FTFUEL}) (i32.sub (i32.load (i32.const ${FTFUEL})) (i32.const 1)))`;
   const ftInc = `(i32.store (i32.const ${FTDEPTH}) (i32.add (i32.load (i32.const ${FTDEPTH})) (i32.const ${ftW})))`;
   const ftSave = () => { usesFts = true; return `(local.set $fts (i32.load (i32.const ${FTDEPTH})))`; };
   const ftRestore = `(i32.store (i32.const ${FTDEPTH}) (local.get $fts))`;
@@ -1155,7 +1165,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     `(local.set $fti (call $ftr (local.get $rex)))`,
     `(if ${ftHit}`,
     // this frame's tax intentionally stays: it remains live under the callee
-    `  (then (return (call_indirect $ft (type $uft) (local.get $fti)))))`,
+    `  (then ${ftBurn} (return (call_indirect $ft (type $uft) (local.get $fti)))))`,
   ]; };
 
   function emitBlock(i) {
@@ -1589,7 +1599,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
             // interprets the callee instead of nesting another wasm frame
             L.push(ftSave(),
                    `(if ${ftOk}`,
-                   `  (then (drop (call $f_${target.toString(16)})) ${ftRestore})`,
+                   `  (then ${ftBurn} (drop (call $f_${target.toString(16)})) ${ftRestore})`,
                    `  (else (drop (call $x_callout (i64.const ${hexs(target)})))))`);
           else {
             // out-of-unit target: it may be compiled in ANOTHER unit — chain
@@ -1598,7 +1608,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
             L.push(`(local.set $fti (call $ftr (i64.const ${hexs(target)})))`,
                    ftSave(),
                    `(if ${ftHit}`,
-                   `  (then (drop (call_indirect $ft (type $uft) (local.get $fti))) ${ftRestore})`,
+                   `  (then ${ftBurn} (drop (call_indirect $ft (type $uft) (local.get $fti))) ${ftRestore})`,
                    `  (else (drop (call $x_callout (i64.const ${hexs(target)})))))`);
           }
           L.push(...reloadAll());
@@ -1612,7 +1622,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           L.push(`(local.set $fti (call $ftr (local.get ${t})))`,
                  ftSave(),
                  `(if ${ftHit}`,
-                 `  (then (drop (call_indirect $ft (type $uft) (local.get $fti))) ${ftRestore})`,
+                 `  (then ${ftBurn} (drop (call_indirect $ft (type $uft) (local.get $fti))) ${ftRestore})`,
                  `  (else (drop (call $x_callout (local.get ${t})))))`);
           L.push(...reloadAll());
           break; }

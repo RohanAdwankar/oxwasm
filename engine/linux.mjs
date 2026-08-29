@@ -7,7 +7,7 @@
 import { CPU, Memory } from './interp.mjs';
 import { compileLoop } from './jit2.mjs';
 import { compileVectorLoop } from './jitsimd.mjs';
-import { compileUnitWat, FTMAP, FTMAP_MAX, FTDLIMIT } from './aot_wat.mjs';
+import { compileUnitWat, FTMAP, FTMAP_MAX, FTDLIMIT, FTFUEL } from './aot_wat.mjs';
 import { decode } from './decode.mjs';
 
 const PAGE = 4096n;
@@ -373,6 +373,9 @@ export class LinuxEngine {
     // us and unbound the stack. run() resets the word at true top level.
     const fdv = (this._ftdv ??= new DataView(this.wmem.buffer));
     const fd0 = fdv.getUint32(FTMAP + 8, true);
+    // fill the chain-fuel tank for this dispatch (see FTFUEL in aot_wat.mjs);
+    // hosts that set no sliceDeadline get an effectively bottomless tank
+    fdv.setUint32(FTFUEL, this.chainFuel ?? 0x0FFFFFFF, true);
     this.syncOut();
     try { const exit = f(); this.syncIn(); this.stats.aotRuns++;
       if (this.onProgress && this.stats.aotRuns % 4e6 === 0) this.onProgress('aot');
@@ -561,6 +564,9 @@ export class LinuxEngine {
           this.blocked = { deadline: this.nowMs() };
           throw new BlockUnwind(target);
         }
+        // deadline fine: re-arm the chain fuel so in-wasm chaining resumes at
+        // full speed — this hop IS the periodic clock check fuel exists for
+        (this._ftdv ??= new DataView(this.wmem.buffer)).setUint32(FTFUEL, this.chainFuel ?? 0x0FFFFFFF, true);
         // The caller (compiled code) already spilled the whole register file to
         // memory before the call, and the guest return address is on the guest
         // stack. rsp lives in the regfile at slot 4.
