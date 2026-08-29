@@ -600,6 +600,7 @@ function sha1hex(str) {
         return r;
       };
     }
+    if (qs.has('pumplog')) window.__oxPump = [];   // per-slice {t,dur,mode,di,da}: where a cycle's time goes
   }
   // ---- input ----
   const scale = () => cv.width / cv.getBoundingClientRect().width;
@@ -637,6 +638,14 @@ function sha1hex(str) {
   const LAT = window.__oxLat = { samples: 0, sumMs: 0, maxMs: 0, hist: new Array(12).fill(0), pumpMaxMs: 0 };
   const inputQ = [];
   let blitPending = false;
+  // zero-delay re-arm: nested setTimeout(0) is clamped to ~4ms by the
+  // browser, which cost ~1s of idle gaps per interaction across ~200 12ms
+  // slices; a MessageChannel post has no clamp and still yields to input
+  // and rendering between tasks
+  const mc = new MessageChannel();
+  let soonArmed = false;
+  mc.port1.onmessage = () => { soonArmed = false; pump(); };
+  const soon = () => { if (!soonArmed) { soonArmed = true; mc.port2.postMessage(0); } };
   const scheduleBlit = () => {
     if (blitPending) return;
     blitPending = true;
@@ -671,6 +680,12 @@ function sha1hex(str) {
     } while (performance.now() - start < 12);
     const dur = performance.now() - start;
     if (dur > LAT.pumpMaxMs) LAT.pumpMaxMs = dur;
+    if (window.__oxPump) { const s2 = eng.stats;
+      window.__oxPump.push({ t: +start.toFixed(1), dur: +dur.toFixed(1), mode,
+        dl: mode === 'timed' ? +(deadline - performance.now()).toFixed(1) : 0,
+        di: s2.interpreted - (window.__oxPI || 0), da: s2.aotRuns - (window.__oxPA || 0) });
+      window.__oxPI = s2.interpreted; window.__oxPA = s2.aotRuns;
+      if (window.__oxPump.length > 4096) window.__oxPump.splice(0, 2048); }
     if (xs.dirty) scheduleBlit();
     const s = eng.stats;
     stat.textContent = \`interp \${s.interpreted.toLocaleString()} · aot units \${s.tiers.aot||0} · \${((performance.now()-t0)/1000).toFixed(0)}s\`;
@@ -678,7 +693,7 @@ function sha1hex(str) {
     if (mode === 'exit') { stat.innerHTML += eng.exitCode === 0 ? ' · <span class="ok">exit 0</span>' : \` · <span class="err">exit \${eng.exitCode}</span>\`; return; }
     if (mode === 'timed') { timer = setTimeout(pump, Math.max(0, Math.min(deadline - performance.now(), 250))); return; }
     if (mode === 'idle') return;                     // input pokes re-arm the pump
-    timer = setTimeout(pump, 0);
+    soon();
   }
   blit();
   window.__ox = { eng, xs, pump: () => pump() };
@@ -746,6 +761,26 @@ function sha1hex(str) {
         eng.aotCallThreshold = 4; eng.aotLoopThreshold = 12;
         eng.aotFailed.clear();                        // anything poisoned pre-units gets a real shot
         P.unitsApplied = performance.now();
+        // Eager registration: instantiate EVERY captured unit now (wasm
+        // compilation is off-thread, so this costs the main thread almost
+        // nothing) instead of waiting for its root entry to re-tier here.
+        // Lazy matching missed most of the interactive path: a function that
+        // was compiled as a member of a larger closure never re-fires as a
+        // tier-up root, so it poisoned and stayed interpreted — measured at
+        // ~5M interp steps per warm menu cycle.
+        for (const [h, bytes] of unitCache) {
+          try {
+            const { instance } = await WebAssembly.instantiate(bytes, { js: { mem: eng.wmem }, env: eng.aotEnv() });
+            for (const name of Object.keys(instance.exports))
+              if (name.startsWith('f_')) {
+                const a = BigInt('0x' + name.slice(2));
+                if (!eng.aotFns.get(a)) eng.aotFns.set(a, instance.exports[name]);
+              }
+            eng.stats.tiers.aot = (eng.stats.tiers.aot || 0) + 1;
+          } catch {}
+        }
+        P.unitsRegistered = performance.now();
+        poke();
       }
     } catch (e) { console.warn('units sidecar failed; staying interpreted', e); }
   })();
@@ -917,6 +952,23 @@ async function inflate(b64) {
   eng.asyncCompile = true;                        // browser: compile units off-thread
   eng.unitBytes = (k) => unitCache.get(k.toString(16));
   eng.tierMsMax = 8;                              // bound sync translation per pump slice
+  // eager registration in the background: every captured unit instantiates
+  // off-thread and registers all its functions, so nothing that was compiled
+  // at pack time ever re-poisons here (lazy root-matching missed closure
+  // members and left the interactive path interpreted)
+  (async () => {
+    for (const [h, bytes] of unitCache) {
+      try {
+        const { instance } = await WebAssembly.instantiate(bytes, { js: { mem: eng.wmem }, env: eng.aotEnv() });
+        for (const name of Object.keys(instance.exports))
+          if (name.startsWith('f_')) {
+            const a = BigInt('0x' + name.slice(2));
+            if (!eng.aotFns.get(a)) eng.aotFns.set(a, instance.exports[name]);
+          }
+        eng.stats.tiers.aot = (eng.stats.tiers.aot || 0) + 1;
+      } catch {}
+    }
+  })();
   const SNAP = ${snapAssets ? JSON.stringify(snapAssets) : 'null'};
   if (SNAP) {
     stat.textContent = 'restoring snapshot…';
@@ -1005,6 +1057,14 @@ async function inflate(b64) {
   const LAT = window.__oxLat = { samples: 0, sumMs: 0, maxMs: 0, hist: new Array(12).fill(0), pumpMaxMs: 0 };
   const inputQ = [];
   let blitPending = false;
+  // zero-delay re-arm: nested setTimeout(0) is clamped to ~4ms by the
+  // browser, which cost ~1s of idle gaps per interaction across ~200 12ms
+  // slices; a MessageChannel post has no clamp and still yields to input
+  // and rendering between tasks
+  const mc = new MessageChannel();
+  let soonArmed = false;
+  mc.port1.onmessage = () => { soonArmed = false; pump(); };
+  const soon = () => { if (!soonArmed) { soonArmed = true; mc.port2.postMessage(0); } };
   const scheduleBlit = () => {
     if (blitPending) return;
     blitPending = true;
@@ -1046,7 +1106,7 @@ async function inflate(b64) {
     if (mode === 'exit') { stat.innerHTML += eng.exitCode === 0 ? ' · <span class="ok">exit 0</span>' : \` · <span class="err">exit \${eng.exitCode}</span>\`; return; }
     if (mode === 'timed') { timer = setTimeout(pump, Math.max(0, Math.min(deadline - performance.now(), 250))); return; }
     if (mode === 'idle') return;                     // input pokes re-arm the pump
-    timer = setTimeout(pump, 0);
+    soon();
   }
   blit();
   pump();

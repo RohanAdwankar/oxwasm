@@ -58,5 +58,6 @@ for (let c = 1; c <= N; c++) {
   await new Promise(r=>setTimeout(r,500));
 }
 console.log('lat:', await q('JSON.stringify(window.__oxLat)'));
+console.log('perf:', await q('JSON.stringify(window.__oxPerf)'));
 console.log('stat:', await q("document.getElementById('stat').textContent"));
 chrome.kill(); process.exit(0);

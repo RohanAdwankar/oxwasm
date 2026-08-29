@@ -408,12 +408,13 @@ export class LinuxEngine {
       // it can't until we return. Unwind exactly like a blocking syscall
       // (state published, resume re-enters interp at this rip); the host sees
       // an immediately-due blocked deadline and re-pumps on the next task.
-      if ((++guard & 0x3FFF) === 0 && this.sliceDeadline != null && performance.now() > this.sliceDeadline) {
+      this._itc = (this._itc | 0) + 1;            // persistent across nested interpUntil calls
+      if ((this._itc & 0xFFF) === 0 && this.sliceDeadline != null && performance.now() > this.sliceDeadline) {
         this.syncOut();
         this.blocked = { deadline: this.nowMs() };
         throw new BlockUnwind(this.cpu.rip);
       }
-      if (guard > 5e9) throw new Error('escape runaway');
+      if (++guard > 5e9) throw new Error('escape runaway');
     }
   }
 
@@ -443,6 +444,16 @@ export class LinuxEngine {
       },
       callout: (target) => {
         target = BigInt.asUintN(64, target);
+        // Chain preemption: a wasm-to-wasm chain never returns to run(), and
+        // each hop's interpUntil restarts its own step counter, so thousands
+        // of short hops dodge every other deadline check (measured: 175ms
+        // slices). At callout entry the caller has spilled the whole regfile
+        // and the return address is on the guest stack — resuming interp AT
+        // the target reproduces the call exactly.
+        if (this.sliceDeadline != null && performance.now() > this.sliceDeadline) {
+          this.blocked = { deadline: this.nowMs() };
+          throw new BlockUnwind(target);
+        }
         // The caller (compiled code) already spilled the whole register file to
         // memory before the call, and the guest return address is on the guest
         // stack. rsp lives in the regfile at slot 4.
@@ -483,6 +494,12 @@ export class LinuxEngine {
           }
         }
         // Not compiled: fall back to interpreting the target to completion.
+        // PROFILE it first — a function whose callers are all compiled is
+        // only ever reached as a callout target, and without this it could
+        // never tier up: cpu.onCall fires only in the interpreter, so the
+        // whole warm interactive path (GTK menu open/close) stayed
+        // interpreted forever at ~5M steps per cycle.
+        if (this.assembleWat) this.profileTarget(target);
         this.syncIn(); this.cpu.rip = target;
         this.interpUntil(() => this.cpu.rip === retAddr && this.cpu.regs[4] === rspExit);
         this.syncOut();

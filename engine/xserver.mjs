@@ -383,6 +383,23 @@ export class XServer {
     const p = w.parent ? this.win(w.parent) : null;
     if (p && p.conn && (p.eventMask & 0x80000)) { const e = build(p.id); e.u16(2, p.conn.seq); this.event(p.conn, e.b); }
   }
+  // A window that disappears (unmap/destroy) uncovers what it hid: real X
+  // sends Expose to everything beneath — GTK repaints on that, and without
+  // it the stale pixels sit until the app's next self-refresh (measured:
+  // menu close took ~4s, riding GIMP's own heartbeat). Uses the class's
+  // existing absPos ({x,y}) — a redefinition here once shadowed it and
+  // silently broke every input event's coordinates.
+  uncover(w) {
+    if (this.noUncover) return;
+    const { x: ax, y: ay } = this.absPos(w);
+    for (const c of this.root.children ?? []) {
+      if (c === w || !c.mapped) continue;
+      const { x: cx, y: cy } = this.absPos(c);
+      const ix = Math.max(ax, cx), iy = Math.max(ay, cy);
+      const iw = Math.min(ax + w.w, cx + c.w) - ix, ih = Math.min(ay + w.h, cy + c.h) - iy;
+      if (iw > 0 && ih > 0) this.expose(c, ix - cx, iy - cy, iw, ih);
+    }
+  }
   expose(w, x, y, ww, hh) {
     if (!w.conn || !(w.eventMask & 0x8000)) return;
     const e = new W(32);
@@ -448,7 +465,10 @@ export class XServer {
         break; }
       case 4: {                                          // DestroyWindow
         const w = this.win(u32(4)); if (!w || w === this.root) break;
-        this.destroyWin(w); this.dirty = true; break; }
+        const wasMapped = w.mapped;
+        this.destroyWin(w); this.dirty = true;
+        if (wasMapped) this.uncover(w);
+        break; }
       case 5: break;                                     // DestroySubwindows
       case 6: break;                                     // ChangeSaveSet
       case 7: {                                          // ReparentWindow
@@ -471,6 +491,7 @@ export class XServer {
         const w = this.win(u32(4)); if (!w || !w.mapped) break;
         w.mapped = false; this.dirty = true;
         this.notify(w, (ev) => { const e = new W(32); e.u8(0, 18); e.u32(4, ev); e.u32(8, w.id); return e; });
+        this.uncover(w);
         break; }
       case 11: break;                                    // UnmapSubwindows
       case 12: {                                         // ConfigureWindow

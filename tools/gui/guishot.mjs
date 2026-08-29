@@ -60,6 +60,7 @@ const files = new Proxy(fileCache, {
 });
 files['/lib64/ld-linux-x86-64.so.2'] = files['/lib/x86_64-linux-gnu/ld-2.27.so'];
 const xs = new XServer({ width: W, height: H });
+if (process.env.NOUNCOVER) xs.noUncover = true;
 const extraArgs = process.argv.slice(7);
 const eng = new LinuxEngine(files[binPath], { argv:[binPath, ...extraArgs],
   env:['DISPLAY=:0','HOME=/root','USER=root','LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu'],
@@ -224,6 +225,10 @@ if (process.env.UNITVETO) {
 if (process.env.XSNOGRAB) xs.disableGrabs = true;
 if (process.env.CHAINSLOW) eng.chainSlow = true;
 if (process.env.ASYNCC) eng.asyncCompile = true;    // browser-parity: off-thread-style deferred unit registration
+if (process.env.AOTTHRESH) {                        // "call,loop" — capture runs use LOW thresholds so the
+  const [c, l] = process.env.AOTTHRESH.split(',');  // manifest covers paths a user repeats more than we do
+  eng.aotCallThreshold = +c; eng.aotLoopThreshold = +l;
+}
 eng.onUnitBytes = (k, bytes) => (globalThis._unitByEntry ??= new Map()).set(k.toString(16), bytes);
 if (process.env.SHADOW) eng.shadowLib = process.env.SHADOW;
 import { snapshotEngine, restoreEngine } from '../../engine/snapshot.mjs';
