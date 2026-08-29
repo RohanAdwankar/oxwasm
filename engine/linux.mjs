@@ -281,6 +281,12 @@ export class LinuxEngine {
       }
       if (this.cacheOnly) { this.aotFailed.add(k); return; }   // no assembler here: skip translation too
     }
+    // Deferral must be CHEAP: once a hot entry crosses the profile threshold,
+    // every subsequent call re-enters here until something registers. With the
+    // slice budget spent, bail before the trampoline probe — that probe
+    // decodes instructions out of guest memory, and paying it a quarter
+    // million times during one busy window was itself a main-thread wedge.
+    if (this.tierMsMax !== undefined && this.tierMs >= this.tierMsMax) return;
     if (this.isTrampoline(entry)) {
       // PLT stub: dispatch through a VALIDATING closure that reads the GOT
       // slot on every call, never a cached alias. The old permanent alias
@@ -303,14 +309,22 @@ export class LinuxEngine {
         // (a cached miss must not stick once the callee's unit registers)
         if (v !== cachedVal || typeof cachedFn !== 'function') { cachedVal = v; cachedFn = this.aotFns.get(v); }
         if (typeof cachedFn === 'function') return cachedFn();
-        throw new DeoptUnwind(entry);          // uncompiled target: interp runs the jmp *GOT
+        // Miss: emulate the `jmp *GOT` ourselves — deopt TO THE TARGET, and
+        // profile it so it tiers. A jmp changes nothing but rip, so resuming
+        // interp at the target is exact. Deopting to `entry` instead was a
+        // LIVELOCK: interp resumed at this stub's own address, the run loop
+        // saw a registered function there and re-dispatched this closure,
+        // which threw again with rip unmoved — the page's whole slice went
+        // to throw/catch with zero guest progress (browser wedge regression).
+        this.profileTarget(v);
+        throw new DeoptUnwind(v);
       };
       this.aotFns.set(k, stub);
       return;
     }
-    // bound the synchronous translation cost per host slice: the host zeroes
-    // tierMs each pump and deferred entries re-trigger on their next call
-    if (this.tierMsMax !== undefined && this.tierMs >= this.tierMsMax) return;
+    // the slice budget (checked above, before the trampoline probe) bounds the
+    // synchronous translation cost per host slice: the host zeroes tierMs each
+    // pump and deferred entries re-trigger on their next call
     const t0c = (this.tierMsMax !== undefined) ? performance.now() : 0;
     const un = (this._unitN = (this._unitN || 0) + 1);   // bisect aid: veto unit N -> stays interpreted
     if (this.unitFilter && !this.unitFilter(un, entry)) { this.aotFailed.add(k); return; }

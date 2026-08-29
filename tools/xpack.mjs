@@ -715,7 +715,7 @@ function sha1hex(str) {
     // whole slice belongs to the guest.
     { if (inputQ.length) lastInputT = inputQ[inputQ.length - 1];
       const busy = (typeof pendingMove !== 'undefined' && pendingMove != null) || start - lastInputT < 2000;
-      eng.tierMsMax = busy ? 0 : (xs.ptr.buttons ? 2 : 8); }
+      eng.tierMsMax = busy ? 2 : (xs.ptr.buttons ? 2 : 8); }   // never 0: a hot uncompiled entry must be able to compile its way out mid-interaction
     if (typeof pendingMove !== 'undefined' && pendingMove) { xs.injectMotion(pendingMove[0], pendingMove[1]); pendingMove = null; }
     eng.sliceDeadline = start + 12;                  // honored INSIDE run(): deep callouts preempt too
     eng.chainFuel = 2048;                            // in-wasm chains re-check the clock every ~2k calls
@@ -1193,7 +1193,7 @@ async function inflate(b64) {
     // whole slice belongs to the guest.
     { if (inputQ.length) lastInputT = inputQ[inputQ.length - 1];
       const busy = (typeof pendingMove !== 'undefined' && pendingMove != null) || start - lastInputT < 2000;
-      eng.tierMsMax = busy ? 0 : (xs.ptr.buttons ? 2 : 8); }
+      eng.tierMsMax = busy ? 2 : (xs.ptr.buttons ? 2 : 8); }   // never 0: a hot uncompiled entry must be able to compile its way out mid-interaction
     if (typeof pendingMove !== 'undefined' && pendingMove) { xs.injectMotion(pendingMove[0], pendingMove[1]); pendingMove = null; }
     eng.sliceDeadline = start + 12;                  // honored INSIDE run(): deep callouts preempt too
     eng.chainFuel = 2048;                            // in-wasm chains re-check the clock every ~2k calls
