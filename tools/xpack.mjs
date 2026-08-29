@@ -631,10 +631,15 @@ function sha1hex(str) {
     return [ (e.clientX - r.left) * s, (e.clientY - r.top) * s ]; };
   let pumping = false;
   const poke = () => { if (window.__oxReady && !pumping && !timer) timer = setTimeout(pump, 0); };
-  cv.addEventListener('pointermove', (e) => { if (!window.__oxReady) return; const [x, y] = pos(e); xs.injectMotion(x, y); poke(); });
-  cv.addEventListener('pointerdown', (e) => { if (!window.__oxReady) return; inputQ.push(performance.now()); cv.focus({ preventScroll: true }); const [x, y] = pos(e); xs.injectMotion(x, y);
+  // Motion coalescing (a real X server compresses MotionNotify): only the
+  // LATEST pointer position is injected, once per pump slice — when the
+  // engine falls behind, moves collapse instead of queueing a gesture-long
+  // backlog (paint cores interpolate between points, strokes stay smooth).
+  let pendingMove = null;
+  cv.addEventListener('pointermove', (e) => { if (!window.__oxReady) return; pendingMove = pos(e); poke(); });
+  cv.addEventListener('pointerdown', (e) => { if (!window.__oxReady) return; inputQ.push(performance.now()); cv.focus({ preventScroll: true }); const [x, y] = pos(e); pendingMove = null; xs.injectMotion(x, y);
     xs.injectButton(e.button === 2 ? 3 : e.button === 1 ? 2 : 1, true); e.preventDefault(); poke(); });
-  cv.addEventListener('pointerup', (e) => { if (!window.__oxReady) return; inputQ.push(performance.now()); xs.injectButton(e.button === 2 ? 3 : e.button === 1 ? 2 : 1, false); e.preventDefault(); poke(); });
+  cv.addEventListener('pointerup', (e) => { if (!window.__oxReady) return; inputQ.push(performance.now()); if (pendingMove) { xs.injectMotion(pendingMove[0], pendingMove[1]); pendingMove = null; } xs.injectButton(e.button === 2 ? 3 : e.button === 1 ? 2 : 1, false); e.preventDefault(); poke(); });
   cv.addEventListener('contextmenu', (e) => e.preventDefault());
   const KC = { Escape:9, Digit1:10, Digit2:11, Digit3:12, Digit4:13, Digit5:14, Digit6:15, Digit7:16,
     Digit8:17, Digit9:18, Digit0:19, Minus:20, Equal:21, Backspace:22, Tab:23,
@@ -689,6 +694,7 @@ function sha1hex(str) {
     const start = performance.now();
     eng.tierMs = 0;                                  // fresh sync-translation budget per slice
     eng.tierMsMax = xs.ptr.buttons ? 2 : 8;          // trickle-compile mid-gesture: strokes stay fluid but the paint path still tiers
+    if (typeof pendingMove !== 'undefined' && pendingMove) { xs.injectMotion(pendingMove[0], pendingMove[1]); pendingMove = null; }
     eng.sliceDeadline = start + 12;                  // honored INSIDE run(): deep callouts preempt too
     let mode = 'ran', deadline = null;
     do {
@@ -1129,6 +1135,7 @@ async function inflate(b64) {
     const start = performance.now();
     eng.tierMs = 0;                                  // fresh sync-translation budget per slice
     eng.tierMsMax = xs.ptr.buttons ? 2 : 8;          // trickle-compile mid-gesture: strokes stay fluid but the paint path still tiers
+    if (typeof pendingMove !== 'undefined' && pendingMove) { xs.injectMotion(pendingMove[0], pendingMove[1]); pendingMove = null; }
     eng.sliceDeadline = start + 12;                  // honored INSIDE run(): deep callouts preempt too
     let mode = 'ran', deadline = null;
     do {
