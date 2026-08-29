@@ -716,8 +716,12 @@ export class LinuxEngine {
         const clk = Number(a1), o = this.RAMOFF + Number(a2 - this.base);
         const v = new DataView(this.wmem.buffer);
         const ms = (clk === 0 || clk === 5 || clk === 6) ? Date.now() : this.nowMs();
-        if (this.dbgClockWatch && a2 >= this.dbgClockWatch[0] && a2 < this.dbgClockWatch[1])
-          console.error(`<clock_gettime clk=${clk} ts=0x${a2.toString(16)} thr=${this.threads?.[this.ti]?.id} rip=0x${cpu.rip.toString(16)} interp=${this.stats.interpreted} wall=${(this.nowMs()/1000)|0}s>`);
+        if (this.dbgClockWatch && a2 >= this.dbgClockWatch[0] && a2 < this.dbgClockWatch[1]) {
+          console.error(`<clock_gettime clk=${clk} ts=0x${a2.toString(16)} rsp=0x${cpu.regs[4].toString(16)} thr=${this.threads?.[this.ti]?.id} rip=0x${cpu.rip.toString(16)} interp=${this.stats.interpreted} wall=${(this.nowMs()/1000)|0}s>`);
+          const st = [];
+          for (let i = -2n; i <= 4n; i++) { try { st.push(`[ts${i >= 0n ? '+' : ''}${i * 8n}]=0x${this.mem.read(a2 + i * 8n, 8n).toString(16)}`); } catch {} }
+          console.error('  ' + st.join(' '));
+        }
         v.setBigUint64(o, BigInt(Math.floor(ms / 1000)), true);
         v.setBigUint64(o + 8, BigInt(Math.floor((ms % 1000) * 1e6)), true);
         ret(0n); break; }
