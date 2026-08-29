@@ -250,11 +250,82 @@ export class XServer {
     return descend(this.root, 0, 0);
   }
 
+  // ---- micro-WM ------------------------------------------------------------
+  // There is no external window manager, so managed toplevels (mapped,
+  // non-override children of root) get a server-drawn title strip above
+  // their frame: drag it to move, press it (or the window body) to raise.
+  // Moves are pure server-side state — the compositor repaints from window
+  // buffers, so the guest only sees a ConfigureNotify.
+  wmManaged(c) { return !!(c.mapped && !c.override && c.cls !== 2 && c.buffer && c.conn && c.w >= 60); }
+  wmName(w) {
+    const p = w.props?.get(39);                            // WM_NAME
+    const v = p?.data ?? (p?.length !== undefined ? p : null);   // live {type,fmt,data} vs restored raw bytes
+    if (!v || !v.length) return '';
+    let s = ''; for (let i = 0; i < Math.min(v.length, 60); i++) s += String.fromCharCode(v[i]);
+    return s;
+  }
+  wmStrip(c) {
+    const TH = 18, x0 = Math.max(0, c.x), x1 = Math.min(this.W, c.x + c.w);
+    const y0 = Math.max(0, c.y - TH), y1 = Math.min(this.H, c.y);
+    for (let y = y0; y < y1; y++) {
+      const edge = y === y0 || y === y1 - 1;
+      for (let x = x0; x < x1; x++)
+        this.fb[y * this.W + x] = (edge || x === x0 || x === x1 - 1) ? 0x1e2836 : 0x33415e;
+    }
+    const f = this.defaultFont;
+    if (f && y1 - y0 > 12) {
+      const name = this.wmName(c) || '(untitled)';
+      let x = x0 + 6; const base = y0 + 13;
+      for (let i = 0; i < name.length && x < x1 - 10; i++) {
+        const g = f.glyph(name.charCodeAt(i));
+        if (!g) continue;
+        for (let r = 0; r < g.rows.length; r++) {
+          const row = g.rows[r];
+          for (let cc = 0; cc < row.length; cc++)
+            if (row[cc]) this.px(x + g.lsb + cc, base - g.ascent + r, 0xe8edf5);
+        }
+        x += g.width;
+      }
+    }
+  }
+  wmStripAt(x, y) {                                        // topmost-first; a window body occludes lower strips
+    const TH = 18, cs = this.root.children;
+    for (let i = cs.length - 1; i >= 0; i--) {
+      const c = cs[i];
+      if (!c.mapped) continue;
+      if (x >= c.x && x < c.x + c.w && y >= c.y && y < c.y + c.h) return null;
+      if (this.wmManaged(c) && x >= c.x && x < c.x + c.w && y >= c.y - TH && y < c.y) return c;
+    }
+    return null;
+  }
+  wmRaise(c) {
+    const cs = this.root.children;
+    if (cs[cs.length - 1] === c) return;
+    this.root.children = cs.filter(w => w !== c); this.root.children.push(c);
+    this.dirty = true;
+  }
+  wmConfigureNotify(w) {
+    if (this.wmNoCfg) return;
+    // synthetic (send_event) per ICCCM: a WM-moved window's coordinates are
+    // authoritative root-relative — GTK then skips its QueryTree
+    // frame-extents dance (observed: 200k QueryTrees after a real one)
+    this.notify(w, (ev) => { const e = new W(32);
+      e.u8(0, 22 | 0x80); e.u32(4, ev); e.u32(8, w.id); e.u32(12, 0);
+      e.i16(16, w.x); e.i16(18, w.y); e.u16(20, w.w); e.u16(22, w.h);
+      e.u16(24, w.bw); e.u8(26, w.override ? 1 : 0); return e; });
+  }
+  wmToplevelOf(w) {
+    let t = w, p = t && t.parent ? this.win(t.parent) : null;
+    while (p && p !== this.root) { t = p; p = t.parent ? this.win(t.parent) : null; }
+    return p === this.root ? t : null;
+  }
+
   // ---- compositing ---------------------------------------------------------
   flush() {
     this.fb.fill(this.root.bgPixel);
     const paint = (w, ax, ay) => {
       if (!w.mapped) return;
+      if (w._hideUntilDrawn) { if (!w._drawn) return; w._hideUntilDrawn = false; }
       if (w.cls !== 2 && w.buffer) {
         if (w.bw > 0) {                                   // border frame outside the window
           for (let i = 0; i < w.bw; i++) {
@@ -271,7 +342,11 @@ export class XServer {
       }
       for (const c of w.children) paint(c, ax + c.x, ay + c.y);
     };
-    for (const c of this.root.children) paint(c, c.x, c.y);
+    for (const c of this.root.children) {
+      paint(c, c.x, c.y);
+      if (!this.noWM && this.wmManaged(c) && !(c._hideUntilDrawn && !c._drawn))
+        this.wmStrip(c);                                  // strip stacks with its window
+    }
     this.dirty = false;
     return this.fb;
   }
@@ -333,6 +408,15 @@ export class XServer {
   injectMotion(x, y) {
     x = Math.max(0, Math.min(this.W - 1, x | 0)); y = Math.max(0, Math.min(this.H - 1, y | 0));
     if (x === this.ptr.x && y === this.ptr.y) return;
+    if (this.wmDrag) {                                     // server-side move; the guest sees only ConfigureNotify
+      this.ptr.x = x; this.ptr.y = y;
+      const w = this.wmDrag.w;
+      w.x = Math.max(-(w.w - 40), Math.min(this.W - 40, x - this.wmDrag.dx));
+      w.y = Math.max(18, Math.min(this.H - 4, y - this.wmDrag.dy));
+      this.wmConfigureNotify(w);
+      this.dirty = true;
+      return;
+    }
     const before = this.windowAt(this.ptr.x, this.ptr.y).w;
     this.ptr.x = x; this.ptr.y = y;
     const at = this.windowAt(x, y);
@@ -356,6 +440,24 @@ export class XServer {
   }
   injectButton(button, down) {
     const bit = 0x100 << (button - 1);
+    if (!this.noWM) {
+      if (down && button === 1 && !this.ptr.buttons) {
+        const strip = this.wmStripAt(this.ptr.x, this.ptr.y);
+        if (strip) {                                     // begin server-side title drag (event swallowed)
+          this.wmRaise(strip);
+          this.wmDrag = { w: strip, dx: this.ptr.x - strip.x, dy: this.ptr.y - strip.y };
+          this.ptr.buttons |= 1; this.ptr.state |= bit;
+          return;
+        }
+        const top = this.wmToplevelOf(this.windowAt(this.ptr.x, this.ptr.y).w);
+        if (top && this.wmManaged(top)) this.wmRaise(top);   // click-to-raise; event still delivered
+      }
+      if (!down && this.wmDrag) {                        // end title drag (release swallowed)
+        this.wmDrag = null;
+        this.ptr.state &= ~bit; this.ptr.buttons &= ~(1 << (button - 1));
+        return;
+      }
+    }
     if (down) {
       this.ptr.buttons |= 1 << (button - 1);
       if (!this.grab) {                                  // implicit grab: press window + its mask
@@ -480,6 +582,15 @@ export class XServer {
       case 8: {                                          // MapWindow
         const w = this.win(u32(4)); if (!w || w.mapped) break;
         w.mapped = true; this.dirty = true;
+        // a window that has never been drawn composites as a black slab while
+        // the guest renders (menus took ~1s to fill): hide it until first ink
+        if (!w._drawn) w._hideUntilDrawn = true;
+        // on-screen placement: keep a managed toplevel's title strip reachable
+        if (!this.noWM && !w.override && w.parent === this.rootId && w.conn && w.w >= 60) {
+          const nx = Math.max(-(w.w - 40), Math.min(this.W - 40, w.x));
+          const ny = Math.max(18, Math.min(this.H - 4, w.y));
+          if (nx !== w.x || ny !== w.y) { w.x = nx; w.y = ny; this.wmConfigureNotify(w); }
+        }
         this.notify(w, (ev) => { const e = new W(32); e.u8(0, 19); e.u32(4, ev); e.u32(8, w.id); e.u8(12, w.override ? 1 : 0); return e; });
         this.expose(w, 0, 0, w.w, w.h);
         break; }
@@ -538,7 +649,9 @@ export class XServer {
         const w = this.win(u32(4));
         const kids = w ? w.children : [];
         this.reply(conn, 0, 0, kids.length * 4, (r) => {
-          r.u32(8, this.rootId); r.u32(12, w?.parent ?? 0); r.u16(16, kids.length);
+          let pid = w && w.parent ? (typeof w.parent === 'object' ? w.parent.id : w.parent) : 0;
+          if (!pid && w && w !== this.root && this.root.children.includes(w)) pid = this.rootId;
+          r.u32(8, this.rootId); r.u32(12, pid); r.u16(16, kids.length);
           kids.forEach((c, i) => r.u32(32 + i * 4, c.id));
         });
         break; }
@@ -810,8 +923,9 @@ export class XServer {
         for (let o = 12; o + 12 <= req.length; o += 12)
           this.arc(d, i16(o), i16(o + 2), u16(o + 4), u16(o + 6), i16(o + 8), i16(o + 10), gc, true);
         this.dirty = true; break; }
-      case 72: {                                         // PutImage
+      case 72: {                                         // PutImage (marks _drawn below)
         const d = this.drawable(u32(4)), gc = this.gcOf(u32(8));
+        if (d) d._drawn = true;
         if (!d || !gc) break;
         const wpx = u16(12), hpx = u16(14), dx = i16(16), dy = i16(18);
         const leftPad = u8(20), depth = u8(21);
@@ -1080,6 +1194,7 @@ export class XServer {
   }
   plot(d, x, y, pix, gc) {
     if (x < 0 || y < 0 || x >= d.w || y >= d.h || !d.buffer) return;
+    d._drawn = true;
     if (!this.clipOK(gc, x, y)) return;
     const i = y * d.w + x, dst = d.buffer[i], s = pix, m = 0xffffff;
     const fn = gc ? gc.fn : 3;
@@ -1097,6 +1212,7 @@ export class XServer {
     d.buffer[i] = out & m;
   }
   rasterFillRect(d, x, y, w, h, pix, gc) {
+    d._drawn = true;
     const x0 = Math.max(0, x), y0 = Math.max(0, y);
     const x1 = Math.min(d.w, x + w), y1 = Math.min(d.h, y + h);
     if (!d.buffer) return;

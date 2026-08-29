@@ -126,10 +126,12 @@ export function restoreEngineCore(eng, xs, assets, CPUctor, inflate) {
     }
     for (const e of sx.res) {
       const r = byId.get(e.id);
-      if (e.parent !== undefined) r.parent = e.parent != null ? byId.get(e.parent) ?? null : null;
+      if (e.parent !== undefined) r.parent = e.parent ?? null;   // live code stores the ID (win() resolves)
       if (e.children) r.children = e.children.map(id => byId.get(id)).filter(Boolean);
     }
     xs.root = byId.get(xs.rootId);
+    for (const c of xs.root?.children ?? []) c.parent ??= xs.rootId;   // older snapshots saved null: QueryTree walked to window 0 forever
+
     xs.grabWindow = sx.grabWindow != null ? byId.get(sx.grabWindow) ?? null : null;
     xs.grab = sx.grab && byId.get(sx.grab.win)
       ? { win: byId.get(sx.grab.win), mask: sx.grab.mask,

@@ -62,6 +62,8 @@ const files = new Proxy(fileCache, {
 files['/lib64/ld-linux-x86-64.so.2'] = files['/lib/x86_64-linux-gnu/ld-2.27.so'];
 const xs = new XServer({ width: W, height: H });
 if (process.env.NOUNCOVER) xs.noUncover = true;
+if (process.env.NOWM) xs.noWM = true;
+if (process.env.WMNOCFG) xs.wmNoCfg = true;
 const extraArgs = process.argv.slice(7);
 const eng = new LinuxEngine(files[binPath], { argv:[binPath, ...extraArgs],
   env:['DISPLAY=:0','HOME=/root','USER=root','LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu'],
@@ -396,7 +398,7 @@ try {
     if (Date.now() - lastLog > 15000) { lastLog = Date.now();
       const rip = eng.cpu.rip; let where = '?';
       for (const m of eng.maps ?? []) if (rip >= m.at && rip < m.at + m.len) where = `${m.path.split('/').pop()}+0x${(rip-m.at+BigInt(m.fileOff)).toString(16)}`;
-      console.error(`[${((Date.now()-t0)/1000)|0}s] chunk=${i} interp=${eng.stats.interpreted} aot=${eng.stats.tiers?.aot||0} aotRuns=${eng.stats.aotRuns||0} failed=${eng.aotFailed?.size||0} rip@${where} blocked=${!!eng.blocked} sys=${JSON.stringify(eng.stats.syscalls||{})}`); }
+      console.error(`[${((Date.now()-t0)/1000)|0}s] chunk=${i} interp=${eng.stats.interpreted} aot=${eng.stats.tiers?.aot||0} aotRuns=${eng.stats.aotRuns||0} failed=${eng.aotFailed?.size||0} rip@${where} blocked=${!!eng.blocked} sys=${JSON.stringify(eng.stats.syscalls||{})}${xs.opCount ? ' ops=' + JSON.stringify(xs.opCount) : ''}`); }
     if (Date.now() - wdMark[0] > 120000) {
       const di = eng.stats.interpreted - wdMark[1];
       if (di < 500000 && Date.now() - wdLastDump > 600000) { wdLastDump = Date.now(); wedgeDump(); }

@@ -593,6 +593,7 @@ function sha1hex(str) {
     const qs = new URLSearchParams(location.search);
     if (qs.has('noasync')) eng.asyncCompile = false;
     if (qs.has('nounits')) eng.aotBudget = 0;
+    if (qs.has('nowm')) xs.noWM = true;
     if (qs.has('trap')) {
       const od = eng.dispatchAot.bind(eng);
       let n = 0, last = 0;
