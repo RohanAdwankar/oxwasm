@@ -4,6 +4,12 @@ const uj = (s) => JSON.parse(s, (_, x) =>
   typeof x === 'string' && x.startsWith('\u2260') ? BigInt('0x' + x.slice(1)) : x);
 const loadCpu = (cpu, st) => { cpu.regs = st.regs.map(BigInt); cpu.xmm = st.xmm.map(BigInt);
   cpu.rip = BigInt(st.rip); cpu.fsBase = BigInt(st.fsBase); cpu.f = { ...st.f }; cpu.icache?.clear(); };
+// zero the in-memory function-dispatch map count (FTMAP in aot_wat.mjs;
+// literal here to stay import-free) and the engine's mirror of it
+const resetFtmap = (eng) => {
+  new DataView(eng.wmem.buffer).setUint32(0x10000, 0, true);
+  eng._ftCount = 0; if (eng._ftSeen) eng._ftSeen = new Set();
+};
 
 // Environment-independent restore. `assets.blobs`/`assets.mem` are byte
 // buffers; `inflate(bytes) -> bytes | Promise<bytes>` supplies gunzip (node:
@@ -45,12 +51,19 @@ export function restoreEngineCore(eng, xs, assets, CPUctor, inflate) {
       pending = (async () => {
         all.set(await first, tiles[0][0]);
         for (let i = 1; i < tiles.length; i++) all.set(await inflate(tiles[i][1]), tiles[i][0]);
+        resetFtmap(eng);
       })();
     } else {
       if (tiles.length) all.set(first, tiles[0][0]);
       for (let i = 1; i < tiles.length; i++) all.set(inflate(tiles[i][1]), tiles[i][0]);
     }
   }
+  // The restored image may carry the CAPTURE engine's function-dispatch map
+  // (scratch below RAMOFF): its funcref-table slots mean nothing here — a
+  // stale hit would call_indirect into an empty table. Zero the count; this
+  // engine's own registrations rebuild the map from scratch. (For the async
+  // tile path this must run after the tiles land — see above.)
+  resetFtmap(eng);
 
   // ---- engine scalars / threads --------------------------------------------
   const dnow = eng.nowMs() - Number(state.now);

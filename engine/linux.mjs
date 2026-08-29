@@ -7,7 +7,7 @@
 import { CPU, Memory } from './interp.mjs';
 import { compileLoop } from './jit2.mjs';
 import { compileVectorLoop } from './jitsimd.mjs';
-import { compileUnitWat } from './aot_wat.mjs';
+import { compileUnitWat, FTMAP, FTMAP_MAX, FTDLIMIT } from './aot_wat.mjs';
 import { decode } from './decode.mjs';
 
 const PAGE = 4096n;
@@ -104,6 +104,11 @@ export class LinuxEngine {
     this.RAMOFF = 1 << 20;
     const pages = Math.max(256, Math.ceil((this.RAMOFF + Number(total)) / 65536) + 16);
     this.wmem = new WebAssembly.Memory({ initial: pages });
+    // global dispatch table: every registered compiled function gets a slot
+    // here plus a sorted (addr -> slot) entry in wasm memory at FTMAP, so
+    // units chain indirect calls / cross-unit calls wasm-to-wasm (see $ftr)
+    this.ftab = new WebAssembly.Table({ element: 'anyfunc', initial: 1024 });
+    this._ftCount = 0; this._ftSeen = new Set();
     this.regview = new BigInt64Array(this.wmem.buffer, 0, 16);
     this.fsview = new BigInt64Array(this.wmem.buffer, 128, 1);   // fs base for AOT TLS accesses
     this.xmmview = new BigInt64Array(this.wmem.buffer, 256, 32); // 16 xmm regs (2 words each) for AOT SIMD
@@ -212,6 +217,34 @@ export class LinuxEngine {
   // Compile the call-graph closure rooted at `entry` (a function entry or a
   // loop head — the translator only needs "runs forward to this frame's ret")
   // and register every function the unit produced for dispatch.
+  // Register one compiled function for dispatch AND for in-wasm chaining:
+  // aotFns serves the engine's JS dispatch; the funcref table + the sorted
+  // (addr, slot) map at FTMAP serve every unit's $ftr resolver, which lets
+  // compiled code make indirect calls / cross-unit calls / indirect tail
+  // jumps without a JS boundary or regfile sync.
+  registerAotFn(a, f) {
+    this.aotFns.set(a, f);
+    // __noFtab bisect lever: an empty map makes every $ftr miss, so all
+    // sites take their pre-existing x_callout / x_deopt fallbacks
+    if (!f || globalThis.__noFtab || this._ftSeen.has(a) || this._ftCount >= FTMAP_MAX) return;
+    this._ftSeen.add(a);
+    const idx = this._ftCount++;
+    if (idx >= this.ftab.length) this.ftab.grow(1024);
+    this.ftab.set(idx, f);
+    const dv = new DataView(this.wmem.buffer);
+    const au = BigInt.asUintN(64, a);
+    let lo = 0, hi = idx;
+    while (lo < hi) { const mid = (lo + hi) >> 1;
+      if (dv.getBigUint64(FTMAP + 16 + mid * 16, true) < au) lo = mid + 1; else hi = mid; }
+    new Uint8Array(this.wmem.buffer)
+      .copyWithin(FTMAP + 16 + (lo + 1) * 16, FTMAP + 16 + lo * 16, FTMAP + 16 + idx * 16);
+    dv.setBigUint64(FTMAP + 16 + lo * 16, au, true);
+    dv.setUint32(FTMAP + 16 + lo * 16 + 8, idx, true);
+    dv.setUint32(FTMAP, this._ftCount, true);
+  }
+
+  aotImports() { return { js: { mem: this.wmem, ftab: this.ftab }, env: this.aotEnv() }; }
+
   tierUpAot(entry) {
     const k = entry;
     if (this.aotFns.has(k) || this.aotFailed.has(k)) return;
@@ -225,12 +258,12 @@ export class LinuxEngine {
       const bytes = this.unitBytes(k);
       if (bytes) {
         this.aotFns.set(k, null);              // placeholder: profiling stops re-triggering
-        WebAssembly.instantiate(bytes, { js: { mem: this.wmem }, env: this.aotEnv() })
+        WebAssembly.instantiate(bytes, this.aotImports())
           .then(({ instance }) => {
             for (const name of Object.keys(instance.exports))
               if (name.startsWith('f_')) {
                 const a = BigInt('0x' + name.slice(2));
-                if (!this.aotFns.get(a)) this.aotFns.set(a, instance.exports[name]);
+                if (!this.aotFns.get(a)) this.registerAotFn(a, instance.exports[name]);
               }
             this.stats.tiers.aot = (this.stats.tiers.aot || 0) + 1;
           })
@@ -248,7 +281,7 @@ export class LinuxEngine {
       // would need invalidation).
       const tgt = this.trampolineTarget(entry);
       const tf = tgt !== null ? this.aotFns.get(tgt) : undefined;
-      if (tf) { this.aotFns.set(k, tf); return; }
+      if (tf) { this.registerAotFn(k, tf); return; }
       this.aotFailed.add(k); return;
     }
     // bound the synchronous translation cost per host slice: the host zeroes
@@ -269,20 +302,20 @@ export class LinuxEngine {
       // dispatch site treats a null entry as not-compiled.
       if (this.asyncCompile) {
         this.aotFns.set(k, null);
-        WebAssembly.instantiate(bytes, { js: { mem: this.wmem }, env: this.aotEnv() })
+        WebAssembly.instantiate(bytes, this.aotImports())
           .then(({ instance }) => {
             for (const a of unit.funcs)
-              if (!this.aotFns.get(a)) this.aotFns.set(a, instance.exports['f_' + a.toString(16)]);
+              if (!this.aotFns.get(a)) this.registerAotFn(a, instance.exports['f_' + a.toString(16)]);
             this.stats.tiers.aot = (this.stats.tiers.aot || 0) + 1;
           })
           .catch((e) => { this.aotFns.delete(k); this.aotFailed.add(k);
                           if (this.onAotFail) this.onAotFail(entry, e.message); });
         return;
       }
-      const inst = new WebAssembly.Instance(new WebAssembly.Module(bytes), { js: { mem: this.wmem }, env: this.aotEnv() });
+      const inst = new WebAssembly.Instance(new WebAssembly.Module(bytes), this.aotImports());
       for (const a of unit.funcs) {
         const ak = a;
-        if (!this.aotFns.has(ak)) this.aotFns.set(ak, inst.exports['f_' + a.toString(16)]);
+        if (!this.aotFns.has(ak)) this.registerAotFn(ak, inst.exports['f_' + a.toString(16)]);
       }
       if (!this.aotFns.has(k)) throw new Error('entry missing from unit');
       this.stats.tiers.aot = (this.stats.tiers.aot || 0) + 1;
@@ -310,6 +343,12 @@ export class LinuxEngine {
   dispatchAot(f) {
     this.stats.disp = (this.stats.disp || 0) + 1;
     if (this._cleanSync) this.stats.dispClean = (this.stats.dispClean || 0) + 1;
+    // Save/restore the wasm-frame budget word (FTMAP+8) around the dispatch:
+    // interpUntil dispatches units NESTED under live wasm frames (a callout's
+    // interpreter), so a reset here would wipe the taxes of everything above
+    // us and unbound the stack. run() resets the word at true top level.
+    const fdv = (this._ftdv ??= new DataView(this.wmem.buffer));
+    const fd0 = fdv.getUint32(FTMAP + 8, true);
     this.syncOut();
     try { const exit = f(); this.syncIn(); this.stats.aotRuns++;
       if (this.onProgress && this.stats.aotRuns % 4e6 === 0) this.onProgress('aot');
@@ -317,6 +356,7 @@ export class LinuxEngine {
     catch (e) { if (e instanceof DeoptUnwind) { this.syncIn(); return BigInt.asUintN(64, e.rip); }
                 if (e instanceof BlockUnwind) { this.syncIn(); return BigInt.asUintN(64, e.rip); }
                 throw e; }
+    finally { fdv.setUint32(FTMAP + 8, fd0, true); }
   }
 
   // Differential shadow: run one compiled-function dispatch BOTH ways — first
@@ -410,6 +450,10 @@ export class LinuxEngine {
     while (!done()) {
       let f = branched ? this.aotFns.get(this.cpu.rip) : undefined;
       if (f && this.aotBudget !== undefined && --this.aotBudget < 0) f = null;
+      // stack budget: this interpreter can be nested deep under live wasm
+      // frames (contained deopt/callout) — don't dispatch further fat wasm
+      // frames when the shared budget word says the stack is near its edge
+      if (f && (this._ftdv ??= new DataView(this.wmem.buffer)).getUint32(FTMAP + 8, true) >= FTDLIMIT) f = null;
       if (f) { this.cpu.rip = this.dispatchMaybeShadow(f);
                if (this.blocked) throw new BlockUnwind(this.cpu.rip);
                continue; }
@@ -501,12 +545,22 @@ export class LinuxEngine {
         let f = this.aotFns.get(target);
         if (f && this.aotBudget !== undefined && --this.aotBudget < 0) f = null;
         if (this.chainSlow) f = null;                       // diagnostic: disable wasm-to-wasm fastpath
+        // Shared wasm-frame budget (FTDEPTH, also bumped by in-wasm
+        // call_indirect chains): each f() here nests a REAL wasm frame, and
+        // post-jump-table units are big functions with fat frames — deep
+        // guest recursion overflowed the host stack. Past the budget the
+        // callee interprets: thin JS frames only, any depth.
+        const ftdv = (this._ftdv ??= new DataView(this.wmem.buffer));
+        const ftd = ftdv.getUint32(FTMAP + 8, true);
+        if (f && ftd >= FTDLIMIT) f = null;
         if (f) {
           // Target is compiled: run it wasm-to-wasm over the shared register
           // file — NO BigInt cpu<->memory sync (the expensive part). It reads
           // and writes the same regfile memory the caller will reload from.
           try { this.stats.aotRuns++;
+            ftdv.setUint32(FTMAP + 8, ftd + 1, true);
             const exit = BigInt.asUintN(64, f());
+            ftdv.setUint32(FTMAP + 8, ftd, true);
             if (this.onCalloutExit) this.onCalloutExit(target, exit, retAddr);
             // The caller DROPS this return and resumes after its call, so we
             // may only come back once the call really returned. A compiled
@@ -520,6 +574,7 @@ export class LinuxEngine {
             return BigInt.asIntN(64, retAddr);
           }
           catch (e) {
+            ftdv.setUint32(FTMAP + 8, ftd, true);
             if (!(e instanceof DeoptUnwind)) throw e;
             // Deopt inside the compiled callee: its state is spilled to the
             // regfile; finish the frame by interpreting, contained here so the
@@ -560,12 +615,17 @@ export class LinuxEngine {
         // guard) passes its own rip — a landing-unit rooted exactly there
         // would re-deopt at the same t forever; only the interpreter can
         // execute that instruction.
+        const fdv = (this._ftdv ??= new DataView(this.wmem.buffer));
+        const fd = fdv.getUint32(FTMAP + 8, true);
         if (f && !this.chainSlow && t !== this._deoChainT && (this._deoD | 0) < 200 &&
+            fd < FTDLIMIT &&                                   // shared wasm-frame budget (see callout)
             (this.sliceDeadline == null || performance.now() <= this.sliceDeadline)) {
           const prevT = this._deoChainT;
           this._deoChainT = t; this._deoD = (this._deoD | 0) + 1;
+          fdv.setUint32(FTMAP + 8, fd + 1, true);
           try { this.stats.aotRuns++; return BigInt.asIntN(64, BigInt.asUintN(64, f())); }
-          finally { this._deoD--; this._deoChainT = prevT; }   // restores through unwinds too
+          finally { this._deoD--; this._deoChainT = prevT;     // restores through unwinds too
+                    fdv.setUint32(FTMAP + 8, fd, true); }
         }
         throw new DeoptUnwind(t); },
     };
@@ -1389,6 +1449,9 @@ export class LinuxEngine {
 
   run(maxSteps = 5e9) {
     let steps = 0;
+    // true top level (never nested): clear the wasm-frame budget word so
+    // taxes leaked by unwound chains can't accumulate across slices
+    (this._ftdv ??= new DataView(this.wmem.buffer)).setUint32(FTMAP + 8, 0, true);
     try {
       let branched = true;    // compiled entries are branch targets: only look up after a branch
       while (steps++ < maxSteps && this.exitCode === null) {

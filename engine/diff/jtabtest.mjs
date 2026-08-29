@@ -94,7 +94,7 @@ for (const name of ['vm1', 'vm2']) {
 
     // AOT
     const e2 = mk();
-    const inst = new WebAssembly.Instance(mod, { js: { mem: e2.wmem }, env: e2.aotEnv() });
+    const inst = new WebAssembly.Instance(mod, e2.aotImports());
     for (let r = 0; r < 16; r++) e2.regview[r] = 0n;
     for (let i = 0; i < prog.length; i++) e2.mem.write(pbuf + BigInt(i), 1n, BigInt(prog[i]));
     e2.regview[4] = BigInt.asIntN(64, rsp); e2.regview[7] = BigInt.asIntN(64, pbuf);

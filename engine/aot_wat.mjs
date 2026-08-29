@@ -9,6 +9,30 @@ import { decode } from './decode.mjs';
 const MASK = { 1: 0xFFn, 2: 0xFFFFn, 4: 0xFFFFFFFFn, 8: 0xFFFFFFFFFFFFFFFFn };
 const SIGN = { 1: 0x80n, 2: 0x8000n, 4: 0x80000000n, 8: 0x8000000000000000n };
 
+// Global function-dispatch map, shared by ALL translation units of an engine:
+// a sorted array of (guest address i64, funcref-table index i32, pad) 16-byte
+// entries living in wasm-memory scratch below the guest RAM base (RAMOFF is
+// 1MB; the regfile ends at 512). The engine appends an entry per registered
+// compiled function; every unit's $ftr does an in-wasm binary search here and
+// call_indirect's through the shared imported table — so indirect calls,
+// cross-unit static calls, and indirect tail jumps chain wasm-to-wasm with no
+// JS boundary and no regfile sync. A miss falls back to x_callout / x_deopt.
+export const FTMAP = 0x10000;        // u32 count at +0, u32 chain depth at +8, entries at +16
+export const FTMAP_MAX = 61000;      // entries: stays well below RAMOFF
+// Wasm calls nest real host-stack frames, so unlike native calls they can
+// blow the ~1MB stack under deep guest recursion — and a frame's size grows
+// with the FUNCTION's size (V8 spill slots), so post-jump-table units (one
+// giant function for a computed-goto interpreter) cost kilobytes per frame.
+// Accounting is therefore WEIGHTED and callee-side: every unit function
+// bumps the depth word at entry by ~its insn count / 512 (min 1) and drops
+// it on every normal exit; unwinds are repaired because the engine's JS
+// chain hops save/restore the word around f() and dispatchAot resets it at
+// each top-level entry. Every call site — direct in-unit calls included —
+// checks the budget first and takes its JS fallback past it; the engine's
+// callout then INTERPRETS the callee (thin JS frames, any depth), so the
+// worst case is the pre-chaining regime, bounded. Exported for linux.mjs.
+export const FTDEPTH = FTMAP + 8, FTDLIMIT = 1200;
+
 export function compileFunctionWatDispatch(mem, entry, { guestBase, ramBase, maxInsns = 8000 } = {}) {
   // ---- decode reachable code ----
   const insnAt = new Map(); const work = [entry]; const seen = new Set(); let count = 0;
@@ -1091,6 +1115,31 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     }
   }
 
+  // indirect TAIL call ($rex holds the computed target, regfile spilled): if
+  // the target is a registered compiled function, run it wasm-to-wasm — the
+  // callee's ret pops OUR caller's return address, so its frame-exit rip is
+  // exactly this frame's exit value.
+  let usesFtr = false, usesFts = false;
+  // Stack accounting is entry-tax-only: a function bumps FTDEPTH by its
+  // weight (frame size grows with function size — V8 spill slots) and NEVER
+  // decrements; instead every call site snapshots the word and restores it
+  // absolutely after the callee returns, which also erases whatever a TAIL
+  // chain under the callee accumulated (tail frames stay physically live
+  // under their successor, so a counted dec there would let mutual tail
+  // recursion pile real frames at net-zero depth — the bug this replaces).
+  const ftW = Math.min(96, Math.max(1, blocks.reduce((s, b) => s + b.insns.length, 0) >> 9));
+  const ftOk  = `(i32.lt_u (i32.load (i32.const ${FTDEPTH})) (i32.const ${FTDLIMIT}))`;
+  const ftHit = `(i32.and (i32.ge_s (local.get $fti) (i32.const 0)) ${ftOk})`;
+  const ftInc = `(i32.store (i32.const ${FTDEPTH}) (i32.add (i32.load (i32.const ${FTDEPTH})) (i32.const ${ftW})))`;
+  const ftSave = () => { usesFts = true; return `(local.set $fts (i32.load (i32.const ${FTDEPTH})))`; };
+  const ftRestore = `(i32.store (i32.const ${FTDEPTH}) (local.get $fts))`;
+  const tailJmp = () => { usesFtr = true; return [
+    `(local.set $fti (call $ftr (local.get $rex)))`,
+    `(if ${ftHit}`,
+    // this frame's tax intentionally stays: it remains live under the callee
+    `  (then (return (call_indirect $ft (type $uft) (local.get $fti)))))`,
+  ]; };
+
   function emitBlock(i) {
     const blk = blocks[i]; const L = [];
     const producers = new Set();
@@ -1517,8 +1566,23 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           L.push(`(local.set $r4 (i64.sub (local.get $r4) (i64.const 8)))`,
                  `(i64.store ${wasmAddr({base:4,index:-1,disp:0n},next)} (i64.const ${hexs(next)}))`);
           L.push(...spillAll());
-          L.push(canDirect(target.toString()) ? `(drop (call $f_${target.toString(16)}))`
-                                              : `(drop (call $x_callout (i64.const ${hexs(target)})))`);
+          if (canDirect(target.toString()))
+            // stack-budget check even on direct calls: past it, x_callout
+            // interprets the callee instead of nesting another wasm frame
+            L.push(ftSave(),
+                   `(if ${ftOk}`,
+                   `  (then (drop (call $f_${target.toString(16)})) ${ftRestore})`,
+                   `  (else (drop (call $x_callout (i64.const ${hexs(target)})))))`);
+          else {
+            // out-of-unit target: it may be compiled in ANOTHER unit — chain
+            // through the global dispatch table without a JS round-trip
+            usesFtr = true;
+            L.push(`(local.set $fti (call $ftr (i64.const ${hexs(target)})))`,
+                   ftSave(),
+                   `(if ${ftHit}`,
+                   `  (then (drop (call_indirect $ft (type $uft) (local.get $fti))) ${ftRestore})`,
+                   `  (else (drop (call $x_callout (i64.const ${hexs(target)})))))`);
+          }
           L.push(...reloadAll());
           break; }
         case 'callind': {   // compute target BEFORE the push moves rsp
@@ -1526,7 +1590,12 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           L.push(`(local.set $r4 (i64.sub (local.get $r4) (i64.const 8)))`,
                  `(i64.store ${wasmAddr({base:4,index:-1,disp:0n},next)} (i64.const ${hexs(next)}))`);
           L.push(...spillAll());
-          L.push(`(drop (call $x_callout (local.get ${t})))`);
+          usesFtr = true;
+          L.push(`(local.set $fti (call $ftr (local.get ${t})))`,
+                 ftSave(),
+                 `(if ${ftHit}`,
+                 `  (then (drop (call_indirect $ft (type $uft) (local.get $fti))) ${ftRestore})`,
+                 `  (else (drop (call $x_callout (local.get ${t})))))`);
           L.push(...reloadAll());
           break; }
         case 'syscall':
@@ -1668,12 +1737,14 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       L.push(`(local.set $pc (call $jtr_${fnAddr.toString(16)} (local.get $rex)))`);
       L.push(`(br_if $L_disp (i32.ge_s (local.get $pc) (i32.const 0)))`);
       L.push(...spillAll());
+      L.push(...tailJmp());
       L.push(`(return (call $x_deopt (local.get $rex) (local.get $rsp0)))`);
     } else if (t.kind === 'deopt') {
       // indirect jump (jump table / tail call) or undecodable byte:
       // hand the frame to the engine at the computed target / that rip
       L.push(`(local.set $rex ${t.src ? rd(t.src,8,lnext) : `(i64.const ${hexs(t.at)})`})`);
       L.push(...spillAll());
+      if (t.src) L.push(...tailJmp());
       L.push(`(return (call $x_deopt (local.get $rex) (local.get $rsp0)))`);
     } else { const b = brTo(t.t); if (b) L.push(b); }
     return L.join('\n      ');
@@ -1686,12 +1757,15 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   for (let r=0;r<16;r++) wat += `    (local $r${r} ${isI32(r)?'i32':'i64'})\n`;
   wat += '    (local $fa i64) (local $fb i64) (local $fr i64) (local $cf i64) (local $rsp0 i64) (local $rex i64)\n';
   if (DISP) wat += '    (local $pc i32)\n';
+  if (usesFtr) wat += '    (local $fti i32)\n';
+  if (usesFts) wat += '    (local $fts i32)\n';
   for (const r of xUsed) wat += `    (local ${xreg(r)} v128)\n`;
   for (const t of tmps) wat += `    (local ${t} i64)\n`;
   for (const t of vtmps) wat += `    (local ${t} v128)\n`;
   for (let r=0;r<16;r++) if (touched(r)) wat += '    ' + reloadR(r) + '\n';
   for (const r of xUsed) wat += '    ' + xReload(r) + '\n';
   wat += '    (local.set $rsp0 (local.get $r4))\n';
+  wat += '    ' + ftInc + '\n';       // entry tax: this frame\'s stack weight
   if (DISP) {
     // flat br_table dispatch: $pc holds the current block's RPO index. Block
     // bodies run in order; a non-fallthrough edge sets $pc and br's $L_disp.
@@ -1786,6 +1860,28 @@ export function compileUnitWat(mem, entry, opts = {}) {
   wat += '  (import "env" "syscall" (func $x_syscall (param i64)))\n';
   wat += '  (import "env" "callout" (func $x_callout (param i64) (result i64)))\n';
   wat += '  (import "env" "deopt" (func $x_deopt (param i64 i64) (result i64)))\n';
+  // the global dispatch table + its in-wasm resolver, iff some site chains
+  // through it (indirect call, out-of-unit static call, indirect tail jump)
+  if ([...texts.values()].some(t => t.includes('(call $ftr '))) {
+    wat += '  (import "js" "ftab" (table $ft 0 funcref))\n';
+    wat += '  (type $uft (func (result i64)))\n';
+    wat += `  (func $ftr (param $a i64) (result i32)
+    (local $lo i32) (local $hi i32) (local $mid i32) (local $p i32) (local $v i64)
+    (local.set $hi (i32.load (i32.const ${FTMAP})))
+    (block $miss
+      (loop $l
+        (br_if $miss (i32.ge_u (local.get $lo) (local.get $hi)))
+        (local.set $mid (i32.shr_u (i32.add (local.get $lo) (local.get $hi)) (i32.const 1)))
+        (local.set $p (i32.add (i32.const ${FTMAP + 16}) (i32.shl (local.get $mid) (i32.const 4))))
+        (local.set $v (i64.load (local.get $p)))
+        (if (i64.eq (local.get $v) (local.get $a))
+          (then (return (i32.load (i32.add (local.get $p) (i32.const 8))))))
+        (if (i64.lt_u (local.get $a) (local.get $v))
+          (then (local.set $hi (local.get $mid)))
+          (else (local.set $lo (i32.add (local.get $mid) (i32.const 1)))))
+        (br $l)))
+    (i32.const -1))\n`;
+  }
   let blocks = 0;
   for (const [k, t] of texts) { wat += t; blocks += funcs.get(k).blocks.length; }
   wat += ')\n';

@@ -812,7 +812,7 @@ function sha1hex(str) {
         // ~5M interp steps per warm menu cycle.
         for (const [h, bytes] of unitCache) {
           try {
-            const { instance } = await WebAssembly.instantiate(bytes, { js: { mem: eng.wmem }, env: eng.aotEnv() });
+            const { instance } = await WebAssembly.instantiate(bytes, eng.aotImports());
             for (const name of Object.keys(instance.exports))
               if (name.startsWith('f_')) {
                 const a = BigInt('0x' + name.slice(2));
@@ -857,7 +857,7 @@ function sha1hex(str) {
           let n = 0;
           for (let i = 0; i < keys.length; i++) {
             try {
-              const { instance } = await WebAssembly.instantiate(vals[i], { js: { mem: eng.wmem }, env: eng.aotEnv() });
+              const { instance } = await WebAssembly.instantiate(vals[i], eng.aotImports());
               for (const name of Object.keys(instance.exports))
                 if (name.startsWith('f_')) {
                   const a = BigInt('0x' + name.slice(2));
@@ -1050,7 +1050,7 @@ async function inflate(b64) {
   (async () => {
     for (const [h, bytes] of unitCache) {
       try {
-        const { instance } = await WebAssembly.instantiate(bytes, { js: { mem: eng.wmem }, env: eng.aotEnv() });
+        const { instance } = await WebAssembly.instantiate(bytes, eng.aotImports());
         for (const name of Object.keys(instance.exports))
           if (name.startsWith('f_')) {
             const a = BigInt('0x' + name.slice(2));
