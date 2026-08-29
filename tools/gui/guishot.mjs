@@ -183,6 +183,7 @@ eng.onProgress = (src) => {
 if (process.env.POLLWD) eng.debugPollAfter = +process.env.POLLWD;
 if (process.env.XSDBG) xs.dbgInput = +process.env.XSDBG;
 if (process.env.RIPTRACE) { eng.ripTrace = new Array(1024).fill(0n); eng.ripTraceI = 0; }
+if (process.env.CLOCKWATCH) eng.dbgClockWatch = process.env.CLOCKWATCH.split(',').map(s => BigInt('0x' + s));
 // WATCH=loHex,hiHex: log interp writes overlapping the range (with rip)
 if (process.env.WATCH) {
   const [lo, hi] = process.env.WATCH.split(',').map(s => BigInt('0x' + s));
