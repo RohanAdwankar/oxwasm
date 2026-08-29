@@ -206,11 +206,18 @@ if (process.env.UNITVETO) {
   const vetoes = process.env.UNITVETO.split(',');
   const symOf = (a) => { for (const m of eng.maps ?? []) if (a >= m.at && a < m.at + m.len)
     return `${m.path.split('/').pop()}+0x${(a - m.at + BigInt(m.fileOff)).toString(16)}`; return null; };
+  // entries may be lib+off names, raw hex addresses, or "range:lo-hi" (hex)
+  const ranges = vetoes.filter(v => v.startsWith('range:'))
+    .map(v => v.slice(6).split('-').map(s => BigInt('0x' + s)));
   const prev = eng.onUnitWat;
   eng.onUnitWat = (un, entry, unit) => {
-    for (const a of unit.funcs ?? []) { const s = symOf(a);
-      if (s && vetoes.includes(s)) { console.error(`<unit vetoed: contains ${s} (entry ${symOf(entry) ?? entry.toString(16)})>`);
-        throw new Error('unit vetoed'); } }
+    for (const a of unit.funcs ?? []) {
+      const s = symOf(a);
+      const hit = (s && vetoes.includes(s)) || vetoes.includes('0x' + a.toString(16)) ||
+        ranges.some(([lo, hi]) => a >= lo && a < hi);
+      if (hit) { console.error(`<unit vetoed: contains ${s ?? '0x' + a.toString(16)} (entry ${symOf(entry) ?? '0x' + entry.toString(16)})>`);
+        throw new Error('unit vetoed'); }
+    }
     prev?.(un, entry, unit);
   };
 }
