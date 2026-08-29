@@ -197,7 +197,10 @@ export class LinuxEngine {
   // For a `jmp *[GOT]` stub with a register-free address, read where it
   // points right now. Post-boot GOT slots are resolved and stable, so the
   // stub can alias its callee's compiled function outright.
-  trampolineTarget(entry) {
+  // Decode a PLT/IFUNC stub (`endbr64/nops then jmp *GOT`) down to its GOT
+  // SLOT ADDRESS — the slot address is immutable even though the slot's
+  // VALUE is rebound (lazy resolution; ld.so re-relocating itself).
+  trampolineGotAddr(entry) {
     try {
       let rip = entry;
       for (let n = 0; n <= 4; n++) {
@@ -208,10 +211,15 @@ export class LinuxEngine {
         if (!op || op.kind === 'reg' || op.base >= 0 || op.index >= 0 || op.fs) return null;
         let a = op.disp;
         if (op.ripRel) a += rip + BigInt(insn.len);
-        return this.mem.read(BigInt.asUintN(64, a), 8n);
+        return BigInt.asUintN(64, a);
       }
       return null;
     } catch { return null; }
+  }
+
+  trampolineTarget(entry) {
+    const a = this.trampolineGotAddr(entry);
+    try { return a !== null ? this.mem.read(a, 8n) : null; } catch { return null; }
   }
 
   // Compile the call-graph closure rooted at `entry` (a function entry or a
@@ -274,25 +282,31 @@ export class LinuxEngine {
       if (this.cacheOnly) { this.aotFailed.add(k); return; }   // no assembler here: skip translation too
     }
     if (this.isTrampoline(entry)) {
-      // PLT alias: a resolved stub whose callee is compiled dispatches
-      // straight into the callee's unit (the jmp is architecturally
-      // transparent — identical register state at stub and target). NOTE:
-      // assumes the GOT slot stays stable (true post-boot; dlopen rebinding
-      // would need invalidation).
-      const tgt = this.trampolineTarget(entry);
-      const tf = tgt !== null ? this.aotFns.get(tgt) : undefined;
-      if (tf) { this.registerAotFn(k, tf); return; }
-      if (tgt !== null && !this.aotFailed.has(tgt)) {
-        // The stub resolves but its target isn't compiled YET. Poisoning the
-        // stub here was permanent — memmove@plt stayed dead even after libc's
-        // memmove tiered up (measured: 1.1M interp calls through three such
-        // stubs on the CPython yardstick). Push the TARGET toward tiering and
-        // reset the stub's counter so it re-aliases on a later threshold hit.
-        this.profileTarget(tgt);
-        this.aotCalls.delete(k);
-        return;
-      }
-      this.aotFailed.add(k); return;
+      // PLT stub: dispatch through a VALIDATING closure that reads the GOT
+      // slot on every call, never a cached alias. The old permanent alias
+      // assumed the slot stays stable — but ld.so RE-RELOCATES ITSELF after
+      // libc loads, rebinding its own malloc/free GOT slots from the minimal
+      // rtld allocator to libc's; the stale alias kept dispatching
+      // rtld-malloc, and glibc aborts on free() of the resulting
+      // mixed-allocator pointers (leafpad, via dlerror's check_free). The
+      // closure is a JS function, so it is NOT put in the funcref table
+      // (which takes only wasm functions): in-wasm resolvers miss the stub
+      // address and route through x_callout, which lands here.
+      const gotAddr = this.trampolineGotAddr(entry);
+      if (gotAddr === null) { this.aotFailed.add(k); return; }
+      const tgt0 = this.trampolineTarget(entry);
+      if (tgt0 !== null) this.profileTarget(tgt0);   // push the real callee toward tiering
+      let cachedVal = null, cachedFn = null;         // re-resolve only when the slot changes
+      const stub = () => {
+        const v = this.mem.read(gotAddr, 8n);
+        // re-lookup when the slot changed OR the target wasn't compiled yet
+        // (a cached miss must not stick once the callee's unit registers)
+        if (v !== cachedVal || typeof cachedFn !== 'function') { cachedVal = v; cachedFn = this.aotFns.get(v); }
+        if (typeof cachedFn === 'function') return cachedFn();
+        throw new DeoptUnwind(entry);          // uncompiled target: interp runs the jmp *GOT
+      };
+      this.aotFns.set(k, stub);
+      return;
     }
     // bound the synchronous translation cost per host slice: the host zeroes
     // tierMs each pump and deferred entries re-trigger on their next call
