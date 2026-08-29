@@ -183,6 +183,19 @@ eng.onProgress = (src) => {
 if (process.env.POLLWD) eng.debugPollAfter = +process.env.POLLWD;
 if (process.env.XSDBG) xs.dbgInput = +process.env.XSDBG;
 if (process.env.RIPTRACE) { eng.ripTrace = new Array(1024).fill(0n); eng.ripTraceI = 0; }
+// WATCH=loHex,hiHex: log interp writes overlapping the range (with rip)
+if (process.env.WATCH) {
+  const [lo, hi] = process.env.WATCH.split(',').map(s => BigInt('0x' + s));
+  eng.mem.watchLo = lo; eng.mem.watchHi = hi;
+  let hits = 0;
+  eng.mem.watch = (a, n, v) => {
+    if (++hits > 400) return;
+    let w = '0x' + eng.cpu.rip.toString(16);
+    for (const m of eng.maps ?? []) if (eng.cpu.rip >= m.at && eng.cpu.rip < m.at + m.len)
+      { w = `${m.path.split('/').pop()}+0x${(eng.cpu.rip - m.at + BigInt(m.fileOff)).toString(16)}`; break; }
+    console.error(`<WATCH write 0x${a.toString(16)}/${n} = 0x${v.toString(16)} rip=${w} interp=${eng.stats.interpreted}>`);
+  };
+}
 // UNITVETO=libc.so.6+0x11bbb0,... : poison to interp any unit CONTAINING one
 // of the named functions (a unit's tier-up entry is just one of its exports,
 // so vetoing must match against all of them). Implemented via onUnitWat,

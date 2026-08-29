@@ -21,7 +21,10 @@ export class Memory {
   // have not arrived yet (streamed sidecar restore). null = disarmed (no cost
   // beyond the null check). The engine converts the throw into a short
   // blocked state and re-executes the instruction once the page lands.
-  constructor(regions) { this.regions = regions; this.pend = null; }   // [{base, bytes}]
+  // watch: optional write-watchpoint (addr, n, v) => void, called before any
+  // write overlapping [watchLo, watchHi). Debug aid; null = no cost beyond
+  // the null check.
+  constructor(regions) { this.regions = regions; this.pend = null; this.watch = null; }   // [{base, bytes}]
   find(addr) {
     const l = this._last;
     if (l !== undefined && addr >= l.base && addr < l.end) return l;
@@ -50,6 +53,7 @@ export class Memory {
   }
   write(addr, n, v) {
     if (this.pend !== null) this.pend(addr, n);
+    if (this.watch !== null && addr < this.watchHi && addr + n > this.watchLo) this.watch(addr, n, v);
     if (this.jrnl) this.jrnl.push([addr, n, this.read(addr, n), null]);
     const r = this.find(addr);
     const o = Number(addr - r.base);
