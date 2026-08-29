@@ -656,6 +656,7 @@ function sha1hex(str) {
     if (timer) { clearTimeout(timer); timer = null; }
     const start = performance.now();
     eng.tierMs = 0;                                  // fresh sync-translation budget per slice
+    eng.sliceDeadline = start + 12;                  // honored INSIDE run(): deep callouts preempt too
     let mode = 'ran', deadline = null;
     do {
       eng.run(1e5);
@@ -1023,6 +1024,7 @@ async function inflate(b64) {
     if (timer) { clearTimeout(timer); timer = null; }
     const start = performance.now();
     eng.tierMs = 0;                                  // fresh sync-translation budget per slice
+    eng.sliceDeadline = start + 12;                  // honored INSIDE run(): deep callouts preempt too
     let mode = 'ran', deadline = null;
     do {
       eng.run(1e5);

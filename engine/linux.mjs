@@ -403,7 +403,17 @@ export class LinuxEngine {
         if (this.assembleWat && n >= this.aotLoopThreshold && !this.aotFns.has(hk) && !this.aotFailed.has(hk))
           this.tierUpAot(this.cpu.rip);
       }
-      if (++guard > 5e9) throw new Error('escape runaway');
+      // slice preemption (browser): a callout can interpret for minutes, and
+      // async-compiled units only register when the event loop turns — which
+      // it can't until we return. Unwind exactly like a blocking syscall
+      // (state published, resume re-enters interp at this rip); the host sees
+      // an immediately-due blocked deadline and re-pumps on the next task.
+      if ((++guard & 0x3FFF) === 0 && this.sliceDeadline != null && performance.now() > this.sliceDeadline) {
+        this.syncOut();
+        this.blocked = { deadline: this.nowMs() };
+        throw new BlockUnwind(this.cpu.rip);
+      }
+      if (guard > 5e9) throw new Error('escape runaway');
     }
   }
 
@@ -1310,6 +1320,7 @@ export class LinuxEngine {
                  if (this.ripTrace !== undefined) { this.ripTrace[this.ripTraceI++ & 1023] = -this.cpu.rip; }  // AOT exit
                  branched = true;
                  if (this.blocked) { if (this.park()) continue; break; }
+                 if (this.sliceDeadline != null && performance.now() > this.sliceDeadline) break;
                  continue; }
         const c = branched ? this.compiled.get(key) : undefined;
         if (c) {
@@ -1335,6 +1346,7 @@ export class LinuxEngine {
         if (this.blocked) { this.cpu.rip = before;            // re-execute the syscall on resume
                             branched = true;
                             if (this.park()) continue; break; }
+        if ((steps & 0xFFF) === 0 && this.sliceDeadline != null && performance.now() > this.sliceDeadline) break;
         if (insn.mnem === 'jcc' && this.cpu.rip < before && this.inExec(this.cpu.rip)) {
           const hk = this.cpu.rip;
           const n = (this.profile.get(hk) || 0) + 1;
