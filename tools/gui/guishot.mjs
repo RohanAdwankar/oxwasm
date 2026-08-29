@@ -187,13 +187,14 @@ if (process.env.RIPTRACE) { eng.ripTrace = new Array(1024).fill(0n); eng.ripTrac
 if (process.env.WATCH) {
   const [lo, hi] = process.env.WATCH.split(',').map(s => BigInt('0x' + s));
   eng.mem.watchLo = lo; eng.mem.watchHi = hi;
-  let hits = 0;
+  // ring of the last 48 hits, recorded only late in the run (the corruption
+  // is near the end of boot; early traffic on the same stack region is noise)
+  const after = process.env.WATCHAFTER ? +process.env.WATCHAFTER : 0;
+  const ring = []; globalThis._watchRing = ring;
   eng.mem.watch = (a, n, v) => {
-    if (++hits > 400) return;
-    let w = '0x' + eng.cpu.rip.toString(16);
-    for (const m of eng.maps ?? []) if (eng.cpu.rip >= m.at && eng.cpu.rip < m.at + m.len)
-      { w = `${m.path.split('/').pop()}+0x${(eng.cpu.rip - m.at + BigInt(m.fileOff)).toString(16)}`; break; }
-    console.error(`<WATCH write 0x${a.toString(16)}/${n} = 0x${v.toString(16)} rip=${w} interp=${eng.stats.interpreted}>`);
+    if (eng.stats.interpreted < after) return;
+    ring.push([a, n, v, eng.cpu.rip, eng.stats.interpreted]);
+    if (ring.length > 48) ring.shift();
   };
 }
 // UNITVETO=libc.so.6+0x11bbb0,... : poison to interp any unit CONTAINING one
@@ -450,6 +451,15 @@ try {
       if (w > 2) await new Promise(r => setTimeout(r, Math.min(w, 50)));
       eng.wake(); } }
 } catch (e) { state = 'FAULT ' + e.message + ' rip=0x' + (e.rip??0n).toString(16);
+  if (globalThis._watchRing?.length) {
+    console.error('  watch hits (last ' + globalThis._watchRing.length + '):');
+    for (const [a, n, v, rip, ic] of globalThis._watchRing) {
+      let w = '0x' + rip.toString(16);
+      for (const m of eng.maps ?? []) if (rip >= m.at && rip < m.at + m.len)
+        { w = `${m.path.split('/').pop()}+0x${(rip - m.at + BigInt(m.fileOff)).toString(16)}`; break; }
+      console.error(`    0x${a.toString(16)}/${n} = 0x${v.toString(16)} rip=${w} interp=${ic}`);
+    }
+  }
   if (eng.ripTrace) {
     console.error('  rip trace (oldest->newest, [aot] = compiled entry/exit):');
     const n = eng.ripTraceI;
