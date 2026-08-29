@@ -475,20 +475,23 @@ function sha1hex(str) {
     else if (name.startsWith('font:')) fonts[name.slice(5)] = parsePCF(await inflateBytes(bytes));
   }
   const xs = new XServer({ width: CFG.W, height: CFG.H, fonts });
+  // Units are keyed by tier-up entry address: a hit instantiates precompiled
+  // wasm off-thread with ZERO translation on this thread, and a miss skips
+  // translation too (cacheOnly — there is no assembler in the page). The old
+  // wat-hash key regenerated the whole unit's WAT synchronously per tier-up
+  // just to compute the key: 30-second pump slices on first menu open.
   const unitCache = new Map();
-  const assembleWat = (wat) => {
-    const hit = unitCache.get(sha1hex(wat));
-    if (hit) return hit;
-    throw new Error('unit not in cache');               // poisons to interp
-  };
   const eng = new LinuxEngine(files[CFG.argv[0]], {
     argv: CFG.argv,
     env: ['DISPLAY=:0','HOME=/root','USER=root',
           'XFILESEARCHPATH=/etc/X11/%T/%N%C:/etc/X11/%T/%N:/usr/lib/X11/%T/%N%C:/usr/lib/X11/%T/%N',
           'LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu'],
-    files, mtimes: CFG.mtimes, memMB: CFG.memMB, assembleWat, xserver: xs,
+    files, mtimes: CFG.mtimes, memMB: CFG.memMB, assembleWat: () => { throw new Error('no assembler'); }, xserver: xs,
     aotCallThreshold: Infinity, aotLoopThreshold: Infinity });
   eng.asyncCompile = true;                        // browser: compile units off-thread
+  eng.unitBytes = (k) => unitCache.get(k.toString(16));
+  eng.cacheOnly = true;
+  eng.tierMsMax = 8;                              // never let sync tier work eat a slice
   P.engineUp = performance.now();
   // ---- stream memory tiles straight into wasm memory ----
   {
@@ -575,13 +578,26 @@ function sha1hex(str) {
     if (qs.has('nounits')) eng.aotBudget = 0;
     if (qs.has('trap')) {
       const od = eng.dispatchAot.bind(eng);
-      let n = 0;
+      let n = 0, last = 0;
       eng.dispatchAot = (f) => {
-        if (window.__oxTrap) { try { localStorage.setItem('oxtrap', (++n) + ':' + eng.cpu.rip.toString(16)); } catch {} }
+        if (window.__oxTrap) {
+          n++;
+          const t = performance.now();
+          if (t - last > 25) { last = t; try { localStorage.setItem('oxtrap', n + ':' + eng.cpu.rip.toString(16) + ':' + t.toFixed(0)); } catch {} }
+        }
         return od(f);
       };
       eng.onProgress = (tag) => {
-        if (window.__oxTrap) { try { localStorage.setItem('oxprog', tag + ':' + eng.cpu.rip.toString(16) + ':' + eng.stats.interpreted); } catch {} }
+        if (window.__oxTrap) { try { localStorage.setItem('oxprog', tag + ':' + eng.cpu.rip.toString(16) + ':' + eng.stats.interpreted + ':' + performance.now().toFixed(0)); } catch {} }
+      };
+      const ot = eng.tierUpAot.bind(eng);
+      let tn = 0, tms = 0;
+      eng.tierUpAot = (rip) => {
+        const t0 = performance.now();
+        const r = ot(rip);
+        tms += performance.now() - t0;
+        try { localStorage.setItem('oxtier', (++tn) + ':' + rip.toString(16) + ':' + tms.toFixed(0) + 'ms'); } catch {}
+        return r;
       };
     }
   }
@@ -639,6 +655,7 @@ function sha1hex(str) {
     pumping = true;
     if (timer) { clearTimeout(timer); timer = null; }
     const start = performance.now();
+    eng.tierMs = 0;                                  // fresh sync-translation budget per slice
     let mode = 'ran', deadline = null;
     do {
       eng.run(1e5);
@@ -876,9 +893,9 @@ async function inflate(b64) {
       const body = bin.subarray(4 + ilen);
       for (const [h, o, n] of idx) unitCache.set(h, body.subarray(o, o + n));
     } }
+  // cache misses still assemble in-page via wabt; hits skip translation
+  // entirely through eng.unitBytes (entry-keyed, wired after engine setup)
   const assembleWat = (wat) => {
-    const hit = unitCache.get(sha1hex(wat));
-    if (hit) return hit;
     const m = wabt.parseWat('unit.wat', wat);
     const bin = m.toBinary({}).buffer; m.destroy();
     return new Uint8Array(bin);
@@ -897,6 +914,8 @@ async function inflate(b64) {
           'LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu'],
     files, mtimes: ${JSON.stringify(mtimes)}, memMB: ${memMB}, assembleWat, xserver: xs });
   eng.asyncCompile = true;                        // browser: compile units off-thread
+  eng.unitBytes = (k) => unitCache.get(k.toString(16));
+  eng.tierMsMax = 8;                              // bound sync translation per pump slice
   const SNAP = ${snapAssets ? JSON.stringify(snapAssets) : 'null'};
   if (SNAP) {
     stat.textContent = 'restoring snapshot…';
@@ -1003,6 +1022,7 @@ async function inflate(b64) {
     pumping = true;
     if (timer) { clearTimeout(timer); timer = null; }
     const start = performance.now();
+    eng.tierMs = 0;                                  // fresh sync-translation budget per slice
     let mode = 'ran', deadline = null;
     do {
       eng.run(1e5);

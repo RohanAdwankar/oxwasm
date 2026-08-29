@@ -149,6 +149,7 @@ export class LinuxEngine {
     this.assembleWat = assembleWat;
     this.aotFns = new Map();                  // ripStr -> wasm export
     this.aotFailed = new Set();
+    this.tierMs = 0;                          // sync translation time this slice (host zeroes; see tierMsMax)
     this.aotCalls = new Map();                // call-target profile
     this.aotCallThreshold = aotCallThreshold;
     this.aotLoopThreshold = aotLoopThreshold;
@@ -191,13 +192,43 @@ export class LinuxEngine {
   tierUpAot(entry) {
     const k = entry;
     if (this.aotFns.has(k) || this.aotFailed.has(k)) return;
+    // Entry-keyed precompiled units (browser manifest): registering one costs
+    // no translation at all — the wasm bytes are instantiated off-thread and
+    // every exported function registers by its address-bearing export name.
+    // Without this, a "cache" keyed by the generated WAT still pays the whole
+    // closure translation on the main thread just to compute the lookup key —
+    // measured at 30-second pump slices on GIMP's first menu open.
+    if (this.unitBytes) {
+      const bytes = this.unitBytes(k);
+      if (bytes) {
+        this.aotFns.set(k, null);              // placeholder: profiling stops re-triggering
+        WebAssembly.instantiate(bytes, { js: { mem: this.wmem }, env: this.aotEnv() })
+          .then(({ instance }) => {
+            for (const name of Object.keys(instance.exports))
+              if (name.startsWith('f_')) {
+                const a = BigInt('0x' + name.slice(2));
+                if (!this.aotFns.get(a)) this.aotFns.set(a, instance.exports[name]);
+              }
+            this.stats.tiers.aot = (this.stats.tiers.aot || 0) + 1;
+          })
+          .catch((e) => { this.aotFns.delete(k); this.aotFailed.add(k);
+                          if (this.onAotFail) this.onAotFail(entry, e.message); });
+        return;
+      }
+      if (this.cacheOnly) { this.aotFailed.add(k); return; }   // no assembler here: skip translation too
+    }
     if (this.isTrampoline(entry)) { this.aotFailed.add(k); return; }
+    // bound the synchronous translation cost per host slice: the host zeroes
+    // tierMs each pump and deferred entries re-trigger on their next call
+    if (this.tierMsMax !== undefined && this.tierMs >= this.tierMsMax) return;
+    const t0c = (this.tierMsMax !== undefined) ? performance.now() : 0;
     const un = (this._unitN = (this._unitN || 0) + 1);   // bisect aid: veto unit N -> stays interpreted
     if (this.unitFilter && !this.unitFilter(un, entry)) { this.aotFailed.add(k); return; }
     try {
       const unit = compileUnitWat(this.mem, entry, { guestBase: this.base, ramBase: this.RAMOFF });
       if (this.onUnitWat) this.onUnitWat(un, entry, unit);
       const bytes = this.assembleWat(unit.wat);
+      if (this.onUnitBytes) this.onUnitBytes(k, bytes);   // manifest capture: entry -> compiled wasm
       // asyncCompile (browser): hand the bytes to the engine's off-thread
       // compiler instead of blocking this slice — execution stays interpreted
       // until the instantiate resolves, then the unit's functions register.
@@ -224,7 +255,7 @@ export class LinuxEngine {
       this.stats.tiers.aot = (this.stats.tiers.aot || 0) + 1;
     } catch (e) { this.aotFailed.add(k);
       if (this.onAotFail) this.onAotFail(entry, e.message);
-    }
+    } finally { if (t0c) this.tierMs += performance.now() - t0c; }
   }
 
   // GPRs at 0..127, fs base at 128, the 16 xmm registers at 256..511 (16B

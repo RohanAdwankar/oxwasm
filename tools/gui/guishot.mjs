@@ -224,6 +224,7 @@ if (process.env.UNITVETO) {
 if (process.env.XSNOGRAB) xs.disableGrabs = true;
 if (process.env.CHAINSLOW) eng.chainSlow = true;
 if (process.env.ASYNCC) eng.asyncCompile = true;    // browser-parity: off-thread-style deferred unit registration
+eng.onUnitBytes = (k, bytes) => (globalThis._unitByEntry ??= new Map()).set(k.toString(16), bytes);
 if (process.env.SHADOW) eng.shadowLib = process.env.SHADOW;
 import { snapshotEngine, restoreEngine } from '../../engine/snapshot.mjs';
 import { CPU as CPUctor } from '../../engine/interp.mjs';
@@ -273,12 +274,14 @@ else if (process.env.DUMPWAT_ENTRY) {
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 const writeUnits = (snapPath) => {
+  // Entry-keyed: [entryRipHex, wasmB64]. The browser registers a unit by its
+  // tier-up entry address with zero translation work — keying by wat hash
+  // forced it to regenerate the whole unit's WAT just to look it up.
   const entries = [];
-  for (const h of usedHashes) {
-    try { entries.push([h, readFileSync(WATCACHE + h + '.wasm').toString('base64')]); } catch {}
-  }
+  for (const [k, bytes] of globalThis._unitByEntry ?? [])
+    entries.push([k, Buffer.from(bytes).toString('base64')]);
   writeFileSync(snapPath + '.units', JSON.stringify(entries));
-  console.error(`<units manifest: ${entries.length} compiled units>`);
+  console.error(`<units manifest: ${entries.length} compiled units (entry-keyed)>`);
 };
 const persistDirty = () => {
   let n = 0;
