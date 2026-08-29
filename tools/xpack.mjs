@@ -327,10 +327,27 @@ if (snapPath) {
   }
   memBuf = Buffer.concat(memParts);
   try {
-    const units = JSON.parse(readFileSync((unitsPath ?? snapPath) + '.units', 'utf8'));
-    unitsBuf = container(units.map(([h, b64]) => [h, Buffer.from(b64, 'base64')]));
+    // NDJSON (one ["entryHex","b64"] per line) parsed line-by-line so a big
+    // capture never materializes a >512MB string; legacy single-JSON-array
+    // files still parse whole.
+    const raw = readFileSync((unitsPath ?? snapPath) + '.units');
+    const units = [];
+    const eol0 = raw.indexOf(10);
+    let nd = false;
+    try { nd = Array.isArray(JSON.parse(raw.toString('utf8', 0, eol0 < 0 ? raw.length : eol0))); } catch {}
+    if (nd) {                                    // NDJSON: one ["entryHex","b64"] per line
+      let o = 0;
+      while (o < raw.length) {
+        let e = raw.indexOf(10, o); if (e < 0) e = raw.length;
+        if (e > o + 1) { const [h, b64] = JSON.parse(raw.toString('utf8', o, e)); units.push([h, Buffer.from(b64, 'base64')]); }
+        o = e + 1;
+      }
+    } else {                                     // legacy: one whole JSON array
+      for (const [h, b64] of JSON.parse(raw.toString('utf8'))) units.push([h, Buffer.from(b64, 'base64')]);
+    }
+    unitsBuf = container(units);
     nUnits = units.length;
-  } catch {}
+  } catch (e) { console.log('xpack: units manifest unreadable:', e.message); }
 }
 
 if (sidecarDir) {

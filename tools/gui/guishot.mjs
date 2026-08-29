@@ -3,6 +3,7 @@
 import { LinuxEngine } from '../../engine/linux.mjs';
 import { XServer } from '../../engine/xserver.mjs';
 import { readFileSync, readdirSync, lstatSync, realpathSync, writeFileSync, unlinkSync } from 'node:fs';
+import * as fsMod from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 let asmN = 0;
@@ -104,6 +105,15 @@ else if (process.env.EXCLUDE_LIBS && !process.env.NOJIT) {
     for (const m of eng.maps ?? []) if (entry >= m.at && entry < m.at + m.len)
       return !pats.some(pat => m.path.includes(pat));
     return true;
+  };
+}
+if (process.env.UNITLOG && !process.env.NOJIT) {
+  // log every tier-up entry BEFORE its (possibly very long) translation, so a
+  // wedged compile names its culprit in the log
+  const prev = eng.unitFilter;
+  eng.unitFilter = (idx, entry) => {
+    console.error(`<tier ${idx} @${entry.toString(16)} t=${Date.now()}>`);
+    return prev ? prev(idx, entry) : true;
   };
 }
 if (process.env.UNIT_RANGES && !process.env.NOJIT) {
@@ -282,11 +292,16 @@ const writeUnits = (snapPath) => {
   // Entry-keyed: [entryRipHex, wasmB64]. The browser registers a unit by its
   // tier-up entry address with zero translation work — keying by wat hash
   // forced it to regenerate the whole unit's WAT just to look it up.
-  const entries = [];
-  for (const [k, bytes] of globalThis._unitByEntry ?? [])
-    entries.push([k, Buffer.from(bytes).toString('base64')]);
-  writeFileSync(snapPath + '.units', JSON.stringify(entries));
-  console.error(`<units manifest: ${entries.length} compiled units (entry-keyed)>`);
+  // Streamed: a big capture's manifest exceeds V8's max string length.
+  const { openSync, writeSync, closeSync } = fsMod;
+  const fd = openSync(snapPath + '.units', 'w');
+  let n = 0;
+  for (const [k, bytes] of globalThis._unitByEntry ?? []) {
+    writeSync(fd, JSON.stringify([k, Buffer.from(bytes).toString('base64')]) + '\n');   // NDJSON: no giant string
+    n++;
+  }
+  closeSync(fd);
+  console.error(`<units manifest: ${n} compiled units (entry-keyed)>`);
 };
 const persistDirty = () => {
   let n = 0;

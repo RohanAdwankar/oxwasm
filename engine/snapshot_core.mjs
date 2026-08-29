@@ -57,7 +57,16 @@ export function restoreEngineCore(eng, xs, assets, CPUctor, inflate) {
   const rebase = (d) => d == null ? null : Number(d) + dnow;
   eng.base = state.base; eng.brk = state.brk; eng.mmapNext = state.mmapNext; eng.stackTop = state.stackTop;
   eng.execRanges = state.execRanges.map(([a, b]) => [BigInt(a), BigInt(b)]);
+  eng.execRangesStatic = (state.execRangesStatic ?? state.execRanges).map(([a, b]) => [BigInt(a), BigInt(b)]);  // loop tiers stay on the pre-widening ground
   eng.maps = state.maps;
+  // Older snapshots' execRanges cover only the main binary + ld.so (mmap
+  // didn't extend them), which blinded profiling to every LIBRARY loop head,
+  // jump landing, and deopt landing — the warm menu path stayed interpreted.
+  // Rebuild coverage from the file-backed maps.
+  for (const m of eng.maps ?? []) {
+    const a = BigInt(m.at), b = BigInt(m.at) + BigInt(m.len);
+    if (!eng.execRanges.some(([x, y]) => x <= a && b <= y)) eng.execRanges.push([a, b]);
+  }
   eng.nextTid = state.nextTid;
   eng.blocked = state.blocked ? { deadline: rebase(state.blocked.deadline) } : null;
   eng._deadline = rebase(state._deadline);

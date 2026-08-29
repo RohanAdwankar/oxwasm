@@ -118,6 +118,9 @@ export class LinuxEngine {
       this.execRanges.push(...interp.loads.filter(s => s.flags & 1)
         .map(s => [s.vaddr + interpBase, s.vaddr + interpBase + BigInt(s.memsz)]));
     }
+    // loop tiers (superblock/simd) stay on this proven ground; unit tier-up
+    // profiling uses the full (mmap-widened) execRanges
+    this.execRangesStatic = this.execRanges.slice();
     this.entry = interp ? interp.entry + interpBase : main.entry + mainBias;
     // auxv facts the dynamic linker needs; the usual layout maps file offset 0
     // in the first PT_LOAD, so the phdrs sit at that segment's vaddr + phoff
@@ -505,11 +508,32 @@ export class LinuxEngine {
         this.syncOut();
         return BigInt.asIntN(64, retAddr);
       },
-      // rsp0 is unused: the frames unwind, they are not interpreted under.
+      // The unit spilled the whole regfile before `(return (call $x_deopt ...))`
+      // and returns our result as its own exit rip — so when the landing is
+      // itself compiled, run it wasm-to-wasm over the shared regfile and
+      // return ITS exit: no exception, no BigInt sync, no run()-loop lap.
+      // (Measured ~69k deopts per warm menu cycle, mostly cross-DSO jumps.)
+      // The depth guard stops a computed-goto ping-pong from consuming host
+      // stack — tail-jumps spend no guest stack, so only this bounds it.
       // Profile the landing so an indirect jump that only runs inside AOT code
       // (a compiled trampoline, a jump table) still tiers up its target.
       deopt: (rip, _rsp0) => { const t = BigInt.asUintN(64, rip);
-        if (this.inExec(t)) this.profileTarget(t); throw new DeoptUnwind(t); },
+        this.stats.deopts = (this.stats.deopts || 0) + 1;
+        if (this.deoptLog) this.deoptLog.set(t, (this.deoptLog.get(t) || 0) + 1);
+        if (this.inExec(t)) this.profileTarget(t);
+        const f = this.aotFns.get(t);
+        // t !== _deoChainT: an instruction-escape deopt (rdtsc/cpuid/div
+        // guard) passes its own rip — a landing-unit rooted exactly there
+        // would re-deopt at the same t forever; only the interpreter can
+        // execute that instruction.
+        if (f && !this.chainSlow && t !== this._deoChainT && (this._deoD | 0) < 200 &&
+            (this.sliceDeadline == null || performance.now() <= this.sliceDeadline)) {
+          const prevT = this._deoChainT;
+          this._deoChainT = t; this._deoD = (this._deoD | 0) + 1;
+          try { this.stats.aotRuns++; return BigInt.asIntN(64, BigInt.asUintN(64, f())); }
+          finally { this._deoD--; this._deoChainT = prevT; }   // restores through unwinds too
+        }
+        throw new DeoptUnwind(t); },
     };
   }
 
@@ -721,6 +745,7 @@ export class LinuxEngine {
           const n = Math.min(Number(a2), Math.max(0, h.bytes.length - fo));
           if (n > 0) this.ram.set(h.bytes.subarray(fo, fo + n), off0);
           (this.maps ??= []).push({ at, len, path: h.path ?? '?', fileOff: fo });
+          this.execRanges.push([at, at + len]);   // library text: profiling must see it (prot untracked)
         }
         ret(at); break; }
       case 11: ret(0n); break;                               // munmap
@@ -1321,7 +1346,12 @@ export class LinuxEngine {
     }
   }
 
-  inExec(rip) { return this.execRanges.some(([a, b]) => rip >= a && rip < b); }
+  inExec(rip) {
+    const c = this._ieCache;
+    if (c !== undefined && rip >= c[0] && rip < c[1]) return true;
+    for (const r of this.execRanges) if (rip >= r[0] && rip < r[1]) { this._ieCache = r; return true; }
+    return false;
+  }
 
   run(maxSteps = 5e9) {
     let steps = 0;
@@ -1370,7 +1400,9 @@ export class LinuxEngine {
           this.profile.set(hk, n);
           // hot loop: first the cheap loop tiers, then whole-frame AOT from
           // the loop head (the unit translator only needs "forward to ret")
-          if (n >= this.threshold && !this.compiled.has(hk)) this.tryCompile(hk, this.cpu.rip);
+          if (n >= this.threshold && !this.compiled.has(hk) &&
+              (this.execRangesStatic ?? this.execRanges).some(([a, b]) => hk >= a && hk < b))
+            this.tryCompile(hk, this.cpu.rip);
           if (this.assembleWat && n >= this.aotLoopThreshold && !this.aotFns.has(hk) && !this.aotFailed.has(hk))
             this.tierUpAot(this.cpu.rip);
         }

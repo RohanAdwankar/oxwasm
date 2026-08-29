@@ -107,7 +107,7 @@ export function snapshotEngine(eng, xs, path) {
   const state = {
     v: 1, now,
     base: eng.base, brk: eng.brk, mmapNext: eng.mmapNext, stackTop: eng.stackTop,
-    execRanges: eng.execRanges, maps: eng.maps ?? [],
+    execRanges: eng.execRanges, execRangesStatic: eng.execRangesStatic ?? null, maps: eng.maps ?? [],
     ti: eng.ti, nextTid: eng.nextTid,
     blocked: eng.blocked, _deadline: eng._deadline,
     _futexAddr: eng._futexAddr ?? null,
