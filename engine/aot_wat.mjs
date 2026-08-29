@@ -877,6 +877,9 @@ function emitUnitFunction(a0, fnAddr, ctx) {
         else put(xv(rm, next));
         break;
       case 0x7F: case 0x29: storeRm(16, dst); break;                          // movdqa/u, movaps store
+      case 0xE7:                                                              // movntdq: non-temporal hint is a no-op here — plain store
+        if (!insn.p66) throw new Error('AOT sse op e7 (MMX movntq) @ ' + insn.rip.toString(16));
+        storeRm(16, dst); break;
       case 0x11:                                                              // movups/ss/sd store
         if (insn.pF3) storeRm(4, dst); else if (insn.pF2) storeRm(8, dst); else storeRm(16, dst);
         break;

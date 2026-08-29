@@ -282,6 +282,16 @@ export class LinuxEngine {
       const tgt = this.trampolineTarget(entry);
       const tf = tgt !== null ? this.aotFns.get(tgt) : undefined;
       if (tf) { this.registerAotFn(k, tf); return; }
+      if (tgt !== null && !this.aotFailed.has(tgt)) {
+        // The stub resolves but its target isn't compiled YET. Poisoning the
+        // stub here was permanent — memmove@plt stayed dead even after libc's
+        // memmove tiered up (measured: 1.1M interp calls through three such
+        // stubs on the CPython yardstick). Push the TARGET toward tiering and
+        // reset the stub's counter so it re-aliases on a later threshold hit.
+        this.profileTarget(tgt);
+        this.aotCalls.delete(k);
+        return;
+      }
       this.aotFailed.add(k); return;
     }
     // bound the synchronous translation cost per host slice: the host zeroes

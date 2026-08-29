@@ -35,9 +35,15 @@ treat these as a band, not a point):
 
 | test     | native | engine   | ratio | was    |
 |----------|--------|----------|-------|--------|
-| loop3M   | 106ms  | ~7600ms  | ~72x  | 225x   |
-| dict300k | 40ms   | ~7800ms  | ~195x | 174x   |
-| str200k  | 34ms   | ~14000ms | ~410x | 331x   |
+| loop3M   | 106ms  | ~7300ms  | ~69x  | 225x   |
+| dict300k | 40ms   | ~6500ms  | ~162x | 174x   |
+| str200k  | 34ms   | ~7400ms  | ~219x | 331x   |
+
+(After two coverage fixes the first chaining datapoint pointed at:
+movntdq — glibc's non-temporal memcpy/memset store, now a plain
+v128.store — and PLT stubs no longer being permanently poisoned when
+their target hadn't compiled YET; memmove@plt et al. now re-alias once
+the target tiers. str200k was the big winner: 14s -> 7.4s.)
 
 The boundary traffic collapsed as designed — deopt round-trips
 42.7M → 4.7k, top-level regfile-sync dispatches → 0.5M, JS chain hops
