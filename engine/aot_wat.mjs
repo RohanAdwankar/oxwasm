@@ -283,7 +283,12 @@ function analyze(mem, entry, { maxInsns = 20000, noJtab = false } = {}) {
     //    fully (cpuid — glibc's one-time ISA probe; fxsave/fxrstor and the
     //    mxcsr accesses — signal/setjmp-adjacent state save paths): deopt
     //    runs them and the frame's remainder in the interpreter, then returns.
-    if (['hlt','ud2','int3','int','cpuid','fxsave','fxrstor','stmxcsr','ldmxcsr'].includes(insn.mnem)) {
+    //  - x87 instructions (the decoder lumps them under one mnem): units
+    //    never model the FPU stack — it lives solely in the interpreter's
+    //    CPU state, which syncOut/syncIn do not touch, so escaping at every
+    //    x87 instruction keeps that state exact while the integer/SSE parts
+    //    of the same function still compile (strtod, printf float paths).
+    if (['hlt','ud2','int3','int','cpuid','fxsave','fxrstor','stmxcsr','ldmxcsr','x87'].includes(insn.mnem)) {
       insnAt.set(key, { mnem: 'udec', rip, next: rip + BigInt(insn.len), len: insn.len });
       continue;
     }
