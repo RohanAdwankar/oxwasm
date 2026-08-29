@@ -562,6 +562,29 @@ function sha1hex(str) {
   P.restored = performance.now();
 
   const blit = () => { const fb = xs.flush(); paintU32(fb); };
+  // ---- debug levers (URL params; no effect unless asked for) ----
+  // ?noasync  — synchronous unit compilation (bisect asyncCompile)
+  // ?nounits  — never dispatch AOT units (interp+loop tiers only)
+  // ?trap     — while window.__oxTrap is set, journal every AOT dispatch
+  //             entry rip to localStorage; if the tab wedges inside one
+  //             compiled unit, a second same-origin tab can read exactly
+  //             which unit it entered (main thread never comes back to ask)
+  {
+    const qs = new URLSearchParams(location.search);
+    if (qs.has('noasync')) eng.asyncCompile = false;
+    if (qs.has('nounits')) eng.aotBudget = 0;
+    if (qs.has('trap')) {
+      const od = eng.dispatchAot.bind(eng);
+      let n = 0;
+      eng.dispatchAot = (f) => {
+        if (window.__oxTrap) { try { localStorage.setItem('oxtrap', (++n) + ':' + eng.cpu.rip.toString(16)); } catch {} }
+        return od(f);
+      };
+      eng.onProgress = (tag) => {
+        if (window.__oxTrap) { try { localStorage.setItem('oxprog', tag + ':' + eng.cpu.rip.toString(16) + ':' + eng.stats.interpreted); } catch {} }
+      };
+    }
+  }
   // ---- input ----
   const scale = () => cv.width / cv.getBoundingClientRect().width;
   const pos = (e) => { const r = cv.getBoundingClientRect(); const s = scale();

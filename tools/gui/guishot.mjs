@@ -223,6 +223,7 @@ if (process.env.UNITVETO) {
 }
 if (process.env.XSNOGRAB) xs.disableGrabs = true;
 if (process.env.CHAINSLOW) eng.chainSlow = true;
+if (process.env.ASYNCC) eng.asyncCompile = true;    // browser-parity: off-thread-style deferred unit registration
 if (process.env.SHADOW) eng.shadowLib = process.env.SHADOW;
 import { snapshotEngine, restoreEngine } from '../../engine/snapshot.mjs';
 import { CPU as CPUctor } from '../../engine/interp.mjs';
