@@ -228,11 +228,15 @@ export function compileFunctionWatDispatch(mem, entry, { guestBase, ramBase, max
 // One FUNCTION at a time: `call` is a mid-block instruction (fall-through
 // successor) whose target is recorded in `calls` for the unit driver;
 // `leave` is a plain epilogue instruction; ret/retn/jmpind end a block.
-function analyze(mem, entry, { maxInsns = 20000 } = {}) {
+function analyze(mem, entry, { maxInsns = 20000, noJtab = false } = {}) {
   const M = 0xFFFFFFFFFFFFFFFFn;
   const insnAt = new Map(); const work = [entry]; const seen = new Set(); let count = 0;
   const calls = new Set();
-  while (work.length) {
+  const byNext = new Map();       // insn.next -> insn: the straight-line chain above an address
+  const jmpinds = [];             // `jmp *reg` sites awaiting jump-table discovery
+  const jtabs = new Map();        // jmpind rip str -> BigInt[] targets read from its table
+  let lo = entry, hi = entry;     // decoded range, the plausibility window for table entries
+  const drain = () => { while (work.length) {
     const rip = work.pop(); const key = rip.toString();
     if (seen.has(key)) continue; seen.add(key);
     if (count++ > maxInsns) throw new Error('function too large');
@@ -259,21 +263,81 @@ function analyze(mem, entry, { maxInsns = 20000 } = {}) {
       continue;
     }
     insn.rip = rip; insn.next = rip + BigInt(insn.len); insnAt.set(key, insn);
-    if (insn.mnem === 'ret' || insn.mnem === 'retn' || insn.mnem === 'jmpind') continue;
+    byNext.set(insn.next.toString(), insn);
+    if (rip < lo) lo = rip; if (rip > hi) hi = rip;
+    if (insn.mnem === 'ret' || insn.mnem === 'retn') continue;
+    if (insn.mnem === 'jmpind') {
+      // discoverable forms: `jmp *R` (table load traced upward) and
+      // `jmp *table(,%idx,8)` (table named right in the operand)
+      if (!noJtab && (insn.src?.kind === 'reg'
+          || (insn.src?.kind === 'mem' && insn.src.base < 0 && insn.src.index >= 0
+              && insn.src.scale === 8 && !insn.src.ripRel && !insn.src.fs))) jmpinds.push(insn);
+      continue;
+    }
     if (insn.mnem === 'jmp') { work.push((insn.next + insn.rel) & M); continue; }
     if (insn.mnem === 'jcc') { work.push((insn.next + insn.rel) & M); work.push(insn.next); continue; }
     if (insn.mnem === 'call') calls.add(((insn.next + insn.rel) & M).toString());
     work.push(insn.next);
+  } };
+  drain();
+  // ---- jump-table discovery (computed goto / switch dispatch) --------------
+  // For each `jmp *R`, walk the straight-line chain of instructions laid out
+  // immediately above it to find R's defining load `mov R,[B+idx*8]`, then
+  // B's defining `lea B,[rip+d]` / absolute address. Reading the table from
+  // GUEST memory at translation time yields post-relocation runtime addresses.
+  // The chain walk is a heuristic (address order, not dominance) — that's
+  // safe: discovery only decides which addresses get DECODED as blocks; at
+  // runtime the resolver matches the actual computed address exactly and
+  // anything unknown still deopts, so a wrong match can only waste space.
+  const wrReg = (p, r) => p.dst && p.dst.kind === 'reg' && p.dst.r === r
+    && !['cmp','test','bt'].includes(p.mnem);
+  const defAbove = (from, r) => { let cur = from;
+    for (let s = 0; s < 16; s++) {
+      const p = byNext.get(cur.rip.toString());
+      if (!p || p.mnem === 'udec') return null;
+      if (wrReg(p, r)) return p;
+      cur = p;
+    } return null; };
+  const tableOf = (j) => {
+    if (j.src.kind === 'mem') return BigInt.asUintN(64, j.src.disp);
+    const ld = defAbove(j, j.src.r);
+    if (!ld || ld.mnem !== 'mov' || (ld.size||8) !== 8 || ld.src.kind !== 'mem'
+        || ld.src.scale !== 8 || ld.src.index < 0 || ld.src.fs) return null;
+    if (ld.src.base < 0) return ld.src.ripRel ? null : BigInt.asUintN(64, ld.src.disp);
+    const lb = defAbove(ld, ld.src.base);
+    if (!lb) return null;
+    if (lb.mnem === 'lea' && lb.src.kind === 'mem' && lb.src.index < 0 && (lb.src.ripRel || lb.src.base < 0))
+      return BigInt.asUintN(64, lb.src.disp + (lb.src.ripRel ? lb.next : 0n));
+    if (lb.mnem === 'mov' && lb.src.kind === 'imm') return BigInt.asUintN(64, lb.src.v);
+    return null;
+  };
+  let dbudget = 4096;             // total discovered targets across the function
+  while (jmpinds.length && dbudget > 0) {
+    const j = jmpinds.shift();
+    const tbl = tableOf(j);
+    if (tbl == null) continue;
+    const targets = [];
+    const min = lo > 0x100000n ? lo - 0x100000n : 0n, max = hi + 0x100000n;
+    for (let i = 0; i < 1024; i++) {
+      let t; try { t = mem.read((tbl + BigInt(i * 8)) & M, 8n); } catch { break; }
+      if (t < min || t > max) break;   // first out-of-range entry = end of table
+      targets.push(t);
+    }
+    if (targets.length < 2) continue;
+    jtabs.set(j.rip.toString(), targets);
+    for (const t of targets) if (!seen.has(t.toString()) && dbudget > 0) { dbudget--; work.push(t); }
+    drain();                      // newly decoded handlers may end in more jmpinds
   }
   const addrs = [...insnAt.keys()].map(BigInt).sort((a,b)=>a<b?-1:1);
   const leaders = new Set([entry.toString()]);
   for (const a of addrs) { const insn = insnAt.get(a.toString());
     if (insn.mnem === 'jcc') { leaders.add(((insn.next+insn.rel)&M).toString()); leaders.add(insn.next.toString()); }
     if (insn.mnem === 'jmp') leaders.add(((insn.next+insn.rel)&M).toString()); }
+  for (const [, ts] of jtabs) for (const t of ts) leaders.add(t.toString());
   const blocks = []; let cur = null;
   for (const a of addrs) { if (leaders.has(a.toString())) { cur = { start: a, insns: [] }; blocks.push(cur); } cur.insns.push(insnAt.get(a.toString())); }
   const bidx = new Map(blocks.map((b,i)=>[b.start.toString(), i]));
-  return { blocks, bidx, M, calls };
+  return { blocks, bidx, M, calls, jtabs };
 }
 
 // ---- Stackifier: turn a reducible CFG into nested wasm loop/block scopes ----
@@ -345,7 +409,11 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     const idx = (addr) => a0.bidx.has(addr.toString()) ? a0.bidx.get(addr.toString()) : -1;
     if (last.mnem === 'jcc') return [idx((next+last.rel)&MM), idx(next)];
     if (last.mnem === 'jmp') return [idx((next+last.rel)&MM)];
-    if (['ret','retn','jmpind'].includes(last.mnem)) return [];
+    if (last.mnem === 'jmpind') {
+      const ts = a0.jtabs?.get(last.rip.toString());
+      return ts ? ts.map(idx).filter(v => v >= 0) : [];
+    }
+    if (['ret','retn'].includes(last.mnem)) return [];
     return [idx(next)];
   };
   // reverse postorder from the ENTRY block — which is NOT necessarily the
@@ -370,13 +438,24 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   // terminator descriptor + successors, all in RPO index space
   const term = [], succs = [];
   const idxOf = (addr) => bidx.has(addr.toString()) ? bidx.get(addr.toString()) : -1;
+  // Jump-table resolution set: the union of every discovered table's in-unit
+  // targets. One shared per-function resolver maps a computed address to its
+  // RPO index; any jtab site can therefore land on any union member at
+  // runtime, so every jtab site lists the whole union as successors — that
+  // makes the cross-block flag analysis model exactly the edges the resolver
+  // can take.
+  const jtabUnion = new Set();
+  if (a0.jtabs) for (const [, ts] of a0.jtabs) for (const t of ts) { const j = idxOf(t); if (j >= 0) jtabUnion.add(j); }
+  const hasJtab = jtabUnion.size > 0;
   let hasDeopt = false;
   for (let i=0;i<N;i++) {
     const insns = blocks[i].insns, last = insns[insns.length-1], next = last.next;
     if (last.mnem === 'jcc') { const t = idxOf((next+last.rel)&MM), f = idxOf(next); term.push({kind:'jcc', t, f}); succs.push([t, f]); }
     else if (last.mnem === 'jmp') { const t = idxOf((next+last.rel)&MM); term.push({kind:'jmp', t}); succs.push([t]); }
     else if (last.mnem === 'ret' || last.mnem === 'retn') { term.push({kind:'ret', pad: last.mnem==='retn' ? Number(last.n) : 0}); succs.push([]); }
-    else if (last.mnem === 'jmpind') { hasDeopt = true; term.push({kind:'deopt', src:last.src}); succs.push([]); }
+    else if (last.mnem === 'jmpind') { hasDeopt = true;
+      if (hasJtab && a0.jtabs.has(last.rip.toString())) { term.push({kind:'jtab', src:last.src}); succs.push([...jtabUnion]); }
+      else { term.push({kind:'deopt', src:last.src}); succs.push([]); } }
     else if (last.mnem === 'udec')   { hasDeopt = true; term.push({kind:'deopt', src:null, at:last.rip}); succs.push([]); }
     else { const t = idxOf(next); term.push({kind:'fall', t}); succs.push([t]); }
   }
@@ -393,7 +472,10 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   // subwidthtest. Set globalThis.__disableDispatch to poison irreducible
   // CFGs back to the interpreter (see diff/disptest.mjs).
   let mode = 'structured', open = null, closeAfter = null;
-  try { ({ open, closeAfter } = structure(N, succs)); }
+  // A resolved jump table needs the dispatch loop's $pc/$L_disp machinery
+  // (and its edge fan-in is irreducible anyway): go straight to dispatch.
+  if (hasJtab) mode = 'dispatch';
+  else try { ({ open, closeAfter } = structure(N, succs)); }
   catch (e) {
     if (!/overlap|irreducible|unclosed|converge/.test(e.message) || globalThis.__disableDispatch) throw e;
     // bisect aid: every dispatch-mode unit gets a global ordinal; a filter
@@ -1576,6 +1658,17 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       L.push(`(local.set $r4 (i64.add (local.get $r4) (i64.const ${8 + t.pad})))`);
       L.push(...spillExit());
       L.push(`(return (local.get $rex))`);
+    } else if (t.kind === 'jtab') {
+      // indirect jump through a discovered jump table: resolve the COMPUTED
+      // address against this function's block map and re-enter the dispatch
+      // loop — one in-wasm branch per computed goto instead of a JS deopt
+      // round-trip. An unknown address (tail call, an undecoded table row)
+      // still deopts, so resolution is exact by construction.
+      L.push(`(local.set $rex ${rd(t.src,8,lnext)})`);
+      L.push(`(local.set $pc (call $jtr_${fnAddr.toString(16)} (local.get $rex)))`);
+      L.push(`(br_if $L_disp (i32.ge_s (local.get $pc) (i32.const 0)))`);
+      L.push(...spillAll());
+      L.push(`(return (call $x_deopt (local.get $rex) (local.get $rsp0)))`);
     } else if (t.kind === 'deopt') {
       // indirect jump (jump table / tail call) or undecodable byte:
       // hand the frame to the engine at the computed target / that rip
@@ -1615,6 +1708,17 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     }
     wat += '    ))\n';                                                 // close loop + exit block
     wat += '    (unreachable)\n  )\n';
+    if (hasJtab) {
+      // address -> RPO index for every jump-table target, as a balanced
+      // binary-search tree of ifs: log2(n) compares per computed goto
+      const pairs = [...jtabUnion].map(j => [blocks[j].start, j]).sort((x,y) => x[0] < y[0] ? -1 : 1);
+      const bs = (lo, hi) => {
+        if (hi - lo === 1) return `(if (result i32) (i64.eq (local.get $a) (i64.const ${hexs(pairs[lo][0])})) (then (i32.const ${pairs[lo][1]})) (else (i32.const -1)))`;
+        const mid = (lo + hi) >> 1;
+        return `(if (result i32) (i64.lt_u (local.get $a) (i64.const ${hexs(pairs[mid][0])}))\n      (then ${bs(lo, mid)})\n      (else ${bs(mid, hi)}))`;
+      };
+      wat += `  (func $jtr_${fnAddr.toString(16)} (param $a i64) (result i32)\n    ${bs(0, pairs.length)}\n  )\n`;
+    }
     return wat;
   }
   for (let i=0;i<N;i++) {
@@ -1636,7 +1740,14 @@ export function compileUnitWat(mem, entry, opts = {}) {
     const a = pending.shift(); const k = a.toString();
     if (funcs.has(k) || poisoned.has(k)) continue;
     try {
-      const an = analyze(mem, a, { maxInsns });
+      let an;
+      try { an = analyze(mem, a, { maxInsns, noJtab: !!globalThis.__noJtab }); }
+      catch (e) {
+        // jump-table discovery can push a function over the size budget;
+        // it compiled before the feature, so retry without it
+        if (!/function too large/.test(e.message) || globalThis.__noJtab) throw e;
+        an = analyze(mem, a, { maxInsns, noJtab: true });
+      }
       // a body that starts undecodable compiles to a pure deopt — worse than
       // useless: dispatching it can ping-pong with the engine. Poison instead
       // so control reaches the interpreter, which faults faithfully.
