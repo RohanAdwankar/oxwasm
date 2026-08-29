@@ -182,6 +182,7 @@ eng.onProgress = (src) => {
 };
 if (process.env.POLLWD) eng.debugPollAfter = +process.env.POLLWD;
 if (process.env.XSDBG) xs.dbgInput = +process.env.XSDBG;
+if (process.env.RIPTRACE) { eng.ripTrace = new Array(1024).fill(0n); eng.ripTraceI = 0; }
 if (process.env.XSNOGRAB) xs.disableGrabs = true;
 if (process.env.CHAINSLOW) eng.chainSlow = true;
 if (process.env.SHADOW) eng.shadowLib = process.env.SHADOW;
@@ -420,6 +421,18 @@ try {
       if (w > 2) await new Promise(r => setTimeout(r, Math.min(w, 50)));
       eng.wake(); } }
 } catch (e) { state = 'FAULT ' + e.message + ' rip=0x' + (e.rip??0n).toString(16);
+  if (eng.ripTrace) {
+    console.error('  rip trace (oldest->newest, [aot] = compiled entry/exit):');
+    const n = eng.ripTraceI;
+    for (let i = Math.max(0, n - 80); i < n; i++) {
+      const v = eng.ripTrace[i & 1023];
+      const aot = v < 0n, rip = aot ? -v : v;
+      let where = '0x' + rip.toString(16);
+      for (const m of eng.maps ?? []) if (rip >= m.at && rip < m.at + m.len)
+        { where = `${m.path.split('/').pop()}+0x${(rip - m.at + BigInt(m.fileOff)).toString(16)}`; break; }
+      console.error(`    ${aot ? '[aot] ' : ''}${where}`);
+    }
+  }
   let where='?'; for (const m of eng.maps ?? []) if ((e.rip??0n) >= m.at && (e.rip??0n) < m.at+m.len) where=`${m.path}+0x${((e.rip??0n)-m.at+BigInt(m.fileOff)).toString(16)}`;
   console.error('  in', where);
   const b=[]; for(let i=-4n;i<10n;i++){try{b.push(Number(eng.mem.read((e.rip??0n)+i,1n)).toString(16).padStart(2,'0'))}catch{b.push('??')}}

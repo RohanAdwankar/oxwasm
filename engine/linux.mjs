@@ -1241,7 +1241,9 @@ export class LinuxEngine {
         const key = this.cpu.rip;
         let f = branched ? this.aotFns.get(key) : undefined;
         if (f && this.aotBudget !== undefined && --this.aotBudget < 0) f = null;
-        if (f) { this.cpu.rip = this.dispatchMaybeShadow(f);
+        if (f) { if (this.ripTrace !== undefined) { this.ripTrace[this.ripTraceI++ & 1023] = -key; }   // negative = AOT entry
+                 this.cpu.rip = this.dispatchMaybeShadow(f);
+                 if (this.ripTrace !== undefined) { this.ripTrace[this.ripTraceI++ & 1023] = -this.cpu.rip; }  // AOT exit
                  branched = true;
                  if (this.blocked) { if (this.park()) continue; break; }
                  continue; }
@@ -1253,6 +1255,7 @@ export class LinuxEngine {
           this.cpu.rip = c.exit; this.stats.compiledRuns++; branched = true; continue;
         }
         const before = this.cpu.rip;
+        if (this.ripTrace !== undefined) this.ripTrace[this.ripTraceI++ & 1023] = before;
         let insn;
         try { insn = this.cpu.step(); }
         catch (e) { if (e === EXIT) break;
