@@ -10,7 +10,7 @@ const entry = BigInt('0x' + execFileSync('bash', ['-c', "nm aot/md5-native | awk
 
 const { wat, blocks } = compileFunctionWat(eng.mem, entry, { guestBase: eng.base, ramBase: eng.RAMOFF });
 writeFileSync('/tmp/md5_blocks.wat', wat);
-execFileSync('wat2wasm', ['/tmp/md5_blocks.wat', '-o', '/tmp/md5_blocks.wasm']);
+execFileSync('wat2wasm', ['--enable-tail-call', '/tmp/md5_blocks.wat', '-o', '/tmp/md5_blocks.wasm']);
 const wasm = new Uint8Array(readFileSync('/tmp/md5_blocks.wasm'));
 console.log('AOT:', blocks, 'basic blocks ->', wasm.length, 'bytes wasm');
 const inst = new WebAssembly.Instance(new WebAssembly.Module(wasm), { js: { mem: eng.wmem } });

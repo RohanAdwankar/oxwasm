@@ -37,7 +37,7 @@ const eng0 = mk();
 const unit = compileUnitWat(eng0.mem, entry, { guestBase: eng0.base, ramBase: eng0.RAMOFF });
 if (!unit.wat.includes('$L_disp')) { console.log('SETUP FAIL: irr did not compile in dispatch mode'); process.exit(1); }
 writeFileSync(join(dir, 'irr.wat'), unit.wat);
-execFileSync('wat2wasm', [join(dir, 'irr.wat'), '-o', join(dir, 'irr.wasm')]);
+execFileSync('wat2wasm', ['--enable-tail-call', join(dir, 'irr.wat'), '-o', join(dir, 'irr.wasm')]);
 const mod = new WebAssembly.Module(readFileSync(join(dir, 'irr.wasm')));
 const entryName = 'f_' + entry.toString(16);
 const SENT = 0xdeadbee0n;

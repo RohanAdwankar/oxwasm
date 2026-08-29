@@ -35,7 +35,7 @@ ret`;
   let r;
   try { r = compileFunctionWat(new Memory([{ base: CODE, bytes: code }]), CODE, { guestBase: CODE, ramBase: 0 }); }
   catch (e) { console.log(`SKIP ${op} mem=${mem}: ${e.message}`); fail++; continue; }
-  writeFileSync('/tmp/fc.wat', r.wat); execFileSync('wat2wasm', ['/tmp/fc.wat', '-o', '/tmp/fc.wasm']);
+  writeFileSync('/tmp/fc.wat', r.wat); execFileSync('wat2wasm', ['--enable-tail-call', '/tmp/fc.wat', '-o', '/tmp/fc.wasm']);
   const mod = new WebAssembly.Module(readFileSync('/tmp/fc.wasm'));
   for (const [x, y] of PAIRS) {
     const xb = wide ? f64(x) : f32(x), yb = wide ? f64(y) : f32(y);

@@ -22,7 +22,7 @@ for (const [name, body, sa, sb, cnt] of CASES) {
   let r;
   try { r = compileFunctionWat(new Memory([{ base: CODE, bytes: code }]), CODE, { guestBase: CODE, ramBase: 0 }); }
   catch (e) { console.log(`SKIP ${name}: ${e.message}`); fail++; continue; }
-  writeFileSync('/tmp/st.wat', r.wat); execFileSync('wat2wasm', ['/tmp/st.wat', '-o', '/tmp/st.wasm']);
+  writeFileSync('/tmp/st.wat', r.wat); execFileSync('wat2wasm', ['--enable-tail-call', '/tmp/st.wat', '-o', '/tmp/st.wasm']);
   const mod = new WebAssembly.Module(readFileSync('/tmp/st.wasm'));
 
   const m = new Memory([{ base: CODE, bytes: code.slice() }]); const cpu = new CPU(m);

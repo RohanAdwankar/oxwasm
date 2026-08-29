@@ -28,7 +28,7 @@ writeFileSync('/tmp/pm.asm', asm);
 execFileSync('nasm', ['-f', 'bin', '-o', '/tmp/pm.bin', '/tmp/pm.asm']);
 const bin = readFileSync('/tmp/pm.bin'); const code = new Uint8Array(0x1000); code.set(bin);
 const r = compileFunctionWat(new Memory([{ base: CODE, bytes: code }]), CODE, { guestBase: CODE, ramBase: 0 });
-writeFileSync('/tmp/pm.wat', r.wat); execFileSync('wat2wasm', ['/tmp/pm.wat', '-o', '/tmp/pm.wasm']);
+writeFileSync('/tmp/pm.wat', r.wat); execFileSync('wat2wasm', ['--enable-tail-call', '/tmp/pm.wat', '-o', '/tmp/pm.wasm']);
 const mod = new WebAssembly.Module(readFileSync('/tmp/pm.wasm'));
 
 let pass = 0, fail = 0;

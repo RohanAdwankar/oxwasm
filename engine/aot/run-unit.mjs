@@ -16,7 +16,7 @@ const entry = eng.entry;
 const t0 = process.hrtime.bigint();
 const unit = compileUnitWat(eng.mem, entry, { guestBase: eng.base, ramBase: eng.RAMOFF });
 writeFileSync('/tmp/unit.wat', unit.wat);
-execFileSync('wat2wasm', ['/tmp/unit.wat', '-o', '/tmp/unit.wasm']);
+execFileSync('wat2wasm', ['--enable-tail-call', '/tmp/unit.wat', '-o', '/tmp/unit.wasm']);
 const mod = new WebAssembly.Module(readFileSync('/tmp/unit.wasm'));
 console.log(`[unit] ${unit.funcs.length} functions (${unit.poisoned.length} poisoned), ${unit.blocks} blocks, ` +
             `${readFileSync('/tmp/unit.wasm').length} bytes wasm, compiled in ${(Number(process.hrtime.bigint()-t0)/1e6).toFixed(1)} ms`);

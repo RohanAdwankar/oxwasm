@@ -26,7 +26,7 @@ for (const mnem of ['mul', 'imul']) {
   const code = new Uint8Array(0x1000); code.set(build(mnem));
   // the compiled wasm is identical for all operands — build it once
   const { wat, entryName } = compileFunctionWat(new Memory([{ base: CODE, bytes: code }]), CODE, { guestBase: CODE, ramBase: 0 });
-  writeFileSync('/tmp/mt.wat', wat); execFileSync('wat2wasm', ['/tmp/mt.wat', '-o', '/tmp/mt.wasm']);
+  writeFileSync('/tmp/mt.wat', wat); execFileSync('wat2wasm', ['--enable-tail-call', '/tmp/mt.wat', '-o', '/tmp/mt.wasm']);
   const mod = new WebAssembly.Module(readFileSync('/tmp/mt.wasm'));
   for (const a of vals) for (const b of vals) {
     // oracle: interpreter

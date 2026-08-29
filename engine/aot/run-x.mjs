@@ -60,7 +60,7 @@ let asmN = 0;
 const assembleWat = (wat) => {
   const w = `/tmp/rx_${process.pid}_${asmN++}`;
   writeFileSync(w + '.wat', wat);
-  execFileSync('wat2wasm', [w + '.wat', '-o', w + '.wasm']);
+  execFileSync('wat2wasm', ['--enable-tail-call', w + '.wat', '-o', w + '.wasm']);
   return new Uint8Array(readFileSync(w + '.wasm'));
 };
 

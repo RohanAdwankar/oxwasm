@@ -68,7 +68,7 @@ for (const name of ['vm1', 'vm2']) {
     console.log(`SETUP FAIL: ${name} compiled without a jump-table resolver`); process.exit(1);
   }
   writeFileSync(join(dir, name + '.wat'), unit.wat);
-  execFileSync('wat2wasm', [join(dir, name + '.wat'), '-o', join(dir, name + '.wasm')]);
+  execFileSync('wat2wasm', ['--enable-tail-call', join(dir, name + '.wat'), '-o', join(dir, name + '.wasm')]);
   const mod = new WebAssembly.Module(readFileSync(join(dir, name + '.wasm')));
   const entryName = 'f_' + entry.toString(16);
 

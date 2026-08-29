@@ -40,7 +40,7 @@ let pass = 0, fail = 0;
 for (const [name, body] of CASES) {
   const code = asm(body);
   const r = compileFunctionWat(new Memory([{ base: CODE, bytes: code }]), CODE, { guestBase: CODE, ramBase: 0 });
-  writeFileSync('/tmp/hnop.wat', r.wat); execFileSync('wat2wasm', ['/tmp/hnop.wat', '-o', '/tmp/hnop.wasm']);
+  writeFileSync('/tmp/hnop.wat', r.wat); execFileSync('wat2wasm', ['--enable-tail-call', '/tmp/hnop.wat', '-o', '/tmp/hnop.wasm']);
   const mod = new WebAssembly.Module(readFileSync('/tmp/hnop.wasm'));
   for (const a of vals) for (const b of [0n, 7n]) {
     const m = new Memory([{ base: CODE, bytes: code.slice() }]);

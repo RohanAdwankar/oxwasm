@@ -846,7 +846,7 @@ function sha1hex(str) {
         const WabtModule = new Function(src + '\\n;return (typeof WabtModule !== "undefined" ? WabtModule : wabt);')();
         const wabt = await WabtModule();
         eng.assembleWat = (wat) => {
-          const m = wabt.parseWat('unit.wat', wat);
+          const m = wabt.parseWat('unit.wat', wat, { tail_call: true });
           const bin = m.toBinary({}).buffer; m.destroy();
           return new Uint8Array(bin);
         };
@@ -1034,7 +1034,7 @@ async function inflate(b64) {
   // cache misses still assemble in-page via wabt; hits skip translation
   // entirely through eng.unitBytes (entry-keyed, wired after engine setup)
   const assembleWat = (wat) => {
-    const m = wabt.parseWat('unit.wat', wat);
+    const m = wabt.parseWat('unit.wat', wat, { tail_call: true });
     const bin = m.toBinary({}).buffer; m.destroy();
     return new Uint8Array(bin);
   };

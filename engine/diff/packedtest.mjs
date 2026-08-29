@@ -123,7 +123,7 @@ for (const opAsm of AOT_OPS) {
   let r;
   try { r = compileFunctionWat(new Memory([{ base: CODE, bytes: code }]), CODE, { guestBase: CODE, ramBase: 0 }); }
   catch (e) { console.log(`AOT SKIP ${opAsm}: ${e.message}`); continue; }
-  writeFileSync('/tmp/pk.wat', r.wat); execFileSync('wat2wasm', ['/tmp/pk.wat', '-o', '/tmp/pk.wasm']);
+  writeFileSync('/tmp/pk.wat', r.wat); execFileSync('wat2wasm', ['--enable-tail-call', '/tmp/pk.wat', '-o', '/tmp/pk.wasm']);
   const mod = new WebAssembly.Module(readFileSync('/tmp/pk.wasm'));
   for (const [a0, a1, b0, b1] of VECS) {
     const m = new Memory([{ base: CODE, bytes: code.slice() }]);

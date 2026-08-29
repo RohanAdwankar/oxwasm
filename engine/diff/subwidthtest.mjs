@@ -40,7 +40,7 @@ ret`;
       let r;
       try { r = compileFunctionWat(new Memory([{ base: CODE, bytes: code }]), CODE, { guestBase: CODE, ramBase: 0 }); }
       catch (e) { console.log(`SKIP ${op} ${regName}, 0x${imm.toString(16)}: ${e.message}`); continue; }
-      writeFileSync('/tmp/sw.wat', r.wat); execFileSync('wat2wasm', ['/tmp/sw.wat', '-o', '/tmp/sw.wasm']);
+      writeFileSync('/tmp/sw.wat', r.wat); execFileSync('wat2wasm', ['--enable-tail-call', '/tmp/sw.wat', '-o', '/tmp/sw.wasm']);
       const mod = new WebAssembly.Module(readFileSync('/tmp/sw.wasm'));
       for (const v of VALS) {
         const m = new Memory([{ base: CODE, bytes: code.slice() }]);

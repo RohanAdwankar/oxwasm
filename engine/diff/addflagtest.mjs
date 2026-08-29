@@ -26,7 +26,7 @@ for (const [regs, vals, S] of [[['rdi','rsi'], vals64, 8], [['edi','esi'], vals3
     let mod, entryName;
     try {
       const r = compileFunctionWat(new Memory([{ base: CODE, bytes: code }]), CODE, { guestBase: CODE, ramBase: 0 });
-      writeFileSync('/tmp/af.wat', r.wat); execFileSync('wat2wasm', ['/tmp/af.wat', '-o', '/tmp/af.wasm']);
+      writeFileSync('/tmp/af.wat', r.wat); execFileSync('wat2wasm', ['--enable-tail-call', '/tmp/af.wat', '-o', '/tmp/af.wasm']);
       mod = new WebAssembly.Module(readFileSync('/tmp/af.wasm')); entryName = r.entryName;
     } catch (e) { fail++; console.log(`COMPILE-FAIL ${mnem}.${cc}.S${S}: ${e.message}`); continue; }
     for (const a of vals) for (const b of vals) {

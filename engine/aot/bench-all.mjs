@@ -37,7 +37,7 @@ for (const c of CASES) {
   const mk = () => new LinuxEngine(elf, { argv:['k'], files:{}, memMB:1024 });
   const eng = mk();
   const { wat, entryName } = compileFunctionWat(eng.mem, entry, { guestBase:eng.base, ramBase:eng.RAMOFF });
-  writeFileSync('/tmp/ba.wat', wat); execFileSync('wat2wasm',['/tmp/ba.wat','-o','/tmp/ba.wasm']);
+  writeFileSync('/tmp/ba.wat', wat); execFileSync('wat2wasm',['--enable-tail-call','/tmp/ba.wat','-o','/tmp/ba.wasm']);
   const mod = new WebAssembly.Module(readFileSync('/tmp/ba.wasm'));
   const buf = eng.brk, SENT = 0xdeadbee0n;
   const envStubs = { syscall(){ throw new Error('escape'); }, callout(){ throw new Error('escape'); }, deopt(){ throw new Error('escape'); } };

@@ -69,7 +69,7 @@ for (const [name, body] of CASES) {
   let r;
   try { r = compileFunctionWat(new Memory([{ base: CODE, bytes: code }]), CODE, { guestBase: CODE, ramBase: 0 }); }
   catch (e) { fail++; console.log(`COMPILE-FAIL ${name}: ${e.message}`); continue; }
-  writeFileSync('/tmp/mb.wat', r.wat); execFileSync('wat2wasm', ['/tmp/mb.wat', '-o', '/tmp/mb.wasm']);
+  writeFileSync('/tmp/mb.wat', r.wat); execFileSync('wat2wasm', ['--enable-tail-call', '/tmp/mb.wat', '-o', '/tmp/mb.wasm']);
   const mod = new WebAssembly.Module(readFileSync('/tmp/mb.wasm'));
   for (const a of vals) for (const b of vals) {
     const mkcode = () => { const c = code.slice(); const dv = new DataView(c.buffer);

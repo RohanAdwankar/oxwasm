@@ -15,7 +15,7 @@ for (const insn of ['cmpsd', 'cmppd', 'cmpss', 'cmpps']) {
     let r;
     try { r = compileFunctionWat(new Memory([{ base: CODE, bytes: code }]), CODE, { guestBase: CODE, ramBase: 0 }); }
     catch (e) { console.log(`SKIP ${insn}/${pred}: ${e.message}`); fail++; continue; }
-    writeFileSync('/tmp/c2t.wat', r.wat); execFileSync('wat2wasm', ['/tmp/c2t.wat', '-o', '/tmp/c2t.wasm']);
+    writeFileSync('/tmp/c2t.wat', r.wat); execFileSync('wat2wasm', ['--enable-tail-call', '/tmp/c2t.wat', '-o', '/tmp/c2t.wasm']);
     const mod = new WebAssembly.Module(readFileSync('/tmp/c2t.wasm'));
     for (const [x, y] of PAIRS) {
       const xb = (f64(x) | (f64(8.5) << 64n)), yb = (f64(y) | (f64(8.5) << 64n));

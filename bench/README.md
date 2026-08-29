@@ -53,3 +53,23 @@ translator refuses (fxsave, movnti/sse e7, entries that begin
 undecodable), each interpreted in full per call (~33M interp steps).
 That is a translator-coverage item, not a dispatch item: the next
 multiplier lives in translating (or special-casing) those refusals.
+
+2026-08-30, after real wasm tail calls (`return_call_indirect` at tail-jmp
+sites; same box, single runs, ±30-50% variance):
+
+| test     | native | engine   | ratio | was    |
+|----------|--------|----------|-------|--------|
+| loop3M   | 106ms  | ~5500ms  | ~52x  | ~69x   |
+| dict300k | 40ms   | ~3500ms  | ~88x  | ~162x  |
+| str200k  | 34ms   | ~3100ms  | ~91x  | ~219x  |
+
+The diagnosis behind it: sampling the stack-budget word at interp time
+showed 99.5% of ALL residual interpretation ran with FTDEPTH saturated at
+its 1200 limit. `(return (call_indirect))` is not a tail call in core
+wasm — every computed-goto hop kept its frame live, one bytecode loop
+ratcheted the real stack (and the budget word) to the limit, and every
+dispatch thereafter was refused for the rest of the loop. With genuine
+tail calls the frame is replaced (tail sites hand back exactly their own
+entry tax), chains hold constant stack, and the residual collapsed:
+interp steps 19.1M -> 83k (230x), deopt round-trips 4.5k -> 0.5k,
+budget-saturated interp samples 99.5% -> 0%.

@@ -26,7 +26,7 @@ for (const [lo, hi] of [['add','adc'], ['sub','sbb']]) {
     try {
       const r = compileFunctionWat(new Memory([{ base: CODE, bytes: code }]), CODE, { guestBase: CODE, ramBase: 0 });
       if (r.wat.includes('(call $x_callout') || r.wat.includes('(drop (call $x_callout')) { fail++; console.log(`POISONED ${lo}/${hi}.${cc}`); continue; }
-      writeFileSync('/tmp/ac.wat', r.wat); execFileSync('wat2wasm', ['/tmp/ac.wat', '-o', '/tmp/ac.wasm']);
+      writeFileSync('/tmp/ac.wat', r.wat); execFileSync('wat2wasm', ['--enable-tail-call', '/tmp/ac.wat', '-o', '/tmp/ac.wasm']);
       mod = new WebAssembly.Module(readFileSync('/tmp/ac.wasm')); entryName = r.entryName;
     } catch (e) { fail++; console.log(`COMPILE-FAIL ${lo}/${hi}.${cc}: ${e.message}`); continue; }
     // rdi=aLo, rsi=bLo, rdx=aHi, rcx=bHi

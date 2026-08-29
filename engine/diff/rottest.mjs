@@ -18,7 +18,7 @@ for (const op of ['rol', 'ror']) for (const w of [1,2,4,8]) for (const cnt of [0
   let r;
   try { r = compileFunctionWat(new Memory([{ base: CODE, bytes: code }]), CODE, { guestBase: CODE, ramBase: 0 }); }
   catch (e) { console.log(`SKIP ${op}${w}/${cnt}: ${e.message}`); fail++; continue; }
-  writeFileSync('/tmp/rt.wat', r.wat); execFileSync('wat2wasm', ['/tmp/rt.wat', '-o', '/tmp/rt.wasm']);
+  writeFileSync('/tmp/rt.wat', r.wat); execFileSync('wat2wasm', ['--enable-tail-call', '/tmp/rt.wat', '-o', '/tmp/rt.wasm']);
   const mod = new WebAssembly.Module(readFileSync('/tmp/rt.wasm'));
   for (const v of VALS) {
     const m = new Memory([{ base: CODE, bytes: code.slice() }]); const cpu = new CPU(m);

@@ -31,7 +31,7 @@ let pass = 0, fail = 0;
 for (const [name, body] of CASES) {
   const code = asm(body);
   const r = compileFunctionWat(new Memory([{ base: CODE, bytes: code }]), CODE, { guestBase: CODE, ramBase: 0 });
-  writeFileSync('/tmp/lea.wat', r.wat); execFileSync('wat2wasm', ['/tmp/lea.wat', '-o', '/tmp/lea.wasm']);
+  writeFileSync('/tmp/lea.wat', r.wat); execFileSync('wat2wasm', ['--enable-tail-call', '/tmp/lea.wat', '-o', '/tmp/lea.wasm']);
   const mod = new WebAssembly.Module(readFileSync('/tmp/lea.wasm'));
   for (const a of vals) for (const b of [0n, 3n, 0x123n]) {
     const m = new Memory([{ base: CODE, bytes: code.slice() }]);

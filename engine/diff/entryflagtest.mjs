@@ -62,7 +62,7 @@ for (const [name, wantPoison, body] of CASES) {
   }
   if (err) { fail++; console.log(`FAIL ${name}: poisoned but should compile: ${err.message}`); continue; }
   // control: differential vs interpreter from the loop-head entry
-  writeFileSync('/tmp/ef.wat', r.wat); execFileSync('wat2wasm', ['/tmp/ef.wat', '-o', '/tmp/ef.wasm']);
+  writeFileSync('/tmp/ef.wat', r.wat); execFileSync('wat2wasm', ['--enable-tail-call', '/tmp/ef.wat', '-o', '/tmp/ef.wasm']);
   const mod = new WebAssembly.Module(readFileSync('/tmp/ef.wasm'));
   for (const [a, s, d] of [[5n, 3n, 50n], [0n, 1n, 10n], [100n, 7n, 100n], [1n, 1n, 4n]]) {
     const m = new Memory([{ base: CODE, bytes: code.slice() }]);

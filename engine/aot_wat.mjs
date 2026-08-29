@@ -1148,24 +1148,29 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   // exactly this frame's exit value.
   let usesFtr = false, usesFts = false;
   // Stack accounting is entry-tax-only: a function bumps FTDEPTH by its
-  // weight (frame size grows with function size — V8 spill slots) and NEVER
-  // decrements; instead every call site snapshots the word and restores it
-  // absolutely after the callee returns, which also erases whatever a TAIL
-  // chain under the callee accumulated (tail frames stay physically live
-  // under their successor, so a counted dec there would let mutual tail
-  // recursion pile real frames at net-zero depth — the bug this replaces).
+  // weight (frame size grows with function size — V8 spill slots) and never
+  // decrements on ret; instead every call site snapshots the word and
+  // restores it absolutely after the callee returns. Tail jumps are REAL
+  // wasm tail calls (return_call_indirect — the frame is physically
+  // replaced), so a tail site hands back exactly its own tax and the callee
+  // re-taxes at its own weight: an unbounded computed-goto chain (CPython's
+  // bytecode dispatch) holds constant real stack AND constant counted depth.
+  // With core-wasm `(return (call_indirect))` each hop kept its frame live,
+  // the word ratcheted to FTDLIMIT within one bytecode loop, and every
+  // dispatch thereafter was refused — 99.5% of residual interp ran with the
+  // budget word saturated (measured).
   const ftW = Math.min(96, Math.max(1, blocks.reduce((s, b) => s + b.insns.length, 0) >> 9));
   const ftOk  = `(i32.and (i32.lt_u (i32.load (i32.const ${FTDEPTH})) (i32.const ${FTDLIMIT})) (i32.ne (i32.load (i32.const ${FTFUEL})) (i32.const 0)))`;
   const ftHit = `(i32.and (i32.ge_s (local.get $fti) (i32.const 0)) ${ftOk})`;
   const ftBurn = `(i32.store (i32.const ${FTFUEL}) (i32.sub (i32.load (i32.const ${FTFUEL})) (i32.const 1)))`;
   const ftInc = `(i32.store (i32.const ${FTDEPTH}) (i32.add (i32.load (i32.const ${FTDEPTH})) (i32.const ${ftW})))`;
+  const ftDec = `(i32.store (i32.const ${FTDEPTH}) (i32.sub (i32.load (i32.const ${FTDEPTH})) (i32.const ${ftW})))`;
   const ftSave = () => { usesFts = true; return `(local.set $fts (i32.load (i32.const ${FTDEPTH})))`; };
   const ftRestore = `(i32.store (i32.const ${FTDEPTH}) (local.get $fts))`;
   const tailJmp = () => { usesFtr = true; return [
     `(local.set $fti (call $ftr (local.get $rex)))`,
     `(if ${ftHit}`,
-    // this frame's tax intentionally stays: it remains live under the callee
-    `  (then ${ftBurn} (return (call_indirect $ft (type $uft) (local.get $fti)))))`,
+    `  (then ${ftBurn} ${ftDec} (return_call_indirect $ft (type $uft) (local.get $fti))))`,
   ]; };
 
   function emitBlock(i) {

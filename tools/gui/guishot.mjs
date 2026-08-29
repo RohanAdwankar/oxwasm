@@ -21,7 +21,7 @@ const assembleWat = (wat) => {
   watMisses++;
   const w = `/tmp/gs_${process.pid}_${asmN++}`;
   writeFileSync(w + '.wat', wat);
-  execFileSync('wat2wasm', [w + '.wat', '-o', w + '.wasm']);
+  execFileSync('wat2wasm', ['--enable-tail-call', w + '.wat', '-o', w + '.wasm']);
   const bytes = new Uint8Array(readFileSync(w + '.wasm'));
   try { unlinkSync(w + '.wat'); unlinkSync(w + '.wasm'); } catch {}
   try { writeFileSync(cp, bytes); } catch {}

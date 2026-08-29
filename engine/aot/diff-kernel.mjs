@@ -17,7 +17,7 @@ function mkEngine(){ return new LinuxEngine(elf, { argv:['k'], files:{}, memMB: 
 const eng = mkEngine();
 const { wat, blocks, entryName } = compileFunctionWat(eng.mem, entry, { guestBase: eng.base, ramBase: eng.RAMOFF });
 writeFileSync('/tmp/dk.wat', wat);
-execFileSync('wat2wasm', ['/tmp/dk.wat', '-o', '/tmp/dk.wasm']);
+execFileSync('wat2wasm', ['--enable-tail-call', '/tmp/dk.wat', '-o', '/tmp/dk.wasm']);
 const mod = new WebAssembly.Module(readFileSync('/tmp/dk.wasm'));
 console.log(`[${sym}] ${blocks} blocks -> ${readFileSync('/tmp/dk.wasm').length} bytes wasm`);
 const envStubs = { syscall(){ throw new Error('unexpected syscall escape'); },
