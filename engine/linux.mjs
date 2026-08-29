@@ -298,7 +298,8 @@ export class LinuxEngine {
               const x = this.xmmview; const M = (1n << 64n) - 1n;
               for (let r = 0; r < 16; r++) { const v = this.cpu.xmm[r] || 0n;
                 x[r*2] = BigInt.asIntN(64, v & M); x[r*2+1] = BigInt.asIntN(64, (v >> 64n) & M); } }
-  syncIn()  { for (let r = 0; r < 16; r++) this.cpu.regs[r] = BigInt.asUintN(64, this.regview[r]);
+  syncIn()  { this._cleanSync = true;
+              for (let r = 0; r < 16; r++) this.cpu.regs[r] = BigInt.asUintN(64, this.regview[r]);
               this.cpu.fsBase = BigInt.asUintN(64, this.fsview[0]);
               const x = this.xmmview;
               for (let r = 0; r < 16; r++) this.cpu.xmm[r] = BigInt.asUintN(64, x[r*2]) | (BigInt.asUintN(64, x[r*2+1]) << 64n); }
@@ -307,6 +308,8 @@ export class LinuxEngine {
   // unwinds here and execution state is already in the regfile/guest stack.
   // Returns the rip to continue at.
   dispatchAot(f) {
+    this.stats.disp = (this.stats.disp || 0) + 1;
+    if (this._cleanSync) this.stats.dispClean = (this.stats.dispClean || 0) + 1;
     this.syncOut();
     try { const exit = f(); this.syncIn(); this.stats.aotRuns++;
       if (this.onProgress && this.stats.aotRuns % 4e6 === 0) this.onProgress('aot');
@@ -411,6 +414,7 @@ export class LinuxEngine {
                if (this.blocked) throw new BlockUnwind(this.cpu.rip);
                continue; }
       const before = this.cpu.rip;
+      this._cleanSync = false;
       const insn = this.cpu.step(); this.stats.interpreted++;
       branched = BRANCHY.has(insn.mnem) || this.cpu.rip !== this.cpu.ripNext && this.cpu.rip !== before + BigInt(insn.len);
       if (this.onProgress && this.stats.interpreted % 2e7 === 0) this.onProgress('callout');
@@ -1409,6 +1413,7 @@ export class LinuxEngine {
         const before = this.cpu.rip;
         if (this.ripTrace !== undefined) this.ripTrace[this.ripTraceI++ & 1023] = before;
         let insn;
+        this._cleanSync = false;
         try { insn = this.cpu.step(); }
         catch (e) { if (e === EXIT) break;
           if (e.pending) {                 // streamed page not here yet: rewind
