@@ -198,6 +198,23 @@ export class LinuxEngine {
       const unit = compileUnitWat(this.mem, entry, { guestBase: this.base, ramBase: this.RAMOFF });
       if (this.onUnitWat) this.onUnitWat(un, entry, unit);
       const bytes = this.assembleWat(unit.wat);
+      // asyncCompile (browser): hand the bytes to the engine's off-thread
+      // compiler instead of blocking this slice — execution stays interpreted
+      // until the instantiate resolves, then the unit's functions register.
+      // aotFns holds null meanwhile so profiling doesn't re-trigger; every
+      // dispatch site treats a null entry as not-compiled.
+      if (this.asyncCompile) {
+        this.aotFns.set(k, null);
+        WebAssembly.instantiate(bytes, { js: { mem: this.wmem }, env: this.aotEnv() })
+          .then(({ instance }) => {
+            for (const a of unit.funcs)
+              if (!this.aotFns.get(a)) this.aotFns.set(a, instance.exports['f_' + a.toString(16)]);
+            this.stats.tiers.aot = (this.stats.tiers.aot || 0) + 1;
+          })
+          .catch((e) => { this.aotFns.delete(k); this.aotFailed.add(k);
+                          if (this.onAotFail) this.onAotFail(entry, e.message); });
+        return;
+      }
       const inst = new WebAssembly.Instance(new WebAssembly.Module(bytes), { js: { mem: this.wmem }, env: this.aotEnv() });
       for (const a of unit.funcs) {
         const ak = a;

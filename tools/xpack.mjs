@@ -488,6 +488,7 @@ function sha1hex(str) {
           'LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu'],
     files, mtimes: CFG.mtimes, memMB: CFG.memMB, assembleWat, xserver: xs,
     aotCallThreshold: Infinity, aotLoopThreshold: Infinity });
+  eng.asyncCompile = true;                        // browser: compile units off-thread
   P.engineUp = performance.now();
   // ---- stream memory tiles straight into wasm memory ----
   {
@@ -568,9 +569,9 @@ function sha1hex(str) {
   let pumping = false;
   const poke = () => { if (window.__oxReady && !pumping && !timer) timer = setTimeout(pump, 0); };
   cv.addEventListener('pointermove', (e) => { if (!window.__oxReady) return; const [x, y] = pos(e); xs.injectMotion(x, y); poke(); });
-  cv.addEventListener('pointerdown', (e) => { if (!window.__oxReady) return; cv.focus({ preventScroll: true }); const [x, y] = pos(e); xs.injectMotion(x, y);
+  cv.addEventListener('pointerdown', (e) => { if (!window.__oxReady) return; inputQ.push(performance.now()); cv.focus({ preventScroll: true }); const [x, y] = pos(e); xs.injectMotion(x, y);
     xs.injectButton(e.button === 2 ? 3 : e.button === 1 ? 2 : 1, true); e.preventDefault(); poke(); });
-  cv.addEventListener('pointerup', (e) => { if (!window.__oxReady) return; xs.injectButton(e.button === 2 ? 3 : e.button === 1 ? 2 : 1, false); e.preventDefault(); poke(); });
+  cv.addEventListener('pointerup', (e) => { if (!window.__oxReady) return; inputQ.push(performance.now()); xs.injectButton(e.button === 2 ? 3 : e.button === 1 ? 2 : 1, false); e.preventDefault(); poke(); });
   cv.addEventListener('contextmenu', (e) => e.preventDefault());
   const KC = { Escape:9, Digit1:10, Digit2:11, Digit3:12, Digit4:13, Digit5:14, Digit6:15, Digit7:16,
     Digit8:17, Digit9:18, Digit0:19, Minus:20, Equal:21, Backspace:22, Tab:23,
@@ -583,31 +584,60 @@ function sha1hex(str) {
     F1:67,F2:68,F3:69,F4:70,F5:71,F6:72,F7:73,F8:74,F9:75,F10:76,
     ArrowUp:111, ArrowLeft:113, ArrowRight:114, ArrowDown:116,
     Home:110, End:115, PageUp:112, PageDown:117, Insert:118, Delete:119, ControlRight:105, AltRight:108 };
-  cv.addEventListener('keydown', (e) => { if (!window.__oxReady) return; const k = KC[e.code]; if (k) { xs.injectKey(k, true); e.preventDefault(); poke(); } });
+  cv.addEventListener('keydown', (e) => { if (!window.__oxReady) return; const k = KC[e.code]; if (k) { inputQ.push(performance.now()); xs.injectKey(k, true); e.preventDefault(); poke(); } });
   cv.addEventListener('keyup', (e) => { if (!window.__oxReady) return; const k = KC[e.code]; if (k) { xs.injectKey(k, false); e.preventDefault(); poke(); } });
 
-  // ---- engine pump ----
+  // ---- engine pump: time-budgeted slices, vsync'd paint ----
+  // Two things the browser gives us that no OS display server has: exact
+  // frame timing (requestAnimationFrame) and off-thread wasm compilation
+  // (eng.asyncCompile). The engine runs in ~12ms wall-clock slices so input
+  // is never stuck behind a long run; paints coalesce onto animation frames;
+  // window.__oxLat tracks per-event input->paint latency and worst pump slice
+  // so Nth-interaction latency is a measured number, not a feeling.
   const t0 = performance.now();
+  const LAT = window.__oxLat = { samples: 0, sumMs: 0, maxMs: 0, hist: new Array(12).fill(0), pumpMaxMs: 0 };
+  const inputQ = [];
+  let blitPending = false;
+  const scheduleBlit = () => {
+    if (blitPending) return;
+    blitPending = true;
+    requestAnimationFrame(() => {
+      blitPending = false;
+      blit();
+      const now = performance.now();
+      while (inputQ.length) {
+        const dt = now - inputQ.shift();
+        LAT.samples++; LAT.sumMs += dt; if (dt > LAT.maxMs) LAT.maxMs = dt;
+        LAT.hist[Math.min(11, Math.max(0, Math.floor(Math.log2(Math.max(1, dt)))))]++;
+      }
+    });
+  };
   function pump() {
     pumping = true;
     if (timer) { clearTimeout(timer); timer = null; }
-    for (let spins = 0; spins < 40; spins++) {
-      eng.run(2e6);
-      if (eng.exitCode !== null) break;
-      if (eng.blocked) break;
-    }
-    if (xs.dirty) blit();
+    const start = performance.now();
+    let mode = 'ran', deadline = null;
+    do {
+      eng.run(1e5);
+      if (eng.exitCode !== null) { mode = 'exit'; break; }
+      if (eng.blocked) {
+        deadline = eng.blocked.deadline;
+        eng.wake();
+        mode = deadline != null ? 'timed' : 'idle';
+        break;
+      }
+      mode = 'ran';
+    } while (performance.now() - start < 12);
+    const dur = performance.now() - start;
+    if (dur > LAT.pumpMaxMs) LAT.pumpMaxMs = dur;
+    if (xs.dirty) scheduleBlit();
     const s = eng.stats;
     stat.textContent = \`interp \${s.interpreted.toLocaleString()} · aot units \${s.tiers.aot||0} · \${((performance.now()-t0)/1000).toFixed(0)}s\`;
-    if (eng.exitCode !== null) { stat.innerHTML += eng.exitCode === 0 ? ' · <span class="ok">exit 0</span>' : \` · <span class="err">exit \${eng.exitCode}</span>\`; pumping = false; return; }
-    if (eng.blocked) {
-      const d = eng.blocked.deadline;
-      eng.wake();
-      if (d != null) { timer = setTimeout(pump, Math.max(0, Math.min(d - performance.now(), 250))); pumping = false; return; }
-      pumping = false; return;
-    }
-    timer = setTimeout(pump, 0);
     pumping = false;
+    if (mode === 'exit') { stat.innerHTML += eng.exitCode === 0 ? ' · <span class="ok">exit 0</span>' : \` · <span class="err">exit \${eng.exitCode}</span>\`; return; }
+    if (mode === 'timed') { timer = setTimeout(pump, Math.max(0, Math.min(deadline - performance.now(), 250))); return; }
+    if (mode === 'idle') return;                     // input pokes re-arm the pump
+    timer = setTimeout(pump, 0);
   }
   blit();
   window.__ox = { eng, xs, pump: () => pump() };
@@ -843,6 +873,7 @@ async function inflate(b64) {
           'XFILESEARCHPATH=/etc/X11/%T/%N%C:/etc/X11/%T/%N:/usr/lib/X11/%T/%N%C:/usr/lib/X11/%T/%N',
           'LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu'],
     files, mtimes: ${JSON.stringify(mtimes)}, memMB: ${memMB}, assembleWat, xserver: xs });
+  eng.asyncCompile = true;                        // browser: compile units off-thread
   const SNAP = ${snapAssets ? JSON.stringify(snapAssets) : 'null'};
   if (SNAP) {
     stat.textContent = 'restoring snapshot…';
@@ -905,9 +936,9 @@ async function inflate(b64) {
   // press->release seconds apart (GTK menus treat that as press-hold-dismiss)
   const poke = () => { if (window.__oxReady && !pumping && !timer) timer = setTimeout(pump, 0); };
   cv.addEventListener('pointermove', (e) => { const [x, y] = pos(e); xs.injectMotion(x, y); poke(); });
-  cv.addEventListener('pointerdown', (e) => { cv.focus({ preventScroll: true }); const [x, y] = pos(e); xs.injectMotion(x, y);
+  cv.addEventListener('pointerdown', (e) => { inputQ.push(performance.now()); cv.focus({ preventScroll: true }); const [x, y] = pos(e); xs.injectMotion(x, y);
     xs.injectButton(e.button === 2 ? 3 : e.button === 1 ? 2 : 1, true); e.preventDefault(); poke(); });
-  cv.addEventListener('pointerup', (e) => { xs.injectButton(e.button === 2 ? 3 : e.button === 1 ? 2 : 1, false); e.preventDefault(); poke(); });
+  cv.addEventListener('pointerup', (e) => { inputQ.push(performance.now()); xs.injectButton(e.button === 2 ? 3 : e.button === 1 ? 2 : 1, false); e.preventDefault(); poke(); });
   cv.addEventListener('contextmenu', (e) => e.preventDefault());
   const KC = { Escape:9, Digit1:10, Digit2:11, Digit3:12, Digit4:13, Digit5:14, Digit6:15, Digit7:16,
     Digit8:17, Digit9:18, Digit0:19, Minus:20, Equal:21, Backspace:22, Tab:23,
@@ -920,31 +951,57 @@ async function inflate(b64) {
     F1:67,F2:68,F3:69,F4:70,F5:71,F6:72,F7:73,F8:74,F9:75,F10:76,
     ArrowUp:111, ArrowLeft:113, ArrowRight:114, ArrowDown:116,
     Home:110, End:115, PageUp:112, PageDown:117, Insert:118, Delete:119, ControlRight:105, AltRight:108 };
-  cv.addEventListener('keydown', (e) => { const k = KC[e.code]; if (k) { xs.injectKey(k, true); e.preventDefault(); poke(); } });
+  cv.addEventListener('keydown', (e) => { const k = KC[e.code]; if (k) { inputQ.push(performance.now()); xs.injectKey(k, true); e.preventDefault(); poke(); } });
   cv.addEventListener('keyup', (e) => { const k = KC[e.code]; if (k) { xs.injectKey(k, false); e.preventDefault(); poke(); } });
 
-  // ---- engine pump with blocking support ----
+  // ---- engine pump: time-budgeted slices, vsync'd paint ----
+  // (see the sidecar shell for rationale: ~12ms slices keep input responsive
+  // whatever the JIT is doing; paints coalesce onto animation frames;
+  // window.__oxLat measures per-event input->paint latency)
   const t0 = performance.now();
+  const LAT = window.__oxLat = { samples: 0, sumMs: 0, maxMs: 0, hist: new Array(12).fill(0), pumpMaxMs: 0 };
+  const inputQ = [];
+  let blitPending = false;
+  const scheduleBlit = () => {
+    if (blitPending) return;
+    blitPending = true;
+    requestAnimationFrame(() => {
+      blitPending = false;
+      blit();
+      const now = performance.now();
+      while (inputQ.length) {
+        const dt = now - inputQ.shift();
+        LAT.samples++; LAT.sumMs += dt; if (dt > LAT.maxMs) LAT.maxMs = dt;
+        LAT.hist[Math.min(11, Math.max(0, Math.floor(Math.log2(Math.max(1, dt)))))]++;
+      }
+    });
+  };
   function pump() {
     pumping = true;
     if (timer) { clearTimeout(timer); timer = null; }
-    for (let spins = 0; spins < 40; spins++) {
-      eng.run(2e6);
-      if (eng.exitCode !== null) break;
-      if (eng.blocked) break;
-    }
-    if (xs.dirty) blit();
+    const start = performance.now();
+    let mode = 'ran', deadline = null;
+    do {
+      eng.run(1e5);
+      if (eng.exitCode !== null) { mode = 'exit'; break; }
+      if (eng.blocked) {
+        deadline = eng.blocked.deadline;
+        eng.wake();
+        mode = deadline != null ? 'timed' : 'idle';
+        break;
+      }
+      mode = 'ran';
+    } while (performance.now() - start < 12);
+    const dur = performance.now() - start;
+    if (dur > LAT.pumpMaxMs) LAT.pumpMaxMs = dur;
+    if (xs.dirty) scheduleBlit();
     const s = eng.stats;
     stat.textContent = \`interp \${s.interpreted.toLocaleString()} · aot units \${s.tiers.aot||0} · \${((performance.now()-t0)/1000).toFixed(0)}s\`;
-    if (eng.exitCode !== null) { stat.innerHTML += eng.exitCode === 0 ? ' · <span class="ok">exit 0</span>' : \` · <span class="err">exit \${eng.exitCode}</span>\`; pumping = false; return; }
-    if (eng.blocked) {
-      const d = eng.blocked.deadline;
-      eng.wake();
-      if (d != null) { timer = setTimeout(pump, Math.max(0, Math.min(d - performance.now(), 250))); pumping = false; return; }
-      pumping = false; return;                       // idle: input events poke the pump
-    }
-    timer = setTimeout(pump, 0);
     pumping = false;
+    if (mode === 'exit') { stat.innerHTML += eng.exitCode === 0 ? ' · <span class="ok">exit 0</span>' : \` · <span class="err">exit \${eng.exitCode}</span>\`; return; }
+    if (mode === 'timed') { timer = setTimeout(pump, Math.max(0, Math.min(deadline - performance.now(), 250))); return; }
+    if (mode === 'idle') return;                     // input pokes re-arm the pump
+    timer = setTimeout(pump, 0);
   }
   blit();
   pump();
