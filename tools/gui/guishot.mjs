@@ -183,6 +183,17 @@ eng.onProgress = (src) => {
 if (process.env.POLLWD) eng.debugPollAfter = +process.env.POLLWD;
 if (process.env.XSDBG) xs.dbgInput = +process.env.XSDBG;
 if (process.env.RIPTRACE) { eng.ripTrace = new Array(1024).fill(0n); eng.ripTraceI = 0; }
+// UNITVETO=libc.so.6+0x11bbb0,... : poison specific units to interp (bisect aid)
+if (process.env.UNITVETO) {
+  const vetoes = process.env.UNITVETO.split(',');
+  eng.unitFilter = (un, entry) => {
+    let s = null;
+    for (const m of eng.maps ?? []) if (entry >= m.at && entry < m.at + m.len)
+      { s = `${m.path.split('/').pop()}+0x${(entry - m.at + BigInt(m.fileOff)).toString(16)}`; break; }
+    if (s && vetoes.includes(s)) { console.error(`<unit vetoed: ${s}>`); return false; }
+    return true;
+  };
+}
 if (process.env.XSNOGRAB) xs.disableGrabs = true;
 if (process.env.CHAINSLOW) eng.chainSlow = true;
 if (process.env.SHADOW) eng.shadowLib = process.env.SHADOW;
