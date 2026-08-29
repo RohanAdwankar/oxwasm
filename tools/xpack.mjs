@@ -830,6 +830,35 @@ function sha1hex(str) {
         eng.cacheOnly = false;
         eng.aotFailed.clear();                        // cache-miss poisons get a real shot
         P.wabtReady = performance.now();
+        // Persist organic compiles per-origin (IndexedDB): what THIS user's
+        // paths made hot registers instantly on their next visit, so repeat
+        // visits skip the first-use warm-up entirely.
+        const idb = await new Promise((res) => { try { const r = indexedDB.open('oxunits', 1);
+          r.onupgradeneeded = () => r.result.createObjectStore('u');
+          r.onsuccess = () => res(r.result); r.onerror = () => res(null); } catch { res(null); } });
+        if (idb) {
+          const st = idb.transaction('u', 'readonly').objectStore('u');
+          const [keys, vals] = await new Promise((res) => {
+            const ks = st.getAllKeys(), vs = st.getAll();
+            vs.onsuccess = () => { ks.onsuccess = () => res([ks.result, vs.result]); ks.onerror = () => res([[], []]); };
+            vs.onerror = () => res([[], []]); });
+          let n = 0;
+          for (let i = 0; i < keys.length; i++) {
+            try {
+              const { instance } = await WebAssembly.instantiate(vals[i], { js: { mem: eng.wmem }, env: eng.aotEnv() });
+              for (const name of Object.keys(instance.exports))
+                if (name.startsWith('f_')) {
+                  const a = BigInt('0x' + name.slice(2));
+                  if (!eng.aotFns.get(a)) eng.aotFns.set(a, instance.exports[name]);
+                }
+              n++;
+            } catch {}
+          }
+          if (n) { eng.stats.tiers.aot = (eng.stats.tiers.aot || 0) + n; P.idbUnits = n; poke(); }
+          eng.onUnitBytes = (k, bytes) => {
+            try { idb.transaction('u', 'readwrite').objectStore('u').put(bytes, k.toString(16)); } catch {}
+          };
+        }
       }
     } catch (e) { console.warn('lazy assembler unavailable; capture-only units', e); }
   })();
