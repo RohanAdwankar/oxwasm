@@ -1549,7 +1549,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       // before body j, so `br $b{j}` lands at its start); only backward
       // edges pay the $pc + br_table dispatcher round-trip. Measured before:
       // 3044 of 3248 edges in a hot unit went through the dispatcher.
-      if (DISP) return j > i ? `(br $b${j})` : `(local.set $pc (i32.const ${j})) (br $L_disp)`;
+      if (DISP) return j > i ? `(br $b${j})` : j === i ? `(br $l${i})` : `(local.set $pc (i32.const ${j})) (br $L_disp)`;
       return `(br ${labelFor(j)})`; };
     const brTo = (j) => j === i+1 ? '' : goto(j);
     if (t.kind === 'jcc') {
@@ -1607,7 +1607,10 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     const tab = Array.from({length:N}, (_,k)=>'$b'+k).join(' ');
     wat += `      (br_table ${tab} $exit_disp (local.get $pc)))\n`;   // closes $b0
     for (let i=0;i<N;i++) {
-      wat += '      ' + bodies[i] + '\n';
+      // every body gets a free loop label so a self-edge (tight single-block
+      // loop — the hottest backward-edge kind) branches directly instead of
+      // paying the $pc + br_table dispatcher round-trip
+      wat += `      (loop $l${i}\n      ` + bodies[i] + ')\n';
       if (i < N-1) wat += `      )\n`;                                 // close $b${i+1}
     }
     wat += '    ))\n';                                                 // close loop + exit block
