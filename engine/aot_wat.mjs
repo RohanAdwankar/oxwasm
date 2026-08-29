@@ -938,6 +938,10 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       case 0x60: case 0x61: case 0x62: case 0x68: case 0x69: case 0x6A: {     // punpck l/h bw/wd/dq
         const EB = { 0x60:1,0x61:2,0x62:4,0x68:1,0x69:2,0x6A:4 }[op], high = op >= 0x68;
         put(`(i8x16.shuffle ${unpckIdx(EB, high).join(' ')} ${dst} ${xv(rm, next)})`); break; }
+      case 0x14: put(insn.p66 ? `(i8x16.shuffle 0 1 2 3 4 5 6 7 16 17 18 19 20 21 22 23 ${dst} ${xv(rm, next)})`     // unpcklpd (= punpcklqdq)
+                              : `(i8x16.shuffle 0 1 2 3 16 17 18 19 4 5 6 7 20 21 22 23 ${dst} ${xv(rm, next)})`); break;  // unpcklps
+      case 0x15: put(insn.p66 ? `(i8x16.shuffle 8 9 10 11 12 13 14 15 24 25 26 27 28 29 30 31 ${dst} ${xv(rm, next)})`   // unpckhpd (= punpckhqdq)
+                              : `(i8x16.shuffle 8 9 10 11 24 25 26 27 12 13 14 15 28 29 30 31 ${dst} ${xv(rm, next)})`); break;  // unpckhps
       case 0x6C: put(`(i8x16.shuffle 0 1 2 3 4 5 6 7 16 17 18 19 20 21 22 23 ${dst} ${xv(rm, next)})`); break;  // punpcklqdq
       case 0x6D: put(`(i8x16.shuffle 8 9 10 11 12 13 14 15 24 25 26 27 28 29 30 31 ${dst} ${xv(rm, next)})`); break; // punpckhqdq
       case 0x67: put(`(i8x16.narrow_i16x8_u ${dst} ${xv(rm, next)})`); break; // packuswb

@@ -42,6 +42,7 @@ self: jmp self`;
 const OPS2 = [   // op xmm0, xmm1
   'punpcklbw','punpckhbw','punpcklwd','punpckhwd','punpckldq','punpckhdq',
   'punpcklqdq','punpckhqdq','packuswb','packsswb','packssdw',
+  'unpcklps','unpckhps','unpcklpd','unpckhpd',
   'paddb','paddw','paddd','paddq','psubb','psubw','psubd','psubq',
   'paddsb','paddsw','paddusb','paddusw','psubsb','psubsw','psubusb','psubusw',
   'pmullw','pmulhw','pmulhuw','pmuludq','pmaddwd',

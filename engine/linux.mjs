@@ -487,7 +487,9 @@ export class LinuxEngine {
       // profile back-edges here too: a callout can nest arbitrarily deep and
       // run for millions of steps — without tier-up, everything under it
       // would stay interpreted forever (GIMP's babl LUT init lives here)
-      if (insn.mnem === 'jcc' && this.cpu.rip < before && this.inExec(this.cpu.rip)) {
+      // jmp too: a rotated loop's back-edge is an UNCONDITIONAL jump — the
+      // hot string-join loop in CPython interpreted 4M steps here invisibly
+      if ((insn.mnem === 'jcc' || insn.mnem === 'jmp') && this.cpu.rip < before && this.inExec(this.cpu.rip)) {
         const hk = this.cpu.rip;
         const n = (this.profile.get(hk) || 0) + 1;
         this.profile.set(hk, n);
@@ -1502,7 +1504,7 @@ export class LinuxEngine {
                             branched = true;
                             if (this.park()) continue; break; }
         if ((steps & 0xFFF) === 0 && this.sliceDeadline != null && performance.now() > this.sliceDeadline) break;
-        if (insn.mnem === 'jcc' && this.cpu.rip < before && this.inExec(this.cpu.rip)) {
+        if ((insn.mnem === 'jcc' || insn.mnem === 'jmp') && this.cpu.rip < before && this.inExec(this.cpu.rip)) {   // jmp: rotated-loop back-edge
           const hk = this.cpu.rip;
           const n = (this.profile.get(hk) || 0) + 1;
           this.profile.set(hk, n);
