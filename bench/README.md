@@ -28,3 +28,22 @@ the translated code itself is not the bottleneck). The planned fix is
 in-unit jump tables: trace the table load feeding `jmp *reg`, read the
 static table at translation time, and emit an in-wasm br_table over the
 targets that fall inside the unit, deopt for the rest.
+
+2026-08-29 later, after in-unit jump tables + wasm-to-wasm chaining
+(same box, single runs; run-to-run variance on this box is ±30-50%, so
+treat these as a band, not a point):
+
+| test     | native | engine   | ratio | was    |
+|----------|--------|----------|-------|--------|
+| loop3M   | 106ms  | ~7600ms  | ~72x  | 225x   |
+| dict300k | 40ms   | ~7800ms  | ~195x | 174x   |
+| str200k  | 34ms   | ~14000ms | ~410x | 331x   |
+
+The boundary traffic collapsed as designed — deopt round-trips
+42.7M → 4.7k, top-level regfile-sync dispatches → 0.5M, JS chain hops
+67M → ~0 — and loop3M (pure bytecode dispatch) got its 3x. dict/str
+moved little because their time is in callout MISSES: hot callees the
+translator refuses (fxsave, movnti/sse e7, entries that begin
+undecodable), each interpreted in full per call (~33M interp steps).
+That is a translator-coverage item, not a dispatch item: the next
+multiplier lives in translating (or special-casing) those refusals.
