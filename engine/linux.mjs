@@ -334,7 +334,17 @@ export class LinuxEngine {
       branched = BRANCHY.has(insn.mnem) || this.cpu.rip !== this.cpu.ripNext && this.cpu.rip !== before + BigInt(insn.len);
       if (this.onProgress && this.stats.interpreted % 2e7 === 0) this.onProgress('callout');
       if (this.exitCode !== null) throw EXIT;
-      if (this.blocked) { this.cpu.rip = before; throw new BlockUnwind(before); }
+      if (this.blocked) {
+        // Publish the interp's CURRENT state to the regfile before unwinding:
+        // dispatchAot's BlockUnwind catch does syncIn(), and without this it
+        // would resurrect the registers spilled at the callout entry — the
+        // thread would resume at the deep syscall rip with call-site rsp/args,
+        // and the next ret would pop a local (observed: a timespec's tv_sec)
+        // as a return address.
+        this.cpu.rip = before;
+        this.syncOut();
+        throw new BlockUnwind(before);
+      }
       // profile back-edges here too: a callout can nest arbitrarily deep and
       // run for millions of steps — without tier-up, everything under it
       // would stay interpreted forever (GIMP's babl LUT init lives here)
