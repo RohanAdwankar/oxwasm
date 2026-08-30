@@ -33,6 +33,33 @@ static uint64_t k_mem(uint64_t n, uint64_t *buf, uint64_t len) {
 // a multiply chain with no calls in it, which read as 0.9x and looked like
 // call/ret being faster than native.
 __attribute__((noinline)) static uint64_t leaf(uint64_t x) { return x * 2654435761u + 1; }
+
+// call1/call8/call64: the SAME call structure with callees of increasing
+// size. Two hypotheses about the call tax died on the assumption that its
+// cost was proportional to something per-call (the funcref lookup, then the
+// register spill set); neither moved the number. This separates the two
+// possible shapes directly. If the per-call cost is a FIXED frame charge,
+// the ratio falls towards the straight-line ratio as the callee grows and
+// the charge amortises. If it scales with the work around the call, it does
+// not.
+__attribute__((noinline)) static uint64_t leaf8(uint64_t x) {
+  for (int i = 0; i < 8; i++) x = x * 2654435761u + 1;
+  return x;
+}
+__attribute__((noinline)) static uint64_t leaf64(uint64_t x) {
+  for (int i = 0; i < 64; i++) x = x * 2654435761u + 1;
+  return x;
+}
+static uint64_t k_call8(uint64_t n) {
+  uint64_t s = 0;
+  for (uint64_t i = 0; i < n; i++) s += leaf8(i) ^ leaf8(s);
+  return s;
+}
+static uint64_t k_call64(uint64_t n) {
+  uint64_t s = 0;
+  for (uint64_t i = 0; i < n; i++) s += leaf64(i) ^ leaf64(s);
+  return s;
+}
 static uint64_t k_call(uint64_t n) {
   uint64_t s = 0;
   for (uint64_t i = 0; i < n; i++) s += leaf(i) ^ leaf(s);
@@ -71,6 +98,8 @@ int main(int argc, char **argv) {
   if (!strcmp(w, "alu"))         r = k_alu(n);
   else if (!strcmp(w, "mem"))    r = k_mem(n, buf, 1024);
   else if (!strcmp(w, "call"))   r = k_call(n);
+  else if (!strcmp(w, "call8"))  r = k_call8(n);
+  else if (!strcmp(w, "call64")) r = k_call64(n);
   else if (!strcmp(w, "branch")) r = k_branch(n);
   else if (!strcmp(w, "subw"))   r = k_subw(n);
   else if (!strcmp(w, "muldiv")) r = k_muldiv(n);
