@@ -1179,17 +1179,36 @@ export class XServer {
     if (!f) { this.error(conn, 7, 0, 47); return; }
     const lo = Math.max(32, f.minChar), hi = Math.min(255, f.maxChar);
     const n = hi - lo + 1;
-    this.reply(conn, 0, 0, 28 + n * 12, (r) => {
+    // XCreateFontSet checks a font's CHARSET_REGISTRY/CHARSET_ENCODING
+    // properties to decide it covers the locale's charset. Reporting none
+    // (as this did) makes every fontset fail — "Unable to load any usable
+    // fontset" — so Athena apps start but never paint any text.
+    const props = [
+      [this.atom('FONT'), this.atom(f._xlfd ?? '-misc-fixed-medium-r-normal--13-120-75-75-c-60-iso8859-1')],
+      [this.atom('CHARSET_REGISTRY'), this.atom('ISO8859')],
+      [this.atom('CHARSET_ENCODING'), this.atom('1')],
+      [this.atom('PIXEL_SIZE'), f.ascent + f.descent],
+      [this.atom('POINT_SIZE'), (f.ascent + f.descent) * 10],
+      [this.atom('RESOLUTION_X'), 75], [this.atom('RESOLUTION_Y'), 75],
+      [this.atom('SPACING'), this.atom('C')],
+      [this.atom('WEIGHT_NAME'), this.atom('medium')],
+      [this.atom('SLANT'), this.atom('R')],
+      [this.atom('FOUNDRY'), this.atom('misc')],
+      [this.atom('FAMILY_NAME'), this.atom('fixed')],
+    ];
+    const PB = 60, CB = PB + props.length * 8;              // props, then char infos
+    this.reply(conn, 0, 0, (CB - 32) + n * 12, (r) => {
       const put = (o, m) => { r.i16(o, m.lsb); r.i16(o + 2, m.rsb); r.i16(o + 4, m.width);
                               r.i16(o + 6, m.ascent); r.i16(o + 8, m.descent); r.u16(o + 10, 0); };
       put(8, f.minBounds);
       put(24, f.maxBounds);
       r.u16(40, lo); r.u16(42, hi); r.u16(44, f.defaultChar);
-      r.u16(46, 0); r.u8(48, 0); r.u8(49, 0); r.u8(50, 0); r.u8(51, 1);
+      r.u16(46, props.length); r.u8(48, 0); r.u8(49, 0); r.u8(50, 0); r.u8(51, 1);
       r.i16(52, f.ascent); r.i16(54, f.descent); r.u32(56, n);
+      props.forEach(([a, v], i) => { r.u32(PB + i * 8, a); r.u32(PB + i * 8 + 4, v); });
       for (let i = 0; i < n; i++) {
         const g = f.glyph(lo + i) ?? { lsb: 0, rsb: 0, width: 0, ascent: 0, descent: 0 };
-        put(60 + i * 12, g);
+        put(CB + i * 12, g);
       }
     });
   }
