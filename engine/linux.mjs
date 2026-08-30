@@ -1186,6 +1186,7 @@ export class LinuxEngine {
         this.fds.set(rfd, { pipe: buf, mode: 'r' });
         this.fds.set(wfd, { pipe: buf, mode: 'w' });
         if (nr === 293 && (Number(a2) & 0x80000)) { this.cloexec.add(rfd); this.cloexec.add(wfd); }
+        this.jsnap(a1, 8);
         const v = new DataView(this.wmem.buffer), o = this.RAMOFF + Number(a1 - this.base);
         v.setUint32(o, rfd, true); v.setUint32(o + 4, wfd, true);
         ret(0n); break; }
@@ -1573,7 +1574,7 @@ export class LinuxEngine {
           if (!c) { ret(-107n); break; }                      // ENOTCONN
           const data = c.read(Number(a3));
           if (data === null) { if (h.sock.nonblock) ret(-11n); else this.block(null); break; }
-          this.ram.set(data, Number(a2 - this.base));
+          this.jsnap(a2, data.length); this.ram.set(data, Number(a2 - this.base));
           ret(BigInt(data.length)); break;
         }
         if (h.ev) {                                           // eventfd: 8-byte counter
@@ -1590,6 +1591,7 @@ export class LinuxEngine {
           while (got < want && h.pipe.chunks.length) {
             const c = h.pipe.chunks[0], avail = c.length - h.pipe.off;
             const take = Math.min(avail, want - got);
+            this.jsnap(this.base + BigInt(dst), take);
             this.ram.set(c.subarray(h.pipe.off, h.pipe.off + take), dst);
             dst += take; got += take; h.pipe.off += take;
             if (h.pipe.off >= c.length) { h.pipe.chunks.shift(); h.pipe.off = 0; }
@@ -1604,6 +1606,7 @@ export class LinuxEngine {
           ret(BigInt(got)); break;
         }
         const n = Math.min(Number(a3), h.bytes.length - h.pos);
+        this.jsnap(a2, n);
         this.ram.set(h.bytes.subarray(h.pos, h.pos + n), Number(a2 - this.base));
         h.pos += n; ret(BigInt(n)); break; }
       case 3: { const cfd = Number(a1), ch = this.fds.get(cfd);
@@ -1693,13 +1696,13 @@ export class LinuxEngine {
         if (!h) { ret(-9n); break; }
         const fo = Number(cpu.regs[10]);
         const n = Math.min(Number(a3), Math.max(0, h.bytes.length - fo));
-        if (n > 0) this.ram.set(h.bytes.subarray(fo, fo + n), Number(a2 - this.base));
+        if (n > 0) { this.jsnap(a2, n); this.ram.set(h.bytes.subarray(fo, fo + n), Number(a2 - this.base)); }
         ret(BigInt(n)); break; }
       case 21: { const p = this.readPath(a1); ret(this.lookup(p) !== undefined || this.isDir(p) ? 0n : -2n); break; }   // access
       case 269: { const p = this.atPath(a1, a2); ret(this.lookup(p) !== undefined || this.isDir(p) ? 0n : -2n); break; }  // faccessat
       case 63: {                                              // uname
         const put = (o, s) => { const b = new TextEncoder().encode(s + '\0');
-          this.ram.set(b, Number(a1 - this.base) + o); };
+          this.jsnap(a1 + BigInt(o), b.length); this.ram.set(b, Number(a1 - this.base) + o); };
         this.ram.fill(0, Number(a1 - this.base), Number(a1 - this.base) + 390);
         put(0, 'Linux'); put(65, 'oxwasm'); put(130, '6.1.0'); put(195, '#1 oxwasm');
         put(260, 'x86_64'); ret(0n); break; }
@@ -1729,6 +1732,7 @@ export class LinuxEngine {
       case 79: {                                              // getcwd
         const b = new TextEncoder().encode((this.cwd ?? '/') + '\0');
         if (b.length > Number(a2)) { ret(-34n); break; }       // ERANGE
+        this.jsnap(a1, b.length);
         this.ram.set(b, Number(a1 - this.base)); ret(BigInt(b.length)); break; }
       case 80: {                                              // chdir
         const p = this.norm(this.readPath(a1));
@@ -1948,6 +1952,7 @@ export class LinuxEngine {
         if (!h?.sock?.conn) { ret(-88n); break; }
         const data = h.sock.conn.read(Number(a3));
         if (data === null) { if (h.sock.nonblock) ret(-11n); else this.block(null); break; }
+        this.jsnap(a2, data.length);
         this.ram.set(data, Number(a2 - this.base)); ret(BigInt(data.length)); break; }
       case 46: {                                              // sendmsg(fd, msghdr*, flags)
         const h = this.fds.get(Number(a1));
@@ -1982,7 +1987,7 @@ export class LinuxEngine {
         let off = 0;
         for (const [p, l] of list) { if (off >= data.length) break;
           const take = Math.min(l, data.length - off);
-          this.ram.set(data.subarray(off, off + take), Number(p - this.base)); off += take; }
+          this.jsnap(p, take); this.ram.set(data.subarray(off, off + take), Number(p - this.base)); off += take; }
         v.setBigUint64(mo + 40, 0n, true);                    // msg_controllen: no ancillary data
         v.setUint32(mo + 48, 0, true);                        // msg_flags
         ret(BigInt(data.length)); break; }
@@ -2003,14 +2008,14 @@ export class LinuxEngine {
           let off = 0;
           for (const [p, l] of list) { if (off >= data.length) break;
             const take = Math.min(l, data.length - off);
-            this.ram.set(data.subarray(off, off + take), Number(p - this.base)); off += take; }
+            this.jsnap(p, take); this.ram.set(data.subarray(off, off + take), Number(p - this.base)); off += take; }
           ret(BigInt(data.length)); break;
         }
         if (!h.bytes) { ret(-9n); break; }
         let got = 0;
         for (const [p, l] of list) {
           const n = Math.min(l, h.bytes.length - h.pos); if (n <= 0) break;
-          this.ram.set(h.bytes.subarray(h.pos, h.pos + n), Number(p - this.base));
+          this.jsnap(p, n); this.ram.set(h.bytes.subarray(h.pos, h.pos + n), Number(p - this.base));
           h.pos += n; got += n;
         }
         ret(BigInt(got)); break; }
@@ -2046,6 +2051,7 @@ export class LinuxEngine {
           : h.ev ? h.ev.count > 0n
           : !!h.bytes;                                        // regular file: always ready (EOF too)
         const base = this.RAMOFF + Number(a1 - this.base);
+        this.jsnap(a1, nfds * 8);                             // revents go back into the caller's array
         let ready = 0;
         for (let i = 0; i < nfds; i++) {
           const o = base + i * 8;
