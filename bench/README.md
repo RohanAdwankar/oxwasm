@@ -845,9 +845,16 @@ A/B'd properly. Same session, interleaved, `call` on a calibrated N:
 | narrowed spill/reload | 7.96x | +/-2% | ~5% |
 | full spill/reload     | 8.02x | +/-4% | ~3% |
 
-**0.75% apart, on a harness that can see 4%.** The change has no measurable
-effect even on the kernel built to expose it. Reverted again, and this time
-the negative is trustworthy rather than merely unproven.
+The full interleaved run (two pairs, alternating) finished after that
+conclusion was drawn and confirms it more strongly:
+
+    narrow 7.96x   full 8.02x
+    narrow 7.91x   full 7.91x
+
+The second pair is identical. Four measurements, no separation between the
+configurations at all — **on a harness that can see 4%.** The change has no
+measurable effect even on the kernel built to expose it. Reverted again, and
+this time the negative is trustworthy rather than merely unproven.
 
 So both hypotheses about the call tax are dead. It is not the funcref table
 (direct calls already bypass it) and it is not the register spill/reload
