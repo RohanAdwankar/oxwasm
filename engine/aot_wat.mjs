@@ -24,16 +24,21 @@ const SIGN = { 1: 0x80n, 2: 0x8000n, 4: 0x80000000n, 8: 0x8000000000000000n };
 // GIMP's 7,684 units), against 3.6-4.2ns for the hash. CPython's loop30M
 // resolves 297M times in an 11s run, so the ~12ns is seconds. Insertion
 // drops from an O(n) memmove to a store, which also cuts tier-up time.
-// The sorted array stays maintained at its old address alongside the hash:
-// a packed page ships prebuilt unit wasm whose $ftr binary-searches it, and
-// those units must keep resolving correctly against a newer engine. It can
-// be dropped once no prebuilt units predate the hash.
+// The hash REPLACES the sorted array that used to live at FTMAP+16; nothing
+// writes that region any more. A unit built before the hash binary-searches
+// it and would therefore misresolve against this engine, so a packed page
+// must be repacked when the resolver changes (demo/gimp is). FTMAP+16 up to
+// FTHASH is dead space, reclaimable together with the 8-byte-slot change
+// that would lift the unit ceiling — both need a repack, so they belong in
+// one step.
 export const FTMAP = 0x10000;        // u32 count at +0, u32 chain depth at +8, u32 fuel at +12
-export const FTMAP_MAX = 20000;      // array entries at +16 (16B each), now bounded to leave room
 export const FTHASH = 0x60000;       // hash slots: i64 key (guest addr, 0 = empty), i32 table slot, pad
-export const FTHBITS = 15, FTSLOTS = 1 << FTHBITS;   // 32768 slots * 16B = 512KB
+export const FTHBITS = 15, FTSLOTS = 1 << FTHBITS;   // 32768 slots * 16B = 512KB, ends below RAMOFF
 export const FTHMASK = FTSLOTS * 16 - 1;
 export const FTHBYTES = FTSLOTS * 16;
+// registered entries, capped to keep the load factor (here 61%) low enough
+// that linear probing stays short
+export const FTMAP_MAX = 20000;
 // Wasm calls nest real host-stack frames, so unlike native calls they can
 // blow the ~1MB stack under deep guest recursion — and a frame's size grows
 // with the FUNCTION's size (V8 spill slots), so post-jump-table units (one

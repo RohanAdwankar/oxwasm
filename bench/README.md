@@ -264,10 +264,13 @@ Landed as a hash table. loop30M end to end:
 like GIMP gains more than CPython does. Registration also drops from an
 O(n) memmove to a store, which cuts tier-up time.
 
-The sorted array is still maintained alongside the hash: a packed page
-ships prebuilt unit wasm whose `$ftr` binary-searches it, and those units
-must keep resolving correctly against a newer engine. It can be deleted
-once no prebuilt units predate the hash — which also removes the memmove.
+Correction to an earlier claim here: the hash REPLACED the sorted array
+rather than running alongside it — nothing writes `FTMAP+16` any more. A
+unit built before the hash binary-searches that region and would
+misresolve, so changing the resolver obliges a repack of any packed page.
+`demo/gimp` has been repacked. Nothing was broken in between, because
+every unit in every run measured here was compiled by the same engine that
+read it, but the window existed and the note was wrong.
 
 For scale, this is worth more than the register-passing call ABI (~13%)
 and cost a fraction of the risk: no ABI change, no flag day, no repack.
@@ -300,7 +303,6 @@ reported every interaction pinned at its 20s cap and burned 2.04 billion
 interpreted steps doing it. The app is idle exactly when it is blocked on
 a deadline that has not arrived yet.
 
-These are node-harness numbers. The packed page still ships prebuilt units
-whose $ftr is the old binary search, so it keeps the old latency until it
-is repacked — the retained sorted array is what makes those units correct
-against this engine meanwhile.
+These were node-harness numbers when first measured; `demo/gimp` has since
+been repacked onto the hash resolver (7,653 units), so the shipped page
+gets them too.
