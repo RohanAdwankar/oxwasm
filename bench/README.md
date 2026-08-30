@@ -767,3 +767,39 @@ at ~1-2% of runtime and dropped, but that was on loop30M, which is not
 call-heavy. Both numbers are right for their workload: the cost is
 negligible in a tight loop and dominant in call-dense code. The mistake was
 generalising the first measurement to the whole engine.
+
+### Narrowing the spill set: a negative result, and a noise floor
+
+The obvious follow-up to the above was implemented: compute each function's
+register footprint, close it transitively over direct callees, and at a
+direct call site spill and reload only what the callee can touch (full set
+retained on the `x_callout` fallback, which interprets and reads
+everything). It works — the emitted call to `leaf` went from nine spills and
+nine reloads to three and three — and the full differential suite passes.
+
+It is reverted anyway, because **it cannot be shown to help.** A/B in one
+session, same machine state:
+
+| kernel | narrowed | full |
+|--------|---------:|-----:|
+| call   | 12.3x | 11.1x |
+| alu (control, contains no calls) | 1.9x | 2.4x |
+
+The control moved 26% between the two halves — and neither mode can affect
+`alu`, which has no calls in it. Across four runs of nominally identical
+configurations, `call` has measured 9.5x, 7.8x, 12.3x and 11.1x. The
+run-to-run spread is larger than the effect, and what sign there is points
+the wrong way.
+
+So the honest state is: the mechanism is understood and the fix is written
+and correct, but unproven. Carrying a codegen change with
+silent-miscompilation surface for an unmeasurable gain is a bad trade, so it
+is out of the tree until the measurement can resolve it.
+
+**The blocker is now the harness, not the engine.** `run.mjs` reports the
+spread alongside the ratio (`+/-N%`) and takes REPS repeats, because a
+single figure hides how much of itself is noise — this change was very
+nearly accepted on a difference smaller than the variance of a kernel it
+could not touch. Before any further codegen work here, the harness needs to
+produce a number that can distinguish a 10% effect: more repetitions, pinned
+iteration counts, and ideally in-process A/B rather than separate runs.

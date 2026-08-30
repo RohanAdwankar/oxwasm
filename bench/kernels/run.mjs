@@ -45,21 +45,28 @@ const nativeOnce = (kernel, n) => {
 const N_HI = Number(process.env.N_HI || 20000000);
 const N_LO = Number(process.env.N_LO || 2000000);
 const kernels = (process.env.KERNELS || 'alu mem call branch subw muldiv').split(/\s+/);
-const best = (f, reps) => { let b = Infinity, out = null;
-  for (let i = 0; i < reps; i++) { const r = f(); if (r.ms < b) b = r.ms; out = r.out; }
-  return { ms: b, out }; };
+// Report the SPREAD, not just the best. A single figure hides how much of
+// itself is noise, and a codegen change was nearly accepted on a difference
+// smaller than the run-to-run variance of a kernel it could not affect.
+const best = (f, reps) => { let b = Infinity, w = 0, out = null;
+  for (let i = 0; i < reps; i++) { const r = f(); if (r.ms < b) b = r.ms; if (r.ms > w) w = r.ms; out = r.out; }
+  return { ms: b, worst: w, out }; };
 
 console.log('kernel      native(ms)  engine(ms)   ratio   (steady state, startup subtracted)');
 const rows = [];
 for (const k of kernels) {
   const nHi = best(() => nativeOnce(k, N_HI), 3), nLo = best(() => nativeOnce(k, N_LO), 3);
-  const eHi = best(() => runOnce(k, N_HI), 2),   eLo = best(() => runOnce(k, N_LO), 2);
+  const REPS = Number(process.env.REPS || 4);
+  const eHi = best(() => runOnce(k, N_HI), REPS), eLo = best(() => runOnce(k, N_LO), REPS);
   // the same answer in both worlds, or the comparison is meaningless
   if (nHi.out !== eHi.out) { console.log(`${k}: MISMATCH native=${nHi.out} engine=${eHi.out}`); continue; }
   const nat = nHi.ms - nLo.ms, eng = eHi.ms - eLo.ms;
   const ratio = eng / nat;
-  rows.push([k, nat, eng, ratio]);
-  console.log(`${k.padEnd(10)} ${nat.toFixed(1).padStart(10)} ${eng.toFixed(1).padStart(11)} ${ratio.toFixed(1).padStart(7)}x`);
+  // how much the engine's own repeats disagreed, as a fraction of the best
+  const jitter = ((eHi.worst - eHi.ms) / eHi.ms * 100);
+  rows.push([k, nat, eng, ratio, jitter]);
+  console.log(`${k.padEnd(10)} ${nat.toFixed(1).padStart(10)} ${eng.toFixed(1).padStart(11)} ` +
+              `${ratio.toFixed(1).padStart(7)}x  +/-${jitter.toFixed(0)}%`);
 }
 if (rows.length) {
   const rs = rows.map(r => r[3]).sort((a, b) => a - b);
