@@ -654,7 +654,16 @@ function sha1hex(str) {
   const pos = (e) => { const r = cv.getBoundingClientRect(); const s = scale();
     return [ (e.clientX - r.left) * s, (e.clientY - r.top) * s ]; };
   let pumping = false;
-  const poke = () => { if (window.__oxReady && !pumping && !timer) timer = setTimeout(pump, 0); };
+  // Input must CANCEL a pending guest-timer sleep, not defer to it. The old
+  // guard bailed out whenever a timer was set, so a click landing while the
+  // pump slept on a guest timer waited out the whole sleep (capped at 250ms)
+  // before the engine ran at all: measured warm menu opens sat at 272-289ms,
+  // with the occasional 54-63ms when the click happened to land mid-run.
+  const poke = () => {
+    if (!window.__oxReady || pumping) return;
+    if (timer) { clearTimeout(timer); timer = null; }
+    soon();
+  };
   // Motion coalescing (a real X server compresses MotionNotify): only the
   // LATEST pointer position is injected, once per pump slice — when the
   // engine falls behind, moves collapse instead of queueing a gesture-long
@@ -1164,7 +1173,16 @@ async function inflate(b64) {
   // defer: never run the engine synchronously inside an input handler — a
   // long pump would delay the matching pointerup, and the guest would see
   // press->release seconds apart (GTK menus treat that as press-hold-dismiss)
-  const poke = () => { if (window.__oxReady && !pumping && !timer) timer = setTimeout(pump, 0); };
+  // Input must CANCEL a pending guest-timer sleep, not defer to it. The old
+  // guard bailed out whenever a timer was set, so a click landing while the
+  // pump slept on a guest timer waited out the whole sleep (capped at 250ms)
+  // before the engine ran at all: measured warm menu opens sat at 272-289ms,
+  // with the occasional 54-63ms when the click happened to land mid-run.
+  const poke = () => {
+    if (!window.__oxReady || pumping) return;
+    if (timer) { clearTimeout(timer); timer = null; }
+    soon();
+  };
   cv.addEventListener('pointermove', (e) => { const [x, y] = pos(e); xs.injectMotion(x, y); poke(); });
   cv.addEventListener('pointerdown', (e) => { inputQ.push(performance.now()); cv.focus({ preventScroll: true }); const [x, y] = pos(e); xs.injectMotion(x, y);
     xs.injectButton(e.button === 2 ? 3 : e.button === 1 ? 2 : 1, true); e.preventDefault(); poke(); });
