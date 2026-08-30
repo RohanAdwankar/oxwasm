@@ -153,3 +153,33 @@ not is their class — a Command button versus an Xaw Text widget, whose
 Redisplay goes through a text source and sink and draws per computed line.
 The next thing to establish is whether that line table is being built at all,
 which is a question about Xaw internals rather than about the server.
+
+### What the terminal lane now runs
+
+Three programs, each exercising a different part of it:
+
+- **xterm**, driven by real keystrokes through the X server, round-trips a
+  whole session. Typing `echo hi` sends `"echo hi\n"` to the shell and brings
+  back `"# echo hi\nhi\r\n# "` — prompt, echo, output, next prompt. ICANON
+  held the line until Enter, ECHO returned the characters, ONLCR expanded the
+  shell's LF to CRLF.
+- **less** clears ICANON and ECHO through TCSETS, loads its terminfo entry,
+  draws 707 bytes of first screen (alternate screen, keypad mode, the file),
+  takes `q` as a single keystroke without waiting for Enter, and exits 0.
+- **nano** does the same with 76 escape sequences and a real editor UI —
+  "GNU nano 7.2", "[ Read 40 lines ]", and the `^G Help  ^O Write Out` bar —
+  and quits cleanly on Ctrl-X.
+
+The raw-mode cases matter because they are the half a shell session never
+reaches: single-character reads, terminfo, and a termios change made by one
+end of the pty being visible to the other.
+
+Getting here needed a correctness fix nothing else had surfaced. A vfork
+child runs in the PARENT's address space, and while its own stores were
+journaled, a syscall writes its RESULT straight into guest memory and
+bypassed the journal entirely. Two of those were live crashes — `ioctl
+TCGETS` put 36 bytes of termios over the parent's stack canary, and
+`readlink` wrote "/dev/pts/0" over a return address, faulting to
+`0x7374702f76656447`, that path in hex. The rest were latent, waiting for a
+program whose child happened to `read()` or `poll()` before exec.
+`engine/diff/jrnltest.mjs` pins the whole class.
