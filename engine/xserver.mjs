@@ -517,6 +517,9 @@ export class XServer {
     }
   }
   expose(w, x, y, ww, hh) {
+    if (process?.env?.XFONTTRACE)
+      console.error(`<xexpose 0x${w.id.toString(16)} ${ww}x${hh} mask=0x${(w.eventMask||0).toString(16)}`
+        + `${!w.conn ? ' NOCONN' : ''}${!(w.eventMask & 0x8000) ? ' NO-EXPOSUREMASK' : ''}>`);
     if (!w.conn || !(w.eventMask & 0x8000)) return;
     const e = new W(32);
     e.u8(0, 12); e.u16(2, w.conn.seq); e.u32(4, w.id);
@@ -536,6 +539,15 @@ export class XServer {
       if (op === 17) console.error(`<xfont GetAtomName ${v.getUint32(4, true)} -> ${this.atoms[v.getUint32(4, true)] ?? '(none)'}>`);
       else { let n = ''; const ln = v.getUint16(4, true); for (let i = 0; i < ln; i++) n += String.fromCharCode(req[8 + i]);
              console.error(`<xfont InternAtom "${n}">`); }
+    }
+    if (process?.env?.XFONTTRACE && (op === 74 || op === 76 || op === 75 || op === 77)) {
+      // what text actually reaches the server, and for which drawable
+      let t = '';
+      if (op === 76 || op === 77) { const n = req[1];
+        for (let i = 0; i < n; i++) t += String.fromCharCode(req[16 + (op === 77 ? i * 2 + 1 : i)]); }
+      else { const n = req[16];                       // first TEXTITEM8: len, delta, string
+        for (let i = 0; i < n && 18 + i < req.length; i++) t += String.fromCharCode(req[18 + i]); }
+      console.error(`<xtext op=${op} drawable=0x${v.getUint32(4, true).toString(16)} "${t}">`);
     }
     if (process?.env?.XFONTTRACE && op >= 45 && op <= 52) {
       const NM = { 45:'OpenFont', 46:'CloseFont', 47:'QueryFont', 48:'QueryTextExtents',
