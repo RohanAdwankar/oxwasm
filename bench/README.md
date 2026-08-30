@@ -73,3 +73,23 @@ tail calls the frame is replaced (tail sites hand back exactly their own
 entry tax), chains hold constant stack, and the residual collapsed:
 interp steps 19.1M -> 83k (230x), deopt round-trips 4.5k -> 0.5k,
 budget-saturated interp samples 99.5% -> 0%.
+
+## Steady state vs warmup
+
+The table numbers above run each test once in a fresh process, so they
+fold the whole tier-up pipeline (translate + assemble per unit) into the
+measured phase — a CPU profile of such a run is ~49% wat2wasm subprocess
+and ~17% translation. `pybench10.py` separates the two: it runs a warmup
+pass of each kernel first, then times a 10x-sized run, giving the
+marginal (steady-state) rate an interactive app sees after warmup:
+
+| test (10x, warmed) | native | engine  | ratio |
+|--------------------|--------|---------|-------|
+| loop30M            | 994ms  | ~9200ms | ~9.3x |
+| dict3M             | 380ms  | ~5700ms | ~15x  |
+| str2M              | 318ms  | ~4000ms | ~12.5x|
+
+A profile of the steady phase is ~40% wasm guest code, ~10% GC, ~20%
+process-startup retranslation, ~5% JS dispatch/callout glue — the
+remaining gap is translated-code quality (per-access address translation,
+flag materialization, block-boundary register traffic), not dispatch.
