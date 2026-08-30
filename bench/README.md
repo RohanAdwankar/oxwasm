@@ -1019,3 +1019,27 @@ straight-line code pays the charge more often per unit of native time than
 this ratio suggests, and one whose calls surround expensive instructions pays
 it less. The two programs here are far enough apart that the ordering is not
 in doubt; a number in the middle would need the timing done directly.
+
+### What shape the inliner has to be
+
+Before writing one: gzip's three hot callees, analyzed.
+
+| callee | insns | blocks | rets | calls |
+|--------|------:|-------:|-----:|------:|
+| `0x408ce0` |  66 |  **9** | 1 | 1 |
+| `0x405190` |  88 | **19** | 2 | 0 |
+| `0x404420` | 114 | **32** | 1 | 0 |
+
+The cheap version of this optimisation — splice single-block leaf callees,
+whose translation is a straight-line instruction list that can be pasted into
+the caller with no control flow to fix up — captures **none** of them. Not one
+of the three is a single block, and two have more than one `ret`.
+
+So the transform that is worth 20% of gzip is the expensive one: merge the
+callee's block graph into the caller's, renumber the RPO indices the dispatch
+loop branches on, and route every `ret` to a join block instead of a wasm
+return. That is a real change to `emitUnitFunction`, not a special case at the
+call site.
+
+Worth knowing before starting rather than after. The easy version would have
+compiled, passed the suite, and moved gzip by nothing.
