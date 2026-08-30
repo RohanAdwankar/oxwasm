@@ -53,9 +53,19 @@ const assembleWat = (wat) => {
 };
 
 const xs = new XServer({ width: 480, height: 200 });
+// A run that spins at full CPU with no new pixels is either still working or
+// stuck in a loop, and the two look identical from outside. Counting X
+// requests separates them: a stuck client repeats the same opcode forever.
+xs.countOps = true; xs.opCount = [];
 const eng = new LinuxEngine(files[bin], { argv:[bin, ...args],
   env:['DISPLAY=:0','PATH=/bin:/usr/bin','HOME=/root','LANG=C','SHELL=/bin/sh','TERM=xterm'],
   files, mtimes, memMB: 512, xserver: xs, tty: !!process.env.XSHOT_TTY, assembleWat });
+// XSHOT_POLLDBG=<seconds> — after that long, log what the guest is polling
+// on. A client spinning in poll() rather than blocking is the shape of an
+// unimplemented or wrongly-answered wait, and this names the fds and the
+// requested event mask.
+if (process.env.XSHOT_POLLDBG) eng.debugPollAfter = Number(process.env.XSHOT_POLLDBG) * 1000;
+
 const t0 = Date.now(); let painted = 0;
 // A cold Xt app can take many minutes to reach first paint, and a run that
 // only prints at the end loses everything if it is killed or the container
@@ -63,15 +73,39 @@ const t0 = Date.now(); let painted = 0;
 // as it goes, so a partial run is still worth something.
 const PROG = process.env.XSHOT_PROGRESS || '/tmp/xshot.progress';
 let lastProg = 0;
+// "Painted" means pixels that DIFFER FROM THE ROOT BACKGROUND. Counting
+// non-zero pixels reported the whole screen the moment flush() ran, since
+// flush fills it with the root colour — and before flush was called at all
+// it reported zero however much the client had drawn. Both readings were
+// artefacts of the probe, not of the app.
+const inked = () => {
+  try { xs.flush(); } catch {}
+  const bg = xs.root?.bgPixel ?? 0;
+  let n = 0;
+  for (let i = 0; i < xs.fb.length; i++) if (xs.fb[i] !== bg) n++;
+  return n;
+};
 const note = () => {
-  const nz = xs.fb.reduce((a, v) => a + (v !== 0 ? 1 : 0), 0);
+  const nz = inked();
   try { writeFileSync(PROG, `t=${((Date.now()-t0)/1000).toFixed(0)}s nonzero=${nz}px exit=${eng.exitCode} units=${watHits + watMisses}\n`
+    + 'xreqs: ' + (xs.opCount || []).map((n, op) => n ? op + 'x' + n : null).filter(Boolean)
+        .sort((a, b) => +b.split('x')[1] - +a.split('x')[1]).join(' ') + '\n'
+    + 'windows: ' + (() => { const out = [];
+        const walk = (w) => { if (!w) return;
+          if (w.mapped && w.cls !== 2) out.push(`${w.w}x${w.h}@${w.x},${w.y}${w._drawn ? '' : ' UNDRAWN'}`);
+          (w.children || []).forEach(walk); };
+        try { walk(xs.root); } catch {}
+        return out.slice(0, 10).join(' '); })() + '\n'
+    + 'xdiag: ' + (typeof xs.diag === 'function' ? xs.diag().join(' | ') : 'n/a') + '\n'
+    + 'syscalls: ' + Object.entries(eng.stats?.syscalls || {})
+        .sort((a, b) => b[1] - a[1]).slice(0, 8).map(([n, c]) => n + 'x' + c).join(' ')
+        + ` blocked=${!!eng.blocked}\n`
     + 'stderr: ' + JSON.stringify((eng.stderr || []).join('').slice(0, 600)) + '\n'); } catch {}
   return nz;
 };
 try { while (eng.exitCode === null && Date.now()-t0 < (Number(process.env.XSHOT_MS) || 120000)) {
   eng.run(2e7); if (eng.blocked) eng.wake();
-  const nz = xs.fb.reduce((a,v)=>a+(v!==0?1:0),0);
+  const nz = inked();
   if (Date.now() - lastProg > 5000) { lastProg = Date.now(); note(); }
   if (nz > 200) { painted = nz; break; }
 } } catch(e) { console.log('THREW:', e.message); }
@@ -80,10 +114,17 @@ console.log(`${bin}: exit=${eng.exitCode} painted=${painted}px in ${((Date.now()
 console.log('stderr:', JSON.stringify((eng.stderr||[]).join('').slice(0,300)));
 // render the framebuffer as coarse text so glyphs are checkable without a viewer
 if (painted) {
-  const bg = xs.fb[0];
+  // Two backgrounds matter: the root, and whatever the window is filled
+  // with. Marking every non-root pixel as ink renders the window as one
+  // solid block and hides the text inside it, which is the thing actually
+  // worth seeing. Treat the two most common colours as background.
+  const freq = new Map();
+  for (const v of xs.fb) freq.set(v, (freq.get(v) || 0) + 1);
+  const common = [...freq.entries()].sort((a, b) => b[1] - a[1]).slice(0, 2).map(e => e[0]);
+  const isBg = (v) => common.includes(v);
   let out = '';
   for (let y = 0; y < xs.H; y += 2) { let line = '';
-    for (let x = 0; x < xs.W; x += 1) line += xs.fb[y*xs.W+x] === bg ? ' ' : '#';
+    for (let x = 0; x < xs.W; x += 1) line += isBg(xs.fb[y*xs.W+x]) ? ' ' : '#';
     if (line.trim()) out += line.replace(/\s+$/,'') + '\n'; }
   writeFileSync('/tmp/xshot.txt', out);
   console.log(out.split('\n').slice(0, 40).join('\n'));

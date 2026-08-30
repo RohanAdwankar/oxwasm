@@ -614,9 +614,15 @@ export class XServer {
       case 8: {                                          // MapWindow
         const w = this.win(u32(4)); if (!w || w.mapped) break;
         w.mapped = true; this.dirty = true;
-        // a window that has never been drawn composites as a black slab while
-        // the guest renders (menus took ~1s to fill): hide it until first ink
-        if (!w._drawn) w._hideUntilDrawn = true;
+        // A window that has never been drawn composites as a black slab while
+        // the guest renders (menus took ~1s to fill), so it is hidden until
+        // first ink — but only when it has NO background. With a background
+        // pixel the buffer was already filled at creation, so there is
+        // nothing to hide and the window is legitimately just its background.
+        // Hiding those too suppressed every Athena toplevel (and, since
+        // flush() skips a hidden window's children, everything inside it):
+        // xmessage mapped, drew, and still composited to a bare root.
+        if (!w._drawn && w.bgNone) w._hideUntilDrawn = true;
         // on-screen placement: keep a managed toplevel's title strip reachable
         if (!this.noWM && !w.override && w.parent === this.rootId && w.conn && w.w >= 60) {
           const nx = Math.max(-(w.w - 40), Math.min(this.W - 40, w.x));
