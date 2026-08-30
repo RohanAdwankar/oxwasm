@@ -105,3 +105,17 @@ boundary crossings 23.1M -> 2,950 for the run):
 
 (loop30M is pure bytecode dispatch inside one unit — never callout-bound
 — so it moves only with translated-code quality; that is the open item.)
+
+## GIMP filter (subprocess) benchmark
+
+Filters>Blur>Blur on a 640x400 canvas in headless Chromium spawns the
+real plug-in binary as a subprocess and runs the full wire protocol
+(1197 tile messages). Wall-time progression as the subprocess engine
+matured: first working run 140s (plug-in fully interpreted) -> 100s
+(fork-window and CLOEXEC fixes) -> ~72s (child engine JITs organically —
+358 units, its interpreted steps 41.7M -> 4.0M — plus parent/child
+slice ping-pong). At 72s the pump profile shows the PARENT 94-98% busy
+in run slices: the remaining time is GIMP core's own tile/projection
+work executing at engine speed on paths the unit capture had never seen
+— a coverage item (capture the filter flow), then translated-code
+quality, not process machinery.
