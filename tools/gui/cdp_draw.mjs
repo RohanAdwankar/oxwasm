@@ -30,10 +30,22 @@ const guest=async(gx,gy)=>{ const r=JSON.parse(await q('JSON.stringify(document.
   const sx=r.width/1024; return [r.x+gx*sx, r.y+gy*sx]; };
 // count non-background pixels in the canvas area the strokes cross
 const inkCount = `(() => { const c=document.getElementById('screen').getContext('2d');
-  const d=c.getImageData(470,430,240,90).data; let n=0;
+  const d=c.getImageData(470,450,240,80).data; let n=0;
   for (let i=0;i<d.length;i+=4) if (d[i]<200||d[i+1]<200||d[i+2]<200) n++;
   return n; })()`;
 const resetLat = `(() => { const L=window.__oxLat; L.samples=0; L.sumMs=0; L.maxMs=0; L.hist=new Array(12).fill(0); return 1; })()`;
+
+// A fresh page has NO image open — just GIMP's empty "(untitled)" window,
+// where a stroke correctly draws nothing. Create one first (File > New >
+// OK), or this measures the latency of doing nothing.
+const click=async(gx,gy)=>{ const [x,y]=await guest(gx,gy);
+  await cmd('Input.dispatchMouseEvent',{type:'mouseMoved',x,y});
+  await cmd('Input.dispatchMouseEvent',{type:'mousePressed',x,y,button:'left',buttons:1,clickCount:1});
+  await cmd('Input.dispatchMouseEvent',{type:'mouseReleased',x,y,button:'left',buttons:0,clickCount:1}); };
+await click(424,383); await new Promise(r=>setTimeout(r,1200));   // File
+await click(452,422); await new Promise(r=>setTimeout(r,2500));   // New...
+await click(587,526); await new Promise(r=>setTimeout(r,4000));   // OK
+console.log('after File>New>OK:', await q('document.getElementById("stat").textContent'));
 
 const before = await q(inkCount);
 const rows = [];
