@@ -17,6 +17,7 @@ node multest.mjs
 node disptest.mjs
 node jtabtest.mjs
 node shelltest.mjs
+node gnutest.mjs
 node pushmemtest.mjs
 node callmemtest.mjs
 node packedtest.mjs
