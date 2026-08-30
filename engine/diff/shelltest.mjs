@@ -24,17 +24,23 @@ const script = 'x=$(echo 5 | tr 5 7); echo got $x; ' +
   'rm /tmp/f; find /tmp/d | sort | tr "\\n" " "; echo; cat /tmp/d/../d/dd/e; ' +
   // cwd (chdir/getcwd), touch (utimensat), and rm -r (rmdir/AT_REMOVEDIR)
   'cd /tmp/d && pwd; touch dd/t && ls dd | sort | tr "\\n" " "; echo; ' +
-  'rm -rf /tmp/d/dd && ls /tmp/d | wc -l';
+  'rm -rf /tmp/d/dd && ls /tmp/d | wc -l; ' +
+  // symlinks: to a file and to a directory, readlink, and unlinking the
+  // link rather than its target
+  'cd /; mkdir -p /tmp/s/sub; echo v > /tmp/s/sub/t; ln -s /tmp/s/sub /tmp/s/dl; ' +
+  'cat /tmp/s/dl/t; readlink /tmp/s/dl; find /tmp/s -type l | tr "\\n" " "; echo; ' +
+  'rm /tmp/s/dl && cat /tmp/s/sub/t';
 const eng = new LinuxEngine(bb, {
   argv: ['busybox', 'sh', '-c', script],
   env: ['PATH=/bin', 'HOME=/root'],
-  files: Object.fromEntries(['busybox', 'sh', 'tr', 'wc', 'cat', 'find', 'ls', 'touch', 'rm', 'mkdir'].map(n => ['/bin/' + n, bb])),
+  files: Object.fromEntries(['busybox', 'sh', 'tr', 'wc', 'cat', 'find', 'ls', 'touch', 'rm', 'mkdir', 'ln', 'readlink'].map(n => ['/bin/' + n, bb])),
   memMB: 256 });
 const t0 = Date.now();
 while (eng.exitCode === null && Date.now() - t0 < 120000) { eng.run(5e7); if (eng.blocked) eng.wake(); }
 const out = eng.stdout.join('');
 const want = 'got 7\nX1\nX2\nX3\nhi\n2\nHELLO\nstatus 0\n1\n' +
-  '/tmp/d /tmp/d/dd /tmp/d/dd/e \ny\n/tmp/d\ne t \n0\n';
+  '/tmp/d /tmp/d/dd /tmp/d/dd/e \ny\n/tmp/d\ne t \n0\n' +
+  'v\n/tmp/s/sub\n/tmp/s/dl \nv\n';
 if (eng.exitCode === 0 && out === want) {
   console.log('shell pipeline (busybox sh: fork/exec/pipes/wait/substitution/redirect) exact');
 } else {

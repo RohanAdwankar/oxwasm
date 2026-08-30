@@ -806,7 +806,29 @@ export class LinuxEngine {
     }
     return (abs ? '/' : '') + out.join('/') || (abs ? '/' : '.');
   }
-  lookup(p) { p = this.norm(p); return this.files[p]; }
+  // Follow symlinks component by component. Costs nothing until the guest
+  // actually makes one (packed sysroots are realpath'd at pack time), so the
+  // hot library-loading path keeps its plain map lookup.
+  resolve(p) {
+    const m = this._fsMeta();
+    if (!m.links.size) return p;
+    for (let hop = 0; hop < 40; hop++) {
+      const segs = p.split('/');
+      let cur = '', hit = false;
+      for (let i = 1; i < segs.length; i++) {
+        cur += '/' + segs[i];
+        const t = m.links.get(cur);
+        if (t === undefined) continue;
+        const base = t.charCodeAt(0) === 47 ? t : cur.slice(0, cur.lastIndexOf('/')) + '/' + t;
+        const rest = segs.slice(i + 1).join('/');
+        p = this.norm(rest ? base + '/' + rest : base);
+        hit = true; break;
+      }
+      if (!hit) return p;
+    }
+    return p;                                    // link loop: leave it dangling
+  }
+  lookup(p) { p = this.resolve(this.norm(p)); return this.files[p]; }
   // Shared fs metadata rides on the files object itself (non-enumerable, so
   // path listings skip it): child engines share `files` by reference, and a
   // busybox NOEXEC applet runs inside the PARENT engine — a per-engine dir
@@ -815,14 +837,14 @@ export class LinuxEngine {
   _fsMeta() {
     let m = this.files._meta;
     if (!m) Object.defineProperty(this.files, '_meta',
-      { value: m = { v: 0, dirs: new Set() }, configurable: true });
+      { value: m = { v: 0, dirs: new Set(), links: new Map() }, configurable: true });
     return m;
   }
   fsBump() { this._fsMeta().v++; }
   // a guest path is a directory iff some provided file lives under it,
   // or the guest mkdir'd it
   isDir(p) {
-    p = this.norm(p);
+    p = this.resolve(this.norm(p));
     if (p === '/' ) return true;
     const pre = p.endsWith('/') ? p : p + '/';
     const m = this._fsMeta();
@@ -851,6 +873,11 @@ export class LinuxEngine {
       const rest = d.slice(pre.length), i = rest.indexOf('/');
       if (rest) names.set(i < 0 ? rest : rest.slice(0, i), true);
     }
+    for (const l of this._fsMeta().links.keys()) {
+      if (!l.startsWith(pre)) continue;
+      const rest = l.slice(pre.length);
+      if (rest && rest.indexOf('/') < 0) names.set(rest, false);
+    }
     // every real directory has these; without them find's recursive walk
     // never terminates (it re-opens the parent forever) and rm -r/du misread
     // the tree
@@ -877,6 +904,24 @@ export class LinuxEngine {
   inoOf(p) { p = this.norm(p); this._inos ??= new Map(); let n = this._inos.get(p);
     if (n === undefined) { n = this._inos.size + 1000; this._inos.set(p, n); }
     return BigInt(n); }
+
+  // fill a struct stat (the by-path shape: dev/ino/nlink/mode/size/times)
+  writeStat(buf, path, size, mode) {
+    const off = this.RAMOFF + Number(buf - this.base);
+    new Uint8Array(this.wmem.buffer, off, 144).fill(0);
+    const v = new DataView(this.wmem.buffer);
+    v.setBigUint64(off + 0, 8n, true);                        // st_dev
+    v.setBigUint64(off + 8, this.inoOf(path), true);          // st_ino
+    v.setBigUint64(off + 16, 1n, true);                       // st_nlink
+    v.setUint32(off + 24, mode, true);                        // st_mode
+    v.setBigUint64(off + 48, BigInt(size), true);             // st_size
+    v.setBigUint64(off + 56, 4096n, true);                    // st_blksize
+    v.setBigUint64(off + 64, BigInt(Math.ceil(size / 512)), true);
+    const mt = BigInt(this.mtimeOf(path));
+    v.setBigUint64(off + 72, mt, true);                       // atime
+    v.setBigUint64(off + 88, mt, true);                       // mtime
+    v.setBigUint64(off + 104, mt, true);                      // ctime
+  }
 
   block(deadline) { this.blocked = { deadline: deadline ?? null }; }
   // host-side wake: mark every parked thread runnable. Safe because every
@@ -1274,7 +1319,9 @@ export class LinuxEngine {
         if (f === undefined) {
           if (this.isDir(p)) {                                // O_DIRECTORY / readdir scans
             const fd = this.allocFd();
-            this.fds.set(fd, { isdir: true, path: this.norm(p), pos: 0 });
+            // the RESOLVED path: listing a symlinked directory must enumerate
+            // what the link points at
+            this.fds.set(fd, { isdir: true, path: this.resolve(this.norm(p)), pos: 0 });
             ret(BigInt(fd)); break;
           }
           if (flags & 0x40) {                                 // O_CREAT: writable guest files
@@ -1288,7 +1335,8 @@ export class LinuxEngine {
         }
         const fd = this.allocFd();
         const wr = (flags & 3) !== 0;                         // O_WRONLY / O_RDWR
-        this.fds.set(fd, { bytes: f, pos: (flags & 0x400) ? f.length : 0, path: this.norm(p), writable: wr });
+        this.fds.set(fd, { bytes: f, pos: (flags & 0x400) ? f.length : 0,
+                           path: this.resolve(this.norm(p)), writable: wr });
         ret(BigInt(fd)); break; }
       case 0: {                                               // read(fd, buf, len)
         const fd = Number(a1), h = this.fds.get(fd);
@@ -1351,6 +1399,10 @@ export class LinuxEngine {
           if (p === '' && (cpu.regs[10] & 0x1000n)) {         // AT_EMPTY_PATH: stat the fd
             const h = this.fds.get(Number(a1));
             if (h) { size = h.bytes.length; mode = 0o100755; statPath = h.path ?? null; }
+          } else if ((cpu.regs[10] & 0x100n) && !p.endsWith('/') &&   // AT_SYMLINK_NOFOLLOW
+                     this._fsMeta().links.has(this.norm(p))) {
+            statPath = this.norm(p);
+            size = this._fsMeta().links.get(statPath).length; mode = 0o120777;
           } else {
             const f = this.lookup(p);
             if (f !== undefined) { size = f.length; mode = 0o100755; }
@@ -1389,26 +1441,18 @@ export class LinuxEngine {
         ret(0n); break; }
       case 4: case 6: {                                       // stat / lstat (by path)
         const p = this.readPath(a1);
+        // lstat does NOT follow a link — unless the path ends in '/', which
+        // POSIX says forces the target (find walks "dir/" that way)
+        if (nr === 6 && !p.endsWith('/')) {
+          const t = this._fsMeta().links.get(this.norm(p));
+          if (t !== undefined) { this.writeStat(a2, this.norm(p), t.length, 0o120777); ret(0n); break; }
+        }
         if (this.debugPollAfter != null && this.nowMs() > this.debugPollAfter) {
           if (this.nowMs() - (this._dbgStatLast ?? 0) > 5000) { this._dbgStatLast = this.nowMs();
             console.error(`<statwd thr=${this.threads?.[this.ti]?.id} ${nr===6?'lstat':'stat'} ${p}>`); } }
         const f = this.lookup(p);
         if (f === undefined && !this.isDir(p)) { ret(-2n); break; }   // ENOENT
-        const off = this.RAMOFF + Number(a2 - this.base);
-        new Uint8Array(this.wmem.buffer, off, 144).fill(0);
-        const v = new DataView(this.wmem.buffer);
-        const size = f ? f.length : 4096;
-        v.setBigUint64(off + 0, 8n, true);
-        v.setBigUint64(off + 8, this.inoOf(p), true);
-        v.setBigUint64(off + 16, 1n, true);
-        v.setUint32(off + 24, f ? 0o100755 : 0o040755, true);
-        v.setBigUint64(off + 48, BigInt(size), true);
-        v.setBigUint64(off + 56, 4096n, true);
-        v.setBigUint64(off + 64, BigInt(Math.ceil(size / 512)), true);
-        const mt = BigInt(this.mtimeOf(p));
-        v.setBigUint64(off + 72, mt, true);                   // st_atime
-        v.setBigUint64(off + 88, mt, true);                   // st_mtime
-        v.setBigUint64(off + 104, mt, true);                  // st_ctime
+        this.writeStat(a2, p, f ? f.length : 4096, f ? 0o100755 : 0o040755);
         ret(0n); break; }
       case 17: {                                              // pread64(fd, buf, count, off)
         const h = this.fds.get(Number(a1));
@@ -1430,6 +1474,11 @@ export class LinuxEngine {
         if (p === '/proc/self/exe') { const b = new TextEncoder().encode(this.argv0 || '/prog');
           this.ram.set(b.subarray(0, Number(a3)), Number(a2 - this.base));
           ret(BigInt(Math.min(b.length, Number(a3)))); break; }
+        const t = this._fsMeta().links.get(this.norm(p));
+        if (t !== undefined) { const b = new TextEncoder().encode(t);
+          const n = Math.min(b.length, Number(a3));
+          this.ram.set(b.subarray(0, n), Number(a2 - this.base));
+          ret(BigInt(n)); break; }
         ret(-22n); break; }                                   // EINVAL: not a symlink
       case 79: {                                              // getcwd
         const b = new TextEncoder().encode((this.cwd ?? '/') + '\0');
@@ -1550,7 +1599,9 @@ export class LinuxEngine {
       case 83: case 258: {                                    // mkdir / mkdirat
         const p = this.norm(this.readPath(nr === 83 ? a1 : a2));
         if (this.isDir(p) || this.files[p] !== undefined) { ret(-17n); break; } // EEXIST
-        this._fsMeta().dirs.add(p); this.fsBump(); ret(0n); break; }
+        this._fsMeta().dirs.add(p); this.fsBump();
+        if (this.mtimes) this.mtimes[p] = Math.floor(Date.now() / 1000);
+        ret(0n); break; }
       case 132: case 235: case 280: {                         // utime / utimes / utimensat
         // touch: utimensat must report ENOENT for a missing path (that is the
         // signal to create it with open(O_CREAT)) and succeed otherwise
@@ -1567,12 +1618,22 @@ export class LinuxEngine {
           this.mtimes[p] = secs;
         }
         ret(0n); break; }
+      case 88: case 266: {                                    // symlink / symlinkat
+        const target = this.readPath(a1);
+        const link = this.norm(this.readPath(nr === 88 ? a2 : a3));
+        if (this.files[link] !== undefined || this.isDir(link) ||
+            this._fsMeta().links.has(link)) { ret(-17n); break; }   // EEXIST
+        this._fsMeta().links.set(link, target); this.fsBump();
+        if (this.mtimes) this.mtimes[link] = Math.floor(Date.now() / 1000);
+        ret(0n); break; }
       case 84: {                                              // rmdir
         ret(BigInt(this.rmdirPath(this.norm(this.readPath(a1))))); break; }
       case 87: case 263: {                                    // unlink / unlinkat (open fds keep their buffer)
         const p = this.norm(this.readPath(nr === 87 ? a1 : a2));
         if (nr === 263 && (Number(a3) & 0x200)) {             // AT_REMOVEDIR (rm -r)
           ret(BigInt(this.rmdirPath(p))); break; }
+        const lm = this._fsMeta().links;
+        if (lm.has(p)) { lm.delete(p); this.fsBump(); ret(0n); break; }   // the link, not its target
         if (this.files[p] === undefined) { ret(this.isDir(p) ? -21n : -2n); break; }  // EISDIR
         delete this.files[p]; this.fsBump(); ret(0n); break; }
       case 77: {                                              // ftruncate(fd, len)
