@@ -46,15 +46,8 @@ export class LinuxEngine {
     // look like a terminal and carry termios state.
     this.tty = tty;
     this.ttyWin = { rows: ttyRows, cols: ttyCols };
-    this.termios = tty ? {
-      iflag: 0x500,          // ICRNL | IXON
-      oflag: 0x5,            // OPOST | ONLCR
-      cflag: 0xBF,           // B38400 | CS8 | CREAD
-      lflag: 0x8A3B,         // ISIG ICANON ECHO ECHOE ECHOK IEXTEN ECHOCTL
-      cc: (() => { const c = new Uint8Array(32);
-        c[0]=3; c[1]=28; c[2]=127; c[3]=21; c[4]=4; c[5]=0; c[6]=1;
-        c[8]=17; c[9]=19; c[10]=26; c[12]=18; c[13]=15; c[14]=23; c[15]=22; return c; })(),
-    } : null;
+    this.termios = tty ? LinuxEngine.defaultTermios() : null;
+    this.ptys = new Map();                    // pty number -> {m2s, s2m, termios, win}
     this.env = env;                           // "KEY=VALUE" strings
     // display/input layer: an X11-protocol server object (see xserver.mjs).
     // AF_UNIX connects to /tmp/.X11-unix/X* attach to it; its screen is the
@@ -813,6 +806,41 @@ export class LinuxEngine {
     return n === '/dev/tty' || n === '/dev/console' || n === '/dev/pts/0';
   }
 
+  static defaultTermios() {
+    return {
+      iflag: 0x500,          // ICRNL | IXON
+      oflag: 0x5,            // OPOST | ONLCR
+      cflag: 0xBF,           // B38400 | CS8 | CREAD
+      lflag: 0x8A3B,         // ISIG ICANON ECHO ECHOE ECHOK IEXTEN ECHOCTL
+      cc: (() => { const c = new Uint8Array(32);
+        c[0]=3; c[1]=28; c[2]=127; c[3]=21; c[4]=4; c[5]=0; c[6]=1;
+        c[8]=17; c[9]=19; c[10]=26; c[12]=18; c[13]=15; c[14]=23; c[15]=22; return c; })(),
+    };
+  }
+
+  // A pty is two pipe buffers crossed: what the master writes, the slave
+  // reads (the keyboard) and what the slave writes, the master reads (the
+  // screen). Both ends share one termios, so a TCSETS through either is
+  // visible to the other — which is the whole point of the pair.
+  //
+  // The handles carry `pipe` for their read side and `wpipe` for their write
+  // side, so read(2) and poll(2) treat a pty end exactly like a pipe and only
+  // write(2) needs to know the difference.
+  newPty() {
+    const n = this._ptyN = (this._ptyN ?? -1) + 1;
+    const pty = { n, m2s: { chunks: [], off: 0 }, s2m: { chunks: [], off: 0 },
+                  termios: LinuxEngine.defaultTermios(),
+                  win: { rows: this.ttyWin.rows, cols: this.ttyWin.cols } };
+    this.ptys.set(n, pty);
+    return pty;
+  }
+  ptmxHandle(pty) {
+    return { ptm: pty, istty: true, pipe: pty.s2m, wpipe: pty.m2s, path: '/dev/ptmx' };
+  }
+  ptsHandle(pty) {
+    return { pts: pty, istty: true, pipe: pty.m2s, wpipe: pty.s2m, path: '/dev/pts/' + pty.n };
+  }
+
   // syscall paths that read guest memory via this.ram bypass Memory's pend
   // guard; the ones that can plausibly source read-only file pages (path
   // strings, write/writev payloads) call this explicitly.
@@ -1048,6 +1076,24 @@ export class LinuxEngine {
       const bytes = this.ram.slice(Number(addr - this.base), Number(addr - this.base) + len);
       const h = defSink(fd);
       if (h?.sock?.conn) { h.sock.conn.write(bytes); this.wakeAllBlk(); return; }
+      if (h?.wpipe) {                                        // a pty end
+        const T = (h.ptm ?? h.pts).termios;
+        if (h.pts) {
+          // program output: OPOST|ONLCR turns a bare \n into \r\n, which is
+          // what makes a terminal's next line start at column 0
+          if ((T.oflag & 1) && (T.oflag & 4) && bytes.includes(10)) {
+            const out = [];
+            for (const b of bytes) { if (b === 10) out.push(13); out.push(b); }
+            h.wpipe.chunks.push(new Uint8Array(out));
+          } else h.wpipe.chunks.push(bytes);
+        } else {
+          // keyboard input: with ECHO set the terminal shows what was typed,
+          // so the same bytes also come back out the master's read side
+          h.wpipe.chunks.push(bytes);
+          if (T.lflag & 8) h.pipe.chunks.push(bytes.slice());
+        }
+        this.wakeAllBlk(); return;
+      }
       if (h?.pipe) { h.pipe.chunks.push(bytes); this.wakeAllBlk(); return; }
       if (h?.ev) {                                           // eventfd: add to the counter
         let v = 0n; for (let i = 7; i >= 0; i--) v = (v << 8n) | BigInt(bytes[i] ?? 0);
@@ -1157,11 +1203,12 @@ export class LinuxEngine {
         ret(BigInt(len)); break; }
       case 16: {                                             // ioctl
         const req = Number(a2 & 0xffffffffn), h = this.fds.get(Number(a1));
-        const isTty = this.tty && (Number(a1) <= 2 || h?.istty);
-        if (!isTty) { ret(-25n); break; }                    // ENOTTY
+        const pty = h?.ptm ?? h?.pts;                        // a pty end, either side
+        // a pty pair works whether or not the session has a console tty
+        if (!pty && !(this.tty && (Number(a1) <= 2 || h?.istty))) { ret(-25n); break; }   // ENOTTY
         const v = new DataView(this.wmem.buffer);
         const off = a3 ? this.RAMOFF + Number(a3 - this.base) : 0;
-        const T = this.termios;
+        const T = pty ? pty.termios : this.termios;
         switch (req) {
           // TCGETS/TCSETS use the KERNEL struct termios: four u32 flags, a
           // u8 c_line, then c_cc[19] — 36 bytes. glibc's user-facing termios
@@ -1183,13 +1230,28 @@ export class LinuxEngine {
             ret(0n); break; }
           case 0x5413: {                                     // TIOCGWINSZ
             if (!a3) { ret(-14n); break; }
-            v.setUint16(off + 0, this.ttyWin.rows, true); v.setUint16(off + 2, this.ttyWin.cols, true);
-            v.setUint16(off + 4, this.ttyWin.cols * 8, true); v.setUint16(off + 6, this.ttyWin.rows * 16, true);
+            const W = pty ? pty.win : this.ttyWin;
+            v.setUint16(off + 0, W.rows, true); v.setUint16(off + 2, W.cols, true);
+            v.setUint16(off + 4, W.cols * 8, true); v.setUint16(off + 6, W.rows * 16, true);
             ret(0n); break; }
-          case 0x5414:                                       // TIOCSWINSZ
-            if (a3) { this.ttyWin.rows = v.getUint16(off + 0, true) || 24;
-                      this.ttyWin.cols = v.getUint16(off + 2, true) || 80; }
-            ret(0n); break;
+          case 0x5414: {                                     // TIOCSWINSZ
+            const W = pty ? pty.win : this.ttyWin;
+            if (a3) { W.rows = v.getUint16(off + 0, true) || 24;
+                      W.cols = v.getUint16(off + 2, true) || 80; }
+            ret(0n); break; }
+          // ptmx-only: the number of the slave, and unlocking it. glibc's
+          // grantpt/unlockpt/ptsname sequence is TIOCSPTLCK then TIOCGPTN,
+          // and openpty/forkpty go straight to TIOCGPTPEER when it exists.
+          case 0x80045430:                                   // TIOCGPTN
+            if (!h?.ptm || !a3) { ret(-25n); break; }
+            v.setUint32(off, h.ptm.n, true); ret(0n); break;
+          case 0x40045431: ret(h?.ptm ? 0n : -25n); break;    // TIOCSPTLCK
+          case 0x5441: {                                     // TIOCGPTPEER
+            if (!h?.ptm) { ret(-25n); break; }
+            const fd = this.allocFd();
+            this.fds.set(fd, this.ptsHandle(h.ptm));
+            ret(BigInt(fd)); break; }
+          case 0x540E: ret(0n); break;                       // TIOCSCTTY
           case 0x540F: if (a3) v.setUint32(off, 1, true); ret(0n); break;   // TIOCGPGRP
           case 0x5410: ret(0n); break;                                      // TIOCSPGRP
           case 0x540B: ret(0n); break;                                      // TCFLSH
@@ -1406,6 +1468,20 @@ export class LinuxEngine {
         const flags = Number(nr === 257 ? a3 : a2);
         // the controlling terminal: a shell opens it to test for job control
         // and `tty` reports its name. Only present in terminal mode.
+        {
+          const np = this.norm(p);
+          if (np === '/dev/ptmx') {                          // allocate a pty pair
+            const fd = this.allocFd();
+            this.fds.set(fd, this.ptmxHandle(this.newPty()));
+            ret(BigInt(fd)); break;
+          }
+          const mp = /^\/dev\/pts\/(\d+)$/.exec(np);
+          if (mp && this.ptys.has(Number(mp[1]))) {          // the slave side
+            const fd = this.allocFd();
+            this.fds.set(fd, this.ptsHandle(this.ptys.get(Number(mp[1]))));
+            ret(BigInt(fd)); break;
+          }
+        }
         if (this.isTtyPath(p)) {
           const fd = this.allocFd();
           this.fds.set(fd, { sink: 'out', istty: true, path: '/dev/pts/0' });
