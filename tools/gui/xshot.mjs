@@ -3,7 +3,10 @@
 // the wrong signal.
 import { LinuxEngine } from '../../engine/linux.mjs';
 import { XServer } from '../../engine/xserver.mjs';
-import { readFileSync, readdirSync, lstatSync, realpathSync, writeFileSync } from 'node:fs';
+import { readFileSync, readdirSync, lstatSync, realpathSync, writeFileSync,
+         existsSync, mkdirSync, unlinkSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 const files = {}, mtimes = {};
 const add = (g,h)=>{ try { files[g]=new Uint8Array(readFileSync(h)); mtimes[g]=0; } catch{} };
@@ -28,10 +31,31 @@ add(bin, bin);
 // spawns a shell, so the binary under test is not the only one it needs.
 for (const p of (process.env.XSHOT_EXTRA || '').split(':').filter(Boolean)) add(p, p);
 if (!files[bin]) { console.log('absent:', bin); process.exit(0); }
+// Without an assembler the engine never tiers up and the whole run is the
+// interpreter — far slower, which made "does it paint yet" unanswerable on
+// any budget. Same cached wat2wasm as guishot; the cache is shared, so a
+// second run of the same app reuses the first run's compilation.
+const WATCACHE = new URL('./watcache/', import.meta.url).pathname;
+try { mkdirSync(WATCACHE, { recursive: true }); } catch {}
+let asmN = 0, watHits = 0, watMisses = 0;
+const assembleWat = (wat) => {
+  const h = createHash('sha1').update(wat).digest('hex');
+  const cp = WATCACHE + h + '.wasm';
+  if (existsSync(cp)) { watHits++; return new Uint8Array(readFileSync(cp)); }
+  watMisses++;
+  const w = `/tmp/xs_${process.pid}_${asmN++}`;
+  writeFileSync(w + '.wat', wat);
+  execFileSync('wat2wasm', ['--enable-tail-call', w + '.wat', '-o', w + '.wasm']);
+  const bytes = new Uint8Array(readFileSync(w + '.wasm'));
+  try { unlinkSync(w + '.wat'); unlinkSync(w + '.wasm'); } catch {}
+  try { writeFileSync(cp, bytes); } catch {}
+  return bytes;
+};
+
 const xs = new XServer({ width: 480, height: 200 });
 const eng = new LinuxEngine(files[bin], { argv:[bin, ...args],
   env:['DISPLAY=:0','PATH=/bin:/usr/bin','HOME=/root','LANG=C','SHELL=/bin/sh','TERM=xterm'],
-  files, mtimes, memMB: 512, xserver: xs, tty: !!process.env.XSHOT_TTY });
+  files, mtimes, memMB: 512, xserver: xs, tty: !!process.env.XSHOT_TTY, assembleWat });
 const t0 = Date.now(); let painted = 0;
 // A cold Xt app can take many minutes to reach first paint, and a run that
 // only prints at the end loses everything if it is killed or the container
@@ -41,7 +65,7 @@ const PROG = process.env.XSHOT_PROGRESS || '/tmp/xshot.progress';
 let lastProg = 0;
 const note = () => {
   const nz = xs.fb.reduce((a, v) => a + (v !== 0 ? 1 : 0), 0);
-  try { writeFileSync(PROG, `t=${((Date.now()-t0)/1000).toFixed(0)}s nonzero=${nz}px exit=${eng.exitCode}\n`
+  try { writeFileSync(PROG, `t=${((Date.now()-t0)/1000).toFixed(0)}s nonzero=${nz}px exit=${eng.exitCode} units=${watHits + watMisses}\n`
     + 'stderr: ' + JSON.stringify((eng.stderr || []).join('').slice(0, 600)) + '\n'); } catch {}
   return nz;
 };
