@@ -801,6 +801,18 @@ export class LinuxEngine {
   // trailing slashes are not part of a name: mkdir("/tmp/a/") and
   // stat("/tmp/a") must agree, and a dir recorded WITH one listed itself
   // as an empty-named child (find then walked "/tmp/a/" forever)
+  // *at syscalls: a RELATIVE path resolves against the directory fd, not the
+  // cwd. gzip (and modern coreutils generally) open the parent directory and
+  // then openat the basename, which is race-safe on a real kernel; ignoring
+  // dirfd turned that into a lookup of "/basename" and a bogus ENOENT.
+  atPath(dirfd, addr) {
+    const p = this.readPath(addr);
+    if (p.charCodeAt(0) === 47) return p;                 // absolute: dirfd irrelevant
+    const fd = Number(BigInt.asIntN(32, dirfd));
+    if (fd === -100) return p;                            // AT_FDCWD: norm() applies the cwd
+    const h = this.fds.get(fd);
+    return (h && h.isdir && h.path) ? h.path + '/' + p : p;
+  }
   norm(p) {
     // relative paths resolve against the process cwd (tar -C, configure
     // scripts, anything that chdir()s and then opens a bare name)
@@ -1324,7 +1336,7 @@ export class LinuxEngine {
         }
         ret(0n); break; }
       case 257: case 2: {                                     // openat(dirfd,path,flags) / open(path,flags)
-        const p = this.readPath(nr === 257 ? a2 : a1);
+        const p = nr === 257 ? this.atPath(a1, a2) : this.readPath(a1);
         const flags = Number(nr === 257 ? a3 : a2);
         let f = this.lookup(p);
         if (f === undefined) {
@@ -1406,7 +1418,7 @@ export class LinuxEngine {
         const isAt = nr === 262;
         let size = null, mode = 0o020620, statPath = null;    // default: char dev (tty)
         if (isAt) {
-          const p = this.readPath(a2);
+          const p = this.atPath(a1, a2);
           if (p === '' && (cpu.regs[10] & 0x1000n)) {         // AT_EMPTY_PATH: stat the fd
             const h = this.fds.get(Number(a1));
             if (h) { size = h.bytes.length; mode = 0o100755; statPath = h.path ?? null; }
@@ -1473,7 +1485,7 @@ export class LinuxEngine {
         if (n > 0) this.ram.set(h.bytes.subarray(fo, fo + n), Number(a2 - this.base));
         ret(BigInt(n)); break; }
       case 21: { const p = this.readPath(a1); ret(this.lookup(p) !== undefined || this.isDir(p) ? 0n : -2n); break; }   // access
-      case 269: { const p = this.readPath(a2); ret(this.lookup(p) !== undefined || this.isDir(p) ? 0n : -2n); break; }  // faccessat
+      case 269: { const p = this.atPath(a1, a2); ret(this.lookup(p) !== undefined || this.isDir(p) ? 0n : -2n); break; }  // faccessat
       case 63: {                                              // uname
         const put = (o, s) => { const b = new TextEncoder().encode(s + '\0');
           this.ram.set(b, Number(a1 - this.base) + o); };
@@ -1608,7 +1620,7 @@ export class LinuxEngine {
       case 110: ret(0n); break;                               // getppid
       case 186: ret(BigInt(this.threads[this.ti].id)); break;  // gettid
       case 83: case 258: {                                    // mkdir / mkdirat
-        const p = this.norm(this.readPath(nr === 83 ? a1 : a2));
+        const p = this.norm(nr === 83 ? this.readPath(a1) : this.atPath(a1, a2));
         if (this.isDir(p) || this.files[p] !== undefined) { ret(-17n); break; } // EEXIST
         this._fsMeta().dirs.add(p); this.fsBump();
         if (this.mtimes) this.mtimes[p] = Math.floor(Date.now() / 1000);
@@ -1618,7 +1630,7 @@ export class LinuxEngine {
         // signal to create it with open(O_CREAT)) and succeed otherwise
         const pa = nr === 280 ? a2 : a1;
         if (nr === 280 && pa === 0n) { ret(0n); break; }       // futimens on a fd
-        const p = this.norm(this.readPath(pa));
+        const p = this.norm(nr === 280 ? this.atPath(a1, pa) : this.readPath(pa));
         if (this.files[p] === undefined && !this.isDir(p)) { ret(-2n); break; }
         if (this.mtimes) {
           let secs = Math.floor(Date.now() / 1000);
@@ -1640,7 +1652,7 @@ export class LinuxEngine {
       case 84: {                                              // rmdir
         ret(BigInt(this.rmdirPath(this.norm(this.readPath(a1))))); break; }
       case 87: case 263: {                                    // unlink / unlinkat (open fds keep their buffer)
-        const p = this.norm(this.readPath(nr === 87 ? a1 : a2));
+        const p = this.norm(nr === 87 ? this.readPath(a1) : this.atPath(a1, a2));
         if (nr === 263 && (Number(a3) & 0x200)) {             // AT_REMOVEDIR (rm -r)
           ret(BigInt(this.rmdirPath(p))); break; }
         const lm = this._fsMeta().links;
