@@ -1260,6 +1260,7 @@ export class LinuxEngine {
           // "*** stack smashing detected ***", which is exactly what it is).
           case 0x5401: {                                     // TCGETS
             if (!a3) { ret(-14n); break; }
+            this.jsnap(a3, 36);
             v.setUint32(off + 0, T.iflag, true); v.setUint32(off + 4, T.oflag, true);
             v.setUint32(off + 8, T.cflag, true); v.setUint32(off + 12, T.lflag, true);
             v.setUint8(off + 16, 0);
@@ -1273,6 +1274,7 @@ export class LinuxEngine {
             ret(0n); break; }
           case 0x5413: {                                     // TIOCGWINSZ
             if (!a3) { ret(-14n); break; }
+            this.jsnap(a3, 8);
             const W = pty ? pty.win : this.ttyWin;
             v.setUint16(off + 0, W.rows, true); v.setUint16(off + 2, W.cols, true);
             v.setUint16(off + 4, W.cols * 8, true); v.setUint16(off + 6, W.rows * 16, true);
@@ -1287,6 +1289,7 @@ export class LinuxEngine {
           // and openpty/forkpty go straight to TIOCGPTPEER when it exists.
           case 0x80045430:                                   // TIOCGPTN
             if (!h?.ptm || !a3) { ret(-25n); break; }
+            this.jsnap(a3, 4);
             v.setUint32(off, h.ptm.n, true); ret(0n); break;
           case 0x40045431: ret(h?.ptm ? 0n : -25n); break;    // TIOCSPTLCK
           case 0x5441: {                                     // TIOCGPTPEER
@@ -1295,7 +1298,7 @@ export class LinuxEngine {
             this.fds.set(fd, this.ptsHandle(h.ptm));
             ret(BigInt(fd)); break; }
           case 0x540E: ret(0n); break;                       // TIOCSCTTY
-          case 0x540F: if (a3) v.setUint32(off, 1, true); ret(0n); break;   // TIOCGPGRP
+          case 0x540F: if (a3) { this.jsnap(a3, 4); v.setUint32(off, 1, true); } ret(0n); break;   // TIOCGPGRP
           case 0x5410: ret(0n); break;                                      // TIOCSPGRP
           case 0x540B: ret(0n); break;                                      // TCFLSH
           case 0x5409: ret(0n); break;                                      // TCSBRK
@@ -1703,6 +1706,7 @@ export class LinuxEngine {
       case 89: {                                              // readlink(path, buf, sz)
         const p = this.readPath(a1);
         if (p === '/proc/self/exe') { const b = new TextEncoder().encode(this.argv0 || '/prog');
+          this.jsnap(a2, Math.min(b.length, Number(a3)));
           this.ram.set(b.subarray(0, Number(a3)), Number(a2 - this.base));
           ret(BigInt(Math.min(b.length, Number(a3)))); break; }
         if (this.tty) {                                       // ttyname(): /proc/self/fd/N
@@ -1711,12 +1715,14 @@ export class LinuxEngine {
             if (Number(m[1]) <= 2 || h2?.istty) {
               const b2 = new TextEncoder().encode('/dev/pts/0');
               const n2 = Math.min(b2.length, Number(a3));
+              this.jsnap(a2, n2);
               this.ram.set(b2.subarray(0, n2), Number(a2 - this.base));
               ret(BigInt(n2)); break; } }
         }
         const t = this._fsMeta().links.get(this.norm(p));
         if (t !== undefined) { const b = new TextEncoder().encode(t);
           const n = Math.min(b.length, Number(a3));
+          this.jsnap(a2, n);
           this.ram.set(b.subarray(0, n), Number(a2 - this.base));
           ret(BigInt(n)); break; }
         ret(-22n); break; }                                   // EINVAL: not a symlink
