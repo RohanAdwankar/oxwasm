@@ -18,11 +18,25 @@ const xs = new XServer({ width: 480, height: 200 });
 const eng = new LinuxEngine(files[bin], { argv:[bin, ...args],
   env:['DISPLAY=:0','PATH=/bin:/usr/bin','HOME=/root','LANG=C'], files, mtimes, memMB: 512, xserver: xs });
 const t0 = Date.now(); let painted = 0;
+// A cold Xt app can take many minutes to reach first paint, and a run that
+// only prints at the end loses everything if it is killed or the container
+// restarts. Checkpoint progress to XSHOT_PROGRESS (default /tmp/xshot.progress)
+// as it goes, so a partial run is still worth something.
+const PROG = process.env.XSHOT_PROGRESS || '/tmp/xshot.progress';
+let lastProg = 0;
+const note = () => {
+  const nz = xs.fb.reduce((a, v) => a + (v !== 0 ? 1 : 0), 0);
+  try { writeFileSync(PROG, `t=${((Date.now()-t0)/1000).toFixed(0)}s nonzero=${nz}px exit=${eng.exitCode}\n`
+    + 'stderr: ' + JSON.stringify((eng.stderr || []).join('').slice(0, 600)) + '\n'); } catch {}
+  return nz;
+};
 try { while (eng.exitCode === null && Date.now()-t0 < (Number(process.env.XSHOT_MS) || 120000)) {
   eng.run(2e7); if (eng.blocked) eng.wake();
   const nz = xs.fb.reduce((a,v)=>a+(v!==0?1:0),0);
+  if (Date.now() - lastProg > 5000) { lastProg = Date.now(); note(); }
   if (nz > 200) { painted = nz; break; }
 } } catch(e) { console.log('THREW:', e.message); }
+note();
 console.log(`${bin}: exit=${eng.exitCode} painted=${painted}px in ${((Date.now()-t0)/1000).toFixed(1)}s`);
 console.log('stderr:', JSON.stringify((eng.stderr||[]).join('').slice(0,300)));
 // render the framebuffer as coarse text so glyphs are checkable without a viewer
