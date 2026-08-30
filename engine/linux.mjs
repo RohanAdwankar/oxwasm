@@ -787,16 +787,50 @@ export class LinuxEngine {
   readPath(addr) { let p = '', a = addr;
     for (;;) { const c = Number(this.mem.read(a, 1n)); if (!c) break; p += String.fromCharCode(c); a++; }
     return p; }
-  norm(p) { return p.replace(/\/{2,}/g, '/').replace(/\/\.\//g, '/').replace(/^\.\//, ''); }
+  // trailing slashes are not part of a name: mkdir("/tmp/a/") and
+  // stat("/tmp/a") must agree, and a dir recorded WITH one listed itself
+  // as an empty-named child (find then walked "/tmp/a/" forever)
+  norm(p) {
+    // relative paths resolve against the process cwd (tar -C, configure
+    // scripts, anything that chdir()s and then opens a bare name)
+    if (p.charCodeAt(0) !== 47 && this.cwd && this.cwd !== '/') p = this.cwd + '/' + p;
+    p = p.replace(/\/{2,}/g, '/');
+    if (!p.includes('.')) return p.length > 1 ? p.replace(/\/+$/, '') : p;   // fast path
+    const abs = p.charCodeAt(0) === 47;
+    const out = [];
+    for (const seg of p.split('/')) {
+      if (seg === '' || seg === '.') continue;
+      if (seg === '..') { if (out.length && out[out.length - 1] !== '..') out.pop();
+                          else if (!abs) out.push('..'); continue; }
+      out.push(seg);
+    }
+    return (abs ? '/' : '') + out.join('/') || (abs ? '/' : '.');
+  }
   lookup(p) { p = this.norm(p); return this.files[p]; }
-  // a guest path is a directory iff some provided file lives under it
+  // Shared fs metadata rides on the files object itself (non-enumerable, so
+  // path listings skip it): child engines share `files` by reference, and a
+  // busybox NOEXEC applet runs inside the PARENT engine — a per-engine dir
+  // cache with no cross-engine invalidation went stale the moment a shell
+  // redirect created a file under a previously-empty directory.
+  _fsMeta() {
+    let m = this.files._meta;
+    if (!m) Object.defineProperty(this.files, '_meta',
+      { value: m = { v: 0, dirs: new Set() }, configurable: true });
+    return m;
+  }
+  fsBump() { this._fsMeta().v++; }
+  // a guest path is a directory iff some provided file lives under it,
+  // or the guest mkdir'd it
   isDir(p) {
     p = this.norm(p);
     if (p === '/' ) return true;
     const pre = p.endsWith('/') ? p : p + '/';
-    if (this._dirset === undefined) {
+    const m = this._fsMeta();
+    if (this._dirset === undefined || this._dirsetV !== m.v) {
+      this._dirsetV = m.v;
       this._dirset = new Set();
-      for (const k of Object.keys(this.files)) {
+      for (const k of [...Object.keys(this.files), ...m.dirs]) {
+        if (m.dirs.has(k)) this._dirset.add(k);
         let i = 0;
         while ((i = k.indexOf('/', i + 1)) > 0) this._dirset.add(k.slice(0, i));
       }
@@ -812,7 +846,27 @@ export class LinuxEngine {
       const rest = k.slice(pre.length), i = rest.indexOf('/');
       if (i < 0) names.set(rest, false); else names.set(rest.slice(0, i), true);
     }
-    return [...names.entries()];
+    for (const d of this._fsMeta().dirs) {         // guest-created (possibly empty) dirs
+      if (!d.startsWith(pre)) continue;
+      const rest = d.slice(pre.length), i = rest.indexOf('/');
+      if (rest) names.set(i < 0 ? rest : rest.slice(0, i), true);
+    }
+    // every real directory has these; without them find's recursive walk
+    // never terminates (it re-opens the parent forever) and rm -r/du misread
+    // the tree
+    return [['.', true], ['..', true], ...names.entries()];
+  }
+  // rmdir/unlinkat(AT_REMOVEDIR): a directory exists either because files
+  // live under it or because the guest mkdir'd it, and is removable only when
+  // nothing is left inside (rm -r unlinks depth-first, then removes the dirs)
+  rmdirPath(p) {
+    if (this.files[p] !== undefined) return -20;              // ENOTDIR
+    if (!this.isDir(p)) return -2;                            // ENOENT
+    const pre = p + '/';
+    for (const k of Object.keys(this.files)) if (k.startsWith(pre)) return -39;   // ENOTEMPTY
+    const m = this._fsMeta();
+    for (const d of m.dirs) if (d.startsWith(pre)) return -39;
+    m.dirs.delete(p); this.fsBump(); return 0;
   }
   allocFd() { let fd = 0; while (this.fds.has(fd)) fd++; return fd; }
   nowMs() { return (typeof performance !== 'undefined') ? performance.now() : Date.now(); }
@@ -1040,7 +1094,7 @@ export class LinuxEngine {
           // (switchTo swaps it in only while the child is current, so other
           // threads' writes are untouched); exec/exit rolls it back.
           const t = { id: pid, cpu: c, state: 'run', dl: null, futex: null, ctid: 0n, _dl: null,
-                      proc: { pid, fds: new Map(this.fds), parent, jrnl: [] } };
+                      proc: { pid, fds: new Map(this.fds), parent, jrnl: [], cwd0: this.cwd ?? '/' } };
           this.threads.push(t);
           // Complete the parent's syscall (rax = pid, rip already past the
           // insn) and switch STRAIGHT to the child — blocking here would
@@ -1065,7 +1119,9 @@ export class LinuxEngine {
         ret(BigInt(tid)); break; }
       case 59: {                                             // execve(path, argv, envp)
         const t = this.threads[this.ti];
-        if (!t.proc) { ret(-38n); break; }                   // exec of the main process: unsupported
+        // the old image of a tail-exec'd main process re-steps its execve on
+        // every blocked-rewind resume: keep it parked, never exec twice
+        if (this._execed) { this.block(null); break; }
         const path = this.readPath(a1);
         const readVec = (p) => { const out = [];
           for (let i = 0n; ; i += 8n) { const sp = this.mem.read(p + i, 8n); if (sp === 0n) break;
@@ -1083,7 +1139,8 @@ export class LinuxEngine {
           aotCallThreshold: this.aotCallThreshold, aotLoopThreshold: this.aotLoopThreshold,
           xserver: this.xserver });
         const skipped = [];
-        for (const [fd, h] of t.proc.fds) {
+        const srcFds = t.proc ? t.proc.fds : this.fds;
+        for (const [fd, h] of srcFds) {
           // close-on-exec descriptors are NOT inherited; if one was the last
           // write end of a pipe (g_spawn's child-error-report pipe), readers
           // get EOF — the signal g_spawn's parent blocks on to learn the
@@ -1107,7 +1164,24 @@ export class LinuxEngine {
           ceng.unitBytes = (k) => cache.get(k.toString(16));
           ceng.onUnitBytes = (k, bytes) => cache.set(k.toString(16), bytes);
         }
+        ceng.cwd = this.cwd;                                 // exec inherits the cwd
         ceng.parentEng = this;
+        if (!t.proc) {
+          // Tail exec of the MAIN process (busybox sh execs the last command
+          // of a script in place): this engine can't replace its own image,
+          // so it becomes a pump for the replacement child — run() forwards
+          // slices to it and adopts its exit code.
+          const pid = (this.nextPid = (this.nextPid ?? 999) + 1);
+          const rec = { pid, eng: ceng, exited: null };
+          (this.children ??= []).push(rec);
+          this._execed = rec;
+          this._pipeEofSweep(skipped);
+          if (this.onSpawn) this.onSpawn(pid, path, argv);
+          t.state = 'dead';                                  // this image never resumes
+          // no ret(): a blocking syscall re-executes on resume, so rax must
+          // still hold the syscall number when the rewound insn re-steps
+          this.block(null); break;
+        }
         (this.children ??= []).push({ pid: t.proc.pid, eng: ceng, exited: null });
         t.state = 'dead';
         this._pipeEofSweep(skipped);
@@ -1205,7 +1279,7 @@ export class LinuxEngine {
           }
           if (flags & 0x40) {                                 // O_CREAT: writable guest files
             f = new Uint8Array(0);
-            this.files[this.norm(p)] = f;
+            this.files[this.norm(p)] = f; this.fsBump();
             if (this.mtimes) this.mtimes[this.norm(p)] = Math.floor(this.nowMs() / 1000);
           } else { ret(-2n); break; }                         // ENOENT
         } else if (flags & 0x200) {                           // O_TRUNC
@@ -1264,6 +1338,7 @@ export class LinuxEngine {
       case 8: {                                               // lseek
         const h = this.fds.get(Number(a1));
         if (!h) { ret(-9n); break; }
+        if (!h.bytes) { ret(-29n); break; }                   // pipe/sink/socket: ESPIPE
         const w = Number(a3);                                 // rdx = whence
         const off = BigInt.asIntN(64, a2);
         h.pos = w === 0 ? Number(off) : w === 1 ? h.pos + Number(off) : h.bytes.length + Number(off);
@@ -1357,8 +1432,19 @@ export class LinuxEngine {
           ret(BigInt(Math.min(b.length, Number(a3)))); break; }
         ret(-22n); break; }                                   // EINVAL: not a symlink
       case 79: {                                              // getcwd
-        const b = new TextEncoder().encode('/\0');
-        this.ram.set(b, Number(a1 - this.base)); ret(2n); break; }
+        const b = new TextEncoder().encode((this.cwd ?? '/') + '\0');
+        if (b.length > Number(a2)) { ret(-34n); break; }       // ERANGE
+        this.ram.set(b, Number(a1 - this.base)); ret(BigInt(b.length)); break; }
+      case 80: {                                              // chdir
+        const p = this.norm(this.readPath(a1));
+        if (this.files[p] !== undefined) { ret(-20n); break; } // ENOTDIR
+        if (!this.isDir(p)) { ret(-2n); break; }               // ENOENT
+        this.cwd = p; ret(0n); break; }
+      case 81: {                                              // fchdir
+        const h = this.fds.get(Number(a1));
+        if (!h) { ret(-9n); break; }
+        if (!h.isdir) { ret(-20n); break; }
+        this.cwd = h.path; ret(0n); break; }
       case 202: {                                             // futex
         const op = Number(a2) & 0x7f;
         if (op === 0 || op === 9) {                           // WAIT / WAIT_BITSET
@@ -1461,11 +1547,34 @@ export class LinuxEngine {
       case 28: ret(0n); break;                                // madvise
       case 110: ret(0n); break;                               // getppid
       case 186: ret(BigInt(this.threads[this.ti].id)); break;  // gettid
-      case 83: ret(0n); break;                                // mkdir: pretend created
+      case 83: case 258: {                                    // mkdir / mkdirat
+        const p = this.norm(this.readPath(nr === 83 ? a1 : a2));
+        if (this.isDir(p) || this.files[p] !== undefined) { ret(-17n); break; } // EEXIST
+        this._fsMeta().dirs.add(p); this.fsBump(); ret(0n); break; }
+      case 132: case 235: case 280: {                         // utime / utimes / utimensat
+        // touch: utimensat must report ENOENT for a missing path (that is the
+        // signal to create it with open(O_CREAT)) and succeed otherwise
+        const pa = nr === 280 ? a2 : a1;
+        if (nr === 280 && pa === 0n) { ret(0n); break; }       // futimens on a fd
+        const p = this.norm(this.readPath(pa));
+        if (this.files[p] === undefined && !this.isDir(p)) { ret(-2n); break; }
+        if (this.mtimes) {
+          let secs = Math.floor(Date.now() / 1000);
+          const tp = nr === 280 ? a3 : a2;                     // timespec[2] / timeval[2]
+          if (tp) { const v = this.mem.read(tp + 16n, 8n);     // [1] = mtime
+                    const ns = this.mem.read(tp + 24n, 8n);
+                    if (ns !== 0x3ffffffen) secs = Number(ns === 0x3fffffffn ? BigInt(secs) : v); }
+          this.mtimes[p] = secs;
+        }
+        ret(0n); break; }
+      case 84: {                                              // rmdir
+        ret(BigInt(this.rmdirPath(this.norm(this.readPath(a1))))); break; }
       case 87: case 263: {                                    // unlink / unlinkat (open fds keep their buffer)
         const p = this.norm(this.readPath(nr === 87 ? a1 : a2));
-        if (this.files[p] === undefined) { ret(-2n); break; }
-        delete this.files[p]; ret(0n); break; }
+        if (nr === 263 && (Number(a3) & 0x200)) {             // AT_REMOVEDIR (rm -r)
+          ret(BigInt(this.rmdirPath(p))); break; }
+        if (this.files[p] === undefined) { ret(this.isDir(p) ? -21n : -2n); break; }  // EISDIR
+        delete this.files[p]; this.fsBump(); ret(0n); break; }
       case 77: {                                              // ftruncate(fd, len)
         const h = this.fds.get(Number(a1));
         if (!h || h.bytes === undefined) { ret(-9n); break; }
@@ -1477,7 +1586,7 @@ export class LinuxEngine {
       case 82: {                                              // rename(old, new)
         const po = this.norm(this.readPath(a1)), pn = this.norm(this.readPath(a2));
         if (this.files[po] === undefined) { ret(-2n); break; }
-        this.files[pn] = this.files[po]; delete this.files[po]; ret(0n); break; }
+        this.files[pn] = this.files[po]; delete this.files[po]; this.fsBump(); ret(0n); break; }
       case 95: ret(0o022n); break;                            // umask
       case 137: case 138: {                                   // statfs / fstatfs: tmpfs-ish dummy
         const buf = a2, o = this.RAMOFF + Number(buf - this.base);
@@ -1710,6 +1819,9 @@ export class LinuxEngine {
   // Undo everything a vfork-window child wrote to the shared image (reverse
   // order), restoring the parent's memory to its at-fork state.
   _vforkRollback(t) {
+    // the vfork child runs IN this engine, so its chdir (tar -C, cd in a
+    // subshell) must not follow the parent out of the window
+    if (t.proc.cwd0 !== undefined) { this.cwd = t.proc.cwd0; t.proc.cwd0 = undefined; }
     const jr = t.proc.jrnl; if (!jr) return;
     for (let i = jr.length - 1; i >= 0; i--) {
       const [a, n, old, snap] = jr[i];
@@ -1764,6 +1876,13 @@ export class LinuxEngine {
   // messages made a mild blur take minutes). While either side makes
   // progress, keep alternating.
   run(maxSteps = 5e9) {
+    if (this._execed) {                // main process tail-exec'd: pump the replacement
+      this.pumpChildren();
+      const c = this._execed;
+      if (c.exited !== null) this.exitCode = c.exited;
+      else this.block(this.nowMs() + 2);
+      return 0;
+    }
     let out = this._run1(maxSteps);
     for (let round = 0; round < 64; round++) {
       if (this.exitCode !== null || !this.blocked) break;
