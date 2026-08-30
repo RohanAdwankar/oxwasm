@@ -803,3 +803,34 @@ nearly accepted on a difference smaller than the variance of a kernel it
 could not touch. Before any further codegen work here, the harness needs to
 produce a number that can distinguish a 10% effect: more repetitions, pinned
 iteration counts, and ideally in-process A/B rather than separate runs.
+
+### The harness, made trustworthy
+
+Fixed, and measured against itself:
+
+| | before | after |
+|---|---:|---:|
+| startup as a share of the measurement (`alu`) | 61% | 8.8% |
+| run-to-run spread | +/-168% | +/-4% |
+| **smallest effect it can resolve** | ~15% | **~4%** |
+
+Three changes got there. Iteration counts are now **calibrated per kernel**
+until steady-state work is at least 8x startup — one N could not serve
+kernels that differ tenfold in cost per iteration, and at a fixed N=40M
+`alu` was 61% startup, i.e. mostly timing the compiler. Each kernel gets a
+**warm-up run** that is discarded, so the wat cache and V8 are hot. And the
+**median of REPS** replaces best-of-2, which chases the one lucky run.
+
+The harness now ends by measuring one kernel twice under identical
+configuration and printing how far the two disagree. That number is its
+resolution, and any claimed effect smaller than it is noise. It is the check
+that would have stopped the spill-narrowing result being believed.
+
+Calibration is capped (`N_CAP`), because chasing the ratio without a ceiling
+made a run take longer than the work it was measuring; when the cap binds,
+the startup% column shows it.
+
+With this, `call` reads 7.71x, 8.13x, 7.80x on repeated runs — so the honest
+figure is **~8x**, not the 9.5x-12.3x the earlier harness produced across
+nominally identical configurations. The spill-narrowing change measured
+~11%, which this harness could now resolve; re-testing it is the next step.
