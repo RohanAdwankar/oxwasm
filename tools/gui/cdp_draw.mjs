@@ -26,8 +26,11 @@ for (let i=0;i<150;i++){ await new Promise(r=>setTimeout(r,200));
   if ((await cmd('Runtime.evaluate',{expression:'window.__oxPerf&&window.__oxPerf.unitsApplied!==undefined'})).result.value) break; }
 await new Promise(r=>setTimeout(r,3000));
 const q=async(e)=>(await cmd('Runtime.evaluate',{expression:e,returnByValue:true})).result.value;
-const guest=async(gx,gy)=>{ const r=JSON.parse(await q('JSON.stringify(document.getElementById("screen").getBoundingClientRect())'));
-  const sx=r.width/1024; return [r.x+gx*sx, r.y+gy*sx]; };
+// the canvas rect is fetched ONCE: doing a CDP round trip per move added
+// ~15ms of probe overhead to every step and swamped the engine's own cost
+const _rect = JSON.parse(await q('JSON.stringify(document.getElementById("screen").getBoundingClientRect())'));
+const _sx = _rect.width / 1024;
+const guest = async (gx, gy) => [_rect.x + gx * _sx, _rect.y + gy * _sx];
 // count non-background pixels in the canvas area the strokes cross
 const inkCount = `(() => { const c=document.getElementById('screen').getContext('2d');
   const d=c.getImageData(470,450,240,80).data; let n=0;

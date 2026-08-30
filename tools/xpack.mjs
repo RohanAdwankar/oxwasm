@@ -669,7 +669,10 @@ function sha1hex(str) {
   // engine falls behind, moves collapse instead of queueing a gesture-long
   // backlog (paint cores interpolate between points, strokes stay smooth).
   let pendingMove = null;
-  cv.addEventListener('pointermove', (e) => { if (!window.__oxReady) return; pendingMove = pos(e); poke(); });
+  // the timestamp rides with the position so latency is measured for the
+  // move actually INJECTED: coalescing drops the rest by design, and counting
+  // a dropped move as a slow paint would measure the wrong thing
+  cv.addEventListener('pointermove', (e) => { if (!window.__oxReady) return; const p = pos(e); p.t = performance.now(); pendingMove = p; poke(); });
   cv.addEventListener('pointerdown', (e) => { if (!window.__oxReady) return; inputQ.push(performance.now()); cv.focus({ preventScroll: true }); const [x, y] = pos(e); pendingMove = null; xs.injectMotion(x, y);
     xs.injectButton(e.button === 2 ? 3 : e.button === 1 ? 2 : 1, true); e.preventDefault(); poke(); });
   cv.addEventListener('pointerup', (e) => { if (!window.__oxReady) return; inputQ.push(performance.now()); if (pendingMove) { xs.injectMotion(pendingMove[0], pendingMove[1]); pendingMove = null; } xs.injectButton(e.button === 2 ? 3 : e.button === 1 ? 2 : 1, false); e.preventDefault(); poke(); });
@@ -734,7 +737,7 @@ function sha1hex(str) {
     { if (inputQ.length) lastInputT = inputQ[inputQ.length - 1];
       const busy = (typeof pendingMove !== 'undefined' && pendingMove != null) || start - lastInputT < 2000;
       eng.tierMsMax = busy ? 2 : (xs.ptr.buttons ? 2 : 8); }   // never 0: a hot uncompiled entry must be able to compile its way out mid-interaction
-    if (typeof pendingMove !== 'undefined' && pendingMove) { xs.injectMotion(pendingMove[0], pendingMove[1]); pendingMove = null; }
+    if (typeof pendingMove !== 'undefined' && pendingMove) { if (pendingMove.t !== undefined) inputQ.push(pendingMove.t); xs.injectMotion(pendingMove[0], pendingMove[1]); pendingMove = null; }
     eng.sliceDeadline = start + 12;                  // honored INSIDE run(): deep callouts preempt too
     eng.chainFuel = 2048;                            // in-wasm chains re-check the clock every ~2k calls
     let mode = 'ran', deadline = null;
@@ -1245,7 +1248,7 @@ async function inflate(b64) {
     { if (inputQ.length) lastInputT = inputQ[inputQ.length - 1];
       const busy = (typeof pendingMove !== 'undefined' && pendingMove != null) || start - lastInputT < 2000;
       eng.tierMsMax = busy ? 2 : (xs.ptr.buttons ? 2 : 8); }   // never 0: a hot uncompiled entry must be able to compile its way out mid-interaction
-    if (typeof pendingMove !== 'undefined' && pendingMove) { xs.injectMotion(pendingMove[0], pendingMove[1]); pendingMove = null; }
+    if (typeof pendingMove !== 'undefined' && pendingMove) { if (pendingMove.t !== undefined) inputQ.push(pendingMove.t); xs.injectMotion(pendingMove[0], pendingMove[1]); pendingMove = null; }
     eng.sliceDeadline = start + 12;                  // honored INSIDE run(): deep callouts preempt too
     eng.chainFuel = 2048;                            // in-wasm chains re-check the clock every ~2k calls
     let mode = 'ran', deadline = null;

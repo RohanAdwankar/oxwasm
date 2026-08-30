@@ -406,3 +406,39 @@ Two lessons worth keeping. The page is now FASTER than the node harness
 numbers — harness figures were pessimistic, not optimistic. And a bug
 living only in the shell is invisible to every engine-level measurement,
 however careful: the artifact has to be measured as the artifact.
+
+## Drawing: strokes in the page
+
+The paint path takes different scheduling than a menu click — motion is
+coalesced to the latest position per pump slice — so it needs its own
+probe (`tools/gui/cdp_draw.mjs`): press, 24 moves at ~60Hz, release, five
+strokes, reading input->paint latency from the page's own instrumentation.
+
+It counts ink pixels as well as timing, and that earned its keep on the
+first run, which reported no marks and zero paints. That looked like a
+drawing regression. It was not: a fresh page opens GIMP's empty
+"(untitled)" window, so the strokes had nothing to paint on and correctly
+drew nothing. A screenshot showed it in one glance; neither of the two
+probe-side explanations guessed beforehand (wrong coordinates, missing
+instrumentation) was right. The probe now does File > New > OK first.
+
+Two measurement defects had to be fixed before the numbers meant anything.
+The probe fetched the canvas rect over CDP on every motion step, ~15ms of
+self-inflicted overhead per move, which is what made an early reading say
+"24 moves in 877ms". And the page only sampled latency on pointerdown, so
+a 24-move drag reported 2 samples — press latency, not smoothness. It now
+timestamps the move that is actually INJECTED, deliberately not every move:
+coalescing drops the rest by design, and counting a dropped move as a slow
+paint would measure the wrong thing.
+
+| warm strokes (5 x 24 moves) | |
+|---|---|
+| input->paint, mean | **24.1ms** median across strokes |
+| input->paint, worst | 59ms median |
+| paints sampled per stroke | 27 |
+| ink pixels | 0 -> 6912 (**strokes draw**) |
+
+24ms mean sits above a 60Hz budget of 16ms — visible as slight lag on a
+fast stroke rather than a stutter — so drawing is correct and usable but
+not yet at parity. Menu latency is unchanged by the added instrumentation
+(warm open median 62ms vs 64ms, same p25/p75 band).
