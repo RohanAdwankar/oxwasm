@@ -109,7 +109,12 @@ export class LinuxEngine {
     // global dispatch table: every registered compiled function gets a slot
     // here plus a sorted (addr -> slot) entry in wasm memory at FTMAP, so
     // units chain indirect calls / cross-unit calls wasm-to-wasm (see $ftr)
-    this.ftab = new WebAssembly.Table({ element: 'anyfunc', initial: 1024 });
+    // Sized up front rather than grown on demand: every unit imports this
+    // table, so a grow has to fix up each importing instance's cached table
+    // base — with thousands of units that made growth O(instances), and the
+    // handful of grows during a warm GIMP menu cycle cost 12% of it. Sizing
+    // it once, before any instance exists, is free.
+    this.ftab = new WebAssembly.Table({ element: 'anyfunc', initial: FTMAP_MAX });
     this._ftCount = 0; this._ftSeen = new Set();
     this.regview = new BigInt64Array(this.wmem.buffer, 0, 16);
     this.fsview = new BigInt64Array(this.wmem.buffer, 128, 1);   // fs base for AOT TLS accesses
@@ -239,7 +244,7 @@ export class LinuxEngine {
     if (!f || globalThis.__noFtab || this._ftSeen.has(a) || this._ftCount >= FTMAP_MAX) return;
     this._ftSeen.add(a);
     const idx = this._ftCount++;
-    if (idx >= this.ftab.length) this.ftab.grow(1024);
+    if (idx >= this.ftab.length) this.ftab.grow(4096);   // only past FTMAP_MAX entries
     this.ftab.set(idx, f);
     const dv = new DataView(this.wmem.buffer);
     const au = BigInt.asUintN(64, a);
