@@ -863,6 +863,15 @@ function sha1hex(str) {
         const WabtModule = new Function(src + '\\n;return (typeof WabtModule !== "undefined" ? WabtModule : wabt);')();
         const wabt = await WabtModule();
         eng.assembleWat = (wat) => {
+          // wabt.js's recursive-descent parser runs on a bounded wasm stack:
+          // ~150 levels of block nesting overflow it ('memory access out of
+          // bounds' from inside wabt). Refuse deep or huge texts cleanly —
+          // the entry poisons and the interpreter runs it.
+          if (wat.length > 1500000) throw new Error('unit too large for in-page assembler');
+          { let d = 0, mx = 0;
+            for (let i = 0; i < wat.length; i++) { const c = wat.charCodeAt(i);
+              if (c === 40) { if (++d > mx) mx = d; } else if (c === 41) d--; }
+            if (mx > 120) throw new Error('unit too deeply nested for in-page assembler'); }
           const m = wabt.parseWat('unit.wat', wat, { tail_call: true });
           const bin = m.toBinary({}).buffer; m.destroy();
           return new Uint8Array(bin);
@@ -1052,6 +1061,11 @@ async function inflate(b64) {
   // cache misses still assemble in-page via wabt; hits skip translation
   // entirely through eng.unitBytes (entry-keyed, wired after engine setup)
   const assembleWat = (wat) => {
+    if (wat.length > 1500000) throw new Error('unit too large for in-page assembler');
+    { let d = 0, mx = 0;
+      for (let i = 0; i < wat.length; i++) { const c = wat.charCodeAt(i);
+        if (c === 40) { if (++d > mx) mx = d; } else if (c === 41) d--; }
+      if (mx > 120) throw new Error('unit too deeply nested for in-page assembler'); }
     const m = wabt.parseWat('unit.wat', wat, { tail_call: true });
     const bin = m.toBinary({}).buffer; m.destroy();
     return new Uint8Array(bin);

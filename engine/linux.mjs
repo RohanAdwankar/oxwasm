@@ -372,7 +372,11 @@ export class LinuxEngine {
         // prune the closure at functions already in the dispatch map: calls
         // reach them via $ftr chaining, so re-including their bodies only
         // duplicates translation work and module bytes
-        skip: (c) => this._ftSeen.has(BigInt(c)) });
+        skip: (c) => this._ftSeen.has(BigInt(c)),
+        // hosts whose assembler is wabt.js (itself wasm) choke on multi-MB
+        // closure texts — child engines cap the unit size and chain instead
+        ...(this.unitMaxFuncs ? { maxFuncs: this.unitMaxFuncs } : {}),
+        ...(this.unitMaxInsns ? { maxInsns: this.unitMaxInsns } : {}) });
       if (this.onUnitWat) this.onUnitWat(un, entry, unit);
       const bytes = this.assembleWat(unit.wat);
       if (this.onUnitBytes) this.onUnitBytes(k, bytes);   // manifest capture: entry -> compiled wasm
@@ -1072,7 +1076,7 @@ export class LinuxEngine {
         // the parent set up (dup2 before exec) connect the two engines.
         const ceng = new LinuxEngine(bytes, {
           argv, env: envp, files: this.files, mtimes: this.mtimes,
-          memMB: this.childMemMB ?? 512, assembleWat: this.assembleWat,
+          memMB: this.childMemMB ?? 256, assembleWat: this.assembleWat,   // small: plug-ins are lean, and the tab already holds the parent's image
           aotCallThreshold: this.aotCallThreshold, aotLoopThreshold: this.aotLoopThreshold,
           xserver: this.xserver });
         const skipped = [];
@@ -1084,8 +1088,11 @@ export class LinuxEngine {
           if (this.cloexec.has(fd)) { skipped.push(h); continue; }
           ceng.fds.set(fd, h);
         }
-        if (this.unitBytes) ceng.unitBytes = this.unitBytes;   // browser: share the manifest
+        // NOTE: the parent's unit manifest is NOT shared — its keys are
+        // parent-address-space entries; the child's library layout differs.
         if (this.asyncCompile) ceng.asyncCompile = this.asyncCompile;
+        ceng.unitMaxFuncs = this.childUnitMaxFuncs ?? 24;    // wabt-sized units
+        ceng.unitMaxInsns = this.childUnitMaxInsns ?? 4000;
         ceng.parentEng = this;
         (this.children ??= []).push({ pid: t.proc.pid, eng: ceng, exited: null });
         t.state = 'dead';
@@ -1737,7 +1744,32 @@ export class LinuxEngine {
     this.wakeAllBlk();   // whatever the children wrote may unblock us
   }
 
+  // Ping-pong the parent and its children within one host slice: a plug-in
+  // tile exchange otherwise costs a full host-pump round trip PER MESSAGE
+  // (child blocks on the wire, parent answers next slice, ... — 1197 tile
+  // messages made a mild blur take minutes). While either side makes
+  // progress, keep alternating.
   run(maxSteps = 5e9) {
+    let out = this._run1(maxSteps);
+    for (let round = 0; round < 64; round++) {
+      if (this.exitCode !== null || !this.blocked) break;
+      const live = (this.children ?? []).filter(c => c.exited === null && c.eng.exitCode === null);
+      if (!live.length) break;
+      const before = live.map(c => c.eng.stats.interpreted + c.eng.stats.aotRuns);
+      this.pumpChildren();
+      if (!live.some((c, i) => c.eng.stats.interpreted + c.eng.stats.aotRuns !== before[i])) break;
+      this.wake();                     // the children may have written what we block on
+      out = this._run1(maxSteps);
+      if (this.sliceDeadline != null && performance.now() > this.sliceDeadline) break;
+    }
+    // while children live, never park indefinitely: the host must keep
+    // pumping so the children run (their progress is what unblocks us)
+    if (this.blocked && this.blocked.deadline == null && this.children?.some(c => c.exited === null))
+      this.blocked.deadline = this.nowMs() + 2;
+    return out;
+  }
+
+  _run1(maxSteps = 5e9) {
     let steps = 0;
     // true top level (never nested): clear the wasm-frame budget word so
     // taxes leaked by unwound chains can't accumulate across slices
@@ -1797,10 +1829,6 @@ export class LinuxEngine {
         }
       }
     } catch (e) { if (e !== EXIT) throw e; }
-    // while children live, never park indefinitely: the host must keep
-    // pumping so the children run (their progress is what unblocks us)
-    if (this.blocked && this.blocked.deadline == null && this.children?.some(c => c.exited === null))
-      this.blocked.deadline = this.nowMs() + 2;
     return { exitCode: this.exitCode, stdout: this.stdout.join(''),
              stderr: (this.stderr || []).join(''), stats: this.stats };
   }
