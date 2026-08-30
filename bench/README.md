@@ -370,3 +370,39 @@ translated-code quality plus the JS X server's pixel work — the same
 conclusion loop30M reached by a different route. The X server's ~13% is
 the only remaining non-guest item and is plain JS pixel copying, so it is
 the one place left where a targeted fix could still pay.
+
+## Interaction latency in the PAGE (not the harness)
+
+Every interaction number above came from the node harness. The packed page
+has something the harness does not — a slice pump — so measuring the real
+artifact was overdue. `cdp_lat.mjs` times native click to the menu's pixels
+on the canvas, per cycle. The shipped page:
+
+    warm open med=279ms p25=272 p75=286 · close med=76ms
+    per-cycle: 789, 63, 280, 289, 286, 272, 279, 54, 278, 272
+
+Bimodal, and that is the tell: ~272-289ms on most cycles, ~54-63ms on a
+couple. Not compute — scheduling. The pump sleeps on a guest timer with
+`setTimeout(pump, min(d, 250))`, and `poke()` bailed out whenever a timer
+was already pending, so a click landing during that sleep waited it out
+(up to 250ms) before any guest code ran. The fast cycles were clicks that
+happened to land while the engine was already running.
+
+With input cancelling the pending sleep (and re-arming through the
+MessageChannel tick, which also dodges the ~4ms nested-setTimeout clamp):
+
+| | before | after | |
+|---|---|---|---|
+| warm menu open, median of 8 | 279ms | **64ms** | 4.4x |
+| open p25 / p75 | 272 / 286 | **61 / 65** | |
+| warm menu close, median of 8 | 76ms | **18ms** | 4.2x |
+| mean input->paint (30 samples) | 198ms | **70ms** | 2.8x |
+
+The variance collapse matters as much as the median: erratic 54-289ms is
+what made the page feel unpredictable, and it is now 57-65ms.
+
+Two lessons worth keeping. The page is now FASTER than the node harness
+(64ms vs ~82.5ms), so the harness's own settle loop was inflating its
+numbers — harness figures were pessimistic, not optimistic. And a bug
+living only in the shell is invisible to every engine-level measurement,
+however careful: the artifact has to be measured as the artifact.
