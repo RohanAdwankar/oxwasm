@@ -442,3 +442,46 @@ paint would measure the wrong thing.
 fast stroke rather than a stutter — so drawing is correct and usable but
 not yet at parity. Menu latency is unchanged by the added instrumentation
 (warm open median 62ms vs 64ms, same p25/p75 band).
+
+### What a stroke is actually made of, and a measurement trap
+
+A CPU profile of the stroke path taken IN THE BROWSER (the node harness has
+neither the pump nor the blit) splits a drag's busy time very differently
+from a menu open:
+
+| busy time | stroke | menu open |
+|---|---|---|
+| translated guest code | **33.1%** | ~76% |
+| X server JS raster | **~32%** | ~13% |
+| — `paintU32` | 12.3% | |
+| — `copyArea` | 10.8% | |
+| — `rasterFillRect` | 5.1% | |
+| interp `step` / `deopt` / `decode` | ~9% | ~0% |
+
+For drawing the JS X server costs as much as the JIT, which inverts the
+conclusion carried over from menu opens and means JIT work alone cannot
+close the 24ms -> 16ms gap.
+
+`paintU32` converts the whole 1024x768 framebuffer from XRGB to RGBA on
+every blit, once per stroke move, however little changed. Replacing four
+byte stores per pixel with one u32 store (endianness detected once, byte
+path kept as fallback, output verified byte-identical):
+
+| framebuffer convert, 1024x768 | |
+|---|---|
+| four byte stores | 1.92ms / frame |
+| one u32 store | **1.03ms / frame** (1.8x) |
+
+**The trap**: the first end-to-end reading said 25.5ms -> 20.5ms and looked
+like a 20% win. It was noise. Paired samples are u32 20.5, 24.2 and byte
+25.5, 22.3, 29.3 — overlapping, with a byte run beating a u32 run. The
+component math explains why: ~0.9ms saved per blit at ~27 blits per stroke
+is ~1ms per move against a 20-25ms budget, roughly 4%, well under this
+box's ±3-5ms run-to-run spread. When the expected effect is smaller than
+the noise, no number of end-to-end runs will resolve it — the component has
+to be measured on its own. The change is kept because it is strictly fewer
+stores and provably identical output, not because the stroke numbers moved.
+
+Not attempted: dirty-rect blitting, the larger win. `dirty` is a bare
+boolean set at 20+ sites, so adding rects means getting every one right and
+one miss is visible corruption.
