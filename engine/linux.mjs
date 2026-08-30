@@ -51,6 +51,7 @@ export class LinuxEngine {
     // allocate the LOWEST free fd, like Linux — busybox relies on
     // close(0); open(file) landing the file on fd 0.
     this.fds = new Map();
+    this.cloexec = new Set();                 // fd numbers with FD_CLOEXEC (per-descriptor, not per-handle)
     this.fds.set(0, { bytes: new Uint8Array(0), pos: 0 });
     this.fds.set(1, { sink: 'out' });
     this.fds.set(2, { sink: 'err' });
@@ -323,7 +324,7 @@ export class LinuxEngine {
       // CPython run). The closure remains the no-assembler fallback.
       if (this.assembleWat) {
         try {
-          const gotOff = Number(BigInt.asIntN(32, gotAddr - this.base + BigInt(this.RAMOFF)));
+          const gotOff = Number(BigInt.asUintN(32, gotAddr - this.base + BigInt(this.RAMOFF)));   // unsigned: GOT slots above 2GB must not wrap negative
           const { wat, entryName } = pltStubWat(entry, gotOff);
           const bytes = this.assembleWat(wat);
           if (this.onUnitBytes) this.onUnitBytes(k, bytes);
@@ -834,6 +835,16 @@ export class LinuxEngine {
     const c = this.threads[this.ti]; c._dl = this._deadline;
     this.ti = i; const n = this.threads[i];
     this.cpu = n.cpu; this._deadline = n._dl ?? null;
+    // A forked (vfork-window) child runs with a COPY of the fd table — its
+    // dup2/close before execve must not disturb the parent's descriptors.
+    // Its memory writes are journaled (rolled back at exec/exit) and it runs
+    // interpreted so every store goes through the journal.
+    if (n.proc) { this._mainFds ??= this.fds; this.fds = n.proc.fds;
+      this.mem.jrnl = n.proc.jrnl;
+      if (this._vforkBudget === undefined) { this._vforkBudget = this.aotBudget; this.aotBudget = 0; } }
+    else { if (this._mainFds) { this.fds = this._mainFds; this._mainFds = null; }
+      if (this.mem.jrnl && this._vforkBudget !== undefined) { this.mem.jrnl = null;
+        this.aotBudget = this._vforkBudget; this._vforkBudget = undefined; } }
   }
   reapTimers() { const now = this.nowMs();
     for (const t of this.threads)
@@ -849,9 +860,9 @@ export class LinuxEngine {
   // run() should surface this.blocked (earliest deadline) to the host.
   park() {
     const t = this.threads[this.ti];
-    if (t.state !== 'dead') {
-      t.state = 'blk'; t.dl = this.blocked?.deadline ?? null;
-      t.futex = this._futexAddr; t._dl = this._deadline;
+    if (t.state !== 'dead' && t.state !== 'vfork') {   // vfork: parent stays
+      t.state = 'blk'; t.dl = this.blocked?.deadline ?? null;   // suspended (child
+      t.futex = this._futexAddr; t._dl = this._deadline;        // owns the stack)
     }
     this._futexAddr = null;
     this.reapTimers();
@@ -922,13 +933,16 @@ export class LinuxEngine {
         const old = Number(a1), h = defSink(old);
         if (!h && !this.fds.has(old)) { ret(-9n); break; }   // EBADF
         const handle = h ?? this.fds.get(old);
-        if (nr === 32) { const fd = this.allocFd(); this.fds.set(fd, handle); ret(BigInt(fd)); break; }
-        const nw = Number(a2); this.fds.set(nw, handle); ret(BigInt(nw)); break; }
+        if (nr === 32) { const fd = this.allocFd(); this.fds.set(fd, handle); this.cloexec.delete(fd); ret(BigInt(fd)); break; }
+        const nw = Number(a2); this.fds.set(nw, handle);
+        if (nr === 292 && (Number(cpu.regs[2]) & 0x80000)) this.cloexec.add(nw); else this.cloexec.delete(nw);
+        ret(BigInt(nw)); break; }
       case 22: case 293: {                                   // pipe / pipe2
         const buf = { chunks: [], pos: 0, off: 0 };
         const rfd = this.allocFd(); this.fds.set(rfd, null); const wfd = this.allocFd(); this.fds.delete(rfd);
         this.fds.set(rfd, { pipe: buf, mode: 'r' });
         this.fds.set(wfd, { pipe: buf, mode: 'w' });
+        if (nr === 293 && (Number(a2) & 0x80000)) { this.cloexec.add(rfd); this.cloexec.add(wfd); }
         const v = new DataView(this.wmem.buffer), o = this.RAMOFF + Number(a1 - this.base);
         v.setUint32(o, rfd, true); v.setUint32(o + 4, wfd, true);
         ret(0n); break; }
@@ -992,9 +1006,41 @@ export class LinuxEngine {
         if (Number(a1) === 0x1002) { cpu.fsBase = a2; ret(0n); } else ret(-22n);
         break;
       case 218: { const t = this.threads[this.ti]; t.ctid = a1; ret(BigInt(t.id)); break; }  // set_tid_address
-      case 56: {                                             // clone: threads only (CLONE_VM)
-        const flags = Number(a1 & 0xffffffffn);
-        if (!(flags & 0x100)) { ret(-38n); break; }          // a real fork -> ENOSYS (callers fall back or fail)
+      case 56: case 57: case 58: {                           // clone / fork / vfork
+        const flags = nr === 56 ? Number(a1 & 0xffffffffn) : 0;
+        if (!(flags & 0x100)) {
+          // fork/vfork: VFORK SEMANTICS — the child shares this memory image
+          // and runs with a copy of the fd table; the parent thread is
+          // suspended until the child execve()s (which moves it into its own
+          // engine) or exits. Exact for the g_spawn / posix_spawn pattern
+          // (dup2 + close + execve between fork and exec), which is what
+          // GIMP's plug-in launcher does.
+          const pid = (this.nextPid = (this.nextPid ?? 999) + 1);
+          const c = new CPU(this.mem);
+          c.onSyscall = (cc) => this.syscall(cc);
+          for (let r = 0; r < 16; r++) c.regs[r] = cpu.regs[r];
+          for (let r = 0; r < 16; r++) c.xmm[r] = cpu.xmm[r] ?? 0n;
+          c.rip = cpu.rip; c.fsBase = cpu.fsBase;
+          c.regs[0] = 0n;                                    // child sees 0
+          const parent = this.threads[this.ti];
+          parent.state = 'vfork';                            // scheduler skips until released
+          // The child shares this memory image, but real fork gives it a
+          // COPY: everything it writes before execve — fork()'s return
+          // value stored to a stack local, and heap mutation from child-
+          // setup callbacks (GIMP's prep_for_exec NULLs and frees the
+          // parent's wire channels!) — must vanish when the parent resumes.
+          // The child runs INTERPRETED with the write journal armed
+          // (switchTo swaps it in only while the child is current, so other
+          // threads' writes are untouched); exec/exit rolls it back.
+          const t = { id: pid, cpu: c, state: 'run', dl: null, futex: null, ctid: 0n, _dl: null,
+                      proc: { pid, fds: new Map(this.fds), parent, jrnl: [] } };
+          this.threads.push(t);
+          // Complete the parent's syscall (rax = pid, rip already past the
+          // insn) and switch STRAIGHT to the child — blocking here would
+          // rewind the parent's rip and re-execute the fork on release.
+          ret(BigInt(pid));
+          this.switchTo(this.threads.length - 1); break;
+        }
         const tid = this.nextTid++;
         const c = new CPU(this.mem);
         c.onSyscall = (cc) => this.syscall(cc);
@@ -1010,6 +1056,55 @@ export class LinuxEngine {
         if (flags & 0x100000) this.mem.write(a3, 4n, BigInt(tid));             // CLONE_PARENT_SETTID
         if (flags & 0x1000000) this.mem.write(cpu.regs[10], 4n, BigInt(tid));  // CLONE_CHILD_SETTID
         ret(BigInt(tid)); break; }
+      case 59: {                                             // execve(path, argv, envp)
+        const t = this.threads[this.ti];
+        if (!t.proc) { ret(-38n); break; }                   // exec of the main process: unsupported
+        const path = this.readPath(a1);
+        const readVec = (p) => { const out = [];
+          for (let i = 0n; ; i += 8n) { const sp = this.mem.read(p + i, 8n); if (sp === 0n) break;
+            out.push(this.readPath(sp)); } return out; };
+        const argv = a2 ? readVec(a2) : [path];
+        const envp = a3 ? readVec(a3) : [];
+        const bytes = this.lookup(path);
+        if (!bytes) { ret(-2n); break; }                     // ENOENT
+        // The child becomes its own engine: fresh memory image for the new
+        // binary, the vfork-window fd table carried over so the wire pipes
+        // the parent set up (dup2 before exec) connect the two engines.
+        const ceng = new LinuxEngine(bytes, {
+          argv, env: envp, files: this.files, mtimes: this.mtimes,
+          memMB: this.childMemMB ?? 512, assembleWat: this.assembleWat,
+          aotCallThreshold: this.aotCallThreshold, aotLoopThreshold: this.aotLoopThreshold,
+          xserver: this.xserver });
+        const skipped = [];
+        for (const [fd, h] of t.proc.fds) {
+          // close-on-exec descriptors are NOT inherited; if one was the last
+          // write end of a pipe (g_spawn's child-error-report pipe), readers
+          // get EOF — the signal g_spawn's parent blocks on to learn the
+          // exec succeeded. The sweep below runs after this context is dead.
+          if (this.cloexec.has(fd)) { skipped.push(h); continue; }
+          ceng.fds.set(fd, h);
+        }
+        if (this.unitBytes) ceng.unitBytes = this.unitBytes;   // browser: share the manifest
+        if (this.asyncCompile) ceng.asyncCompile = this.asyncCompile;
+        ceng.parentEng = this;
+        (this.children ??= []).push({ pid: t.proc.pid, eng: ceng, exited: null });
+        t.state = 'dead';
+        this._pipeEofSweep(skipped);
+        this._vforkRollback(t);
+        t.proc.parent.state = 'run';                         // vfork release
+        if (this.onSpawn) this.onSpawn(t.proc.pid, path, argv);
+        this.block(null); ret(0n); break; }
+      case 61: {                                             // wait4(pid, status*, options, rusage)
+        const pid = Number(BigInt.asIntN(32, a1)), opts = Number(a3);
+        const kids = this.children ?? [];
+        const mine = kids.filter(c => pid <= 0 || c.pid === pid);
+        if (!mine.length) { ret(-10n); break; }              // ECHILD
+        const done = mine.find(c => c.exited !== null || (c.eng && c.eng.exitCode !== null));
+        if (!done) { if (opts & 1) ret(0n); else this.block(null); break; }   // WNOHANG / block
+        const code = done.exited ?? done.eng.exitCode;
+        if (a2) this.mem.write(a2, 4n, BigInt((code & 0xff) << 8));           // WIFEXITED status
+        this.children.splice(this.children.indexOf(done), 1);
+        ret(BigInt(done.pid)); break; }
       case 24: ret(0n); break;                               // sched_yield (quantum rotation covers fairness)
       case 273: ret(0n); break;                              // set_robust_list
       case 157: ret(0n); break;                              // prctl (PR_SET_NAME etc.)
@@ -1019,16 +1114,25 @@ export class LinuxEngine {
         new Uint8Array(this.wmem.buffer, o, n).fill(0);
         new DataView(this.wmem.buffer).setUint8(o, 1);
         ret(8n); break; }
-      case 60: {                                             // exit: THREAD exit
+      case 60: case 231: {                                   // exit / exit_group
         const t = this.threads[this.ti];
-        if (this.threads.filter(x => x.state !== 'dead').length <= 1) {
+        if (t.proc) {
+          // a vfork-window child died without execve (e.g. g_spawn's _exit
+          // after a failed exec): release the parent, record the status for
+          // wait4, retire this context
+          t.state = 'dead';
+          this._pipeEofSweep([...t.proc.fds.values()]);
+          this._vforkRollback(t);
+          t.proc.parent.state = 'run';
+          (this.children ??= []).push({ pid: t.proc.pid, eng: null, exited: Number(a1 & 0xffn) });
+          this.block(null); ret(0n); break;
+        }
+        if (nr === 231 || this.threads.filter(x => x.state !== 'dead').length <= 1) {
           this.exitCode = Number(a1 & 0xffn); cpu.halted = true; ret(0n); break;
         }
         t.state = 'dead';
         if (t.ctid) { this.mem.write(t.ctid, 4n, 0n); this.futexWake(t.ctid, 1 << 30); }
         this.block(null); ret(0n); break; }                  // park() skips dead threads
-      case 231:                                              // exit_group: whole process
-        this.exitCode = Number(a1 & 0xffn); cpu.halted = true; ret(0n); break;
       case 228: {                                            // clock_gettime(clk, ts*)
         const clk = Number(a1), o = this.RAMOFF + Number(a2 - this.base);
         const v = new DataView(this.wmem.buffer);
@@ -1120,12 +1224,22 @@ export class LinuxEngine {
             dst += take; got += take; h.pipe.off += take;
             if (h.pipe.off >= c.length) { h.pipe.chunks.shift(); h.pipe.off = 0; }
           }
-          ret(BigInt(got)); break;                            // 0 => EOF (writer done)
+          // empty: EOF only once the writing side is gone (weof — set when a
+          // child process holding the write end exits); otherwise BLOCK like
+          // a real pipe — the plug-in wire protocol reads before data arrives
+          if (got === 0 && want > 0 && !h.pipe.weof) {
+            if (h.nonblock) { ret(-11n); break; }             // EAGAIN
+            this.block(null); break;
+          }
+          ret(BigInt(got)); break;
         }
         const n = Math.min(Number(a3), h.bytes.length - h.pos);
         this.ram.set(h.bytes.subarray(h.pos, h.pos + n), Number(a2 - this.base));
         h.pos += n; ret(BigInt(n)); break; }
-      case 3: this.fds.delete(Number(a1)); ret(0n); break;    // close
+      case 3: { const cfd = Number(a1), ch = this.fds.get(cfd);
+        this.fds.delete(cfd); this.cloexec.delete(cfd);
+        if (ch?.pipe && ch.mode === 'w') this._pipeEofSweep([ch]);
+        ret(0n); break; }                                     // close
       case 8: {                                               // lseek
         const h = this.fds.get(Number(a1));
         if (!h) { ret(-9n); break; }
@@ -1312,11 +1426,15 @@ export class LinuxEngine {
       case 72: {                                              // fcntl
         const h = this.fds.get(Number(a1)), cmd = Number(a2);
         if (cmd === 3) { ret(BigInt(2 | (h?.sock?.nonblock ? 0x800 : 0))); break; }   // F_GETFL: O_RDWR
-        if (cmd === 4) { if (h?.sock) h.sock.nonblock = !!(Number(a3) & 0x800); ret(0n); break; }  // F_SETFL
+        if (cmd === 4) { if (h?.sock) h.sock.nonblock = !!(Number(a3) & 0x800); if (h?.pipe) h.nonblock = !!(Number(a3) & 0x800); ret(0n); break; }  // F_SETFL
+        if (cmd === 1) { ret(BigInt(this.cloexec.has(Number(a1)) ? 1 : 0)); break; }   // F_GETFD
+        if (cmd === 2) { if (Number(a3) & 1) this.cloexec.add(Number(a1)); else this.cloexec.delete(Number(a1)); ret(0n); break; }  // F_SETFD
         if (cmd === 0 || cmd === 1030) {                      // F_DUPFD / F_DUPFD_CLOEXEC
           if (!h) { ret(-9n); break; }
           let fd = Number(a3); while (this.fds.has(fd)) fd++;
-          this.fds.set(fd, h); ret(BigInt(fd)); break;
+          this.fds.set(fd, h);
+          if (cmd === 1030) this.cloexec.add(fd); else this.cloexec.delete(fd);
+          ret(BigInt(fd)); break;
         }
         ret(0n); break; }                                     // F_GETFD/F_SETFD/...
       case 28: ret(0n); break;                                // madvise
@@ -1479,7 +1597,7 @@ export class LinuxEngine {
                timeoutMs = Number(v.getBigUint64(o, true)) * 1000 + Number(v.getBigUint64(o + 8, true)) / 1e6; }
         const readyR = (h) => !h ? false
           : h.sock ? !!(h.sock.conn && h.sock.conn.readable())
-          : h.pipe ? h.pipe.chunks.length > 0
+          : h.pipe ? (h.pipe.chunks.length > 0 || !!h.pipe.weof)
           : h.ev ? h.ev.count > 0n
           : !!h.bytes;                                        // regular file: always ready (EOF too)
         const base = this.RAMOFF + Number(a1 - this.base);
@@ -1526,7 +1644,7 @@ export class LinuxEngine {
         }
         const readyR = (h) => !h ? false
           : h.sock ? !!(h.sock.conn && h.sock.conn.readable())
-          : h.pipe ? h.pipe.chunks.length > 0
+          : h.pipe ? (h.pipe.chunks.length > 0 || !!h.pipe.weof)
           : h.ev ? h.ev.count > 0n
           : !!h.bytes;
         const scan = (ptr) => { if (ptr === 0n) return [];
@@ -1560,11 +1678,71 @@ export class LinuxEngine {
     return false;
   }
 
+  // Child processes (execve'd plug-ins etc.) are separate engines pumped
+  // from the parent's run(): each gets a small interleaved slice, blocked
+  // children are re-woken (their pipes may have data written by us), and a
+  // child's exit sets weof on its pipe write-ends so our readers see EOF.
+  // Is any live descriptor anywhere in the process tree still a WRITE end of
+  // this pipe buffer? Scanned at close/exec/exit so readers see EOF exactly
+  // when the last writer disappears — across engines (parent and execve'd
+  // children share pipe buffers by reference).
+  // Undo everything a vfork-window child wrote to the shared image (reverse
+  // order), restoring the parent's memory to its at-fork state.
+  _vforkRollback(t) {
+    const jr = t.proc.jrnl; if (!jr) return;
+    for (let i = jr.length - 1; i >= 0; i--) {
+      const [a, n, old, snap] = jr[i];
+      try { if (snap) this.mem.view(a, BigInt(snap.length)).set(snap); else this.mem.write(a, n, old); } catch {}
+    }
+    t.proc.jrnl = null;
+    if (this.mem.jrnl === jr) this.mem.jrnl = null;
+    if (this._vforkBudget !== undefined) { this.aotBudget = this._vforkBudget; this._vforkBudget = undefined; }
+  }
+
+  _pipeWriterAlive(buf) {
+    let root = this; while (root.parentEng) root = root.parentEng;
+    const seen = new Set();
+    const scan = (e) => {
+      if (seen.has(e)) return false; seen.add(e);
+      const tables = [e.fds];
+      if (e._mainFds) tables.push(e._mainFds);
+      for (const t of e.threads ?? []) if (t.state !== 'dead' && t.proc?.fds) tables.push(t.proc.fds);
+      for (const tb of tables) for (const [, h] of tb) if (h?.pipe === buf && h.mode === 'w') return true;
+      for (const c of e.children ?? []) if (c.eng && c.exited === null && c.eng.exitCode === null && scan(c.eng)) return true;
+      return false;
+    };
+    return scan(root);
+  }
+  _pipeEofSweep(handles) {
+    for (const h of handles) if (h?.pipe && h.mode === 'w' && !h.pipe.weof && !this._pipeWriterAlive(h.pipe)) h.pipe.weof = true;
+    this.wakeAllBlk();
+    let root = this; while (root.parentEng) root = root.parentEng;
+    if (root !== this) root.wakeAllBlk();
+  }
+
+  pumpChildren() {
+    for (const c of this.children) {
+      if (c.exited !== null) continue;
+      const e = c.eng;
+      if (e.exitCode === null) {
+        if (e.blocked) e.wake();
+        try { e.run(3e5); } catch (err) { c.exited = 127; c.error = err.message; }
+      }
+      if (c.exited === null && e.exitCode !== null) {
+        c.exited = e.exitCode;
+        this._pipeEofSweep([...e.fds.values()]);
+        if (this.onChildExit) this.onChildExit(c);
+      }
+    }
+    this.wakeAllBlk();   // whatever the children wrote may unblock us
+  }
+
   run(maxSteps = 5e9) {
     let steps = 0;
     // true top level (never nested): clear the wasm-frame budget word so
     // taxes leaked by unwound chains can't accumulate across slices
     (this._ftdv ??= new DataView(this.wmem.buffer)).setUint32(FTMAP + 8, 0, true);
+    if (this.children?.some(c => c.exited === null)) this.pumpChildren();
     try {
       let branched = true;    // compiled entries are branch targets: only look up after a branch
       while (steps++ < maxSteps && this.exitCode === null) {
@@ -1619,6 +1797,10 @@ export class LinuxEngine {
         }
       }
     } catch (e) { if (e !== EXIT) throw e; }
+    // while children live, never park indefinitely: the host must keep
+    // pumping so the children run (their progress is what unblocks us)
+    if (this.blocked && this.blocked.deadline == null && this.children?.some(c => c.exited === null))
+      this.blocked.deadline = this.nowMs() + 2;
     return { exitCode: this.exitCode, stdout: this.stdout.join(''),
              stderr: (this.stderr || []).join(''), stats: this.stats };
   }

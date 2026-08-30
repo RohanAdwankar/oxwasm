@@ -83,7 +83,7 @@ function neededOf(bytes) {
   return needs.map(off => { let s = ''; for (let i = strtab + off; bytes[i]; i++) s += String.fromCharCode(bytes[i]); return s; });
 }
 const files = {};
-const libdirs = ['/usr/lib/x86_64-linux-gnu', '/lib/x86_64-linux-gnu'];
+const libdirs = ['/usr/lib/x86_64-linux-gnu', '/lib/x86_64-linux-gnu', '/usr/lib'];
 const queue = [guestPath];
 while (queue.length) {
   const g = queue.pop();
@@ -134,6 +134,15 @@ if (gtk) {
         for (const dd of libdirs) if (hostOf[dd + '/' + dep] && !files[dd + '/' + dep]) { files[dd + '/' + dep] = readFileSync(hostOf[dd + '/' + dep]); break; }
     }
 }
+// GIMP plug-ins are separate binaries fork/exec'd at filter time — pack the
+// whole plug-ins dir (small: they link against libraries already packed) and
+// any DT_NEEDED libs not yet in the closure, or every filter fails ENOENT.
+for (const [g, h] of Object.entries(hostOf))
+  if (/^\/usr\/lib\/gimp\/2\.0\/(plug-ins|modules|environ|interpreters)\//.test(g) && !files[g]) {
+    files[g] = readFileSync(h);
+    for (const dep of neededOf(files[g]))
+      for (const dd of libdirs) if (hostOf[dd + '/' + dep] && !files[dd + '/' + dep]) { files[dd + '/' + dep] = readFileSync(hostOf[dd + '/' + dep]); break; }
+  }
 if (files['/lib/x86_64-linux-gnu/ld-2.27.so'] && !files['/lib64/ld-linux-x86-64.so.2'])
   files['/lib64/ld-linux-x86-64.so.2'] = files['/lib/x86_64-linux-gnu/ld-2.27.so'];
 for (const [g, b] of Object.entries(files))
