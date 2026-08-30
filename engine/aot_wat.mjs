@@ -329,7 +329,7 @@ export function compileFunctionWatDispatch(mem, entry, { guestBase, ramBase, max
 // One FUNCTION at a time: `call` is a mid-block instruction (fall-through
 // successor) whose target is recorded in `calls` for the unit driver;
 // `leave` is a plain epilogue instruction; ret/retn/jmpind end a block.
-function analyze(mem, entry, { maxInsns = 20000, noJtab = false } = {}) {
+export function analyze(mem, entry, { maxInsns = 20000, noJtab = false } = {}) {
   const M = 0xFFFFFFFFFFFFFFFFn;
   const insnAt = new Map(); const work = [entry]; const seen = new Set(); let count = 0;
   const calls = new Set();
