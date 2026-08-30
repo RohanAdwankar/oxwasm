@@ -1155,7 +1155,11 @@ export class XServer {
   listFonts(pattern) {
     const rx = new RegExp('^' + pattern.toLowerCase().replace(/[.+^${}()|[\]]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.') + '$');
     const out = [];
-    for (const e of this.fonts) for (const n of e.names) if (rx.test(n)) { out.push(n); break; }
+    // every matching name, not just the first per font: XCreateFontSet asks
+    // for an XLFD pattern and needs the XLFD-shaped alias back, and stopping
+    // at the first name returned the short one ("builtin5x7") instead —
+    // "Unable to load any usable fontset", and Athena apps never paint.
+    for (const e of this.fonts) for (const n of e.names) if (rx.test(n)) out.push(n);
     if (!out.length) {
       // XLFD pattern with no concrete match: reflect it back with every
       // wildcard field filled by a plausible default. XCreateFontSet probes
