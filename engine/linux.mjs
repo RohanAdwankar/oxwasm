@@ -1026,6 +1026,7 @@ export class LinuxEngine {
 
   // fill a struct stat (the by-path shape: dev/ino/nlink/mode/size/times)
   writeStat(buf, path, size, mode, rdev = 0n, ino = null) {
+    this.jsnap(buf, 144);
     const off = this.RAMOFF + Number(buf - this.base);
     new Uint8Array(this.wmem.buffer, off, 144).fill(0);
     const v = new DataView(this.wmem.buffer);
@@ -1646,6 +1647,7 @@ export class LinuxEngine {
           // sink/tty: leave mode as the char-device default
         }
         const buf = isAt ? cpu.regs[2] : a2;
+        this.jsnap(buf, 144);
         const off = this.RAMOFF + Number(buf - this.base);
         new Uint8Array(this.wmem.buffer, off, 144).fill(0);
         const v = new DataView(this.wmem.buffer);
@@ -2125,6 +2127,21 @@ export class LinuxEngine {
   // children share pipe buffers by reference).
   // Undo everything a vfork-window child wrote to the shared image (reverse
   // order), restoring the parent's memory to its at-fork state.
+  // A vfork child runs in the PARENT's address space, so everything it
+  // writes has to be undone when it execs. Its own stores go through
+  // this.mem and are journaled — but a syscall writes its RESULT straight
+  // into guest memory via this.ram/this.wmem, which the journal never saw.
+  // The child stat()ing a file therefore left 144 bytes of struct stat
+  // permanently on the parent's stack; with enough of them the parent
+  // resumed to "*** stack smashing detected ***".
+  //
+  // Call this with the range a syscall is about to write, before writing it.
+  jsnap(addr, len) {
+    const jr = this.mem.jrnl;
+    if (!jr || len <= 0) return;
+    try { jr.push([addr, 0, 0n, this.mem.view(addr, BigInt(len)).slice()]); } catch {}
+  }
+
   _vforkRollback(t) {
     // the vfork child runs IN this engine, so its chdir (tar -C, cd in a
     // subshell) must not follow the parent out of the window

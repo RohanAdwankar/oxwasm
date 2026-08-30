@@ -59,7 +59,11 @@ const xs = new XServer({ width: 480, height: 200 });
 xs.countOps = true; xs.opCount = [];
 const eng = new LinuxEngine(files[bin], { argv:[bin, ...args],
   env:['DISPLAY=:0','PATH=/bin:/usr/bin','HOME=/root','LANG=C','SHELL=/bin/sh','TERM=xterm'],
-  files, mtimes, memMB: 512, xserver: xs, tty: !!process.env.XSHOT_TTY, assembleWat });
+  files, mtimes, memMB: 512, xserver: xs, tty: !!process.env.XSHOT_TTY,
+  // XSHOT_NOJIT=1 runs pure interpretation. Useful as a control: a fault
+  // that disappears without the JIT is in translated code or in something
+  // that only tracks interpreter writes.
+  assembleWat: process.env.XSHOT_NOJIT ? null : assembleWat });
 // XSHOT_POLLDBG=<seconds> — after that long, log what the guest is polling
 // on. A client spinning in poll() rather than blocking is the shape of an
 // unimplemented or wrongly-answered wait, and this names the fds and the
