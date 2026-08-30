@@ -7,7 +7,7 @@
 import { CPU, Memory } from './interp.mjs';
 import { compileLoop } from './jit2.mjs';
 import { compileVectorLoop } from './jitsimd.mjs';
-import { compileUnitWat, FTMAP, FTMAP_MAX, FTDLIMIT, FTFUEL } from './aot_wat.mjs';
+import { compileUnitWat, pltStubWat, FTMAP, FTMAP_MAX, FTDLIMIT, FTFUEL } from './aot_wat.mjs';
 import { decode } from './decode.mjs';
 
 const PAGE = 4096n;
@@ -273,6 +273,7 @@ export class LinuxEngine {
                 const a = BigInt('0x' + name.slice(2));
                 if (!this.aotFns.get(a)) this.registerAotFn(a, instance.exports[name]);
               }
+            if (instance.exports.drive) this.aotDrive = instance.exports.drive;
             this.stats.tiers.aot = (this.stats.tiers.aot || 0) + 1;
           })
           .catch((e) => { this.aotFns.delete(k); this.aotFailed.add(k);
@@ -288,20 +289,41 @@ export class LinuxEngine {
     // million times during one busy window was itself a main-thread wedge.
     if (this.tierMsMax !== undefined && this.tierMs >= this.tierMsMax) return;
     if (this.isTrampoline(entry)) {
-      // PLT stub: dispatch through a VALIDATING closure that reads the GOT
-      // slot on every call, never a cached alias. The old permanent alias
-      // assumed the slot stays stable — but ld.so RE-RELOCATES ITSELF after
-      // libc loads, rebinding its own malloc/free GOT slots from the minimal
-      // rtld allocator to libc's; the stale alias kept dispatching
-      // rtld-malloc, and glibc aborts on free() of the resulting
-      // mixed-allocator pointers (leafpad, via dlerror's check_free). The
-      // closure is a JS function, so it is NOT put in the funcref table
-      // (which takes only wasm functions): in-wasm resolvers miss the stub
-      // address and route through x_callout, which lands here.
+      // PLT stub: dispatch must read the GOT slot on EVERY call, never a
+      // cached alias. The old permanent alias assumed the slot stays stable —
+      // but ld.so RE-RELOCATES ITSELF after libc loads, rebinding its own
+      // malloc/free GOT slots from the minimal rtld allocator to libc's; the
+      // stale alias kept dispatching rtld-malloc, and glibc aborts on free()
+      // of the resulting mixed-allocator pointers (leafpad, via dlerror's
+      // check_free).
       const gotAddr = this.trampolineGotAddr(entry);
       if (gotAddr === null) { this.aotFailed.add(k); return; }
       const tgt0 = this.trampolineTarget(entry);
       if (tgt0 !== null) this.profileTarget(tgt0);   // push the real callee toward tiering
+      // Preferred form: a WASM stub (see pltStubWat) that reads the GOT slot
+      // live and tail-calls through the shared table — it registers in the
+      // funcref table under the stub's address, so translated call sites and
+      // the dispatch driver route through PLT indirection with no JS hop
+      // (the JS closure below cost a callout round-trip per call: 23M in one
+      // CPython run). The closure remains the no-assembler fallback.
+      if (this.assembleWat) {
+        try {
+          const gotOff = Number(BigInt.asIntN(32, gotAddr - this.base + BigInt(this.RAMOFF)));
+          const { wat, entryName } = pltStubWat(entry, gotOff);
+          const bytes = this.assembleWat(wat);
+          if (this.onUnitBytes) this.onUnitBytes(k, bytes);
+          if (this.asyncCompile) {
+            this.aotFns.set(k, null);
+            WebAssembly.instantiate(bytes, this.aotImports())
+              .then(({ instance }) => { this.registerAotFn(k, instance.exports[entryName]); })
+              .catch(() => { this.aotFns.delete(k); });   // fall back to re-tiering
+          } else {
+            const inst = new WebAssembly.Instance(new WebAssembly.Module(bytes), this.aotImports());
+            this.registerAotFn(k, inst.exports[entryName]);
+          }
+          return;
+        } catch (e) { /* fall through to the JS closure */ }
+      }
       let cachedVal = null, cachedFn = null;         // re-resolve only when the slot changes
       const stub = () => {
         const v = this.mem.read(gotAddr, 8n);
@@ -344,6 +366,7 @@ export class LinuxEngine {
           .then(({ instance }) => {
             for (const a of unit.funcs)
               if (!this.aotFns.get(a)) this.registerAotFn(a, instance.exports['f_' + a.toString(16)]);
+            if (instance.exports.drive) this.aotDrive = instance.exports.drive;
             this.stats.tiers.aot = (this.stats.tiers.aot || 0) + 1;
           })
           .catch((e) => { this.aotFns.delete(k); this.aotFailed.add(k);
@@ -355,6 +378,7 @@ export class LinuxEngine {
         const ak = a;
         if (!this.aotFns.has(ak)) this.registerAotFn(ak, inst.exports['f_' + a.toString(16)]);
       }
+      if (inst.exports.drive) this.aotDrive = inst.exports.drive;
       if (!this.aotFns.has(k)) throw new Error('entry missing from unit');
       this.stats.tiers.aot = (this.stats.tiers.aot || 0) + 1;
     } catch (e) { this.aotFailed.add(k);
@@ -392,7 +416,14 @@ export class LinuxEngine {
     fdv.setUint32(FTFUEL, this.chainFuel ?? 0x0FFFFFFF, true);
     this.syncOut();
     const entry = this.cpu.rip;
-    try { const exit = f(); this.syncIn(); this.stats.aotRuns++;
+    try { let exit = f();
+      // In-wasm driver: a top frame's guest ret exits its wasm function, but
+      // the next rip is usually another compiled function — chain to it in
+      // wasm ($drive resolves via the shared map and call_indirects, burning
+      // the same fuel/depth budgets) instead of paying a JS round-trip with a
+      // full regfile syncOut/syncIn per top-frame ret.
+      if (this.aotDrive) exit = this.aotDrive(exit);
+      this.syncIn(); this.stats.aotRuns++;
       if (this.onProgress && this.stats.aotRuns % 4e6 === 0) this.onProgress('aot');
       return BigInt.asUintN(64, exit); }
     catch (e) { if (e instanceof DeoptUnwind) { this.syncIn();

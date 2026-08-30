@@ -42,6 +42,53 @@ export const FTDEPTH = FTMAP + 8, FTDLIMIT = 1200;
 // eng.chainFuel (hosts without deadlines leave it effectively unlimited).
 export const FTFUEL = FTMAP + 12;
 
+// The in-wasm resolver over the sorted (addr, table-slot) map at FTMAP —
+// shared by every unit module and by generated PLT stubs.
+const FTR_WAT = `  (func $ftr (param $a i64) (result i32)
+    (local $lo i32) (local $hi i32) (local $mid i32) (local $p i32) (local $v i64)
+    (local.set $hi (i32.load (i32.const ${FTMAP})))
+    (block $miss
+      (loop $l
+        (br_if $miss (i32.ge_u (local.get $lo) (local.get $hi)))
+        (local.set $mid (i32.shr_u (i32.add (local.get $lo) (local.get $hi)) (i32.const 1)))
+        (local.set $p (i32.add (i32.const ${FTMAP + 16}) (i32.shl (local.get $mid) (i32.const 4))))
+        (local.set $v (i64.load (local.get $p)))
+        (if (i64.eq (local.get $v) (local.get $a))
+          (then (return (i32.load (i32.add (local.get $p) (i32.const 8))))))
+        (if (i64.lt_u (local.get $a) (local.get $v))
+          (then (local.set $hi (local.get $mid)))
+          (else (local.set $lo (i32.add (local.get $mid) (i32.const 1)))))
+        (br $l)))
+    (i32.const -1))\n`;
+
+// A PLT/IFUNC stub as a WASM function: read the GOT slot LIVE from guest
+// memory (so ld.so rebinding the slot — even re-relocating itself — is
+// always honored), resolve the value through the shared map, and tail-call
+// the compiled callee entirely in wasm; x_callout keeps the JS fallback for
+// an uncompiled target. Registered in the funcref table under the stub's
+// own address, this lets translated call sites, tail jumps, and the
+// dispatch driver route through PLT indirection with no JS boundary — the
+// JS-closure version of this stub was 23M callout round-trips in one
+// CPython benchmark run.
+export function pltStubWat(entry, gotOff) {
+  const wat = '(module\n  (import "js" "mem" (memory 4096))\n'
+    + '  (import "env" "callout" (func $x_callout (param i64) (result i64)))\n'
+    + '  (import "js" "ftab" (table $ft 0 funcref))\n'
+    + '  (type $uft (func (result i64)))\n'
+    + FTR_WAT
+    + `  (func (export "f_${entry.toString(16)}") (result i64)
+    (local $v i64) (local $fti i32)
+    (local.set $v (i64.load (i32.const ${gotOff})))
+    (local.set $fti (call $ftr (local.get $v)))
+    (if (i32.and (i32.ge_s (local.get $fti) (i32.const 0))
+          (i32.and (i32.lt_u (i32.load (i32.const ${FTDEPTH})) (i32.const ${FTDLIMIT}))
+                   (i32.ne (i32.load (i32.const ${FTFUEL})) (i32.const 0))))
+      (then (i32.store (i32.const ${FTFUEL}) (i32.sub (i32.load (i32.const ${FTFUEL})) (i32.const 1)))
+            (return_call_indirect $ft (type $uft) (local.get $fti))))
+    (return (call $x_callout (local.get $v))))\n)\n`;
+  return { wat, entryName: 'f_' + entry.toString(16) };
+}
+
 export function compileFunctionWatDispatch(mem, entry, { guestBase, ramBase, maxInsns = 8000 } = {}) {
   // ---- decode reachable code ----
   const insnAt = new Map(); const work = [entry]; const seen = new Set(); let count = 0;
@@ -1912,22 +1959,25 @@ export function compileUnitWat(mem, entry, opts = {}) {
   if ([...texts.values()].some(t => t.includes('(call $ftr '))) {
     wat += '  (import "js" "ftab" (table $ft 0 funcref))\n';
     wat += '  (type $uft (func (result i64)))\n';
-    wat += `  (func $ftr (param $a i64) (result i32)
-    (local $lo i32) (local $hi i32) (local $mid i32) (local $p i32) (local $v i64)
-    (local.set $hi (i32.load (i32.const ${FTMAP})))
-    (block $miss
+    wat += FTR_WAT;
+    // In-wasm dispatch driver: after a top frame's guest ret exits its wasm
+    // function, resolve the exit rip and chain to the next compiled function
+    // without returning to JS — the JS dispatch loop paid a full regfile
+    // syncOut/syncIn per top-frame ret (23M round-trips in one CPython
+    // benchmark run). Exits to JS only on a resolver miss or exhausted
+    // budget; the same FTDEPTH/FTFUEL words gate it, so host slice deadlines
+    // and stack limits behave exactly as for in-unit chains.
+    wat += `  (func (export "drive") (param $rip i64) (result i64)
+    (local $fti i32)
+    (block $out
       (loop $l
-        (br_if $miss (i32.ge_u (local.get $lo) (local.get $hi)))
-        (local.set $mid (i32.shr_u (i32.add (local.get $lo) (local.get $hi)) (i32.const 1)))
-        (local.set $p (i32.add (i32.const ${FTMAP + 16}) (i32.shl (local.get $mid) (i32.const 4))))
-        (local.set $v (i64.load (local.get $p)))
-        (if (i64.eq (local.get $v) (local.get $a))
-          (then (return (i32.load (i32.add (local.get $p) (i32.const 8))))))
-        (if (i64.lt_u (local.get $a) (local.get $v))
-          (then (local.set $hi (local.get $mid)))
-          (else (local.set $lo (i32.add (local.get $mid) (i32.const 1)))))
+        (local.set $fti (call $ftr (local.get $rip)))
+        (br_if $out (i32.lt_s (local.get $fti) (i32.const 0)))
+        (br_if $out (i32.eqz (i32.and (i32.lt_u (i32.load (i32.const ${FTDEPTH})) (i32.const ${FTDLIMIT})) (i32.ne (i32.load (i32.const ${FTFUEL})) (i32.const 0)))))
+        (i32.store (i32.const ${FTFUEL}) (i32.sub (i32.load (i32.const ${FTFUEL})) (i32.const 1)))
+        (local.set $rip (call_indirect $ft (type $uft) (local.get $fti)))
         (br $l)))
-    (i32.const -1))\n`;
+    (local.get $rip))\n`;
   }
   let blocks = 0;
   for (const [k, t] of texts) { wat += t; blocks += funcs.get(k).blocks.length; }
