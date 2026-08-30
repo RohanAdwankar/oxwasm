@@ -1093,6 +1093,17 @@ export class LinuxEngine {
         if (this.asyncCompile) ceng.asyncCompile = this.asyncCompile;
         ceng.unitMaxFuncs = this.childUnitMaxFuncs ?? 24;    // wabt-sized units
         ceng.unitMaxInsns = this.childUnitMaxInsns ?? 4000;
+        // Per-binary child unit cache: a plug-in's load layout is
+        // deterministic (same binary, same files, same allocator sequence),
+        // so its compiled units are keyed by (path, entry) and reused across
+        // spawns — the first run of a filter tiers organically, repeats
+        // register instantly.
+        {
+          const cache = (this.childUnits ??= new Map()).get(path) ?? new Map();
+          this.childUnits.set(path, cache);
+          ceng.unitBytes = (k) => cache.get(k.toString(16));
+          ceng.onUnitBytes = (k, bytes) => cache.set(k.toString(16), bytes);
+        }
         ceng.parentEng = this;
         (this.children ??= []).push({ pid: t.proc.pid, eng: ceng, exited: null });
         t.state = 'dead';
