@@ -391,12 +391,28 @@ export class LinuxEngine {
     // hosts that set no sliceDeadline get an effectively bottomless tank
     fdv.setUint32(FTFUEL, this.chainFuel ?? 0x0FFFFFFF, true);
     this.syncOut();
+    const entry = this.cpu.rip;
     try { const exit = f(); this.syncIn(); this.stats.aotRuns++;
       if (this.onProgress && this.stats.aotRuns % 4e6 === 0) this.onProgress('aot');
       return BigInt.asUintN(64, exit); }
-    catch (e) { if (e instanceof DeoptUnwind) { this.syncIn(); return BigInt.asUintN(64, e.rip); }
-                if (e instanceof BlockUnwind) { this.syncIn(); return BigInt.asUintN(64, e.rip); }
-                throw e; }
+    catch (e) { if (e instanceof DeoptUnwind) { this.syncIn();
+        // A deopt back to the exact rip we dispatched made zero progress, and
+        // the caller's loop will re-dispatch the same function — with a deopt
+        // GUARD at the entry insn (e.g. a 128-bit `div` whose back-edge
+        // carries the remainder in rdx) that is an infinite churn: leafpad's
+        // boot spun forever inside libc's multiword division. Blacklist the
+        // entry after repeated same-rip deopts; the interpreter runs it.
+        if (e.rip === entry) {
+          const n = ((this._entryDeopts ??= new Map()).get(entry) || 0) + 1;
+          this._entryDeopts.set(entry, n);
+          if (n >= 32 && this.aotFns.has(entry)) {
+            this.aotFns.delete(entry); this.aotFailed.add(entry);
+            if (this.onAotFail) this.onAotFail(entry, 'entry-deopt churn (blacklisted)');
+          }
+        }
+        return BigInt.asUintN(64, e.rip); }
+      if (e instanceof BlockUnwind) { this.syncIn(); return BigInt.asUintN(64, e.rip); }
+      throw e; }
     finally { fdv.setUint32(FTMAP + 8, fd0, true); }
   }
 
