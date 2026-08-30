@@ -235,3 +235,39 @@ already-narrow values, `xor r,r` / `sub r,r` as a constant zero, `test r,r`
 emitting the value once, constant shift counts folded against their mask)
 are worth ~2% of emitted bytes on their own — real for wat2wasm and
 wabt.js time, but not the multiplier.
+
+### The global funcref resolver was the real cost (landed: ~15% on loop30M)
+
+Splitting those 330M calls by kind: 10% are same-module direct, 30% are
+cross-unit static calls, and **60% are indirect** (CPython dispatching
+through type slots). Every one of the latter two — 297M of them — resolved
+its target through `$ftr`, which was a binary search over the sorted
+`(addr, slot)` map.
+
+Benchmarked against an open-addressed hash of the same entries, with 90% of
+lookups deliberately landing on a 24-entry hot set (a scattered access
+pattern is far worse for the search, so this is the charitable case):
+
+| registered units | binary search | hash |
+|------------------|---------------|------|
+| 1,226 (the loop30M run) | 15.5ns | 3.6ns |
+| 7,684 (packed GIMP) | 21.3ns | 4.2ns |
+
+Landed as a hash table. loop30M end to end:
+
+| | runs | mean |
+|---|------|------|
+| binary search | 11210, 11014, 10982, 10468ms | ~10.9s |
+| hash | 9088, 9550ms | ~9.3s |
+
+**~15%**, and it scales with the number of compiled units, so a large app
+like GIMP gains more than CPython does. Registration also drops from an
+O(n) memmove to a store, which cuts tier-up time.
+
+The sorted array is still maintained alongside the hash: a packed page
+ships prebuilt unit wasm whose `$ftr` binary-searches it, and those units
+must keep resolving correctly against a newer engine. It can be deleted
+once no prebuilt units predate the hash — which also removes the memmove.
+
+For scale, this is worth more than the register-passing call ABI (~13%)
+and cost a fraction of the risk: no ABI change, no flag day, no repack.

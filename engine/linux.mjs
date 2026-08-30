@@ -7,7 +7,8 @@
 import { CPU, Memory } from './interp.mjs';
 import { compileLoop } from './jit2.mjs';
 import { compileVectorLoop } from './jitsimd.mjs';
-import { compileUnitWat, pltStubWat, FTMAP, FTMAP_MAX, FTDLIMIT, FTFUEL } from './aot_wat.mjs';
+import { compileUnitWat, pltStubWat, FTMAP, FTMAP_MAX, FTDLIMIT, FTFUEL,
+         FTHASH, FTHBITS, FTHMASK, FTHBYTES } from './aot_wat.mjs';
 import { decode } from './decode.mjs';
 
 const PAGE = 4096n;
@@ -242,13 +243,15 @@ export class LinuxEngine {
     this.ftab.set(idx, f);
     const dv = new DataView(this.wmem.buffer);
     const au = BigInt.asUintN(64, a);
-    let lo = 0, hi = idx;
-    while (lo < hi) { const mid = (lo + hi) >> 1;
-      if (dv.getBigUint64(FTMAP + 16 + mid * 16, true) < au) lo = mid + 1; else hi = mid; }
-    new Uint8Array(this.wmem.buffer)
-      .copyWithin(FTMAP + 16 + (lo + 1) * 16, FTMAP + 16 + lo * 16, FTMAP + 16 + idx * 16);
-    dv.setBigUint64(FTMAP + 16 + lo * 16, au, true);
-    dv.setUint32(FTMAP + 16 + lo * 16 + 8, idx, true);
+    // open addressing with linear probing, mirroring $ftr's own walk
+    let p = FTHASH + (((Math.imul(Number(au & 0xFFFFFFFFn), 0x9E3779B1) >>> (32 - FTHBITS))) << 4);
+    for (;;) {
+      const k = dv.getBigUint64(p, true);
+      if (k === 0n || k === au) break;
+      p = FTHASH + (((p - FTHASH) + 16) & FTHMASK);
+    }
+    dv.setBigUint64(p, au, true);
+    dv.setUint32(p + 8, idx, true);
     dv.setUint32(FTMAP, this._ftCount, true);
   }
 
@@ -264,6 +267,9 @@ export class LinuxEngine {
   // functions).
   rebuildFtmap() {
     new DataView(this.wmem.buffer).setUint32(FTMAP, 0, true);
+    // open addressing has no in-place delete: clearing and reinserting is
+    // the only way to drop an entry (a blacklisted unit, a restored image)
+    new Uint8Array(this.wmem.buffer, FTHASH, FTHBYTES).fill(0);
     this._ftCount = 0; this._ftSeen = new Set();
     for (const [a, f] of this.aotFns)
       if (f && !f.jsStub) this.registerAotFn(a, f);

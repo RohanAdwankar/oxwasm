@@ -10,15 +10,30 @@ const MASK = { 1: 0xFFn, 2: 0xFFFFn, 4: 0xFFFFFFFFn, 8: 0xFFFFFFFFFFFFFFFFn };
 const SIGN = { 1: 0x80n, 2: 0x8000n, 4: 0x80000000n, 8: 0x8000000000000000n };
 
 // Global function-dispatch map, shared by ALL translation units of an engine:
-// a sorted array of (guest address i64, funcref-table index i32, pad) 16-byte
-// entries living in wasm-memory scratch below the guest RAM base (RAMOFF is
-// 1MB; the regfile ends at 512). The engine appends an entry per registered
-// compiled function; every unit's $ftr does an in-wasm binary search here and
+// an open-addressed hash table of (guest address i64, funcref-table index
+// i32) 16-byte slots living in wasm-memory scratch below the guest RAM base
+// (RAMOFF is 1MB; the regfile ends at 512). The engine inserts a slot per
+// registered compiled function; every unit's $ftr hashes into it and
 // call_indirect's through the shared imported table — so indirect calls,
 // cross-unit static calls, and indirect tail jumps chain wasm-to-wasm with no
 // JS boundary and no regfile sync. A miss falls back to x_callout / x_deopt.
-export const FTMAP = 0x10000;        // u32 count at +0, u32 chain depth at +8, entries at +16
-export const FTMAP_MAX = 61000;      // entries: stays well below RAMOFF
+//
+// This was a sorted array with a binary search, which is what a resolver
+// looks like until you measure it: at 1,226 registered units a lookup cost
+// 15.5ns even with 90% of lookups hitting a 24-entry hot set (21.3ns at
+// GIMP's 7,684 units), against 3.6-4.2ns for the hash. CPython's loop30M
+// resolves 297M times in an 11s run, so the ~12ns is seconds. Insertion
+// drops from an O(n) memmove to a store, which also cuts tier-up time.
+// The sorted array stays maintained at its old address alongside the hash:
+// a packed page ships prebuilt unit wasm whose $ftr binary-searches it, and
+// those units must keep resolving correctly against a newer engine. It can
+// be dropped once no prebuilt units predate the hash.
+export const FTMAP = 0x10000;        // u32 count at +0, u32 chain depth at +8, u32 fuel at +12
+export const FTMAP_MAX = 20000;      // array entries at +16 (16B each), now bounded to leave room
+export const FTHASH = 0x60000;       // hash slots: i64 key (guest addr, 0 = empty), i32 table slot, pad
+export const FTHBITS = 15, FTSLOTS = 1 << FTHBITS;   // 32768 slots * 16B = 512KB
+export const FTHMASK = FTSLOTS * 16 - 1;
+export const FTHBYTES = FTSLOTS * 16;
 // Wasm calls nest real host-stack frames, so unlike native calls they can
 // blow the ~1MB stack under deep guest recursion — and a frame's size grows
 // with the FUNCTION's size (V8 spill slots), so post-jump-table units (one
@@ -45,21 +60,22 @@ export const FTFUEL = FTMAP + 12;
 // The in-wasm resolver over the sorted (addr, table-slot) map at FTMAP —
 // shared by every unit module and by generated PLT stubs.
 const FTR_WAT = `  (func $ftr (param $a i64) (result i32)
-    (local $lo i32) (local $hi i32) (local $mid i32) (local $p i32) (local $v i64)
-    (local.set $hi (i32.load (i32.const ${FTMAP})))
-    (block $miss
-      (loop $l
-        (br_if $miss (i32.ge_u (local.get $lo) (local.get $hi)))
-        (local.set $mid (i32.shr_u (i32.add (local.get $lo) (local.get $hi)) (i32.const 1)))
-        (local.set $p (i32.add (i32.const ${FTMAP + 16}) (i32.shl (local.get $mid) (i32.const 4))))
-        (local.set $v (i64.load (local.get $p)))
-        (if (i64.eq (local.get $v) (local.get $a))
-          (then (return (i32.load (i32.add (local.get $p) (i32.const 8))))))
-        (if (i64.lt_u (local.get $a) (local.get $v))
-          (then (local.set $hi (local.get $mid)))
-          (else (local.set $lo (i32.add (local.get $mid) (i32.const 1)))))
-        (br $l)))
-    (i32.const -1))\n`;
+    (local $p i32) (local $k i64)
+    (local.set $p (i32.add (i32.const ${FTHASH})
+      (i32.shl (i32.shr_u (i32.mul (i32.wrap_i64 (local.get $a)) (i32.const 0x9E3779B1))
+                          (i32.const ${32 - FTHBITS})) (i32.const 4))))
+    (block $done
+      (loop $probe
+        (local.set $k (i64.load (local.get $p)))
+        (br_if $done (i64.eq (local.get $k) (local.get $a)))
+        (br_if $done (i64.eqz (local.get $k)))
+        (local.set $p (i32.add (i32.const ${FTHASH})
+          (i32.and (i32.add (i32.sub (local.get $p) (i32.const ${FTHASH})) (i32.const 16))
+                   (i32.const ${FTHMASK}))))
+        (br $probe)))
+    (if (result i32) (i64.eq (i64.load (local.get $p)) (local.get $a))
+      (then (i32.load (i32.add (local.get $p) (i32.const 8))))
+      (else (i32.const -1))))\n`;
 
 // A PLT/IFUNC stub as a WASM function: read the GOT slot LIVE from guest
 // memory (so ld.so rebinding the slot — even re-relocating itself — is
