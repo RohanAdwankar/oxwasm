@@ -24,10 +24,14 @@ add('/etc/ld.so.cache','/etc/ld.so.cache');
 })('/usr/share/X11/locale', '/usr/share/X11/locale');
 const bin = process.argv[2], args = process.argv.slice(3);
 add(bin, bin);
+// XSHOT_EXTRA=/bin/dash:/bin/ls — extra guest files. A terminal emulator
+// spawns a shell, so the binary under test is not the only one it needs.
+for (const p of (process.env.XSHOT_EXTRA || '').split(':').filter(Boolean)) add(p, p);
 if (!files[bin]) { console.log('absent:', bin); process.exit(0); }
 const xs = new XServer({ width: 480, height: 200 });
 const eng = new LinuxEngine(files[bin], { argv:[bin, ...args],
-  env:['DISPLAY=:0','PATH=/bin:/usr/bin','HOME=/root','LANG=C'], files, mtimes, memMB: 512, xserver: xs });
+  env:['DISPLAY=:0','PATH=/bin:/usr/bin','HOME=/root','LANG=C','SHELL=/bin/sh','TERM=xterm'],
+  files, mtimes, memMB: 512, xserver: xs, tty: !!process.env.XSHOT_TTY });
 const t0 = Date.now(); let painted = 0;
 // A cold Xt app can take many minutes to reach first paint, and a run that
 // only prints at the end loses everything if it is killed or the container
