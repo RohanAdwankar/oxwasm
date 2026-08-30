@@ -271,3 +271,36 @@ once no prebuilt units predate the hash — which also removes the memmove.
 
 For scale, this is worth more than the register-passing call ABI (~13%)
 and cost a fraction of the risk: no ABI change, no flag day, no repack.
+
+### GIMP gains more than CPython (as predicted by unit count)
+
+Same snapshot, same click script, engine BUSY time per interaction (clicks
+are injected when the engine parks, so wall time does not enter). The two
+runs did identical work — 5,541 units both, 1,507,965,828 vs 1,507,965,922
+interpreted steps — so the difference is resolver cost alone:
+
+| | binary search | hash | |
+|---|---|---|---|
+| snapshot restore, settle | 605ms | **229ms** | 2.6x |
+| first menu open (cold path) | 4596ms | **682ms** | 6.7x |
+| first menu close (cold path) | 5915ms | **614ms** | 9.6x |
+| warm menu open, median of 8 | 120.4ms | **91.4ms** | 1.32x |
+| warm menu close, median of 8 | 28.9ms | **19.3ms** | 1.50x |
+
+Warm interactions gain 24-33%, more than loop30M's 15%, because GIMP has
+7,684 registered units against CPython's 1,226 and the search was
+O(log n) with cache misses. The cold first interaction gains far more
+still: that path tiers units up, and registration itself was an O(n)
+memmove per unit, which the hash replaces with a store.
+
+Measuring interaction latency needs care about what "idle" means. A pump
+loop that calls `eng.wake()` whenever `eng.blocked` is set turns GIMP's
+poll-with-timeout into a busy spin: the first version of this harness
+reported every interaction pinned at its 20s cap and burned 2.04 billion
+interpreted steps doing it. The app is idle exactly when it is blocked on
+a deadline that has not arrived yet.
+
+These are node-harness numbers. The packed page still ships prebuilt units
+whose $ftr is the old binary search, so it keeps the old latency until it
+is repacked — the retained sorted array is what makes those units correct
+against this engine meanwhile.
