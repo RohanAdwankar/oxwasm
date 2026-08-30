@@ -93,3 +93,15 @@ A profile of the steady phase is ~40% wasm guest code, ~10% GC, ~20%
 process-startup retranslation, ~5% JS dispatch/callout glue — the
 remaining gap is translated-code quality (per-access address translation,
 flag materialization, block-boundary register traffic), not dispatch.
+
+2026-08-30, after wasm PLT stubs + the in-wasm dispatch driver (JS
+boundary crossings 23.1M -> 2,950 for the run):
+
+| test (10x, warmed) | native | engine  | ratio | was    |
+|--------------------|--------|---------|-------|--------|
+| loop30M            | 994ms  | ~9700ms | ~9.8x | ~9.3x  |
+| dict3M             | 300ms  | ~3100ms | ~10x  | ~15x   |
+| str2M              | 300ms  | ~1950ms | ~6.3x | ~12.5x |
+
+(loop30M is pure bytecode dispatch inside one unit — never callout-bound
+— so it moves only with translated-code quality; that is the open item.)
