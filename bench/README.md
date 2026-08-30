@@ -526,3 +526,46 @@ quantization, and ~22ms is about that. If so, drawing smoothness is a
 scheduling problem like the 250ms input-wakeup bug was, not a throughput
 one, and more JS optimization will keep returning nothing. That is the next
 thing to test, and it is worth more than another component speedup.
+
+### Where a stroke's 21.6ms actually goes (hypothesis disproved)
+
+The previous section guessed stroke latency was rAF-scheduling-bound: the
+blit is coalesced onto `requestAnimationFrame`, so input->paint should not
+beat ~16.7ms. **That was wrong.** Splitting the measurement three ways —
+input queued until the pump picks it up, pump work, and the wait for the
+animation frame — gives:
+
+| input->paint 21.6ms | | |
+|---|---|---|
+| wait, input -> pump | 2.2ms | 10% |
+| compute, pump work | **14.0ms** | **65%** |
+| rAF, blit requested -> frame fires | 5.8ms | 27% |
+
+The pump picks input up almost immediately, so drawing is compute-bound,
+not scheduling-bound. That also explains the two null results without any
+exotic floor: the 1.8x convert and the 29x copyArea were each a small
+slice of a 14ms compute half, so a large multiplier on a small part moved
+~1-2ms and vanished under noise.
+
+The consequence for planning: rAF's 5.8ms is a floor that stays (bypassing
+it would wreck frame pacing), and 2.2ms of pickup is already negligible.
+Reaching a 16ms/60Hz budget therefore needs compute at ~8ms, a 1.75x on
+that half. The stroke profile puts ~33% of it in translated guest code and
+the rest in X server JS and residual interpretation — so this lands back on
+translated-code quality, the same place loop30M ends up.
+
+Two measurement defects had to be cleared first, both of which produced
+believable numbers:
+
+- The probe's `resetLat` did not zero the accumulators newly added to the
+  page, so `work` ran cumulatively (109.6 -> 194.2 across five strokes)
+  while the divisor reset. The parts failing to sum to the total is what
+  exposed it.
+- The rAF counter's first patch attempt wrote nothing: the pattern occurs
+  in BOTH shell templates, the assertion demanded exactly one, the write
+  aborted — and an "ok" printed by a later block in the same output got
+  read as success. The repacked page had no counter and reported a tidy
+  -1.0. `git status` showing only the probe modified is what caught it.
+
+Hence the rule now followed: grep the PACKED `index.html` for a new field
+before believing any number that field is supposed to produce.
