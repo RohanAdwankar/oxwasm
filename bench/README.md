@@ -176,11 +176,24 @@ them all back, because the emitter has no idea which ones the rest of the
 unit still needs.
 
 That is the next multiplier, and it is a dataflow problem, not a codegen
-trick: backward liveness gives the registers actually read after a call,
-and a forward "is the local authoritative" pass keeps the skipped ones
-safe (a register whose local was never reloaded must also be skipped by
-every later spill, so the regfile keeps the value the callee left — which
-is exactly the value a deopt to the interpreter needs).
+trick. The spills cannot shrink — an interpreted callee reads the regfile,
+so it must see all 16 — but the reloads can:
+
+- Backward liveness over the block graph gives the registers actually read
+  after a call. Analyzing the EMITTED text is exact and cheap: `local.get
+  $rK` is a read, `local.set $rK` a write. Spills do not count as reads
+  (they are conditional on the same analysis).
+- Skipping a reload leaves that local stale, with the regfile authoritative
+  — which is what a deopt needs. So every later spill of a stale register
+  must be skipped too, and a write to it clears the staleness.
+- The subtle part is a merge whose predecessors disagree: stale on one
+  path, written-and-authoritative on the other. Spilling there writes
+  garbage from one side; not spilling leaves the regfile behind on the
+  other. Rather than emit compensation code on edges, resolve it by
+  fixpoint — start optimistic (skip every dead reload), and wherever a
+  block entry has predecessors that disagree about a register, demote the
+  reload that caused it and re-run. Removing skips only shrinks the stale
+  sets, so it terminates.
 
 Small folds landed alongside this measurement (dead width masks on
 already-narrow values, `xor r,r` / `sub r,r` as a constant zero, `test r,r`
