@@ -528,6 +528,24 @@ export class XServer {
   handle(conn, req) {
     const v = new DataView(req.buffer, req.byteOffset, req.length);
     const op = req[0], d1 = req[1];
+    // XFONTTRACE=1 logs every font request with the name or pattern asked
+    // for. XCreateFontSet failing shows up here as the pattern Xlib probes;
+    // wrapping handle() from outside a test turned out not to work, so the
+    // hook lives in the server.
+    if (process?.env?.XFONTTRACE && (op === 16 || op === 17)) {
+      if (op === 17) console.error(`<xfont GetAtomName ${v.getUint32(4, true)} -> ${this.atoms[v.getUint32(4, true)] ?? '(none)'}>`);
+      else { let n = ''; const ln = v.getUint16(4, true); for (let i = 0; i < ln; i++) n += String.fromCharCode(req[8 + i]);
+             console.error(`<xfont InternAtom "${n}">`); }
+    }
+    if (process?.env?.XFONTTRACE && op >= 45 && op <= 52) {
+      const NM = { 45:'OpenFont', 46:'CloseFont', 47:'QueryFont', 48:'QueryTextExtents',
+                   49:'ListFonts', 50:'ListFontsWithInfo', 51:'SetFontPath', 52:'GetFontPath' };
+      let txt = '';
+      const str = (o, n) => { let r = ''; for (let i = 0; i < n; i++) r += String.fromCharCode(req[o + i]); return r; };
+      if (op === 45) txt = str(12, v.getUint16(8, true));
+      else if (op === 49 || op === 50) txt = str(8, v.getUint16(6, true));
+      console.error(`<xfont ${NM[op]}${txt ? ' "' + txt + '"' : ''}>`);
+    }
     if (this.countOps) {
       this.opCount[op] = (this.opCount[op] || 0) + 1;
       if (op === 72) {                                   // PutImage: any non-white pixels?

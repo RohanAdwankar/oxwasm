@@ -11,6 +11,17 @@ for (const d of ['/lib/x86_64-linux-gnu','/usr/lib/x86_64-linux-gnu','/lib64']) 
   let e; try { e = readdirSync(d); } catch { continue; }
   for (const f of e) { try { const r=realpathSync(join(d,f)); if (lstatSync(r).isFile()) add(join(d,f),r); } catch{} } }
 add('/etc/ld.so.cache','/etc/ld.so.cache');
+// Xlib needs its locale database to build a fontset at all. Without it every
+// run opened with "locale not supported by Xlib, locale set to C" and then
+// "Unable to load any usable fontset" — a deficiency of the probe's file set,
+// not of the server answering the font requests.
+(function walkLocale(d, g) {
+  let e; try { e = readdirSync(d); } catch { return; }
+  for (const f of e) { const hp = join(d, f), gp = g + '/' + f;
+    let st; try { st = lstatSync(hp); } catch { continue; }
+    if (st.isDirectory()) walkLocale(hp, gp);
+    else { try { add(gp, realpathSync(hp)); } catch {} } }
+})('/usr/share/X11/locale', '/usr/share/X11/locale');
 const bin = process.argv[2], args = process.argv.slice(3);
 add(bin, bin);
 if (!files[bin]) { console.log('absent:', bin); process.exit(0); }
