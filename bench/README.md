@@ -834,3 +834,33 @@ With this, `call` reads 7.71x, 8.13x, 7.80x on repeated runs — so the honest
 figure is **~8x**, not the 9.5x-12.3x the earlier harness produced across
 nominally identical configurations. The spill-narrowing change measured
 ~11%, which this harness could now resolve; re-testing it is the next step.
+
+### Settled: spill/reload is not the call tax either
+
+With the harness able to resolve ~4%, the reverted change was re-applied and
+A/B'd properly. Same session, interleaved, `call` on a calibrated N:
+
+| | ratio | spread | resolution |
+|--|------:|-------:|-----------:|
+| narrowed spill/reload | 7.96x | +/-2% | ~5% |
+| full spill/reload     | 8.02x | +/-4% | ~3% |
+
+**0.75% apart, on a harness that can see 4%.** The change has no measurable
+effect even on the kernel built to expose it. Reverted again, and this time
+the negative is trustworthy rather than merely unproven.
+
+So both hypotheses about the call tax are dead. It is not the funcref table
+(direct calls already bypass it) and it is not the register spill/reload
+(removing two thirds of it changes nothing). The 18 wasm memory operations
+around a call are real in the emitted text, but they evidently are not what
+the ~8x is made of — plausibly V8 already collapses redundant stores and
+loads to the same linear-memory slots, which would make the wat-level
+instruction count a poor proxy for cost. That is worth remembering
+generally: counting emitted ops has now mispredicted twice.
+
+What is left as a candidate is the call machinery itself rather than what
+surrounds it — the wasm frame, the stack-budget load/compare/store on every
+call, and whatever V8 charges to enter a generated function. Measuring that
+needs a different experiment: vary the callee's size and see how the per-call
+cost amortises, which separates fixed frame cost from anything proportional
+to the spill set.

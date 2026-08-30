@@ -106,7 +106,10 @@ for (const k of kernels) {
 
 // Self-check: measure one kernel a second time, same configuration. Whatever
 // these two disagree by is the smallest effect this harness can see.
-const probe = results[0]?.k ?? kernels[0];
+// SELFCHECK=0 skips it: when A/B'ing two configurations the second
+// measurement of each is the comparison, and the self-check doubles an
+// already long run.
+const probe = process.env.SELFCHECK === '0' ? null : (results[0]?.k ?? kernels[0]);
 if (probe) {
   const nProbe = results[0]?.n;
   const a = measure(probe, nProbe), b = measure(probe, nProbe);
