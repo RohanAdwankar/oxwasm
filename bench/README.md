@@ -956,3 +956,66 @@ so the frame never exists. The amortisation curve already says what that is
 worth — a callee big enough to hide the charge runs at 1.38x, and a call
 removed entirely pays nothing at all. That is the next hypothesis, and like
 the last three it gets measured before it gets built.
+
+## What real binaries actually call
+
+Everything above measures the call boundary on kernels built to expose it.
+None of it says what the boundary costs a real program, and the amortisation
+curve makes that a question about the program rather than the translator: if
+the charge is fixed at roughly 22 native instruction-times, what it costs
+depends entirely on how far apart a program's calls are.
+
+`tools/callprof.mjs` runs an unmodified binary in the interpreter, where
+`cpu.onCall` fires on every executed call, counts targets, and sizes each one
+with the same whole-function analysis the unit builder uses. Two input sizes
+are differenced so the number is steady state, not ld.so — startup alone is
+about 100k instructions at 96 per call, which on a short run *is* the
+measurement.
+
+| program | steady-state insns/call | charge share | hot callees |
+|---------|------------------------:|-------------:|-------------|
+| `sha256sum` 200KB | **184,223** | ~0% | none — 47 calls total |
+| `gzip -1` 200KB   | **77**      | **~20%** | three, of 66/88/114 insns |
+
+The two ends are as far apart as the question allows.
+
+**sha256sum's hot loop calls nothing.** Its whole steady state — 8.66M
+instructions of block transform — contains 47 calls. The per-call charge is
+not a small cost here, it is not a cost at all, and no amount of work on the
+call boundary would move this program by a measurable amount.
+
+**gzip's hot loop calls constantly**, and one call every 77 instructions puts
+the fixed charge at about a fifth of its engine time. But the shape of that
+is much more specific than "gzip makes a lot of calls":
+
+| callee | size | calls | share |
+|--------|-----:|------:|------:|
+| `0x408ce0` |  66 insns | 125,586 | 51.3% |
+| `0x405190` |  88 insns |  67,012 | 27.4% |
+| `0x404420` | 114 insns |  48,103 | 19.7% |
+
+Three functions, 268 instructions between them, are **98.4%** of every call
+gzip makes. Splicing those three into their callers is a bounded, concrete
+change — not a general inliner, three functions — and it is the whole of the
+20%.
+
+Two things this settles.
+
+**The 8x call figure never described a real program.** gzip, the most
+call-dense real workload measured, pays ~20%, not 8x, because its callees are
+66-114 instructions rather than one. The synthetic kernel measured the charge
+correctly and represented nothing.
+
+**Inlining is worth building, but as a targeted transform with a size budget
+in the low hundreds.** A 64-instruction cutoff — the obvious first guess, and
+the one this tool shipped with — classifies all three of gzip's hot callees
+as too large and reports 0.2% inlinable. The opportunity sits just past where
+an unmeasured threshold would have hidden it.
+
+Caveat: the interpreter is a faithful stand-in for the *distribution* of call
+targets, which is a property of the program, but instructions-per-call is not
+the same as time-per-call. A program whose calls sit inside cheap
+straight-line code pays the charge more often per unit of native time than
+this ratio suggests, and one whose calls surround expensive instructions pays
+it less. The two programs here are far enough apart that the ordering is not
+in doubt; a number in the middle would need the timing done directly.
