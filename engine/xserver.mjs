@@ -78,6 +78,8 @@ class W {
 const pad4 = (n) => (n + 3) & ~3;
 
 // ---- the server ------------------------------------------------------------
+import { builtinFont } from './font5x7.mjs';
+
 export class XServer {
   constructor({ width = 800, height = 600, fonts = {} } = {}) {
     this.W = width; this.H = height;
@@ -90,12 +92,24 @@ export class XServer {
     // fonts: name -> parsed PCF; register XLFD-ish aliases
     this.fonts = [];
     for (const [name, f] of Object.entries(fonts)) this.fonts.push({ names: [name.toLowerCase()], font: f });
+    // Last-resort core font. Athena/Xt clients (xmessage, xfontsel, xclock,
+    // xedit) load a SERVER-side font at startup and abort with "Unable to
+    // load any usable ISO8859 font" if there is none; GTK apps never showed
+    // this because Xft rasterizes client-side. Appended AFTER the supplied
+    // PCFs so a real font always wins the match, and it only ever answers
+    // requests that would otherwise have found nothing.
+    this.fonts.push({ names: ['builtin5x7'], font: builtinFont(), builtin: true });
     this.defaultFont = this.fonts[0]?.font ?? null;
     const alias = (pat, key) => { const e = this.fonts.find(e => e.names.includes(key)); if (e) e.names.push(pat); };
     alias('fixed', '6x13'); alias('variable', '6x13'); alias('cursor', 'cursor');
     // a well-formed XLFD name so XCreateFontSet (Xt/Xaw fontsets) can parse
     // charset fields out of what ListFonts returns
     alias('-misc-fixed-medium-r-normal--13-120-75-75-c-60-iso8859-1', '6x13');
+    { const bi = this.fonts[this.fonts.length - 1];
+      const claimed = new Set(this.fonts.flatMap(e => e === bi ? [] : e.names));
+      for (const n of ['fixed', 'variable', 'cursor', '6x13', '9x15', '5x7',
+                       '-misc-fixed-medium-r-normal--13-120-75-75-c-60-iso8859-1'])
+        if (!claimed.has(n)) bi.names.push(n); }
     // window tree
     this.rootId = 0x266;
     this.root = { id: this.rootId, parent: null, x: 0, y: 0, w: width, h: height, bw: 0,

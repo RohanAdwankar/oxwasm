@@ -21,6 +21,7 @@ node gnutest.mjs
 node attest.mjs
 node pipetest.mjs
 node ttytest.mjs
+node fonttest.mjs
 node pushmemtest.mjs
 node callmemtest.mjs
 node packedtest.mjs
