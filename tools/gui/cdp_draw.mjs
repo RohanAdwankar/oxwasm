@@ -76,8 +76,10 @@ for (let s = 0; s < STROKES; s++) {
   await new Promise(r=>setTimeout(r,600));
   const lat = JSON.parse(await q('JSON.stringify(window.__oxLat)'));
   const mean = lat.samples ? lat.sumMs / lat.samples : -1;
-  rows.push({ wall, mean, max: lat.maxMs, samples: lat.samples, pumpMax: lat.pumpMaxMs });
-  console.log(`stroke ${s+1}: ${STEPS} moves in ${wall}ms · input->paint mean ${mean.toFixed(1)}ms max ${lat.maxMs.toFixed(0)}ms (${lat.samples} paints) · worst pump ${lat.pumpMaxMs.toFixed(0)}ms`);
+  const wait = lat.samples ? lat.sumWait / lat.samples : -1;
+  const work = lat.samples ? lat.sumWork / lat.samples : -1;
+  rows.push({ wall, mean, max: lat.maxMs, samples: lat.samples, pumpMax: lat.pumpMaxMs, wait, work });
+  console.log(`stroke ${s+1}: ${STEPS} moves in ${wall}ms · input->paint ${mean.toFixed(1)}ms = wait ${wait.toFixed(1)} + work ${work.toFixed(1)} · max ${lat.maxMs.toFixed(0)}ms (${lat.samples} paints) · worst pump ${lat.pumpMaxMs.toFixed(0)}ms`);
 }
 if (PROF) {
   const { profile } = await cmd('Profiler.stop');
@@ -88,7 +90,7 @@ if (PROF) {
 const after = await q(inkCount);
 const med = (a) => [...a].sort((x,y)=>x-y)[a.length>>1];
 const warm = rows.slice(1);
-console.log(`SUMMARY warm stroke: input->paint mean med ${med(warm.map(r=>r.mean)).toFixed(1)}ms · max med ${med(warm.map(r=>r.max)).toFixed(0)}ms`);
+console.log(`SUMMARY warm stroke: input->paint med ${med(warm.map(r=>r.mean)).toFixed(1)}ms = wait ${med(warm.map(r=>r.wait)).toFixed(1)} + work ${med(warm.map(r=>r.work)).toFixed(1)} · max med ${med(warm.map(r=>r.max)).toFixed(0)}ms`);
 console.log(`ink pixels ${before} -> ${after} (${after>before?'STROKES DREW':'NO MARKS - correctness failure'})`);
 console.log('stat:', await q('document.getElementById("stat").textContent'));
 ws.close(); chrome.kill('SIGKILL'); process.exit(0);

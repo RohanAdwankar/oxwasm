@@ -688,9 +688,9 @@ function sha1hex(str) {
   // move actually INJECTED: coalescing drops the rest by design, and counting
   // a dropped move as a slow paint would measure the wrong thing
   cv.addEventListener('pointermove', (e) => { if (!window.__oxReady) return; const p = pos(e); p.t = performance.now(); pendingMove = p; poke(); });
-  cv.addEventListener('pointerdown', (e) => { if (!window.__oxReady) return; inputQ.push(performance.now()); cv.focus({ preventScroll: true }); const [x, y] = pos(e); pendingMove = null; xs.injectMotion(x, y);
+  cv.addEventListener('pointerdown', (e) => { if (!window.__oxReady) return; { const _t = performance.now(); inputQ.push({ t: _t, p: _t }); } cv.focus({ preventScroll: true }); const [x, y] = pos(e); pendingMove = null; xs.injectMotion(x, y);
     xs.injectButton(e.button === 2 ? 3 : e.button === 1 ? 2 : 1, true); e.preventDefault(); poke(); });
-  cv.addEventListener('pointerup', (e) => { if (!window.__oxReady) return; inputQ.push(performance.now()); if (pendingMove) { xs.injectMotion(pendingMove[0], pendingMove[1]); pendingMove = null; } xs.injectButton(e.button === 2 ? 3 : e.button === 1 ? 2 : 1, false); e.preventDefault(); poke(); });
+  cv.addEventListener('pointerup', (e) => { if (!window.__oxReady) return; { const _t = performance.now(); inputQ.push({ t: _t, p: _t }); } if (pendingMove) { xs.injectMotion(pendingMove[0], pendingMove[1]); pendingMove = null; } xs.injectButton(e.button === 2 ? 3 : e.button === 1 ? 2 : 1, false); e.preventDefault(); poke(); });
   cv.addEventListener('contextmenu', (e) => e.preventDefault());
   const KC = { Escape:9, Digit1:10, Digit2:11, Digit3:12, Digit4:13, Digit5:14, Digit6:15, Digit7:16,
     Digit8:17, Digit9:18, Digit0:19, Minus:20, Equal:21, Backspace:22, Tab:23,
@@ -703,7 +703,7 @@ function sha1hex(str) {
     F1:67,F2:68,F3:69,F4:70,F5:71,F6:72,F7:73,F8:74,F9:75,F10:76,
     ArrowUp:111, ArrowLeft:113, ArrowRight:114, ArrowDown:116,
     Home:110, End:115, PageUp:112, PageDown:117, Insert:118, Delete:119, ControlRight:105, AltRight:108 };
-  cv.addEventListener('keydown', (e) => { if (!window.__oxReady) return; const k = KC[e.code]; if (k) { inputQ.push(performance.now()); xs.injectKey(k, true); e.preventDefault(); poke(); } });
+  cv.addEventListener('keydown', (e) => { if (!window.__oxReady) return; const k = KC[e.code]; if (k) { const _t = performance.now(); inputQ.push({ t: _t, p: _t }); xs.injectKey(k, true); e.preventDefault(); poke(); } });
   cv.addEventListener('keyup', (e) => { if (!window.__oxReady) return; const k = KC[e.code]; if (k) { xs.injectKey(k, false); e.preventDefault(); poke(); } });
 
   // ---- engine pump: time-budgeted slices, vsync'd paint ----
@@ -714,7 +714,13 @@ function sha1hex(str) {
   // window.__oxLat tracks per-event input->paint latency and worst pump slice
   // so Nth-interaction latency is a measured number, not a feeling.
   const t0 = performance.now();
-  const LAT = window.__oxLat = { samples: 0, sumMs: 0, maxMs: 0, hist: new Array(12).fill(0), pumpMaxMs: 0 };
+  // sumWait/sumWork split input->paint into the two halves that need
+  // different fixes: time spent WAITING for the pump to pick the event up,
+  // and time from the pump running to the pixels landing (which includes
+  // the rAF the blit is coalesced onto). Component speedups only move the
+  // second; a floor in the first is a scheduling problem.
+  const LAT = window.__oxLat = { samples: 0, sumMs: 0, maxMs: 0, hist: new Array(12).fill(0), pumpMaxMs: 0,
+                                 sumWait: 0, sumWork: 0 };
   const inputQ = []; let lastInputT = 0;
   let blitPending = false;
   // zero-delay re-arm: nested setTimeout(0) is clamped to ~4ms by the
@@ -733,8 +739,11 @@ function sha1hex(str) {
       blit();
       const now = performance.now();
       while (inputQ.length) {
-        const dt = now - inputQ.shift();
+        const q = inputQ.shift(), qt = (typeof q === 'object' && q) ? q.t : q;
+        const qp = (typeof q === 'object' && q && q.p != null) ? q.p : qt;
+        const dt = now - qt;
         LAT.samples++; LAT.sumMs += dt; if (dt > LAT.maxMs) LAT.maxMs = dt;
+        LAT.sumWait += (qp - qt); LAT.sumWork += (now - qp);
         LAT.hist[Math.min(11, Math.max(0, Math.floor(Math.log2(Math.max(1, dt)))))]++;
       }
     });
@@ -749,10 +758,10 @@ function sha1hex(str) {
     // interaction ate every slice's budget for tens of seconds (menu opens
     // 0.5s -> 30s+). No input for 2s = self-optimize freely; otherwise the
     // whole slice belongs to the guest.
-    { if (inputQ.length) lastInputT = inputQ[inputQ.length - 1];
+    { if (inputQ.length) { const _l = inputQ[inputQ.length - 1]; lastInputT = (typeof _l === 'object' && _l) ? _l.t : _l; }
       const busy = (typeof pendingMove !== 'undefined' && pendingMove != null) || start - lastInputT < 2000;
       eng.tierMsMax = busy ? 2 : (xs.ptr.buttons ? 2 : 8); }   // never 0: a hot uncompiled entry must be able to compile its way out mid-interaction
-    if (typeof pendingMove !== 'undefined' && pendingMove) { if (pendingMove.t !== undefined) inputQ.push(pendingMove.t); xs.injectMotion(pendingMove[0], pendingMove[1]); pendingMove = null; }
+    if (typeof pendingMove !== 'undefined' && pendingMove) { if (pendingMove.t !== undefined) inputQ.push({ t: pendingMove.t, p: start }); xs.injectMotion(pendingMove[0], pendingMove[1]); pendingMove = null; }
     eng.sliceDeadline = start + 12;                  // honored INSIDE run(): deep callouts preempt too
     eng.chainFuel = 2048;                            // in-wasm chains re-check the clock every ~2k calls
     let mode = 'ran', deadline = null;
@@ -1235,7 +1244,13 @@ async function inflate(b64) {
   // whatever the JIT is doing; paints coalesce onto animation frames;
   // window.__oxLat measures per-event input->paint latency)
   const t0 = performance.now();
-  const LAT = window.__oxLat = { samples: 0, sumMs: 0, maxMs: 0, hist: new Array(12).fill(0), pumpMaxMs: 0 };
+  // sumWait/sumWork split input->paint into the two halves that need
+  // different fixes: time spent WAITING for the pump to pick the event up,
+  // and time from the pump running to the pixels landing (which includes
+  // the rAF the blit is coalesced onto). Component speedups only move the
+  // second; a floor in the first is a scheduling problem.
+  const LAT = window.__oxLat = { samples: 0, sumMs: 0, maxMs: 0, hist: new Array(12).fill(0), pumpMaxMs: 0,
+                                 sumWait: 0, sumWork: 0 };
   const inputQ = []; let lastInputT = 0;
   let blitPending = false;
   // zero-delay re-arm: nested setTimeout(0) is clamped to ~4ms by the
@@ -1254,8 +1269,11 @@ async function inflate(b64) {
       blit();
       const now = performance.now();
       while (inputQ.length) {
-        const dt = now - inputQ.shift();
+        const q = inputQ.shift(), qt = (typeof q === 'object' && q) ? q.t : q;
+        const qp = (typeof q === 'object' && q && q.p != null) ? q.p : qt;
+        const dt = now - qt;
         LAT.samples++; LAT.sumMs += dt; if (dt > LAT.maxMs) LAT.maxMs = dt;
+        LAT.sumWait += (qp - qt); LAT.sumWork += (now - qp);
         LAT.hist[Math.min(11, Math.max(0, Math.floor(Math.log2(Math.max(1, dt)))))]++;
       }
     });
@@ -1270,10 +1288,10 @@ async function inflate(b64) {
     // interaction ate every slice's budget for tens of seconds (menu opens
     // 0.5s -> 30s+). No input for 2s = self-optimize freely; otherwise the
     // whole slice belongs to the guest.
-    { if (inputQ.length) lastInputT = inputQ[inputQ.length - 1];
+    { if (inputQ.length) { const _l = inputQ[inputQ.length - 1]; lastInputT = (typeof _l === 'object' && _l) ? _l.t : _l; }
       const busy = (typeof pendingMove !== 'undefined' && pendingMove != null) || start - lastInputT < 2000;
       eng.tierMsMax = busy ? 2 : (xs.ptr.buttons ? 2 : 8); }   // never 0: a hot uncompiled entry must be able to compile its way out mid-interaction
-    if (typeof pendingMove !== 'undefined' && pendingMove) { if (pendingMove.t !== undefined) inputQ.push(pendingMove.t); xs.injectMotion(pendingMove[0], pendingMove[1]); pendingMove = null; }
+    if (typeof pendingMove !== 'undefined' && pendingMove) { if (pendingMove.t !== undefined) inputQ.push({ t: pendingMove.t, p: start }); xs.injectMotion(pendingMove[0], pendingMove[1]); pendingMove = null; }
     eng.sliceDeadline = start + 12;                  // honored INSIDE run(): deep callouts preempt too
     eng.chainFuel = 2048;                            // in-wasm chains re-check the clock every ~2k calls
     let mode = 'ran', deadline = null;
