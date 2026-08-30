@@ -1494,7 +1494,16 @@ export class LinuxEngine {
         this._deadline = deadline; this.block(deadline); break; }
       case 39: ret(1n); break;                               // getpid
       case 102: case 104: case 107: case 108: ret(0n); break; // getuid/getgid/geteuid/getegid
-      case 105: case 106: ret(0n); break;                     // setuid/setgid
+      // Credentials and ownership are single-user here: everything runs as
+      // one uid, so these succeed rather than reporting ENOSYS. xterm calls
+      // setegid() (i.e. setresgid) to drop privileges after opening its pty
+      // and treats the failure as fatal — "setegid(0): Function not
+      // implemented", then "Cannot chown /dev/pts/0".
+      case 105: case 106:                                     // setuid / setgid
+      case 113: case 114:                                     // setreuid / setregid
+      case 117: case 119:                                     // setresuid / setresgid
+      case 92: case 93: case 260:                             // chown / fchown / fchownat
+      case 90: case 91: case 268: ret(0n); break;             // chmod / fchmod / fchmodat
       case 157: ret(0n); break;                               // prctl
       case 96: {                                              // gettimeofday(tv*, tz)
         if (a1 !== 0n) {
