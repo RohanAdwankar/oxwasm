@@ -668,3 +668,54 @@ codegen idea but a comparison against the same functions compiled natively,
 to see how much of the 9 is irreducible x86-semantics tax (width masking,
 lazy flags, the 32-bit zero-extend rule) versus recoverable. Until that
 exists, "rewrite the translator" is not yet a justified plan.
+
+## Where the gap to native actually is (per instruction class)
+
+The aggregate figures — "5-10x off native", "~13 wasm ops per x86
+instruction" — say the expansion is systemic without saying where it lives.
+`bench/kernels/` answers that: six kernels, each leaning on one thing, the
+same static binary run natively and on the engine. Each is timed at two
+iteration counts and the difference taken, so startup, ELF load and JIT
+compile cancel and only steady-state throughput is left; a kernel whose
+engine output differs from native is aborted rather than compared.
+
+| kernel | native (ms) | engine (ms) | ratio |
+|--------|------------:|------------:|------:|
+| call    |  42.1 | 401.0 | **9.5x** |
+| mem     |  12.8 |  52.8 | 4.1x |
+| subw    |  10.8 |  37.0 | 3.4x |
+| alu     |  27.1 |  72.8 | 2.7x |
+| branch  | 104.9 | 186.9 | 1.8x |
+| muldiv  | 106.1 | 170.7 | 1.6x |
+
+**call/ret is the outlier, at more than twice the next class.** Everything
+else — the straight-line code a translator rewrite would target — is between
+1.6x and 4.1x. That reverses the standing conclusion. The residual gap is
+not uniform expansion needing SSA and better register allocation; it is
+concentrated in one mechanism, the funcref table. Every guest `call` becomes
+a hash lookup plus `call_indirect`, and the earlier 15-33% win from hashing
+that resolver was an early sighting of the same thing.
+
+The obvious lead is that a call whose target is known and lies inside the
+same translation unit does not need the table at all — a direct wasm call
+would skip both the lookup and the indirect dispatch. Unit boundaries are
+what force the indirect path today.
+
+Two caveats on the 9.5x. The callee is a two-operation leaf, so per-call
+overhead is as exposed as it can possibly be; real functions amortise it,
+and this is the worst case for call-heavy code rather than a whole-program
+claim. And nothing here is 10x — the worst *code* class is 4.1x, so a mixed
+workload sits nearer 2-3x than the 5-10x that has been assumed.
+
+### The 0.9x that wasn't
+
+The first run reported call at **0.9x** — faster than native — which would
+have been a pleasing and completely false result. At `-O2` gcc inlined the
+leaf, so `k_call` and `leaf` did not exist as symbols and the kernel
+measured a multiply chain containing no calls. `objdump` showed one `call`
+in the whole of main, and it was `printf`. With `__attribute__((noinline))`
+the same kernel measures 9.5x.
+
+A benchmark that cannot fail is not measuring anything. The check that
+caught this — does the binary actually contain the instruction the kernel
+claims to test — is worth running on any kernel added here.

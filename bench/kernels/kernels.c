@@ -28,8 +28,11 @@ static uint64_t k_mem(uint64_t n, uint64_t *buf, uint64_t len) {
   return s;
 }
 
-// 3. call/ret: the funcref-table path, not straight-line code
-static uint64_t leaf(uint64_t x) { return x * 2654435761u + 1; }
+// 3. call/ret: the funcref-table path, not straight-line code.
+// noinline is load-bearing — at -O2 gcc inlined this and the kernel measured
+// a multiply chain with no calls in it, which read as 0.9x and looked like
+// call/ret being faster than native.
+__attribute__((noinline)) static uint64_t leaf(uint64_t x) { return x * 2654435761u + 1; }
 static uint64_t k_call(uint64_t n) {
   uint64_t s = 0;
   for (uint64_t i = 0; i < n; i++) s += leaf(i) ^ leaf(s);
