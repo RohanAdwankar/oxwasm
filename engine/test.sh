@@ -16,6 +16,7 @@ node simdbench.mjs
 node multest.mjs
 node disptest.mjs
 node jtabtest.mjs
+node shelltest.mjs
 node pushmemtest.mjs
 node callmemtest.mjs
 node packedtest.mjs

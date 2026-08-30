@@ -918,8 +918,11 @@ export class LinuxEngine {
         return;
       }
       const str = new TextDecoder().decode(bytes);
-      if (h?.sink === 'err') { (this.stderr ||= []).push(str); (this.stderrBytes ||= []).push(bytes); }
-      else { this.stdout.push(str); this.stdoutBytes.push(bytes); }
+      // sink output belongs to the process TREE's observer: an execve'd
+      // child's stdout/stderr surface on the root engine, like a terminal
+      let root = this; while (root.parentEng) root = root.parentEng;
+      if (h?.sink === 'err') { (root.stderr ||= []).push(str); (root.stderrBytes ||= []).push(bytes); }
+      else { root.stdout.push(str); root.stdoutBytes.push(bytes); }
     };
     switch (nr) {
       case 1:                                                // write(fd, buf, len)
