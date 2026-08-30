@@ -871,3 +871,45 @@ call, and whatever V8 charges to enter a generated function. Measuring that
 needs a different experiment: vary the callee's size and see how the per-call
 cost amortises, which separates fixed frame cost from anything proportional
 to the spill set.
+
+## The call tax is fixed, and it amortises to near parity
+
+Rather than guess a third mechanism after the funcref table and the
+spill/reload both failed, measure the *shape* of the cost: identical call
+structure, callees of 1, 8 and 64 operations.
+
+| callee body | native (ms) | engine (ms) | ratio | spread |
+|-------------|------------:|------------:|------:|-------:|
+| 1 op   |  990.8 | 8083.8 | **7.78x** | +/-4% |
+| 8 ops  |  939.2 | 2647.9 | **2.53x** | +/-2% |
+| 64 ops | 1601.6 | 2470.5 | **1.38x** | +/-7% |
+
+Monotonic, and steep. This is the signature of a **fixed per-call charge**,
+not a cost proportional to anything around the call — which is why narrowing
+the spill set did nothing, and why removing an indirection that was already
+absent did nothing.
+
+Two consequences, and the second is the important one.
+
+**The 8x headline was an artifact of the callee's size.** A function whose
+entire body is `x * 2654435761 + 1` pays the frame charge on every call with
+nothing to amortise it against. Real code does not call functions that small
+in hot loops, and where it does, compilers inline them — as gcc did to this
+very kernel until `noinline` forced the issue.
+
+**Translated code inside a function is close to native.** Fitting
+engine = F + k*W across the last two points gives k ~ 1.2: the body itself
+runs at roughly 1.2x native, with a fixed charge worth on the order of ten
+leaf-bodies per call. That is a much better picture of the translator than
+any aggregate so far, and it means the straight-line codegen — the thing an
+SSA-and-register-allocation rewrite would target — is not where the
+remaining gap lives.
+
+The target is therefore the call boundary itself: the wasm frame, the
+stack-budget load/compare/store executed on every call, and V8's cost to
+enter a generated function. Whether any of that is reducible is the next
+question; unlike the previous two candidates, this one is measured to matter
+before anything is written.
+
+Caveat: `call64` carries +/-7% spread at 10.8% startup, so 1.38x has real
+uncertainty. The trend across three points does not.
