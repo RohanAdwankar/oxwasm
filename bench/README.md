@@ -719,3 +719,51 @@ the same kernel measures 9.5x.
 A benchmark that cannot fail is not measuring anything. The check that
 caught this — does the binary actually contain the instruction the kernel
 claims to test — is worth running on any kernel added here.
+
+### Correction: it is the spill/reload, not the funcref table
+
+The conclusion above — that call/ret's 9.5x is the funcref table, and that
+direct intra-unit calls would fix it — is **wrong on both halves**. Direct
+calls are already implemented (`canDirect` in aot_wat.mjs emits
+`(call $f_TARGET)` with no lookup), and dumping the emitted wat for the call
+kernel shows the call to `leaf` taking exactly that direct path.
+
+What surrounds it is the cost. One call to a function whose whole body is
+`x * 2654435761 + 1`:
+
+```
+(local.set $r4 (i64.sub (local.get $r4) (i64.const 8)))   ; push return addr
+(i64.store ... (i64.const 4200820))
+(i64.store (i32.const 0)  (local.get $r0))                ; spill r0
+(i64.store (i32.const 8)  (local.get $r1))                ; ... 9 registers
+(i64.store (i32.const 16) (local.get $r2))
+(i64.store (i32.const 24) (local.get $r3))
+(i64.store (i32.const 32) (local.get $r4))
+(i64.store (i32.const 40) (local.get $r5))
+(i64.store (i32.const 48) (local.get $r6))
+(i64.store (i32.const 56) (local.get $r7))
+(i64.store (i32.const 64) (local.get $r8))
+(local.set $fts (i32.load (i32.const 65544)))             ; stack budget
+(if (i32.and (i32.lt_u ...) (i32.ne ...))
+  (then ... (drop (call $f_401b80)) ...)                  ; the actual call
+  (else (drop (call $x_callout ...))))
+(local.set $r0 (i64.load (i32.const 0)))                  ; reload 9 registers
+...
+```
+
+**~18 memory operations plus a budget check, to call a function that does
+two.** Across the whole unit that is 21,948 regfile stores and 18,933 loads.
+`spillAll()`/`reloadAll()` write back every touched register plus all xmm
+around every call, because the regfile in memory is the interface between
+translation units and the callee expects to find registers there.
+
+The target is therefore narrowing that set, not removing an indirection that
+is already gone. For a direct call the callee is known, so its actual read
+set and clobber set can be computed and only those registers spilled — for
+`leaf`, rdi in and rax out, so two operations instead of eighteen.
+
+This also reconciles an earlier result. "Spill/reload liveness" was measured
+at ~1-2% of runtime and dropped, but that was on loop30M, which is not
+call-heavy. Both numbers are right for their workload: the cost is
+negligible in a tight loop and dominant in call-dense code. The mistake was
+generalising the first measurement to the whole engine.
