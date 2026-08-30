@@ -18,7 +18,7 @@ const xs = new XServer({ width: 480, height: 200 });
 const eng = new LinuxEngine(files[bin], { argv:[bin, ...args],
   env:['DISPLAY=:0','PATH=/bin:/usr/bin','HOME=/root','LANG=C'], files, mtimes, memMB: 512, xserver: xs });
 const t0 = Date.now(); let painted = 0;
-try { while (eng.exitCode === null && Date.now()-t0 < 120000) {
+try { while (eng.exitCode === null && Date.now()-t0 < (Number(process.env.XSHOT_MS) || 120000)) {
   eng.run(2e7); if (eng.blocked) eng.wake();
   const nz = xs.fb.reduce((a,v)=>a+(v!==0?1:0),0);
   if (nz > 200) { painted = nz; break; }
