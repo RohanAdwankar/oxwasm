@@ -20,6 +20,7 @@ node shelltest.mjs
 node gnutest.mjs
 node attest.mjs
 node pipetest.mjs
+node ttytest.mjs
 node pushmemtest.mjs
 node callmemtest.mjs
 node packedtest.mjs

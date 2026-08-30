@@ -38,8 +38,23 @@ export class LinuxEngine {
   // the tier's own test suites.
   constructor(elfBytes, { argv = ['prog'], env = [], memMB = 256, threshold = Infinity, files = {},
                           assembleWat = null, aotCallThreshold = 4, aotLoopThreshold = 12,
-                          xserver = null, mtimes = {} } = {}) {
+                          xserver = null, mtimes = {}, tty = false, ttyRows = 24, ttyCols = 80 } = {}) {
     this.files = files;                       // path -> Uint8Array (read-only)
+    // Terminal mode: with it off, ioctl answers ENOTTY for everything, so
+    // isatty() is false, `tty` prints "not a tty", stty fails outright and a
+    // shell disables job control. With it on the standard fds and /dev/tty
+    // look like a terminal and carry termios state.
+    this.tty = tty;
+    this.ttyWin = { rows: ttyRows, cols: ttyCols };
+    this.termios = tty ? {
+      iflag: 0x500,          // ICRNL | IXON
+      oflag: 0x5,            // OPOST | ONLCR
+      cflag: 0xBF,           // B38400 | CS8 | CREAD
+      lflag: 0x8A3B,         // ISIG ICANON ECHO ECHOE ECHOK IEXTEN ECHOCTL
+      cc: (() => { const c = new Uint8Array(32);
+        c[0]=3; c[1]=28; c[2]=127; c[3]=21; c[4]=4; c[5]=0; c[6]=1;
+        c[8]=17; c[9]=19; c[10]=26; c[12]=18; c[13]=15; c[14]=23; c[15]=22; return c; })(),
+    } : null;
     this.env = env;                           // "KEY=VALUE" strings
     // display/input layer: an X11-protocol server object (see xserver.mjs).
     // AF_UNIX connects to /tmp/.X11-unix/X* attach to it; its screen is the
@@ -789,6 +804,15 @@ export class LinuxEngine {
     this.cpu.regs[4] = sp;
   }
 
+  // The three names that resolve to this session's terminal.  glibc's ttyname()
+  // readlinks /proc/self/fd/N and then stats the answer, so every stat flavour
+  // has to agree with fstat on the fd or isatty()/ttyname() disagree.
+  isTtyPath(p) {
+    if (!this.tty) return false;
+    const n = this.norm(p);
+    return n === '/dev/tty' || n === '/dev/console' || n === '/dev/pts/0';
+  }
+
   // syscall paths that read guest memory via this.ram bypass Memory's pend
   // guard; the ones that can plausibly source read-only file pages (path
   // strings, write/writev payloads) call this explicitly.
@@ -929,12 +953,13 @@ export class LinuxEngine {
     return BigInt(n); }
 
   // fill a struct stat (the by-path shape: dev/ino/nlink/mode/size/times)
-  writeStat(buf, path, size, mode) {
+  writeStat(buf, path, size, mode, rdev = 0n, ino = null) {
     const off = this.RAMOFF + Number(buf - this.base);
     new Uint8Array(this.wmem.buffer, off, 144).fill(0);
     const v = new DataView(this.wmem.buffer);
     v.setBigUint64(off + 0, 8n, true);                        // st_dev
-    v.setBigUint64(off + 8, this.inoOf(path), true);          // st_ino
+    v.setBigUint64(off + 8, ino ?? this.inoOf(path), true);   // st_ino
+    v.setBigUint64(off + 40, rdev, true);                     // st_rdev
     v.setBigUint64(off + 16, 1n, true);                       // st_nlink
     v.setUint32(off + 24, mode, true);                        // st_mode
     v.setBigUint64(off + 48, BigInt(size), true);             // st_size
@@ -1130,7 +1155,48 @@ export class LinuxEngine {
         crypto.getRandomValues(bytes.subarray(0, Math.min(len, 65536)));
         this.ram.set(bytes, Number(buf - this.base));
         ret(BigInt(len)); break; }
-      case 16: ret(-25n); break;                             // ioctl -> ENOTTY
+      case 16: {                                             // ioctl
+        const req = Number(a2 & 0xffffffffn), h = this.fds.get(Number(a1));
+        const isTty = this.tty && (Number(a1) <= 2 || h?.istty);
+        if (!isTty) { ret(-25n); break; }                    // ENOTTY
+        const v = new DataView(this.wmem.buffer);
+        const off = a3 ? this.RAMOFF + Number(a3 - this.base) : 0;
+        const T = this.termios;
+        switch (req) {
+          // TCGETS/TCSETS use the KERNEL struct termios: four u32 flags, a
+          // u8 c_line, then c_cc[19] — 36 bytes. glibc's user-facing termios
+          // is 60 bytes with c_ispeed/c_ospeed appended, and writing that
+          // many bytes overruns the caller's buffer (the guest reported
+          // "*** stack smashing detected ***", which is exactly what it is).
+          case 0x5401: {                                     // TCGETS
+            if (!a3) { ret(-14n); break; }
+            v.setUint32(off + 0, T.iflag, true); v.setUint32(off + 4, T.oflag, true);
+            v.setUint32(off + 8, T.cflag, true); v.setUint32(off + 12, T.lflag, true);
+            v.setUint8(off + 16, 0);
+            new Uint8Array(this.wmem.buffer, off + 17, 19).set(T.cc.subarray(0, 19));
+            ret(0n); break; }
+          case 0x5402: case 0x5403: case 0x5404: {           // TCSETS / SETSW / SETSF
+            if (!a3) { ret(-14n); break; }
+            T.iflag = v.getUint32(off + 0, true); T.oflag = v.getUint32(off + 4, true);
+            T.cflag = v.getUint32(off + 8, true); T.lflag = v.getUint32(off + 12, true);
+            T.cc.set(new Uint8Array(this.wmem.buffer, off + 17, 19).slice(0, 19));
+            ret(0n); break; }
+          case 0x5413: {                                     // TIOCGWINSZ
+            if (!a3) { ret(-14n); break; }
+            v.setUint16(off + 0, this.ttyWin.rows, true); v.setUint16(off + 2, this.ttyWin.cols, true);
+            v.setUint16(off + 4, this.ttyWin.cols * 8, true); v.setUint16(off + 6, this.ttyWin.rows * 16, true);
+            ret(0n); break; }
+          case 0x5414:                                       // TIOCSWINSZ
+            if (a3) { this.ttyWin.rows = v.getUint16(off + 0, true) || 24;
+                      this.ttyWin.cols = v.getUint16(off + 2, true) || 80; }
+            ret(0n); break;
+          case 0x540F: if (a3) v.setUint32(off, 1, true); ret(0n); break;   // TIOCGPGRP
+          case 0x5410: ret(0n); break;                                      // TIOCSPGRP
+          case 0x540B: ret(0n); break;                                      // TCFLSH
+          case 0x5409: ret(0n); break;                                      // TCSBRK
+          default: ret(-25n); break;
+        }
+        break; }
       case 158:                                              // arch_prctl
         if (Number(a1) === 0x1002) { cpu.fsBase = a2; ret(0n); } else ret(-22n);
         break;
@@ -1338,6 +1404,13 @@ export class LinuxEngine {
       case 257: case 2: {                                     // openat(dirfd,path,flags) / open(path,flags)
         const p = nr === 257 ? this.atPath(a1, a2) : this.readPath(a1);
         const flags = Number(nr === 257 ? a3 : a2);
+        // the controlling terminal: a shell opens it to test for job control
+        // and `tty` reports its name. Only present in terminal mode.
+        if (this.isTtyPath(p)) {
+          const fd = this.allocFd();
+          this.fds.set(fd, { sink: 'out', istty: true, path: '/dev/pts/0' });
+          ret(BigInt(fd)); break;
+        }
         let f = this.lookup(p);
         if (f === undefined) {
           if (this.isDir(p)) {                                // O_DIRECTORY / readdir scans
@@ -1426,6 +1499,8 @@ export class LinuxEngine {
                      this._fsMeta().links.has(this.norm(p))) {
             statPath = this.norm(p);
             size = this._fsMeta().links.get(statPath).length; mode = 0o120777;
+          } else if (this.isTtyPath(p)) {
+            this.writeStat(cpu.regs[2], '/dev/pts/0', 0, 0o020620, 0x8800n, 1001n); ret(0n); break;
           } else {
             const f = this.lookup(p);
             if (f !== undefined) { size = f.length; mode = 0o100755; }
@@ -1435,6 +1510,8 @@ export class LinuxEngine {
           }
         } else {
           const h = this.fds.get(Number(a1));
+          if (this.tty && (Number(a1) <= 2 || h?.istty)) {     // terminal: match stat("/dev/pts/0")
+            this.writeStat(a2, '/dev/pts/0', 0, 0o020620, 0x8800n, 1001n); ret(0n); break; }
           if (h?.bytes) { size = h.bytes.length; mode = 0o100755; statPath = h.path ?? null; }  // regular file
           else if (h?.pipe) { size = 0; mode = 0o010600; }                 // FIFO
           else if (h?.sock) { size = 0; mode = 0o140777; }                 // socket
@@ -1473,6 +1550,8 @@ export class LinuxEngine {
         if (this.debugPollAfter != null && this.nowMs() > this.debugPollAfter) {
           if (this.nowMs() - (this._dbgStatLast ?? 0) > 5000) { this._dbgStatLast = this.nowMs();
             console.error(`<statwd thr=${this.threads?.[this.ti]?.id} ${nr===6?'lstat':'stat'} ${p}>`); } }
+        if (this.isTtyPath(p)) {
+          this.writeStat(a2, '/dev/pts/0', 0, 0o020620, 0x8800n, 1001n); ret(0n); break; }
         const f = this.lookup(p);
         if (f === undefined && !this.isDir(p)) { ret(-2n); break; }   // ENOENT
         this.writeStat(a2, p, f ? f.length : 4096, f ? 0o100755 : 0o040755);
@@ -1497,6 +1576,15 @@ export class LinuxEngine {
         if (p === '/proc/self/exe') { const b = new TextEncoder().encode(this.argv0 || '/prog');
           this.ram.set(b.subarray(0, Number(a3)), Number(a2 - this.base));
           ret(BigInt(Math.min(b.length, Number(a3)))); break; }
+        if (this.tty) {                                       // ttyname(): /proc/self/fd/N
+          const m = /^\/proc\/(?:self|\d+)\/fd\/(\d+)$/.exec(this.norm(p));
+          if (m) { const h2 = this.fds.get(Number(m[1]));
+            if (Number(m[1]) <= 2 || h2?.istty) {
+              const b2 = new TextEncoder().encode('/dev/pts/0');
+              const n2 = Math.min(b2.length, Number(a3));
+              this.ram.set(b2.subarray(0, n2), Number(a2 - this.base));
+              ret(BigInt(n2)); break; } }
+        }
         const t = this._fsMeta().links.get(this.norm(p));
         if (t !== undefined) { const b = new TextEncoder().encode(t);
           const n = Math.min(b.length, Number(a3));
@@ -1618,6 +1706,14 @@ export class LinuxEngine {
         ret(0n); break; }                                     // F_GETFD/F_SETFD/...
       case 28: ret(0n); break;                                // madvise
       case 110: ret(0n); break;                               // getppid
+      // Job control: a shell loops on getpgrp() != tcgetpgrp(fd) until they
+      // agree, so these must match what TIOCGPGRP reports. Leaving getpgrp
+      // unimplemented made dash spin forever — 1.28M ioctls in one run.
+      case 111: ret(1n); break;                               // getpgrp
+      case 121: ret(1n); break;                               // getpgid
+      case 109: ret(0n); break;                               // setpgid
+      case 112: ret(1n); break;                               // setsid
+      case 124: ret(1n); break;                               // getsid
       case 186: ret(BigInt(this.threads[this.ti].id)); break;  // gettid
       case 83: case 258: {                                    // mkdir / mkdirat
         const p = this.norm(nr === 83 ? this.readPath(a1) : this.atPath(a1, a2));
