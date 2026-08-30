@@ -569,3 +569,42 @@ believable numbers:
 
 Hence the rule now followed: grep the PACKED `index.html` for a new field
 before believing any number that field is supposed to produce.
+
+### Instruction expansion: ~13 wasm ops per x86 instruction
+
+Both interaction paths and loop30M now point at translated-code quality, so
+the bounding question is how many wasm ops the translator emits per guest
+instruction — no amount of scheduling gets below that ratio.
+
+Over a full CPython loop30M run: **4,383,601 wasm ops for 342,875 x86
+instructions translated, ~12.8 ops per instruction** (72.2MB of wat, 389
+units). Cross-check from a different angle: 72.2MB over 342,875
+instructions is ~210 bytes of wat per instruction, and a typical emitted
+line runs ~120 characters, so ~2 lines per guest instruction — consistent.
+
+Caveats, because the measurement has real limits: the instruction counter
+hooks only the dispatch-layout path, so units taking the structured layout
+contribute ops without instructions and the true ratio is somewhat LOWER
+than 12.8. The op counter also counts constants and block structure as ops.
+And the per-unit pairing in the first version was simply invalid — it
+reported a unit at 7253x, which is what a mis-joined index looks like; the
+two counters are pushed from different functions and their lists do not
+correspond. Only the aggregate is meaningful, and only as an order of
+magnitude.
+
+What it implies is robust to that uncertainty. At roughly ten wasm ops per
+guest instruction, the 5-10x gap to native is not a handful of bad
+patterns — it is systemic expansion. Reaching ~2x needs the ratio down
+around 3-4, which means a genuinely better translator (SSA with real
+register allocation, flag elision across blocks, addressing-mode folding),
+not more peepholes. That is worth knowing before spending another burst on
+local codegen tweaks.
+
+Consistent with that: three codegen ideas were killed by measurement before
+implementation this session — a hash for the computed-goto resolver (~1%),
+spill/reload liveness (~1-2% of runtime), and using wasm's `offset=`
+immediate instead of an explicit add (**0%** — 2.16ns per dependent load
+either way, since V8 already folds the add into the addressing mode). The
+wins all came from machinery instead: the funcref resolver hash (15-33%),
+the input-wakeup fix (4.4x on menu latency), funcref table pre-sizing (2.1x
+on first interaction), copyArea (29x).
