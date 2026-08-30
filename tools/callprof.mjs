@@ -17,11 +17,18 @@
 //   node tools/callprof.mjs /bin/gzip -c /some/file > /dev/null
 import { LinuxEngine } from '../engine/linux.mjs';
 import { analyze } from '../engine/aot_wat.mjs';
-import { readFileSync, readdirSync, lstatSync, realpathSync } from 'node:fs';
+import { readFileSync, readdirSync, lstatSync, realpathSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
 const files = {}, mtimes = {};
-const add = (g, h) => { try { files[g] = new Uint8Array(readFileSync(h)); mtimes[g] = 0; } catch {} };
+// Real mtimes, not 0. An epoch-zero mtime is not neutral: gzip refuses to
+// store it and warns "file timestamp out of range", exiting 2 — which native
+// gzip does too on a `touch -d @0` file. The first run of this tool spent a
+// detour on that warning as if it were an engine bug. It was the file set.
+const add = (g, h) => {
+  try { files[g] = new Uint8Array(readFileSync(h)); mtimes[g] = Math.floor(statSync(h).mtimeMs / 1000); }
+  catch {}
+};
 for (const d of ['/lib/x86_64-linux-gnu', '/usr/lib/x86_64-linux-gnu', '/lib64']) {
   let e; try { e = readdirSync(d); } catch { continue; }
   for (const f of e) { try { const r = realpathSync(join(d, f)); if (lstatSync(r).isFile()) add(join(d, f), r); } catch {} }
@@ -33,6 +40,14 @@ if (!bin) { console.log('usage: callprof.mjs <binary> [args...]'); process.exit(
 add(bin, bin);
 for (const p of (process.env.EXTRA || '').split(':').filter(Boolean)) add(p, p);
 for (const p of (process.env.INFILE || '').split(':').filter(Boolean)) add(p, p);
+// TREE=/usr/lib/python3.11 — an interpreter is not one file. Without its
+// stdlib CPython never reaches main(), and the call mix measured would be
+// the mix of its own startup failure.
+const walk = (d) => { let e; try { e = readdirSync(d); } catch { return; }
+  for (const f of e) { const hp = join(d, f);
+    let st; try { st = lstatSync(hp); } catch { continue; }
+    if (st.isDirectory()) walk(hp); else { try { add(hp, realpathSync(hp)); } catch {} } } };
+for (const d of (process.env.TREE || '').split(':').filter(Boolean)) walk(d);
 
 const eng = new LinuxEngine(new Uint8Array(readFileSync(bin)),
   { argv: [bin, ...args], env: ['PATH=/usr/bin:/bin', 'HOME=/root', 'LANG=C'],
@@ -77,6 +92,10 @@ const total = rows.reduce((s, r) => s + r.c, 0);
 const buckets = [[1, 4], [5, 8], [9, 16], [17, 32], [33, 64]];
 console.log(`binary       ${bin} ${args.join(' ')}`);
 console.log(`exit         ${eng.exitCode}${steps >= BUDGET ? '  (STEP BUDGET HIT - partial)' : ''}`);
+// A nonzero guest exit is a breadth signal, not noise: print what the guest
+// said about it rather than leaving the number unexplained.
+if (eng.exitCode) for (const l of (eng.stderr || []).join('').trim().split('\n').slice(0, 6))
+  console.log(`stderr       ${l}`);
 console.log(`call sites   ${rows.length} distinct targets, ${total} dynamic calls`);
 // The decisive statistic, and not the one this tool was written to collect.
 // The per-call charge measured on the kernels is fixed at roughly 22 native
