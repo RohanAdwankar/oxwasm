@@ -834,6 +834,50 @@ export class LinuxEngine {
     this.ptys.set(n, pty);
     return pty;
   }
+  // The input side of the line discipline: bytes "typed" into the master.
+  //
+  // In canonical mode (ICANON) a terminal hands the reading program whole
+  // LINES, not keystrokes — it buffers until Enter and lets ERASE and KILL
+  // edit what is pending. A shell reading its own prompt depends on this;
+  // without it every keystroke arrives as a separate read and backspace
+  // shows up as a literal 0x7f in the command.
+  //
+  // ECHO is what makes typing visible, and it echoes the EDITED text: an
+  // erase has to un-draw the character (backspace, space, backspace), not
+  // echo the erase byte itself.
+  ttyInput(pty, bytes) {
+    const T = pty.termios;
+    const echo = (b) => { if (T.lflag & 8) pty.s2m.chunks.push(b instanceof Uint8Array ? b : new Uint8Array(b)); };
+    if (!(T.lflag & 2)) {                                   // raw: straight through
+      pty.m2s.chunks.push(bytes);
+      echo(bytes.slice());
+      return;
+    }
+    const line = (pty.line ??= []);
+    for (let b of bytes) {
+      if (b === 13 && (T.iflag & 0x100)) b = 10;            // ICRNL
+      else if (b === 10 && (T.iflag & 0x40)) b = 13;        // INLCR
+      if (b === T.cc[2]) {                                   // VERASE
+        if (line.length) { line.pop(); echo([8, 32, 8]); }
+        continue;
+      }
+      if (b === T.cc[3]) {                                   // VKILL
+        while (line.length) { line.pop(); echo([8, 32, 8]); }
+        continue;
+      }
+      if (b === T.cc[4] && !line.length) {                    // VEOF on an empty line
+        pty.m2s.weof = true;
+        continue;
+      }
+      line.push(b);
+      echo([b]);
+      if (b === 10) {                                        // Enter: the line is now readable
+        pty.m2s.chunks.push(new Uint8Array(line));
+        line.length = 0;
+      }
+    }
+  }
+
   ptmxHandle(pty) {
     return { ptm: pty, istty: true, pipe: pty.s2m, wpipe: pty.m2s, path: '/dev/ptmx' };
   }
@@ -1087,10 +1131,8 @@ export class LinuxEngine {
             h.wpipe.chunks.push(new Uint8Array(out));
           } else h.wpipe.chunks.push(bytes);
         } else {
-          // keyboard input: with ECHO set the terminal shows what was typed,
-          // so the same bytes also come back out the master's read side
-          h.wpipe.chunks.push(bytes);
-          if (T.lflag & 8) h.pipe.chunks.push(bytes.slice());
+          // keyboard input, through the line discipline
+          this.ttyInput(h.ptm, bytes);
         }
         this.wakeAllBlk(); return;
       }

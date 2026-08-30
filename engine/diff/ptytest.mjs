@@ -87,8 +87,50 @@ const writeFd = (h, str) => {
   check('master writes reach the slave', drain(ss.pipe) === 'ls\n', '(slave saw nothing)');
   check('ECHO returns typed bytes to the master', drain(mm.pipe) === 'ls\n', '(no echo)');
   p3.termios.lflag &= ~8;                                     // ECHO off
-  writeFd(mm, 'x');
-  check('ECHO off suppresses the echo', drain(mm.pipe) === '' && drain(ss.pipe) === 'x', '(echoed anyway)');
+  writeFd(mm, 'x\n');
+  check('ECHO off suppresses the echo', drain(mm.pipe) === '' && drain(ss.pipe) === 'x\n', '(echoed anyway)');
+}
+
+// Canonical mode (ICANON): a terminal hands the reading program whole LINES,
+// not keystrokes, and lets ERASE/KILL edit what is still pending. A shell
+// reading its own prompt depends on this — without it every keystroke is a
+// separate read and backspace arrives as a literal 0x7f in the command.
+{
+  const p = eng.newPty(), mm = eng.ptmxHandle(p), ss = eng.ptsHandle(p);
+  check('ICANON is on by default', !!(p.termios.lflag & 2), 'lflag=0x' + p.termios.lflag.toString(16));
+  writeFd(mm, 'ls -l');
+  check('a partial line is not delivered', drain(ss.pipe) === '', '(delivered before Enter)');
+  check('but it is echoed as typed', drain(mm.pipe) === 'ls -l', '(no echo while typing)');
+  writeFd(mm, '\n');
+  check('Enter delivers the whole line at once', drain(ss.pipe) === 'ls -l\n', '(line not flushed)');
+
+  // ERASE must edit the pending line and un-draw the character, not echo 0x7f
+  writeFd(mm, 'abc');  drain(mm.pipe);
+  writeFd(mm, '\x7f');
+  check('ERASE un-draws rather than echoing 0x7f', drain(mm.pipe) === '\b \b', JSON.stringify(drain(mm.pipe)));
+  writeFd(mm, '\n');
+  check('ERASE removed the character from the line', drain(ss.pipe) === 'ab\n', '(erase not applied)');
+
+  // ERASE on an empty line must not erase past the start
+  writeFd(mm, '\x7f\x7f'); drain(mm.pipe);
+  writeFd(mm, 'z\n');
+  check('ERASE stops at the start of the line', drain(ss.pipe) === 'z\n', '(erased past the start)');
+
+  // KILL discards the whole pending line
+  writeFd(mm, 'throw away'); drain(mm.pipe);
+  writeFd(mm, '\x15');                                       // VKILL = ^U
+  writeFd(mm, 'kept\n'); drain(mm.pipe);
+  check('KILL discards the pending line', drain(ss.pipe) === 'kept\n', '(kill did not clear)');
+
+  // ICRNL: Enter arrives as CR from a terminal and must become LF
+  writeFd(mm, 'cr\r'); drain(mm.pipe);
+  check('ICRNL turns CR into LF', drain(ss.pipe) === 'cr\n', '(CR not translated)');
+
+  // Raw mode (ICANON off) must deliver each keystroke immediately — this is
+  // what a curses app or a shell in raw mode relies on.
+  p.termios.lflag &= ~2;
+  writeFd(mm, 'r'); drain(mm.pipe);
+  check('raw mode delivers without waiting for Enter', drain(ss.pipe) === 'r', '(buffered in raw mode)');
 }
 
 // TIOCGPTN through the real ioctl path must name the slave the master owns.
@@ -111,4 +153,4 @@ const writeFd = (h, str) => {
 check('pty termios is not the console termios', pty.termios !== eng.termios, '(shares the console struct)');
 
 if (fail) { console.log(`PTYTEST ${fail} FAILED`); process.exit(1); }
-console.log('pty pairs: crossed buffers, shared termios, ECHO and ONLCR exact');
+console.log('pty pairs: crossed buffers, shared termios, canonical mode, ERASE/KILL, ECHO, ONLCR exact');
