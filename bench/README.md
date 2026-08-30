@@ -335,6 +335,38 @@ construction, before any instance exists, costs nothing:
 | warm menu open, median of 8 | 91.4ms | **82.5ms** | -10% |
 | warm menu close, median of 8 | 19.3ms | **18.2ms** | -6% |
 
-The other finding is that ~12% of a "warm" cycle is still tier-up: GIMP
-reaches new code on the eighth identical menu open. Whatever is left in
-these interactions is not one hot spot.
+That table above says ~12% of a warm cycle is tier-up. **It is wrong**,
+and the way it is wrong is worth keeping: the profile covered all eight
+measured cycles at once, and cycle 0 is a 330ms outlier that compiles 183
+units. Averaging one cold cycle into seven warm ones and calling the
+result "warm" hid which phase the compilation lived in. Per-cycle
+accounting settles it — cycles 2-7 compile essentially nothing:
+
+    cycle 0: new=183   cycles 2-5: new=0
+    cycle 1: new=16    cycle 6: new=1, cycle 7: new=0
+    (zero recompiles and zero failures throughout)
+
+There is a real finding under the mistake: new units still appear in
+cycles 0-1 even after three warmup cycles, because `aotCallThreshold` is
+4. A function called once per interaction needs four interactions before
+it tiers up, so the first several interactions after a load are
+structurally slower whatever the shipped manifest contains.
+
+### What a genuinely steady interaction is made of
+
+Profiling only cycles 2 onward (1105ms of samples, of which the inspector
+itself is 29.3% — discounted below, leaving ~781ms of real work):
+
+| | share of real work |
+|---|---|
+| translated guest code (all wasm frames) | ~76% |
+| X server blit and raster (`copyArea`, `rasterFillRect`) | ~13% |
+| X protocol handling (`handle`, `clientData`) | ~3% |
+| syscalls | ~2% |
+| GC | <1% |
+
+No tier-up, no table growth, no resolver. A steady GIMP interaction is
+translated-code quality plus the JS X server's pixel work — the same
+conclusion loop30M reached by a different route. The X server's ~13% is
+the only remaining non-guest item and is plain JS pixel copying, so it is
+the one place left where a targeted fix could still pay.
