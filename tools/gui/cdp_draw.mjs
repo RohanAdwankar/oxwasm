@@ -51,8 +51,14 @@ await click(587,526); await new Promise(r=>setTimeout(r,4000));   // OK
 console.log('after File>New>OK:', await q('document.getElementById("stat").textContent'));
 
 const before = await q(inkCount);
+// Optional CPU profile of the stroke path, taken in the BROWSER so the pump
+// and the X server's blitting are in frame — a node-harness profile has
+// neither. PROF=<path> profiles every stroke after the first.
+const PROF = process.env.PROF;
+if (PROF) await cmd('Profiler.enable');
 const rows = [];
 for (let s = 0; s < STROKES; s++) {
+  if (PROF && s === 1) await cmd('Profiler.start');
   await q(resetLat);
   const y = 450 + s * 8;
   const [x0,y0] = await guest(480, y);
@@ -72,6 +78,12 @@ for (let s = 0; s < STROKES; s++) {
   const mean = lat.samples ? lat.sumMs / lat.samples : -1;
   rows.push({ wall, mean, max: lat.maxMs, samples: lat.samples, pumpMax: lat.pumpMaxMs });
   console.log(`stroke ${s+1}: ${STEPS} moves in ${wall}ms · input->paint mean ${mean.toFixed(1)}ms max ${lat.maxMs.toFixed(0)}ms (${lat.samples} paints) · worst pump ${lat.pumpMaxMs.toFixed(0)}ms`);
+}
+if (PROF) {
+  const { profile } = await cmd('Profiler.stop');
+  const { writeFileSync } = await import('node:fs');
+  writeFileSync(PROF, JSON.stringify(profile));
+  console.log('stroke profile -> ' + PROF);
 }
 const after = await q(inkCount);
 const med = (a) => [...a].sort((x,y)=>x-y)[a.length>>1];
