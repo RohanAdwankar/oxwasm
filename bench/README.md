@@ -485,3 +485,44 @@ stores and provably identical output, not because the stroke numbers moved.
 Not attempted: dirty-rect blitting, the larger win. `dirty` is a bare
 boolean set at 20+ sites, so adding rects means getting every one right and
 one miss is visible corruption.
+
+### copyArea 29x — and why stroke latency still does not move
+
+`copyArea` was the largest JS item in a stroke after the blit fix (10.8% of
+busy). It was a per-pixel double loop calling `plot()` per pixel; GIMP blits
+its canvas through it constantly. Plain GXcopy with no clip list and no clip
+mask is a pure rectangle move, so it becomes row-wise `set(subarray(...))`:
+
+| 600x360 copy, GIMP-shaped | |
+|---|---|
+| per-pixel via plot() | 2.699ms |
+| row-wise fast path | **0.094ms** (29x) |
+
+Two mistakes, both caught before measuring. `copyWithin` copies WITHIN the
+destination buffer, but the usual case is a copy between surfaces (pixmap ->
+window) — `set(subarray(...))` reads the right buffer and still has memmove
+semantics for self-overlapping scrolls. And clamping out-of-bounds rects
+mismatched the per-pixel path on 145 of 300 random cases, because this
+implementation writes 0 into the destination where the source rect falls
+outside the source surface; what X's spec leaves undefined is irrelevant
+when the job is to match the code being replaced. The fast path now requires
+both rects fully in bounds. Differential test: 2000 random cases across
+in/out of bounds and GXcopy/GXxor, zero mismatches, 212 on the fast path.
+
+**And the end-to-end stroke latency does not move**, across three builds:
+
+| build | warm stroke mean, per sample |
+|---|---|
+| byte blit | 25.5, 22.3ms |
+| u32 blit (1.8x convert) | 20.5, 24.2ms |
+| u32 + copyArea (29x) | 22.3, 24.0, 22.0ms |
+
+Fully overlapping. Two verified component wins totalling a large share of
+the X server's JS produce no measurable change, which is evidence about
+where stroke latency actually lives: not in that JS. The likely floor is
+scheduling — the blit is coalesced onto `requestAnimationFrame`, so
+input->paint cannot beat roughly one frame (16.7ms) plus pump-slice
+quantization, and ~22ms is about that. If so, drawing smoothness is a
+scheduling problem like the 250ms input-wakeup bug was, not a throughput
+one, and more JS optimization will keep returning nothing. That is the next
+thing to test, and it is worth more than another component speedup.
