@@ -119,3 +119,42 @@ in run slices: the remaining time is GIMP core's own tile/projection
 work executing at engine speed on paths the unit capture had never seen
 — a coverage item (capture the filter flow), then translated-code
 quality, not process machinery.
+
+## Where the remaining loop30M gap actually is (2026-08-30)
+
+Two measurements to stop guessing at the next multiplier.
+
+**The computed-goto resolver is not the bottleneck.** Each in-unit computed
+jump maps a target address to a block index through `$jtr`, a balanced BST
+of i64 compares (log2 n per hop). A microbenchmark of that resolver alone
+(N=100 targets, the shape of CPython's handler set, 30M resolves) against
+an O(1) multiply-shift hash into a probe table:
+
+| resolver | 30M resolves | rate |
+|----------|--------------|------|
+| BST (current) | 143-145ms | ~209M/s |
+| hash + verify | 111-120ms | ~260M/s |
+
+~1ns saved per computed goto. Against loop30M's ~9-11s that is ~1%, so the
+BST stays — the complexity of a perfect-hash resolver buys nothing.
+
+**A CPU profile of a full loop30M run** (node harness, cold process through
+the timed steady phase; 24s wall):
+
+| bucket | share |
+|--------|-------|
+| guest code (2 wasm functions) | 42.6% |
+| wat2wasm subprocess (`spawnSync`) | 22.9% |
+| translation (decode/analyze/emit) | 6.8% |
+| harness wat-cache stat/read | 5.7% |
+| js-to-wasm boundary | 3.3% |
+| GC | 2.0% |
+
+The timed steady window (11.2s of the 24s) is essentially all
+`wasm-function[5]` and `[3]` — the translated CPython eval loop. Dispatch
+machinery, boundary crossings, and flag/address lowering no longer show up:
+lazy flags already lower `cmp`+`jcc` to a single `i64.lt_u` on the stashed
+operands, and an address is one `i32.wrap_i64` plus a folded constant.
+What is left is per-instruction code quality INSIDE the unit, which is
+where the next multiplier has to come from. (`spawnSync` is a node-harness
+artifact — the browser assembles in-process with wabt.js.)
