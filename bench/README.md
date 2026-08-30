@@ -913,3 +913,46 @@ before anything is written.
 
 Caveat: `call64` carries +/-7% spread at 10.8% startup, so 1.38x has real
 uncertainty. The trend across three points does not.
+
+## The stack-budget check is not the fixed charge either
+
+The amortisation curve made the target specific: a fixed per-call charge
+worth roughly ten leaf-bodies. Three things sit inside that boundary — the
+stack-budget check, the wasm frame, and V8's cost to enter a generated
+function. Only the first is under the translator's control, so it went
+first.
+
+The direct-call sequence normally emits a load of the depth counter, a
+compare against the limit, a store, the call, and a restore. A
+diagnostic-only build (`OXWASM_NO_STACKGUARD=1`) dropped all of it and
+emitted the bare `call`. This is not shippable in any form: the check is
+what stops deep guest recursion from blowing the wasm stack, and without it
+the callout escape never fires. It exists to be measured and then removed.
+
+Interleaved four times against the guarded build, on the 1-op callee where
+the fixed charge is at its most visible:
+
+| build | ratio | spread |
+|-------|------:|-------:|
+| guard   | 7.46x | +/-3% |
+| noguard | 7.41x | +/-6% |
+| guard   | 7.37x | +/-3% |
+| noguard | 7.72x | +/-4% |
+
+The two builds interleave rather than separate — the noguard points bracket
+the guard points in both directions. At this harness's ~4% resolution the
+stack-budget check costs nothing measurable, on the kernel constructed to
+make it maximally visible.
+
+That is the third mechanism eliminated inside the call boundary, after the
+funcref table and the spill/reload. What remains — the wasm call frame and
+V8's entry cost — is not something the translator emits, so it cannot be
+emitted differently.
+
+Which changes the question. If the per-call charge is fixed and none of its
+components are ours, the lever is not making calls cheaper but **making
+fewer of them**: inlining small callees into the caller's translation unit
+so the frame never exists. The amortisation curve already says what that is
+worth — a callee big enough to hide the charge runs at 1.38x, and a call
+removed entirely pays nothing at all. That is the next hypothesis, and like
+the last three it gets measured before it gets built.
