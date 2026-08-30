@@ -124,3 +124,32 @@ blocker, and saying so before measuring is the mistake to avoid repeating.
 The `QueryFont` change also moved the per-character metrics, which had
 started at a fixed offset 60; `xserver.mjs` is bundled into the packed GIMP
 page, so that layout is now checked byte-for-byte in `fonttest.mjs`.
+
+### Where xmessage stands, precisely
+
+It paints: window frame, message area, button box, and the button's label
+rendered from the built-in font. What is missing is the **message text**, and
+the measurements narrow it a long way:
+
+- The only string that ever reaches the server is `"okay"`, from the button.
+  The message draw is never issued, so this is not a rendering bug.
+- The message widget (78x12 at 4,4 for a 12-character message) is sized
+  exactly from our font metrics — 12 chars x 6px plus padding — so it knows
+  both the string and the font, and `QueryFont` is working.
+- It sits inside an 88-wide container, so it is not clipped.
+- It receives its Expose (event mask 0x20853d, Exposure bit set), and the
+  server sends no error on any request in the connection ring.
+- The last three requests are MapWindow, PolyText8("okay"), then
+  SetClipRectangles and silence: a widget set up its clip to draw and then
+  decided there was nothing to draw.
+
+Two explanations have been tested and are wrong. It is not the fontset
+(`XmbDrawString`) path: running with `-xrm '*international: false'` changes
+nothing. It is not a missing request: ClearArea, CopyArea, PolyFillRectangle
+and the rest are all implemented, and no error was returned.
+
+The remaining difference between the widget that draws and the one that does
+not is their class — a Command button versus an Xaw Text widget, whose
+Redisplay goes through a text source and sink and draws per computed line.
+The next thing to establish is whether that line table is being built at all,
+which is a question about Xaw internals rather than about the server.
