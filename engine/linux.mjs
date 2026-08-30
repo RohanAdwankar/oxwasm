@@ -367,7 +367,11 @@ export class LinuxEngine {
     const un = (this._unitN = (this._unitN || 0) + 1);   // bisect aid: veto unit N -> stays interpreted
     if (this.unitFilter && !this.unitFilter(un, entry)) { this.aotFailed.add(k); return; }
     try {
-      const unit = compileUnitWat(this.mem, entry, { guestBase: this.base, ramBase: this.RAMOFF });
+      const unit = compileUnitWat(this.mem, entry, { guestBase: this.base, ramBase: this.RAMOFF,
+        // prune the closure at functions already in the dispatch map: calls
+        // reach them via $ftr chaining, so re-including their bodies only
+        // duplicates translation work and module bytes
+        skip: (c) => this._ftSeen.has(BigInt(c)) });
       if (this.onUnitWat) this.onUnitWat(un, entry, unit);
       const bytes = this.assembleWat(unit.wat);
       if (this.onUnitBytes) this.onUnitBytes(k, bytes);   // manifest capture: entry -> compiled wasm

@@ -1900,13 +1900,19 @@ function emitUnitFunction(a0, fnAddr, ctx) {
 
 // ---- unit driver -----------------------------------------------------------
 export function compileUnitWat(mem, entry, opts = {}) {
-  const { guestBase, ramBase, maxFuncs = 96, maxInsns = 20000 } = opts;
+  const { guestBase, ramBase, maxFuncs = 96, maxInsns = 20000, skip } = opts;
   const funcs = new Map();                       // addrStr -> analysis
   const poisoned = new Set();                    // addrStr -> engine-only (callout)
   const pending = [entry];
   while (pending.length && funcs.size < maxFuncs) {
     const a = pending.shift(); const k = a.toString();
     if (funcs.has(k) || poisoned.has(k)) continue;
+    // Closure pruning: a call target the host already has compiled and
+    // mapped is reachable through $ftr chaining at full speed — including
+    // it again would duplicate its whole body in this unit (CPython's eval
+    // loop compiled 7 overlapping 5.9MB closures, one per hot loop head).
+    // Not poisoned: call sites emit the $ftr chain, not a callout.
+    if (skip && k !== entry.toString() && skip(k)) continue;
     try {
       let an;
       try { an = analyze(mem, a, { maxInsns, noJtab: !!globalThis.__noJtab }); }
