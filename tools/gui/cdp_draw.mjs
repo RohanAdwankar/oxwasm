@@ -36,7 +36,7 @@ const inkCount = `(() => { const c=document.getElementById('screen').getContext(
   const d=c.getImageData(470,450,240,80).data; let n=0;
   for (let i=0;i<d.length;i+=4) if (d[i]<200||d[i+1]<200||d[i+2]<200) n++;
   return n; })()`;
-const resetLat = `(() => { const L=window.__oxLat; L.samples=0; L.sumMs=0; L.maxMs=0; L.sumWait=0; L.sumWork=0; L.hist=new Array(12).fill(0); return 1; })()`;
+const resetLat = `(() => { const L=window.__oxLat; L.samples=0; L.sumMs=0; L.maxMs=0; L.sumWait=0; L.sumWork=0; L.sumRaf=0; L.blits=0; L.hist=new Array(12).fill(0); return 1; })()`;
 
 // A fresh page has NO image open — just GIMP's empty "(untitled)" window,
 // where a stroke correctly draws nothing. Create one first (File > New >
@@ -78,8 +78,9 @@ for (let s = 0; s < STROKES; s++) {
   const mean = lat.samples ? lat.sumMs / lat.samples : -1;
   const wait = lat.samples ? lat.sumWait / lat.samples : -1;
   const work = lat.samples ? lat.sumWork / lat.samples : -1;
-  rows.push({ wall, mean, max: lat.maxMs, samples: lat.samples, pumpMax: lat.pumpMaxMs, wait, work });
-  console.log(`stroke ${s+1}: ${STEPS} moves in ${wall}ms · input->paint ${mean.toFixed(1)}ms = wait ${wait.toFixed(1)} + work ${work.toFixed(1)} · max ${lat.maxMs.toFixed(0)}ms (${lat.samples} paints) · worst pump ${lat.pumpMaxMs.toFixed(0)}ms`);
+  const raf = lat.blits ? lat.sumRaf / lat.blits : -1;
+  rows.push({ wall, mean, max: lat.maxMs, samples: lat.samples, pumpMax: lat.pumpMaxMs, wait, work, raf });
+  console.log(`stroke ${s+1}: ${STEPS} moves in ${wall}ms · input->paint ${mean.toFixed(1)}ms = wait ${wait.toFixed(1)} + work ${work.toFixed(1)} (of which rAF ${raf.toFixed(1)}) · max ${lat.maxMs.toFixed(0)}ms (${lat.samples} paints) · worst pump ${lat.pumpMaxMs.toFixed(0)}ms`);
 }
 if (PROF) {
   const { profile } = await cmd('Profiler.stop');
@@ -90,7 +91,7 @@ if (PROF) {
 const after = await q(inkCount);
 const med = (a) => [...a].sort((x,y)=>x-y)[a.length>>1];
 const warm = rows.slice(1);
-console.log(`SUMMARY warm stroke: input->paint med ${med(warm.map(r=>r.mean)).toFixed(1)}ms = wait ${med(warm.map(r=>r.wait)).toFixed(1)} + work ${med(warm.map(r=>r.work)).toFixed(1)} · max med ${med(warm.map(r=>r.max)).toFixed(0)}ms`);
+console.log(`SUMMARY warm stroke: input->paint med ${med(warm.map(r=>r.mean)).toFixed(1)}ms = wait ${med(warm.map(r=>r.wait)).toFixed(1)} + work ${med(warm.map(r=>r.work)).toFixed(1)} (rAF ${med(warm.map(r=>r.raf)).toFixed(1)}) · max med ${med(warm.map(r=>r.max)).toFixed(0)}ms`);
 console.log(`ink pixels ${before} -> ${after} (${after>before?'STROKES DREW':'NO MARKS - correctness failure'})`);
 console.log('stat:', await q('document.getElementById("stat").textContent'));
 ws.close(); chrome.kill('SIGKILL'); process.exit(0);

@@ -734,10 +734,15 @@ function sha1hex(str) {
   const scheduleBlit = () => {
     if (blitPending) return;
     blitPending = true;
+    // how long the blit sat waiting for the next animation frame, kept apart
+    // from the compute before it: work = compute + this, and at 60Hz this
+    // averages ~8ms on its own, which caps what any JS speedup can win
+    const _rafReq = performance.now();
     requestAnimationFrame(() => {
       blitPending = false;
       blit();
       const now = performance.now();
+      LAT.blits = (LAT.blits || 0) + 1; LAT.sumRaf = (LAT.sumRaf || 0) + (now - _rafReq);
       while (inputQ.length) {
         const q = inputQ.shift(), qt = (typeof q === 'object' && q) ? q.t : q;
         const qp = (typeof q === 'object' && q && q.p != null) ? q.p : qt;
@@ -1264,10 +1269,15 @@ async function inflate(b64) {
   const scheduleBlit = () => {
     if (blitPending) return;
     blitPending = true;
+    // how long the blit sat waiting for the next animation frame, kept apart
+    // from the compute before it: work = compute + this, and at 60Hz this
+    // averages ~8ms on its own, which caps what any JS speedup can win
+    const _rafReq = performance.now();
     requestAnimationFrame(() => {
       blitPending = false;
       blit();
       const now = performance.now();
+      LAT.blits = (LAT.blits || 0) + 1; LAT.sumRaf = (LAT.sumRaf || 0) + (now - _rafReq);
       while (inputQ.length) {
         const q = inputQ.shift(), qt = (typeof q === 'object' && q) ? q.t : q;
         const qp = (typeof q === 'object' && q && q.p != null) ? q.p : qt;
