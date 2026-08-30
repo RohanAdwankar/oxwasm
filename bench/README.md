@@ -175,8 +175,43 @@ each. Every escape to an untranslated callee spills all 16 GPRs and reads
 them all back, because the emitter has no idea which ones the rest of the
 unit still needs.
 
-That is the next multiplier, and it is a dataflow problem, not a codegen
-trick. The spills cannot shrink — an interpreted callee reads the regfile,
+### ...but dynamically it is worth ~13%, and trimming reloads is worth ~1%
+
+Static byte share is not runtime share, so before building the dataflow
+pass the cost was measured directly. Instrumenting every unit-to-unit call
+site with a counter: **loop30M makes 330,120,276 unit-to-unit calls** — 11
+per Python loop iteration — in an ~11s timed phase, i.e. ~33ns per call.
+
+A microbenchmark of the two call ABIs (30M calls, callee with a realistic
+body touching several registers and memory):
+
+| call ABI | 30M calls | per call |
+|----------|-----------|----------|
+| regfile through linear memory (today: caller spills 16, callee prologue loads 16, callee exit spills 16, caller reloads 16) | 374-378ms | 12.5ns |
+| registers as wasm params/results (multi-value) | 237-251ms | 8.1ns |
+
+So the sync costs ~4.4ns of the ~33ns call. Passing registers instead is
+worth ~1.45s of the 11s — **~13%** — and it is the largest single
+identified win. Trimming just the caller-side reloads by liveness moves
+about a tenth of the sync traffic, i.e. **~1-2% of runtime**: not worth
+200 lines of dataflow on its own, though it remains a code-size win.
+
+The rest of the 10x is broad. At ~33ns (~110 cycles) per call for callee
+bodies of a few dozen instructions, translated code runs several cycles
+per x86 instruction where native manages a fraction of one. That is the
+per-instruction grind — i64 arithmetic for 32-bit operations, width masks,
+wrap/extend churn, no scheduling for ILP — not any single structure.
+
+The register ABI is a flag day: every unit, PLT stub, `$drive`, and the
+funcref table type change together, and packed unit caches must be
+regenerated. The JS boundary should keep the memory ABI (passing 16
+BigInts per dispatch would be worse), so each unit wants a thin
+memory-ABI entry wrapper alongside its register-ABI body, with two
+parallel funcref tables indexed alike.
+
+### The dataflow shape, if the reload trim is ever wanted
+
+The spills cannot shrink — an interpreted callee reads the regfile,
 so it must see all 16 — but the reloads can:
 
 - Backward liveness over the block graph gives the registers actually read
