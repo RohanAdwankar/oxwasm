@@ -23,6 +23,7 @@ node pipetest.mjs
 node ttytest.mjs
 node fonttest.mjs
 node ptytest.mjs
+node jrnltest.mjs
 node pushmemtest.mjs
 node callmemtest.mjs
 node packedtest.mjs

@@ -1702,7 +1702,8 @@ export class LinuxEngine {
       case 269: { const p = this.atPath(a1, a2); ret(this.lookup(p) !== undefined || this.isDir(p) ? 0n : -2n); break; }  // faccessat
       case 63: {                                              // uname
         const put = (o, s) => { const b = new TextEncoder().encode(s + '\0');
-          this.jsnap(a1 + BigInt(o), b.length); this.ram.set(b, Number(a1 - this.base) + o); };
+          this.ram.set(b, Number(a1 - this.base) + o); };
+        this.jsnap(a1, 390);                                  // the zero-fill covers the whole struct
         this.ram.fill(0, Number(a1 - this.base), Number(a1 - this.base) + 390);
         put(0, 'Linux'); put(65, 'oxwasm'); put(130, '6.1.0'); put(195, '#1 oxwasm');
         put(260, 'x86_64'); ret(0n); break; }
