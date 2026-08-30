@@ -7,6 +7,11 @@ const loadCpu = (cpu, st) => { cpu.regs = st.regs.map(BigInt); cpu.xmm = st.xmm.
 // zero the in-memory function-dispatch map count (FTMAP in aot_wat.mjs;
 // literal here to stay import-free) and the engine's mirror of it
 const resetFtmap = (eng) => {
+  // Prefer the engine's rebuild: it re-registers everything already in
+  // aotFns, so units applied before an async tile chain finishes don't get
+  // locked out of the in-wasm dispatch map (zero-only left them in aotFns
+  // but permanently unmapped — every in-wasm resolution missed).
+  if (eng.rebuildFtmap) return eng.rebuildFtmap();
   new DataView(eng.wmem.buffer).setUint32(0x10000, 0, true);
   eng._ftCount = 0; if (eng._ftSeen) eng._ftSeen = new Set();
 };

@@ -253,6 +253,21 @@ export class LinuxEngine {
 
   aotImports() { return { js: { mem: this.wmem, ftab: this.ftab }, env: this.aotEnv() }; }
 
+  // Rebuild the in-memory (addr, slot) dispatch map from aotFns. Snapshot
+  // restore must invalidate the map baked into the restored image (its slots
+  // belong to the CAPTURE engine's table), but zeroing alone was a trap:
+  // functions registered before the async tile chain finished stayed in
+  // aotFns yet never re-entered the map — every in-wasm resolution missed
+  // and each tail jump/call paid a JS hop (measured: ~500k callouts and
+  // ~50k deopts per warm GIMP menu cycle, all to compiled-but-unmapped
+  // functions).
+  rebuildFtmap() {
+    new DataView(this.wmem.buffer).setUint32(FTMAP, 0, true);
+    this._ftCount = 0; this._ftSeen = new Set();
+    for (const [a, f] of this.aotFns)
+      if (f && !f.jsStub) this.registerAotFn(a, f);
+  }
+
   tierUpAot(entry) {
     const k = entry;
     if (this.aotFns.has(k) || this.aotFailed.has(k)) return;
@@ -341,6 +356,7 @@ export class LinuxEngine {
         this.profileTarget(v);
         throw new DeoptUnwind(v);
       };
+      stub.jsStub = true;             // not table-eligible: rebuildFtmap skips it
       this.aotFns.set(k, stub);
       return;
     }

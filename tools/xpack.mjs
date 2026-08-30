@@ -827,8 +827,9 @@ function sha1hex(str) {
             for (const name of Object.keys(instance.exports))
               if (name.startsWith('f_')) {
                 const a = BigInt('0x' + name.slice(2));
-                if (!eng.aotFns.get(a)) eng.aotFns.set(a, instance.exports[name]);
+                if (!eng.aotFns.get(a)) eng.registerAotFn(a, instance.exports[name]);   // registerAotFn: the funcref-table entry is what lets in-wasm resolvers chain to it
               }
+            if (instance.exports.drive) eng.aotDrive = instance.exports.drive;
             eng.stats.tiers.aot = (eng.stats.tiers.aot || 0) + 1;
           } catch {}
         }
@@ -872,8 +873,9 @@ function sha1hex(str) {
               for (const name of Object.keys(instance.exports))
                 if (name.startsWith('f_')) {
                   const a = BigInt('0x' + name.slice(2));
-                  if (!eng.aotFns.get(a)) eng.aotFns.set(a, instance.exports[name]);
+                  if (!eng.aotFns.get(a)) eng.registerAotFn(a, instance.exports[name]);   // registerAotFn: the funcref-table entry is what lets in-wasm resolvers chain to it
                 }
+            if (instance.exports.drive) eng.aotDrive = instance.exports.drive;
               n++;
             } catch {}
           }
@@ -1065,8 +1067,9 @@ async function inflate(b64) {
         for (const name of Object.keys(instance.exports))
           if (name.startsWith('f_')) {
             const a = BigInt('0x' + name.slice(2));
-            if (!eng.aotFns.get(a)) eng.aotFns.set(a, instance.exports[name]);
+            if (!eng.aotFns.get(a)) eng.registerAotFn(a, instance.exports[name]);   // registerAotFn: the funcref-table entry is what lets in-wasm resolvers chain to it
           }
+            if (instance.exports.drive) eng.aotDrive = instance.exports.drive;
         eng.stats.tiers.aot = (eng.stats.tiers.aot || 0) + 1;
       } catch {}
     }
