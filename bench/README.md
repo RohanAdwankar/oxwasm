@@ -306,3 +306,35 @@ a deadline that has not arrived yet.
 These were node-harness numbers when first measured; `demo/gimp` has since
 been repacked onto the hash resolver (7,653 units), so the shipped page
 gets them too.
+
+### Profiling only the interaction, not the process (a table grow was 12%)
+
+A `--cpu-prof` of the whole GIMP run is useless for interaction latency:
+the sysroot walk, snapshot restore and tier-up dominate it, and the menu
+cycles are a rounding error. Starting and stopping the inspector profiler
+around ONLY the eight measured cycles gives the real breakdown:
+
+| | share of a warm cycle |
+|---|---|
+| guest wasm code | ~24% |
+| `ftab.grow` | 12.0% |
+| still tiering up new units | ~12% |
+| profiler overhead (discount) | 10.2% |
+| GC | 5.5% |
+| X server raster (`copyArea`, `rasterFillRect`) | ~5% |
+
+The `grow` was one call site: `this.ftab.grow(1024)` in `registerAotFn`.
+Not the copy — every compiled unit IMPORTS that table, so a grow makes V8
+fix up each importing instance's cached table base, which is
+O(instances) once thousands of units exist. Sizing the table once at
+construction, before any instance exists, costs nothing:
+
+| | growing | pre-sized | |
+|---|---|---|---|
+| first menu open | 682.4ms | **330.0ms** | 2.1x |
+| warm menu open, median of 8 | 91.4ms | **82.5ms** | -10% |
+| warm menu close, median of 8 | 19.3ms | **18.2ms** | -6% |
+
+The other finding is that ~12% of a "warm" cycle is still tier-up: GIMP
+reaches new code on the eighth identical menu open. Whatever is left in
+these interactions is not one hot spot.
