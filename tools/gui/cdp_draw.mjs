@@ -36,7 +36,7 @@ const inkCount = `(() => { const c=document.getElementById('screen').getContext(
   const d=c.getImageData(470,450,240,80).data; let n=0;
   for (let i=0;i<d.length;i+=4) if (d[i]<200||d[i+1]<200||d[i+2]<200) n++;
   return n; })()`;
-const resetLat = `(() => { const L=window.__oxLat; L.samples=0; L.sumMs=0; L.maxMs=0; L.hist=new Array(12).fill(0); return 1; })()`;
+const resetLat = `(() => { const L=window.__oxLat; L.samples=0; L.sumMs=0; L.maxMs=0; L.sumWait=0; L.sumWork=0; L.hist=new Array(12).fill(0); return 1; })()`;
 
 // A fresh page has NO image open — just GIMP's empty "(untitled)" window,
 // where a stroke correctly draws nothing. Create one first (File > New >
