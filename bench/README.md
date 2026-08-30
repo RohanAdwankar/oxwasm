@@ -608,3 +608,63 @@ either way, since V8 already folds the add into the addressing mode). The
 wins all came from machinery instead: the funcref resolver hash (15-33%),
 the input-wakeup fix (4.4x on menu latency), funcref table pre-sizing (2.1x
 on first interaction), copyArea (29x).
+
+## Where the emitted ops actually go (op histogram)
+
+The 12.8-ops-per-instruction figure above says the expansion is systemic but
+not where it lives, and the note ended by proposing "SSA with real register
+allocation, flag elision across blocks, addressing-mode folding". Two of
+those three turn out to be **already implemented**, which is worth recording
+before another burst is spent re-inventing them:
+
+- **Registers are already in wasm locals**, in both emitters. Function mode
+  (`compileFunctionWatDispatch`) loads the regfile into `$r0..$r15` at entry
+  and stores back at exit; unit mode (`emitUnitFunction`) does the same. The
+  regfile at wasm offsets 0-511 is the *interface* between units, not the
+  working representation inside one.
+- **Flag elision across blocks is already implemented** — `modeled()`,
+  `CLOBBER`, `flagKind()` and a reaching-definitions fixpoint over the CFG
+  decide which flag writes are live; dead ones are never materialized, and a
+  producer/consumer pair that spans blocks agrees on `(kind,size)` or the
+  function is poisoned to the interpreter.
+
+Checked by dumping the wat for `sub rdi, rsi; setb al`: `$fa`/`$fb` are set
+*before* the subtraction (not re-read after, which would have made the flag
+inputs the result), the 64-bit case skips the width mask entirely, and the
+two registers load once at entry and store once at exit. That path is tight.
+
+So a histogram, categorising every op emitted across 71 real units
+(1,784,110 ops) in a dash pipeline of sha256sum/sort/tr/gzip:
+
+|      share | category |
+|-----------:|----------|
+| 27.8% | constants |
+| 24.0% | regfile `local.get`/`local.set` |
+| 17.9% | guest memory load/store |
+|  8.6% | address arithmetic + width conversion |
+|  5.0% | scratch temps |
+|  3.8% | structured control |
+|  3.0% | lazy-flag locals |
+|  2.4% | masking / logic |
+|  2.4% | simd |
+|  2.1% | compares |
+|  1.1% | block dispatch (`br`) |
+|  1.0% | calls / tail calls |
+
+Two caveats, both load-bearing. The guest **faulted** partway through this
+run (`fault: 8`) rather than exiting cleanly, so the workload is a partial
+one — the units it did translate are real, but this is not a completed
+program. And the biggest bucket is the least real: `i32.const`/`i64.const`
+are counted as ops here, but V8 folds most of them into the consuming
+instruction's immediate or addressing mode, exactly as the `offset=`
+experiment already showed (0% difference). Discounting constants puts the
+honest figure nearer **9 ops per guest instruction**, not 12.8.
+
+That reframes the target. The remaining mass is register-local traffic
+(24%) and guest memory access (17.9%) — and neither is obviously wasteful:
+locals are what a good translator *should* emit, and guest loads/stores are
+the program's actual work. The next measurement worth making is not another
+codegen idea but a comparison against the same functions compiled natively,
+to see how much of the 9 is irreducible x86-semantics tax (width masking,
+lazy flags, the 32-bit zero-extend rule) versus recoverable. Until that
+exists, "rewrite the translator" is not yet a justified plan.
