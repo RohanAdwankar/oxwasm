@@ -1300,6 +1300,39 @@ export class XServer {
     return x;
   }
   copyArea(src, dst, gc, sx, sy, dx, dy, w, h) {
+    // Fast path: plain GXcopy with no clip list and no clip mask is a pure
+    // rectangle move, so it is row-wise subarray/set instead of w*h calls
+    // through plot(). A browser stroke profile put copyArea at 10.8% of a
+    // drag's busy time — GIMP blits its canvas through this constantly.
+    // Anything else (raster ops, clipping) keeps the per-pixel path, which
+    // is what makes the fast path safe to add rather than a rewrite.
+    // The fast path must reproduce THIS implementation's behaviour, not X's
+    // spec: the per-pixel path writes 0 into the destination wherever the
+    // source rect falls outside the source surface. Rather than reproduce
+    // that, take the fast path only when both rects are fully in bounds —
+    // which is the case GIMP's canvas blits actually hit. A differential
+    // test against the per-pixel path caught this: clamping instead of
+    // restricting mismatched on 145 of 300 random rects.
+    const plain = (!gc || (gc.fn === 3 && !gc.clip && !gc.clipMask?.buffer));
+    const inBounds = src.buffer && dst.buffer &&
+      sx >= 0 && sy >= 0 && sx + w <= src.w && sy + h <= src.h &&
+      dx >= 0 && dy >= 0 && dx + w <= dst.w && dy + h <= dst.h;
+    if (plain && inBounds) {
+      const cw = w, ch = h;
+      if (cw > 0 && ch > 0) {
+        dst._drawn = true;
+        const sxa = sx, sya = sy, dxa = dx, dya = dy;
+        // set(subarray) and not copyWithin: the usual case is a copy BETWEEN
+        // surfaces (pixmap -> window), where copyWithin would read the wrong
+        // buffer entirely. set() also has memmove semantics when source and
+        // destination share a buffer, so a self-overlapping scroll is safe.
+        for (let yy = 0; yy < ch; yy++) {
+          const so = (sya + yy) * src.w + sxa, dof = (dya + yy) * dst.w + dxa;
+          dst.buffer.set(src.buffer.subarray(so, so + cw), dof);
+        }
+      }
+      return;
+    }
     const tmp = new Uint32Array(w * h);
     for (let yy = 0; yy < h; yy++) for (let xx = 0; xx < w; xx++) {
       const x0 = sx + xx, y0 = sy + yy;
