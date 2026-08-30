@@ -857,6 +857,33 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       return size === 8 && !op.high ? e : `(i64.and ${e} (i64.const ${MASKl[size]}))`; }
     return `(${LD[size]} ${wasmAddr(op, next)})`;
   };
+  // Peephole: how many low bits an emitted expression is already known to
+  // occupy. Lets the width masks that x86 semantics demand be skipped when
+  // the value provably fits — a movzbl's result does not need a second
+  // & 0xFFFFFFFF. Purely a code-size/compile-time win (7MB of wat for one
+  // CPython unit is wat2wasm time, wabt.js time in the page, and V8 compile
+  // time); the differential suite proves the semantics are unchanged.
+  const cleanBits = (e) => {
+    e = e.trim();
+    if (e.startsWith('(i64.load8_u')) return 8;
+    if (e.startsWith('(i64.load16_u')) return 16;
+    if (e.startsWith('(i64.load32_u')) return 32;
+    if (e.startsWith('(i64.extend_i32_u')) return 32;
+    let m = /^\(i64\.const (0x[0-9a-fA-F]+|\d+)\)$/.exec(e);
+    if (m) { try { const v = BigInt(m[1]); return v === 0n ? 1 : v.toString(2).length; } catch {} }
+    m = /^\(i64\.and .* \(i64\.const (0x[0-9a-fA-F]+|\d+)\)\)$/.exec(e);
+    if (m) { try { const v = BigInt(m[1]);
+      if (v > 0n && (v & (v + 1n)) === 0n) return v.toString(2).length; } catch {} }
+    return 64;
+  };
+  // a constant shift count folds against its & 31 / & 63 mask
+  const shmask32 = (e, mask) => {
+    const m = /^\(i32\.const (-?\d+)\)$/.exec(e.trim());
+    return m ? `(i32.const ${Number(m[1]) & mask})` : `(i32.and ${e} (i32.const ${mask}))`;
+  };
+  // mask expr to `bits`, unless it is already that narrow
+  const nmask = (e, bits) => cleanBits(e) <= bits
+    ? e : `(i64.and ${e} (i64.const 0x${((1n << BigInt(bits)) - 1n).toString(16).toUpperCase()}))`;
   const wr = (op, size, expr, next) => {
     if (op.kind === 'reg') {
       if (isI32(op.r)) {
@@ -866,10 +893,10 @@ function emitUnitFunction(a0, fnAddr, ctx) {
         return `(local.set ${reg(op.r)} (i32.or (i32.and (local.get ${reg(op.r)}) (i32.const ${Number((~m)&0xFFFFFFFFn)})) (i32.and (i32.wrap_i64 ${expr}) (i32.const ${Number(m)}))))`;
       }
       if (size === 8) return `(local.set ${reg(op.r)} ${expr})`;
-      if (size === 4) return `(local.set ${reg(op.r)} (i64.and ${expr} (i64.const 0xFFFFFFFF)))`;
+      if (size === 4) return `(local.set ${reg(op.r)} ${nmask(expr, 32)})`;
       const m = MASKl[size];
       if (op.high) return `(local.set ${reg(op.r)} (i64.or (i64.and (local.get ${reg(op.r)}) (i64.const ${(~0xFF00n)&MASKl[8]})) (i64.shl (i64.and ${expr} (i64.const 0xFF)) (i64.const 8))))`;
-      return `(local.set ${reg(op.r)} (i64.or (i64.and (local.get ${reg(op.r)}) (i64.const ${(~m)&MASKl[8]})) (i64.and ${expr} (i64.const ${m}))))`;
+      return `(local.set ${reg(op.r)} (i64.or (i64.and (local.get ${reg(op.r)}) (i64.const ${(~m)&MASKl[8]})) ${nmask(expr, size * 8)}))`;
     }
     return `(${ST[size]} ${wasmAddr(op, next)} ${expr})`;
   };
@@ -1326,7 +1353,13 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           if (prod && (insn.mnem === 'sub' || insn.mnem === 'add')) { L.push(`(local.set $fa ${rd(insn.dst,S,next)})`, `(local.set $fb ${rd(insn.src,S,next)})`); }
           let expr;
           let i32expr = null;
-          if (S === 4 && insn.dst.kind === 'reg') { i32expr = `(${ALU32[insn.mnem]} ${rd32(insn.dst,next)} ${rd32(insn.src,next)})`; expr = `(i64.extend_i32_u ${i32expr})`; }
+          // xor r,r and sub r,r are the idiomatic zeroing forms; emitting the
+          // read twice (and its masks) is pure noise in the hottest blocks
+          const zeroing = (insn.mnem === 'xor' || insn.mnem === 'sub') &&
+                          insn.dst.kind === 'reg' && insn.src.kind === 'reg' &&
+                          insn.dst.r === insn.src.r && !insn.dst.high && !insn.src.high;
+          if (zeroing) { expr = '(i64.const 0)'; i32expr = '(i32.const 0)'; }
+          else if (S === 4 && insn.dst.kind === 'reg') { i32expr = `(${ALU32[insn.mnem]} ${rd32(insn.dst,next)} ${rd32(insn.src,next)})`; expr = `(i64.extend_i32_u ${i32expr})`; }
           else if (S === 8) expr = `(${ALU[insn.mnem]} ${rd(insn.dst,8,next)} ${rd(insn.src,8,next)})`;
           else expr = `(i64.and (${ALU[insn.mnem]} ${rd(insn.dst,S,next)} ${rd(insn.src,S,next)}) (i64.const ${m}))`;
           if (insn.dst.kind === 'reg') {
@@ -1376,7 +1409,9 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           }
           break; }
         case 'cmp': setFlags('sub',S,rd(insn.dst,S,next),rd(insn.src,S,next),`(i64.and (i64.sub ${rd(insn.dst,S,next)} ${rd(insn.src,S,next)}) (i64.const ${m}))`); break;
-        case 'test': setFlags('logic',S,null,null,`(i64.and ${rd(insn.dst,S,next)} ${rd(insn.src,S,next)})`); break;
+        case 'test': {                                  // test r,r (the ZF/SF probe) is just the value
+          const ta = rd(insn.dst,S,next), tb = rd(insn.src,S,next);
+          setFlags('logic',S,null,null, ta === tb ? ta : `(i64.and ${ta} ${tb})`); break; }
         case 'inc': case 'dec': {
           const prod = (producers.has(ii));
           let expr;
@@ -1402,7 +1437,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           setFlags('sub',S,'(i64.const 0)',`(local.get ${orig})`,`(local.get ${t})`); break; }
         case 'shl': case 'shr': case 'sar': {
           if (S === 4 && insn.dst.kind === 'reg') {
-            const c=`(i32.and ${rd32(insn.src,next)} (i32.const 31))`; const a=rd32(insn.dst,next); let e;
+            const c=shmask32(rd32(insn.src,next), 31); const a=rd32(insn.dst,next); let e;
             if (insn.mnem==='shl') e=`(i32.shl ${a} ${c})`; else if (insn.mnem==='shr') e=`(i32.shr_u ${a} ${c})`; else e=`(i32.shr_s ${a} ${c})`;
             L.push(wr32reg(insn.dst.r, e));
             setFlags('logic', S, null, null, rd(insn.dst,S,next));   // nonzero-imm counts only (modeled() gates)
@@ -1484,7 +1519,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           if (S === 8) { const a=rd(insn.dst,8,next);
             const c=`(i32.and ${rd32(insn.src,next)} (i32.const 63))`;
             L.push(`(local.set ${reg(insn.dst.r)} (i64.${rot?'rotl':'rotr'} ${a} (i64.extend_i32_u ${c})))`); }
-          else if (S === 4) { const c=`(i32.and ${rd32(insn.src,next)} (i32.const 31))`;
+          else if (S === 4) { const c=shmask32(rd32(insn.src,next), 31);
             if (insn.dst.kind === 'reg') L.push(wr32reg(insn.dst.r, `(i32.${rot?'rotl':'rotr'} ${rd32(insn.dst,next)} ${c})`));
             else L.push(wr(insn.dst,4,`(i64.and (i64.extend_i32_u (i32.${rot?'rotl':'rotr'} ${rd32(insn.dst,next)} ${c})) (i64.const ${m}))`,next)); }
           else { const W = S*8;

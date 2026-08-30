@@ -158,3 +158,32 @@ operands, and an address is one `i32.wrap_i64` plus a folded constant.
 What is left is per-instruction code quality INSIDE the unit, which is
 where the next multiplier has to come from. (`spawnSync` is a node-harness
 artifact — the browser assembles in-process with wabt.js.)
+
+### Inside the unit: regfile spill/reload is a third of the emitted code
+
+Breaking down the 7.1MB of wat for CPython's eval-loop unit by pattern:
+
+| pattern | count | share of bytes |
+|---------|-------|----------------|
+| regfile spill (`i64.store (i32.const N) (local.get $rK)`) | 28,038 | 16.8% |
+| regfile reload (`local.set $rK (i64.load (i32.const N))`) | 27,389 | 16.0% |
+| `i32.wrap_i64` of a register (address lowering) | 15,966 | 6.8% |
+| width masks (`& 0xFFFFFFFF`) | 4,728 | 1.4% |
+
+The unit has 1,725 callout sites and reloads a mean of 15.0 registers at
+each. Every escape to an untranslated callee spills all 16 GPRs and reads
+them all back, because the emitter has no idea which ones the rest of the
+unit still needs.
+
+That is the next multiplier, and it is a dataflow problem, not a codegen
+trick: backward liveness gives the registers actually read after a call,
+and a forward "is the local authoritative" pass keeps the skipped ones
+safe (a register whose local was never reloaded must also be skipped by
+every later spill, so the regfile keeps the value the callee left — which
+is exactly the value a deopt to the interpreter needs).
+
+Small folds landed alongside this measurement (dead width masks on
+already-narrow values, `xor r,r` / `sub r,r` as a constant zero, `test r,r`
+emitting the value once, constant shift counts folded against their mask)
+are worth ~2% of emitted bytes on their own — real for wat2wasm and
+wabt.js time, but not the multiplier.
