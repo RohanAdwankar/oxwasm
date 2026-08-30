@@ -376,7 +376,14 @@ function sha1hex(str) {
     stat.textContent = `interp ${s.interpreted.toLocaleString()} · aot units ${s.tiers.aot||0} · ${((performance.now()-t0)/1000).toFixed(0)}s`;
     pumping = false;
     if (mode === 'exit') { stat.innerHTML += eng.exitCode === 0 ? ' · <span class="ok">exit 0</span>' : ` · <span class="err">exit ${eng.exitCode}</span>`; return; }
-    if (mode === 'timed') { timer = setTimeout(pump, Math.max(0, Math.min(deadline - performance.now(), 250))); return; }
+    if (mode === 'timed') {
+      // an immediately-due deadline (slice preemption, deopt/callout clock
+      // checks) must not wait on a setTimeout: nested timers are clamped to
+      // ~4ms, and a menu open crosses dozens of preemptions — route through
+      // the MessageChannel tick instead; real guest timers keep setTimeout.
+      const d = deadline - performance.now();
+      if (d <= 0) { soon(); return; }
+      timer = setTimeout(pump, Math.min(d, 250)); return; }
     if (mode === 'idle') return;                     // input pokes re-arm the pump
     soon();
   }
