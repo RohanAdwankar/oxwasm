@@ -1248,3 +1248,40 @@ was tried and is far worse than the problem: it duplicates them into every unit
 that calls them, taking gzip from 380 emitted functions to 715 and tier-up from
 877ms to 4018ms. Pruning is worth more than inlining. The inliner works with
 what is in the closure.
+
+### Where the tier-up cost actually is, and a replacement that made it worse
+
+The interleaved A/B settles loop-site selection at **0.937x** steady state
+(4736 -> 4438ms, +/-5%) with startup at 873 -> 995ms. Same steady-state gain
+as inlining everything, 63% less duplicated code — and almost the same startup
+penalty, which is the surprising part. Cutting duplication by two thirds barely
+moved tier-up.
+
+So where is the +122ms? Run with inlining on and the budget set to **zero**, so
+the selection analysis runs and nothing is inlined:
+
+| configuration | tier-up (median of 3) |
+|---------------|----------------------:|
+| baseline | 872ms |
+| inlining on, budget 0 (analysis only, nothing inlined) | **962ms** |
+| inlining on, 275 copies | 943ms |
+
+The duplicated code costs nothing next to the analysis that chose it. Roughly
+90ms of the 122 is the SCC pass, run on every function the emitter touches.
+
+**The obvious fix made things worse, and that is worth recording.** Replacing
+Tarjan with a backward-branch interval scan — one O(N) pass, no successor
+graph, no recursion — is much cheaper analysis. But it is a looser criterion:
+it marks every block whose address falls between a backward branch and its
+target, which on gzip selected 594 sites instead of 275. Tier-up went to
+**1149ms**, worse than the SCC it replaced. Tightening the budget to 320 only
+brought it to 493 copies.
+
+Two changes at once — cheaper analysis and looser selection — and the loose
+selection cost more than the cheap analysis saved. Reverted. The measured
+configuration stands: SCC selection, 0.937x steady state, +122ms tier-up.
+
+What that leaves for anyone picking this up: the 90ms is real and the cheap
+scan was the right *idea*, but it has to reproduce SCC's selection rather than
+approximate it loosely — or the SCC has to be skipped for functions with no
+inlinable call sites, which is a cheaper thing to test first.
