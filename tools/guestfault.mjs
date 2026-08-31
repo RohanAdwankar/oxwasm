@@ -170,6 +170,11 @@ try { let g = 0; while (eng.exitCode === null) { eng.run(5e6); if (eng.blocked) 
 catch (e) { err = e.message; }
 
 console.log(`fault: ${err} @rip 0x${eng.cpu.rip.toString(16)} after ${eng.stats.interpreted} interpreted insns`);
+// stderr matters as much as stdout here: a guest that exits 1 silently on
+// stdout has usually said why on fd 2, and reporting only the fault address
+// is what once turned "CPython prints 42" into "CPython faults at startup".
+const errTxt = (eng.stderr || []).join('').trim();
+if (errTxt) console.log('  guest stderr: ' + errTxt.slice(0, 400).replace(/\n/g, '\n                '));
 console.log(`  exit=${eng.exitCode} stdout=${(eng.stdoutBytes||[]).reduce((a,b)=>a+b.length,0)}B` +
             (assembleWat ? ` aotFns=${eng.aotFns.size}` : ' (pure interpreter)'));
 const at = locate(eng, eng.cpu.rip);

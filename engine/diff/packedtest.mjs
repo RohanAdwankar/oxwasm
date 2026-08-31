@@ -43,6 +43,13 @@ const OPS2 = [   // op xmm0, xmm1
   'punpcklbw','punpckhbw','punpcklwd','punpckhwd','punpckldq','punpckhdq',
   'punpcklqdq','punpckhqdq','packuswb','packsswb','packssdw',
   'unpcklps','unpckhps','unpcklpd','unpckhpd',
+  // movhlps/movlhps are the register forms of the 0F 12 / 0F 16 opcodes whose
+  // memory forms are movlps/movhps, and they move the OTHER half: movhlps is
+  // dst[63:0] <- src[127:64]. Both tiers implemented 0F 12 as "take the low
+  // qword" regardless of operand kind, so movhlps silently produced the wrong
+  // value - and nothing here tested it, which is why it stayed silent through
+  // a whole GIMP and a whole CPython.
+  'movhlps','movlhps',
   'paddb','paddw','paddd','paddq','psubb','psubw','psubd','psubq',
   'paddsb','paddsw','paddusb','paddusw','psubsb','psubsw','psubusb','psubusw',
   'pmullw','pmulhw','pmulhuw','pmuludq','pmaddwd',

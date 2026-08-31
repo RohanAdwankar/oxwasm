@@ -1090,3 +1090,82 @@ This is the handle the native reference run needs: break when a string of
 that length and prefix is created, watch its refcount, and diff the rip
 sequence against the eight writes above. python3 is `ET_EXEC`, so its text
 addresses are identical under gdb — the rips transfer directly.
+
+## The bug: `movhlps` moved the wrong half
+
+`tools/pyref.gdb.py` runs the same python3 natively under gdb, identifies the
+object by what it *is* rather than where it lives, and logs the same refcount
+sequence. Two passes: pass 1 conditions on `PyDict_SetItem+0x32` with
+`*(long*)($rdx+0x10) == 1235` to find the address, pass 2 re-runs watching
+that address from the creation site so the log covers the whole life. gdb
+disables ASLR and python3 is `ET_EXEC`, so both the object address and every
+text rip are stable and directly comparable.
+
+**The identity condition matched two objects**, not one — checking that
+mattered, because diffing against the wrong one showed a bogus divergence at
+the very first write. The second object is the counterpart:
+
+| # | native | engine |
+|---|---|---|
+| create | 1 | 1 |
+| 1 | →2 at `0x51f342` | →2 at `0x51f342` |
+| 2 | →1 at `0x5408d5` | →1 at `0x5408d5` |
+| 3 | →2 at `0x52e5e1` | →2 at `0x52e5e1` |
+| 4 | →3 at `0x52e5e1` | →3 at `0x52e5e1` |
+| 5 | →2 at `0x52d4a0` | →2 at `0x52d4a0` |
+| 6 | **→3 at `0x56530c`** | **absent** |
+| 7 | →2 at `0x52cbb9` | →1 at `0x52cbb9` |
+| 8 | →1 at `0x52d4a0` | →**0**, freed |
+| 9 | →0 at `0x52d75d` | — |
+
+One missing incref. A watchpoint reports `$pc` after the store, so write 6 is
+`addq $0x1,(%rcx)` at `0x565308`, and `%rcx` comes from:
+
+```
+5652da:  movhlps %xmm0,%xmm1      ; xmm1[63:0] <- xmm0[127:64]
+5652dd:  movq    %xmm0,%rsi
+5652e2:  movq    %xmm1,%rcx
+...
+565304:  addq    $0x1,(%rsi)      ; incref the first of a returned pair
+565308:  addq    $0x1,(%rcx)      ; incref the second   <-- landed elsewhere
+```
+
+**`0F 12 /r` is two instructions.** With a memory operand it is
+`movlps`/`movlpd` — load the low qword. With a *register* operand it is
+`MOVHLPS`, whose entire purpose is the other half: `dst[63:0] = src[127:64]`.
+Both tiers implemented it as "take the low qword" regardless of operand kind:
+
+```js
+// interp.mjs
+case 0x12: this.xmm[insn.xr] = (this.xmm[insn.xr] & ~MASK64) | rdRm(8);
+// aot_wat.mjs
+case 0x12: put(`(i64x2.replace_lane 0 ${dst} ${rm.kind==='xmm'?xlo(rm,next):…})`);
+```
+
+So wherever gcc uses `movhlps` to unpack a pair returned in one xmm — here two
+object pointers about to be increfed — the second pointer was wrong, the
+incref landed on an unrelated address, and a live object was freed early.
+`0F 16` (`movlhps`) was already correct, which is why only one half of the
+pattern broke. Fixed in both tiers.
+
+**CPython 3.11 now runs to completion in the interpreter**: `exit=0`, "42" on
+stdout, 20.7M instructions, no fault. It previously died at 15.3M.
+
+**The regression test would have caught it, and now does.**
+`engine/diff/packedtest.mjs` checks register-form SSE ops against the real CPU
+via `./stepper`, and `movhlps`/`movlhps` were simply not in its list. Added:
+591/591 bit-exact with the fix; reverting the fix gives exactly 2 mismatches,
+and the values name the bug — `hw=8e8f8c8d8a8b8889` (the high qword) against
+`interp=8687848582838081` (the low one). A regression test that does not fail
+on the old code is worth nothing, so that was checked rather than assumed.
+
+Suite green, breadth still 26/26.
+
+**A separate AOT bug remains, and it is not this one.** With the AOT tier live
+CPython fails much earlier, at ~560k instructions, with
+`SystemError: Negative size passed to PyUnicode_New` from
+`_install_external_importers`. Running it with the fix and with the fix
+reverted gives the same failure at 559,918 and 560,126 instructions — so this
+is pre-existing and unrelated. It was invisible until `guestfault.mjs` started
+printing the guest's **stderr**: the exit code and fault address alone said
+only "exit 1, no output".

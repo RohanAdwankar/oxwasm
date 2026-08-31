@@ -252,7 +252,15 @@ export class CPU {
             const src = this.xmm[insn.rm.kind === 'xmm' ? insn.rm.r : 0]; let msk = 0n;
             for (let k = 0n; k < 16n; k++) if ((src >> (8n*k + 7n)) & 1n) msk |= 1n << k;
             this.regs[insn.xr] = msk; break; }
-          case 0x12: this.xmm[insn.xr] = (this.xmm[insn.xr] & ~0xFFFFFFFFFFFFFFFFn) | rdRm(8); break;   // movlps/movlpd load low
+          // 0F 12 is TWO instructions. With a memory operand it is movlps/movlpd,
+          // loading the low qword. With a REGISTER operand it is MOVHLPS, whose
+          // whole point is the other half: dst[63:0] = src[127:64]. Reading the
+          // low qword in both cases silently produced the wrong pointer wherever
+          // gcc used movhlps to unpack a pair returned in one xmm - in CPython
+          // that pair is two object pointers about to be increfed, so one incref
+          // landed on the wrong address and a live object was freed early.
+          case 0x12: this.xmm[insn.xr] = (this.xmm[insn.xr] & ~0xFFFFFFFFFFFFFFFFn) |
+            (insn.rm.kind === 'xmm' ? (this.xmm[insn.rm.r] >> 64n) : rdRm(8)); break;   // movhlps / movlps
           case 0x13: wrRm(8, this.xmm[insn.xr] & 0xFFFFFFFFFFFFFFFFn); break;                             // movlps store
           case 0x16: this.xmm[insn.xr] = (this.xmm[insn.xr] & 0xFFFFFFFFFFFFFFFFn) | (rdRm(8) << 64n); break; // movhps load high
           case 0x17: wrRm(8, this.xmm[insn.xr] >> 64n); break;                                            // movhps store

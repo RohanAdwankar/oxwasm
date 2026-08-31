@@ -1217,6 +1217,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   const ZERO = '(v128.const i64x2 0 0)';
   // low 64 bits of an xmm value as an i64 expr
   const xlo = (rm, next) => `(i64x2.extract_lane 0 ${xv(rm, next)})`;
+  const xhi = (rm, next) => `(i64x2.extract_lane 1 ${xv(rm, next)})`;
   const xlo32 = (rm, next) => `(i32x4.extract_lane 0 ${xv(rm, next)})`;
   // punpck byte-shuffle indices (matches interp's interleave of low/high halves)
   const unpckIdx = (EB, high) => { const n = 8 / EB, base = high ? 8 : 0, idx = [];
@@ -1272,7 +1273,10 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       case 0x11:                                                              // movups/ss/sd store
         if (insn.pF3) storeRm(4, dst); else if (insn.pF2) storeRm(8, dst); else storeRm(16, dst);
         break;
-      case 0x12: put(`(i64x2.replace_lane 0 ${dst} ${rm.kind==='xmm'?xlo(rm,next):`(i64.load ${wasmAddr(rm,next)})`})`); break;  // movlps load low
+      // register operand = MOVHLPS (dst low <- src HIGH), memory = movlps
+      // (dst low <- [mem]). Taking the low half in both cases is a silent
+      // wrong-pointer bug wherever gcc unpacks an xmm-returned pair.
+      case 0x12: put(`(i64x2.replace_lane 0 ${dst} ${rm.kind==='xmm'?xhi(rm,next):`(i64.load ${wasmAddr(rm,next)})`})`); break;  // movhlps / movlps
       case 0x13: storeRm(8, dst); break;                                      // movlps store low
       case 0x16: put(`(i64x2.replace_lane 1 ${dst} ${rm.kind==='xmm'?xlo(rm,next):`(i64.load ${wasmAddr(rm,next)})`})`); break;  // movhps load high
       case 0x17: L.push(`(v128.store64_lane 1 ${wasmAddr(rm, next)} ${dst})`); break;   // movhps store high (lane, addr, value)
