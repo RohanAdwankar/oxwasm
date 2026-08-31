@@ -473,77 +473,111 @@ export function analyze(mem, entry, { maxInsns = 20000, noJtab = false } = {}) {
 // itself in bidx. One site also means the duplication cost is bounded by the
 // callee's size, which is the case the measurement actually found.
 export function inlineCallees(a0, fnAddr, resolve, opts = {}) {
-  const budget = opts.budget ?? 160;            // low HUNDREDS: a 64-insn cutoff
-  const M = a0.M;                               // excludes all three of gzip's
-  // OXWASM_INLINE_ONLY=hex,hex - diagnostic: splice only these targets, so a
-  // measurement can separate "the frame saving is real" from "merging graphs
-  // pushed the caller into the br_table relooper and that cost more".
-  const only = opts.only ?? null;
-  const sites = new Map();                      // targetStr -> {n, retTo}
-  for (const b of a0.blocks) for (const insn of b.insns) {
-    if (insn.mnem !== 'call') continue;
-    const t = ((insn.next + insn.rel) & M).toString();
-    const e = sites.get(t);
-    if (e) e.n++; else sites.set(t, { n: 1, retTo: insn.next });
-  }
-  const rej = opts.rej || null;                 // diagnostic: why a target was refused
+  const budget = opts.budget ?? 160;      // per-callee size cap, in instructions
+  const total  = opts.total  ?? 640;      // per-function cap on duplicated code
+  const only = opts.only ?? null;         // OXWASM_INLINE_ONLY, for diagnosis
+  const rej = opts.rej || null;
   const no = (t, why) => { if (rej) rej(t, why); };
-  const chosen = new Map();                     // targetStr -> {an, retTo}
-  const taken = new Set(a0.blocks.map(b => b.start.toString()));
-  for (const [t, site] of sites) {
+  const M = a0.M;
+
+  // Every call site, in program order. A callee with several sites gets a
+  // COPY PER SITE: v1 spliced only single-site callees, to keep guest
+  // addresses usable as block identity, and that excluded every callee that
+  // mattered - gzip's four hot ones have 8, 5, 3 and 2 sites in one caller.
+  // Hot callees are called from many places; that is part of why they are hot.
+  const sites = [];
+  a0.blocks.forEach((b, bi) => b.insns.forEach((insn, ii) => {
+    if (insn.mnem !== 'call') return;
+    sites.push({ t: ((insn.next + insn.rel) & M).toString(), retTo: insn.next, bi, ii });
+  }));
+
+  const cand = new Map();                 // targetStr -> { an, size }
+  for (const site of sites) {
+    const t = site.t;
+    if (cand.has(t)) continue;
     if (only && !only.has(t)) continue;
-    if (site.n !== 1) { no(t, 'sites=' + site.n); continue; }   // see above: one site only
-    if (t === fnAddr.toString()) { no(t, 'self'); continue; }   // direct recursion has no fixed point
+    if (t === fnAddr.toString()) { no(t, 'self'); continue; }   // recursion has no fixed point
     const c = resolve(t);
     if (!c) { no(t, 'not-in-unit'); continue; }
-    if (c.jtabs && c.jtabs.size) { no(t, 'jtab'); continue; }   // a jump table needs the callee's own resolver
+    if (c.jtabs && c.jtabs.size) { no(t, 'jtab'); continue; }   // needs the callee's own resolver
     let size = 0, bad = false;
     for (const b of c.blocks) for (const i of b.insns) {
       size++;
-      // an undecodable byte compiles to a deopt that unwinds THIS frame, and
-      // an indirect jump deopts too - inlining either would unwind the
-      // caller's frame instead of the callee's, which is not the same program
+      // an undecodable byte or an indirect jump compiles to a deopt that
+      // unwinds THIS frame; spliced in, it would unwind the caller's
       if (i.mnem === 'udec' || i.mnem === 'jmpind') bad = true;
     }
     if (bad || size === 0 || size > budget) { no(t, bad ? 'deopt-insn' : 'size=' + size); continue; }
-    if (c.blocks.some(b => taken.has(b.start.toString()))) { no(t, 'addr-collision'); continue; }
-    for (const b of c.blocks) taken.add(b.start.toString());
-    chosen.set(t, { an: c, retTo: site.retTo });
+    cand.set(t, { an: c, size });
   }
-  if (!chosen.size) return null;
+  if (!cand.size) return null;
 
+  // Spend the duplication budget on the cheapest copies first, so a small
+  // callee at many sites wins over a large one at few.
+  const pick = new Map();                 // "bi:ii" -> { t, copy, retTo }
+  let spent = 0, copyN = 0;
+  for (const site of sites.filter(x => cand.has(x.t))
+                          .sort((x, y) => cand.get(x.t).size - cand.get(y.t).size)) {
+    const sz = cand.get(site.t).size;
+    if (spent + sz > total) { no(site.t, 'over-total'); continue; }
+    spent += sz;
+    pick.set(site.bi + ':' + site.ii, { t: site.t, copy: copyN++, retTo: site.retTo });
+  }
+  if (!pick.size) return null;
+
+  const cid = (copy, addr) => 'i' + copy + ':' + addr.toString();
   const blocks = [];
-  for (const b of a0.blocks) {
+  a0.blocks.forEach((b, bi) => {
     let cur = { start: b.start, insns: [] };
-    for (const insn of b.insns) {
-      if (insn.mnem === 'call') {
-        const t = ((insn.next + insn.rel) & M).toString();
-        if (chosen.has(t)) {
-          // the call still pushes its return address - guest memory stays
-          // byte-exact - but terminates its block and branches into the body
-          cur.insns.push({ ...insn, inlineTo: BigInt(t) });
-          blocks.push(cur);
-          cur = { start: insn.next, insns: [] };
-          continue;
-        }
+    b.insns.forEach((insn, ii) => {
+      const p = pick.get(bi + ':' + ii);
+      if (p) {
+        // the call still pushes its return address - the guest stack stays
+        // byte-exact - but terminates its block and branches into the copy
+        // the copy's ENTRY is the call target, not blocks[0]: analyze() lays
+        // blocks out by address and a function's entry is not necessarily its
+        // lowest address (a unit rooted at a loop head decodes blocks below it)
+        cur.insns.push({ ...insn, inlineTo: cid(p.copy, BigInt(p.t)) });
+        blocks.push(cur);
+        cur = { start: insn.next, insns: [] };
+        return;
       }
       cur.insns.push(insn);
-    }
-    // an empty tail means the call was already last in its block, so the
-    // continuation is a leader that a0 already carries - do not duplicate it
+    });
+    // an empty tail means the call was already last in its block, so a0
+    // already carries the continuation as a leader - do not duplicate it
     if (cur.insns.length) blocks.push(cur);
-  }
-  for (const [, { an, retTo }] of chosen)
-    for (const b of an.blocks)
-      blocks.push({ start: b.start, insns: b.insns.map(i =>
-        (i.mnem === 'ret' || i.mnem === 'retn') ? { ...i, inlineRet: retTo } : i) });
+  });
 
-  blocks.sort((x, y) => x.start < y.start ? -1 : x.start > y.start ? 1 : 0);
-  const bidx = new Map(blocks.map((b, i) => [b.start.toString(), i]));
-  if (bidx.size !== blocks.length) return null;            // duplicate leader: refuse
+  for (const [, p] of pick) {
+    const c = cand.get(p.t).an;
+    const inCallee = (addr) => c.bidx.has(addr.toString());
+    for (const b of c.blocks) {
+      const insns = b.insns.slice();
+      const last = { ...insns[insns.length - 1] };
+      const nx = last.next;
+      if (last.mnem === 'ret' || last.mnem === 'retn') last.inlineRet = p.retTo.toString();
+      else if (last.mnem === 'jcc') {
+        const ta = (nx + last.rel) & M;
+        last.edgeT = inCallee(ta) ? cid(p.copy, ta) : null;
+        last.edgeF = inCallee(nx) ? cid(p.copy, nx) : null;
+      } else if (last.mnem === 'jmp') {
+        const ta = (nx + last.rel) & M;
+        last.edgeT = inCallee(ta) ? cid(p.copy, ta) : null;
+      } else {
+        last.edgeN = inCallee(nx) ? cid(p.copy, nx) : null;
+      }
+      insns[insns.length - 1] = last;
+      blocks.push({ start: b.start, id: cid(p.copy, b.start), insns });
+    }
+  }
+
+  const bidx = new Map(blocks.map((b, i) => [b.id ?? b.start.toString(), i]));
+  if (bidx.size !== blocks.length) return null;            // duplicate identity: refuse
   const calls = new Set(a0.calls);
-  for (const [t, { an }] of chosen) { calls.delete(t); for (const c of an.calls) calls.add(c); }
-  return { blocks, bidx, M, calls, jtabs: a0.jtabs, inlined: [...chosen.keys()] };
+  for (const [, { an }] of cand) for (const c of an.calls) calls.add(c);
+  return { blocks, bidx, M, calls, jtabs: a0.jtabs,
+           inlined: [...pick.values()].map(p => p.t), dup: spent };
 }
 
 // ---- Stackifier: turn a reducible CFG into nested wasm loop/block scopes ----
@@ -613,10 +647,16 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   const succAddrIdx = (i) => {
     const insns = a0.blocks[i].insns, last = insns[insns.length-1], next = last.next;
     const idx = (addr) => a0.bidx.has(addr.toString()) ? a0.bidx.get(addr.toString()) : -1;
+    const ide = (e) => e == null ? -1 : (a0.bidx.has(e) ? a0.bidx.get(e) : -1);
     // an inlined call site and an inlined callee's ret are both plain edges
     // inside this function now, not frame transitions
-    if (last.inlineTo !== undefined) return [idx(last.inlineTo)];
-    if (last.inlineRet !== undefined) return [idx(last.inlineRet)];
+    if (last.inlineTo !== undefined) return [ide(last.inlineTo)];
+    if (last.inlineRet !== undefined) return [ide(last.inlineRet)];
+    // a spliced block resolves its own branches by copy-local id, never by
+    // address - `next + rel` would land on the ORIGINAL callee block
+    if (last.edgeT !== undefined) return last.edgeF !== undefined
+      ? [ide(last.edgeT), ide(last.edgeF)] : [ide(last.edgeT)];
+    if (last.edgeN !== undefined) return [ide(last.edgeN)];
     if (last.mnem === 'jcc') return [idx((next+last.rel)&MM), idx(next)];
     if (last.mnem === 'jmp') return [idx((next+last.rel)&MM)];
     if (last.mnem === 'jmpind') {
@@ -639,8 +679,13 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   const rpoOf = new Array(An).fill(-1);
   order.forEach((addrIdx, r) => rpoOf[addrIdx] = r);
   const blocks = order.map(ai => a0.blocks[ai]);    // blocks laid out in RPO
+  // A block's IDENTITY is its guest address, except for a block spliced in by
+  // the inliner: the same callee inlined at two call sites appears twice, so
+  // each copy carries its own id and its cloned branches carry copy-local
+  // edge ids. Everything downstream works on indices and is unaffected.
+  const bId = (b) => b.id ?? b.start.toString();
   const N = blocks.length;
-  const bidx = new Map(blocks.map((b,i)=>[b.start.toString(), i]));
+  const bidx = new Map(blocks.map((b,i)=>[bId(b), i]));
   const MASKl = { 1: 0xFFn, 2: 0xFFFFn, 4: 0xFFFFFFFFn, 8: 0xFFFFFFFFFFFFFFFFn };
   const SIGNl = { 1: 0x80n, 2: 0x8000n, 4: 0x80000000n, 8: 0x8000000000000000n };
   const andmask = (e, S) => S === 8 ? e : `(i64.and ${e} (i64.const ${MASKl[S]}))`;   // truncate to width; full 64 is a no-op
@@ -648,6 +693,10 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   // terminator descriptor + successors, all in RPO index space
   const term = [], succs = [];
   const idxOf = (addr) => bidx.has(addr.toString()) ? bidx.get(addr.toString()) : -1;
+  // an explicit edge from a spliced block: null means the target is outside
+  // the callee, which must deopt rather than resolve to some other function's
+  // block that happens to sit at the same address
+  const idxOfEdge = (e) => e == null ? -1 : (bidx.has(e) ? bidx.get(e) : -1);
   // Jump-table resolution set: the union of every discovered table's in-unit
   // targets. One shared per-function resolver maps a computed address to its
   // RPO index; any jtab site can therefore land on any union member at
@@ -660,13 +709,29 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   let hasDeopt = false;
   for (let i=0;i<N;i++) {
     const insns = blocks[i].insns, last = insns[insns.length-1], next = last.next;
-    if (last.inlineTo !== undefined) { const t = idxOf(last.inlineTo);
+    if (last.inlineTo !== undefined) { const t = idxOfEdge(last.inlineTo);
       if (t < 0) throw new Error('AOT: inlined callee entry not a block');
-      term.push({kind:'inlinecall', t, ta: last.inlineTo}); succs.push([t]); }
-    else if (last.inlineRet !== undefined) { const t = idxOf(last.inlineRet);
+      term.push({kind:'inlinecall', t, ta: last.next}); succs.push([t]); }
+    else if (last.inlineRet !== undefined) { const t = idxOfEdge(last.inlineRet);
       if (t < 0) throw new Error('AOT: inlined return site not a block');
-      term.push({kind:'inlineret', t, ta: last.inlineRet,
+      term.push({kind:'inlineret', t, ta: last.next,
                  pad: last.mnem === 'retn' ? Number(last.n) : 0}); succs.push([t]); }
+    // a spliced block's own branches, resolved by copy-local id. `ta`/`fa`
+    // stay the REAL guest addresses so a target outside the callee still has
+    // somewhere real to deopt to.
+    else if (last.edgeT !== undefined && last.mnem === 'jcc') {
+      const ta = (next+last.rel)&MM, fa = next;
+      const t = idxOfEdge(last.edgeT), f = idxOfEdge(last.edgeF);
+      if (t < 0 || f < 0) hasDeopt = true;
+      term.push({kind:'jcc', t, f, ta, fa}); succs.push([t, f]); }
+    else if (last.edgeT !== undefined) {
+      const ta = (next+last.rel)&MM, t = idxOfEdge(last.edgeT);
+      if (t < 0) hasDeopt = true;
+      term.push({kind:'jmp', t, ta}); succs.push([t]); }
+    else if (last.edgeN !== undefined) {
+      const t = idxOfEdge(last.edgeN);
+      if (t < 0) hasDeopt = true;
+      term.push({kind:'fall', t, ta: next}); succs.push([t]); }
     else if (last.mnem === 'jcc') { const ta = (next+last.rel)&MM, fa = next, t = idxOf(ta), f = idxOf(fa);
       if (t < 0 || f < 0) hasDeopt = true;
       term.push({kind:'jcc', t, f, ta, fa}); succs.push([t, f]); }
@@ -2087,9 +2152,13 @@ const inlineEnabled = () => globalThis.__inline ??
   (typeof process !== 'undefined' && process.env?.OXWASM_INLINE === '1');
 const inlineBudget = () => Number(
   (typeof process !== 'undefined' && process.env?.OXWASM_INLINE_BUDGET) || 160);
+// Per-function cap on duplicated instructions. A callee at 8 sites is 8
+// copies, so the interesting limit is the total, not the per-callee size.
+const inlineTotal = () => Number(
+  (typeof process !== 'undefined' && process.env?.OXWASM_INLINE_TOTAL) || 640);
 
 export function compileUnitWat(mem, entry, opts = {}) {
-  const INLINE = inlineEnabled(), INLINE_BUDGET = inlineBudget();
+  const INLINE = inlineEnabled(), INLINE_BUDGET = inlineBudget(), INLINE_TOTAL = inlineTotal();
   const ONLY = (typeof process !== 'undefined' && process.env?.OXWASM_INLINE_ONLY) || '';
   const INLINE_ONLY = ONLY ? new Set(ONLY.split(',').map(h => BigInt('0x' + h.trim()).toString())) : null;
   const { guestBase, ramBase, maxFuncs = 96, maxInsns = 20000, skip } = opts;
@@ -2149,7 +2218,7 @@ export function compileUnitWat(mem, entry, opts = {}) {
           try {
             const m = inlineCallees(an, BigInt(k), (t) =>
               (funcs.has(t) && !poisoned.has(t)) ? funcs.get(t) : null,
-              { budget: INLINE_BUDGET, only: INLINE_ONLY,
+              { budget: INLINE_BUDGET, total: INLINE_TOTAL, only: INLINE_ONLY,
                 rej: INLINE_ONLY ? (t, why) => {
                   const st = globalThis.__inlStats = globalThis.__inlStats || { fns: 0, callees: 0 };
                   (st.rej = st.rej || []).push(BigInt(t).toString(16) + ':' + why + ' in ' + k);

@@ -1084,3 +1084,57 @@ which says the run is dominated by startup and compilation rather than the
 compression loop — so this A/B cannot resolve a 20% steady-state effect at
 all. No performance claim is made here in either direction; the number will
 come from the startup-subtracting method or it will not come.
+
+### v2: a copy per call site, and a harness that can see the result
+
+Two changes, in the order they had to happen.
+
+**The restriction is gone.** A block's identity is no longer its guest
+address: a spliced block carries an explicit `id` (`i<copy>:<addr>`) and its
+cloned branches carry copy-local edge ids, because `next + rel` would resolve
+to the *original* callee block. `ta`/`fa` stay the real guest addresses, so a
+branch leaving the callee still has somewhere real to deopt to. A callee at
+eight sites is eight copies, so the meaningful limit is the per-function total
+of duplicated instructions (`OXWASM_INLINE_TOTAL`, default 640), spent on the
+cheapest copies first — not the per-callee size.
+
+With that, gzip's hot callees are finally reachable: 60 copies across 10
+functions, output byte-identical, and no function pushed into the `br_table`
+relooper (dispatch-mode count unchanged at 85).
+
+**`bench/realab.mjs`.** Wall-clock on a real binary was never going to answer
+this. Every A/B above ran gzip in about a second whether the input was 200KB
+or 2MB, which is the signature of a run dominated by ELF load, tiering and
+`wat2wasm` rather than by the compression loop. So realab runs each
+configuration at two input sizes in separate processes, takes medians, and
+subtracts — the same startup subtraction the kernel harness needed before its
+numbers meant anything. It also hashes stdout in both arms and refuses to
+report a ratio as meaningful when it falls inside the harness's own noise.
+
+**First trustworthy number, and it is smaller than predicted.** Inlining only
+gzip's four hot callees, 20MB input, medians of three with the 2KB run
+subtracted:
+
+| arm | big | small | steady state |
+|-----|----:|------:|-------------:|
+| baseline | 1909ms | 922ms | **987ms** |
+| hot callees inlined | 1941ms | 1008ms | **933ms** |
+
+Identical output hash in both arms. B/A = **0.945x**, against harness noise of
++/-5% — so this run says "possibly about 5%, and it cannot tell 5% from
+nothing very confidently". Not the ~20% the fixed-charge model predicted from
+77 instructions per call.
+
+That gap is the interesting part, and it is a warning about the model rather
+than about the code. `22/(1.1*77 + 22)` treats every call as costing the full
+fixed charge measured on a 1-op callee in a tight synthetic loop. Real call
+sites are not that: the charge competes with a branch predictor that has seen
+the same call a hundred thousand times, and with a V8 that may already handle
+a hot monomorphic wasm call better than the kernel's worst case. The
+amortisation curve is still right about the *shape*; the coefficient does not
+transfer to a real program unchanged.
+
+Also worth recording: startup is **48% of the big run even at 20MB**. gzip -1
+compresses 20MB in about a second of engine steady state here. Getting the
+startup share down further would need a much larger input or a way to time the
+compression loop directly.
