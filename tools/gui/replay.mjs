@@ -315,35 +315,27 @@ const rows = [];
 for (let i = 0; i < N; i++) {
   const i0 = eng.stats.interpreted, a0 = eng.stats.aotRuns;
   const t0 = process.hrtime.bigint();
-  // CLICKAT=x,y. The default was a guess at (420,30) that landed on the ROOT
-  // window and moved GIMP 28 instructions - the point has to come from the
-  // window tree (WINDOWS=1) or it is not an interaction at all.
-  const [CX, CY] = (process.env.CLICKAT || '434,382').split(',').map(Number);
-  xs.injectMotion(CX, CY); xs.injectButton(1, true);
-  // profile ALL THREE pumps of round 0, not just the first: the first run of
-  // this captured 888 of the round's 13,565 interpreted steps and the split by
-  // image would have been read as if it were the whole story.
+  // SCRIPT is a ';'-separated round: "click:x,y", "esc", "drag:x1,y1,x2,y2".
+  // One fixed click reaches one code path; the capture is only as good as the
+  // interactions that drive it, and the units that matter are spread across
+  // the toolbox, the menus and the paint path.
+  const SCRIPT = process.env.SCRIPT ||
+    `click:${process.env.CLICKAT || '434,382'};esc` +
+    (process.env.DRAG ? `;drag:${process.env.DRAG}` : '');
   const P0 = profile && i === 0;
-  if (P0) { eng.wake(); profileRound(1500); } else pump(1500, true);
-  xs.injectButton(1, false);
-  if (P0) { eng.wake(); profileRound(1500); } else pump(1500, true);
-  // Escape, not a second click. A click somewhere else leaves the UI in a
-  // different state each round - the first run of this loop collapsed to 4ms
-  // by iteration 2 because it had walked into a state where nothing responded.
-  // Escape closes a menu and returns to where the round started, which is what
-  // makes first-vs-Nth a comparison of the same interaction.
-  xs.injectKey(9, true); xs.injectKey(9, false);     // keycode 9 = Escape
-  if (P0) { eng.wake(); profileRound(1500); } else pump(1500, true);
-  // DRAG=x1,y1,x2,y2 adds a pointer stroke to the round. A click and a stroke
-  // reach different code - motion handling, tool state, the paint path - and
-  // the capture is only as good as the interactions that drive it.
-  if (process.env.DRAG) {
-    const [ax, ay, bx, by] = process.env.DRAG.split(',').map(Number);
-    xs.injectMotion(ax, ay); xs.injectButton(1, true);
-    for (let k = 1; k <= 8; k++)
-      xs.injectMotion(ax + ((bx - ax) * k / 8) | 0, ay + ((by - ay) * k / 8) | 0);
-    xs.injectButton(1, false);
-    if (P0) { eng.wake(); profileRound(1500); } else pump(1500, true);
+  const step = () => { if (P0) { eng.wake(); profileRound(1500); } else pump(1500, true); };
+  for (const act of SCRIPT.split(';').filter(Boolean)) {
+    const [kind, args] = act.split(':');
+    const a = (args || '').split(',').map(Number);
+    if (kind === 'click') { xs.injectMotion(a[0], a[1]); xs.injectButton(1, true); step();
+                            xs.injectButton(1, false); step(); }
+    else if (kind === 'esc') { xs.injectKey(9, true); xs.injectKey(9, false); step(); }
+    else if (kind === 'drag') {
+      xs.injectMotion(a[0], a[1]); xs.injectButton(1, true);
+      for (let k = 1; k <= 8; k++)
+        xs.injectMotion(a[0] + ((a[2] - a[0]) * k / 8) | 0, a[1] + ((a[3] - a[1]) * k / 8) | 0);
+      xs.injectButton(1, false); step();
+    }
   }
   const ms = Number(process.hrtime.bigint() - t0) / 1e6;
   const interp = eng.stats.interpreted - i0, aot = eng.stats.aotRuns - a0;
