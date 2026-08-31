@@ -71,6 +71,20 @@ const run = (allow) => {          // allow: null = compile all, else a Set of en
       files, mtimes, memMB: Number(process.env.MEMMB || 1024), assembleWat });
   if (process.env.SHADOW) eng.shadowLib = process.env.SHADOW;
   if (process.env.SHADOWMAX) eng.shadowMax = Number(process.env.SHADOWMAX);
+  // SYSLOG=<file> - record every syscall (nr and the four register arguments)
+  // in order. Diffing two configurations' logs finds WHEN behaviour first
+  // differs without needing a theory about why: the first differing line is
+  // the first guest-visible consequence of the miscompile.
+  const sysLog = [];
+  if (process.env.SYSLOG) {
+    const orig = eng.syscall.bind(eng);
+    eng.syscall = (cpu) => {
+      sysLog.push(`${cpu.regs[0]} ${cpu.regs[7].toString(16)} ${cpu.regs[6].toString(16)} ` +
+                  `${cpu.regs[2].toString(16)} ${cpu.regs[10].toString(16)}`);
+      return orig(cpu);
+    };
+    eng.cpu.onSyscall = (cpu) => eng.syscall(cpu);
+  }
   eng.onUnitWat = (n, entry, unit) => funcsOf.set(entry, unit.funcs);
   eng.unitFilter = (n, entry) => { order.push(entry); return allow === null || allow.has(entry); };
   let err = null;
@@ -80,6 +94,8 @@ const run = (allow) => {          // allow: null = compile all, else a Set of en
   const se = (eng.stderr || []).join('');
   const out = (eng.stdoutBytes || []).reduce((a, b) => a + b.length, 0);
   const good = !err && eng.exitCode === 0 && !/Error|Traceback|error/.test(se);
+  if (process.env.SYSLOG) { writeFileSync(process.env.SYSLOG, sysLog.join('\n') + '\n');
+    console.log(`  syscalls logged: ${sysLog.length} -> ${process.env.SYSLOG}`); }
   if (eng._shadowStats) { const q = eng._shadowStats;
     console.log(`  shadow: tried=${q.tried} compared=${q.compared} aborted=${q.aborted} diverged=${q.diverged}`); }
   return { good, err, exit: eng.exitCode, out, se, order, funcsOf,

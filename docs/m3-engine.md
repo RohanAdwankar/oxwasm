@@ -1295,3 +1295,41 @@ What remains, testable next:
 Nothing is claimed fixed. The previous entry's guess that the bad function
 was "elsewhere in unit 327's closure" is wrong: the closure is one function,
 and it compares clean.
+
+### Localizing without a theory: diff the syscall traces
+
+The shadow said the function behaves identically on all 681 entries, yet
+compiling it alone breaks the program — a contradiction that no amount of
+further staring at the disassembly was going to resolve. So instead of
+another hypothesis about *why*, `SYSLOG=<file>` records every syscall (number
+plus the four register arguments) in order, and the two configurations get
+diffed. The first differing line is the first guest-visible consequence of
+the miscompile, whatever caused it.
+
+Filtering `clock_gettime` (timing-dependent, and not evidence), the traces
+are **identical through syscall 86** — the same `newfstatat` — and then:
+
+```
+GOOD (interpreted)              BAD (that one function compiled)
+201 0 0 8            time()     9 0 ff6a8000 3 22     mmap(NULL, 0xff6a8000, RW, ANON)
+257 ffffff9c 5ddea27 openat()   12 1011c1000 ...      brk(0x1011c1000)
+12 1b41000 ...       brk()      9 0 ff6c8000 3 22     mmap(NULL, ~4GB, ...)
+                                1 2 a314d0 ...        write(2, ...)   <- the traceback
+```
+
+The bad run asks for **0xff6a8000 bytes — 4,285,464,576**. As a signed 32-bit
+value that is **−9,928,704**: a negative length reinterpreted as a huge
+unsigned one, which is precisely the shape of `Negative size passed to
+PyUnicode_New`. The wrong value is a *size*, and the function is a reverse
+string search, so a returned pointer below the start would make the caller's
+`p - start` negative. That is a concrete mechanism, and it is now pinned to a
+single program point rather than inferred.
+
+It also sharpens the contradiction usefully. The shadow compared 681 entries
+at `0x5ccce80` and found none wrong, so **the failing call is not among
+them** — the function must be reached by a path that never goes through
+`dispatchMaybeShadow`. The candidate is the in-wasm `$ftr`/`drive` chain:
+once execution is inside compiled code, a guest call or tail-jump to an
+address in the funcref table dispatches in wasm without returning to JS, and
+the shadow only sees JS-side dispatches. Counting actual entries to that rip
+against the 681 shadow attempts would confirm it, and is the next step.
