@@ -2256,6 +2256,11 @@ const inlineTotal = () => Number(
 
 export function compileUnitWat(mem, entry, opts = {}) {
   const INLINE = inlineEnabled(), INLINE_BUDGET = inlineBudget(), INLINE_TOTAL = inlineTotal();
+  // OXWASM_PHASE=1 attributes tier-up time to the phases that spend it. The
+  // inlining tier-up cost is +116ms and unexplained; guessing at it from A/B
+  // wall clock has already produced one withdrawn conclusion.
+  const PHASE = typeof process !== 'undefined' && process.env?.OXWASM_PHASE === '1';
+  const PH = PHASE ? (globalThis.__aotPhase ??= { inline: 0, emit: 0, chars: 0 }) : null;
   // Note on what inlining can NOT reach. Closure pruning drops a callee the
   // host already has compiled and mapped, so a callee that tiered up before
   // its caller is invisible to the inliner. Un-pruning small callees to get
@@ -2319,6 +2324,7 @@ export function compileUnitWat(mem, entry, opts = {}) {
         // callers in other units - only how this one function reaches it.
         let use = an;
         if (INLINE) {
+          const tp0 = PHASE ? performance.now() : 0;
           try {
             const m = inlineCallees(an, BigInt(k), (t) =>
               (funcs.has(t) && !poisoned.has(t)) ? funcs.get(t) : null,
@@ -2331,7 +2337,9 @@ export function compileUnitWat(mem, entry, opts = {}) {
               globalThis.__inlStats = globalThis.__inlStats || { fns: 0, callees: 0 };
               globalThis.__inlStats.fns++; globalThis.__inlStats.callees += m.inlined.length; }
           } catch { /* a merge that does not hold: emit the function unmodified */ }
+          if (PHASE) PH.inline += performance.now() - tp0;
         }
+        const te0 = PHASE ? performance.now() : 0;
         try { texts.set(k, emitUnitFunction(use, BigInt(k), ctx)); }
         catch (e) {
           // an inlined body that fails to emit must not poison a function that
@@ -2339,6 +2347,7 @@ export function compileUnitWat(mem, entry, opts = {}) {
           if (use === an) throw e;
           texts.set(k, emitUnitFunction(an, BigInt(k), ctx));
         }
+        if (PHASE) { PH.emit += performance.now() - te0; PH.chars += (texts.get(k) || '').length; }
       }
       catch (e) {
         if (k === entry.toString()) throw e;

@@ -1367,3 +1367,31 @@ a fixed +116ms of tier-up**.
 That is a real win for anything long-running and for the shipped page, which
 pays the tier-up at build time. It stays opt-in for short-lived processes,
 where +116ms is not repaid.
+
+### Where the +116ms goes, measured instead of inferred
+
+Guessing at this from A/B wall clock produced one withdrawn conclusion, so:
+`OXWASM_PHASE=1` times the phases of tier-up directly. gzip, one run each, no
+statistics needed.
+
+| phase | baseline | inlining on | delta |
+|-------|---------:|------------:|------:|
+| `inlineCallees` (selection + merge) | 0ms | 34ms | **+34ms** |
+| `emitUnitFunction` | 360ms | 415ms | **+55ms** |
+| `assembleWat` (cache warm) | 33ms | 29ms | ~0 |
+| emitted wat | 13.9MB | 15.6MB | +1.7MB |
+
+**89ms of the 116ms is accounted for directly**, and the remainder is within
+slop of what compiling 13% more wasm should cost V8.
+
+This corrects the magnitude of an earlier claim as well as its sign. The
+isolation experiment had attributed ~90ms to the selection pass; it is **34ms**.
+The CSR rewrite plausibly took it from about 40ms to 34ms, which is exactly the
+~6ms the seven-rep A/B measured and exactly why four reps could not see it. The
+numbers finally agree with each other.
+
+And the conclusion is not the hopeful one. Emission is the largest share, it is
+proportional to text volume (13% more wat, 15% more emit time), and that is
+inherent to duplicating code rather than a fixable inefficiency. Roughly three
+quarters of inlining's tier-up cost is the price of the duplication itself.
+Only the 34ms of selection is worth attacking, and it is the smallest piece.
