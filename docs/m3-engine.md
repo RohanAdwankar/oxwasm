@@ -667,3 +667,42 @@ callout landings — the top six of which are all marked "never compiled, no
 unit covers it". Every one of those six is in the 142-unit capture; the two
 hot addresses NOT captured were already in the shipped manifest. The capture
 is exactly the gap set, which is the reason it works.
+
+### Where a runtime tier-up spends its time
+
+`tools/gui/cdp_tier.mjs` wraps `tierUpAot` and `assembleWat` in the page and
+reports the per-unit split, so the cost of in-browser compilation is a number
+rather than an intuition. On the repacked `demo/gimp`:
+
+| | units | sync tier work | emit (compileUnitWat) | assemble (wabt.js) | median | max |
+|---|---:|---:|---:|---:|---:|---:|
+| File > New > OK | 10 | 109ms | 37ms (35%) | **71ms (65%)** | 2.8ms | **53ms** |
+| two paint strokes | 17 | 16ms | 9ms (55%) | 7ms (45%) | 0.3ms | 4.7ms |
+
+Two things fall out.
+
+**wabt.js is the majority of the on-thread cost.** Instantiation is already
+off-thread (`asyncCompile`), so what remains on the main thread is emitting
+WAT text and parsing it back — and the parse is 65% of that on the menu
+path. Emitting wasm binary directly would remove the parse entirely and part
+of the emit with it, which makes it the single largest lever on tier-up
+latency.
+
+**`tierMsMax` does not bound a unit, only the next one.** The check is
+`if (tierMs >= tierMsMax) return` — a pre-check. Once the slice is under
+budget a unit of any cost proceeds, so a 53ms unit landed against the 2ms
+budget in force during interaction, and 9 of 27 units overshot. 53ms is
+three dropped frames.
+
+The exposure is worse than 53ms suggests, because unit sizes are extremely
+skewed. Across the shipped manifest's 7,810 units the median is 1,776 bytes
+of wasm but the largest is 958,307, and half of all unit bytes live in the
+largest 4% of units. The 53ms unit was 0.23 MB of WAT; at the ~230ms/MB
+wabt.js rate that implies, a multi-megabyte closure would stall for seconds
+— which is the failure the `unitBytes` comment already records as
+"30-second pump slices on GIMP's first menu open".
+
+That is the argument for capping unit size against the budget rather than
+leaving it unbounded: `unitMaxFuncs`/`unitMaxInsns` exist and truncation is
+already sound (calls to skipped functions chain through `$ftr`), but the
+page sets neither.
