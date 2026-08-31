@@ -514,3 +514,30 @@ which reads as "dispatch missed it". The causal attribution points at
 counted where the engine happened to be; the other counts what caused the
 work. Acting on the first would have meant debugging a dispatch path that was
 working correctly.
+
+### The capture gap, closed and verified
+
+The fix for #31 does not need a sysroot, which this container does not have.
+`replay.mjs CAPTURE=<file>` gives the restored engine an assembler and records
+every unit it compiles *while the interaction is driven* — capturing the
+interactive path directly from the shipped artifact. `EXTRA=<file>` then loads
+those units alongside the manifest, so the fix can be verified before anything
+is repacked.
+
+| run | units | functions | round-0 interpreted |
+|-----|------:|----------:|--------------------:|
+| shipped manifest | 7,653 | 13,173 | **13,565** |
+| + 9 captured units | 7,662 | 13,187 | **3,023** |
+
+**Nine units — fourteen functions — remove 78% of the first interaction's
+interpreted work.** That is the root cause confirmed by repair: the manifest
+was missing the interactive path, and adding it is a rounding error on a
+7,653-unit pack.
+
+Two honest notes. The wall-clock comparison from these runs is not usable —
+the verification run was slower across *every* round (293ms median vs 147ms
+baseline), which is machine contention, not the units; the interpreted count is
+the clean signal because it does not vary with load. And 3,023 interpreted
+steps remain, expected: the capture drove the interaction once, and the call
+threshold only compiles a function after four calls, so anything called three
+times or fewer during the capture is still uncovered.

@@ -13,7 +13,9 @@ import { CPU } from '../../engine/interp.mjs';
 import { restoreEngineCore } from '../../engine/snapshot_core.mjs';
 import { parsePCF } from '../../engine/pcf.mjs';
 import { decode } from '../../engine/decode.mjs';
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { gunzipSync } from 'node:zlib';
 
 const DIR = process.argv[2] || 'demo/gimp';
@@ -57,6 +59,21 @@ const memLen = snap.memLen;
 // guess: restore writes the saved fb straight into xs.fb and a mismatch is an
 // out-of-bounds set rather than a resize
 const root = (snap.x?.res || []).find(w => w.parent === null) || { w: 1024, h: 768 };
+// CAPTURE=<file>: give the engine an assembler and record every unit it
+// compiles while the interaction is driven, so the interactive path the
+// pack-time capture missed can be captured FROM THE SHIPPED ARTIFACT - no
+// sysroot needed, which this container does not have.
+const CAPTURE = process.env.CAPTURE || null;
+const captured = [];
+let asmN = 0;
+const assembleWat = (wat) => {
+  const w = `/tmp/rp_${process.pid}_${asmN++}`;
+  writeFileSync(w + '.wat', wat);
+  execFileSync('wat2wasm', ['--enable-tail-call', w + '.wat', '-o', w + '.wasm']);
+  const b = new Uint8Array(readFileSync(w + '.wasm'));
+  try { unlinkSync(w + '.wat'); unlinkSync(w + '.wasm'); } catch {}
+  return b;
+};
 const xs = new XServer({ width: root.w, height: root.h, fonts });
 const eng = new LinuxEngine(elf, {
   argv: ['/usr/bin/gimp'],
@@ -64,7 +81,11 @@ const eng = new LinuxEngine(elf, {
         'LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu'],
   // the engine allocates memMB plus its own two reserved megabytes, so the
   // snapshot's memLen is memMB + 2 - solve for it rather than guessing
-  files, mtimes: {}, memMB: Math.round(Number(memLen) / (1 << 20)) - 2, xserver: xs });
+  files, mtimes: {}, memMB: Math.round(Number(memLen) / (1 << 20)) - 2, xserver: xs,
+  ...(CAPTURE ? { assembleWat } : {}) });
+if (CAPTURE) eng.onUnitWat = (n, entry, unit) => {
+  try { captured.push([entry.toString(16), assembleWat(unit.wat)]); } catch {}
+};
 
 await restoreEngineCore(eng, xs,
   { json: json.toString('utf8'), blobs, mem: new Uint8Array(gz('app.mem.gz')) },
@@ -89,9 +110,14 @@ await restoreEngineCore(eng, xs,
   console.log(`rom files ${romFiles}, fills replayed ${(filled / 1048576).toFixed(1)} MB`);
 }
 
-// every captured unit, registered the way the page does it
+// every captured unit, registered the way the page does it. EXTRA=<file> adds
+// units captured by a previous CAPTURE run, which is how a fix to the manifest
+// gets verified before anything is repacked.
 let units = 0, fns = 0;
-for (const [, bytes] of container(gz('app.units.gz'))) {
+const unitSets = [container(gz('app.units.gz'))];
+if (process.env.EXTRA && existsSync(process.env.EXTRA))
+  unitSets.push(container(readFileSync(process.env.EXTRA)));
+for (const [, bytes] of unitSets.flatMap(m => [...m])) {
   try {
     const { instance } = await WebAssembly.instantiate(new Uint8Array(bytes), eng.aotImports());
     for (const name of Object.keys(instance.exports))
@@ -379,6 +405,16 @@ if (profile) {
                 : 'no compiled entry at this rip';
     console.log(`    ${String(n).padStart(5)}  0x${rip.toString(16)}  ${where}  [${known}]`);
   }
+}
+
+if (CAPTURE && captured.length) {
+  // same container shape as app.units: u32 index length, JSON index, bodies
+  const idx = [], parts = []; let off = 0;
+  for (const [name, buf] of captured) { idx.push([name, off, buf.length]); off += buf.length; parts.push(Buffer.from(buf)); }
+  const ib = Buffer.from(JSON.stringify(idx));
+  const hdr = Buffer.alloc(4); hdr.writeUInt32LE(ib.length, 0);
+  writeFileSync(CAPTURE, Buffer.concat([hdr, ib, ...parts]));
+  console.log(`\ncaptured ${captured.length} units -> ${CAPTURE}`);
 }
 
 const rest = rows.slice(1);
