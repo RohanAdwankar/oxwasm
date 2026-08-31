@@ -876,3 +876,59 @@ all, the pure interpreter faults identically: rip `0x553f771`, fault address
 before any compression happens. Both tiers failing the same way is the same
 signature as the CPython case, and points below both executors at what they
 share.
+
+### xz was not a miscompile: brk never failed
+
+`tools/guestfault.mjs` generalises what `gueststack.mjs` did for CPython —
+symbol resolution over `eng.maps` plus the main image, an rbp walk, and a
+disassembly window taken from guest memory — for any binary. On `xz -9` it
+named the fault in one run:
+
+```
+fault: 21464d88 @rip 0x553f771 after 281292 interpreted insns
+  rip -> libc.so.6+0xac771          (inside _int_malloc)
+  regs: rax=1464d70 rbx=20000010 rsi=21464d80 ...
+  #0  malloc+0x1a2
+  #1  liblzma.so.5  (encoder setup)
+  ...
+  #6  xz+0xab99
+```
+
+The registers say it outright: `rbx = 0x20000010` is the allocation size —
+**512MB + 16, on a 512MB guest** — and `rsi` is `rax + 0x20000010`, a chunk
+pointer exactly one whole guest region past the block being split. `xz -9`
+reserves a dictionary larger than the machine it was given.
+
+Two predictions confirmed it in one run each: `xz -1` at 512MB succeeds
+(exit 0, 5,092 bytes), and `xz -9` at 1536MB succeeds (exit 0, 4,392 bytes).
+Nothing was miscompiled.
+
+**But the engine had a real bug, one level down.** `mmap` bounds-checks its
+range and returns `-ENOMEM`; `brk` did not:
+
+```js
+case 12:                                 // brk
+  if (a1 > this.brk) this.brk = align(a1, PAGE);
+  ret(this.brk); break;                  // any value accepted, echoed back
+```
+
+glibc's main arena grows with `brk`. Telling malloc that memory past the end
+of the guest region was its to use is why the failure surfaced as a fault
+deep inside `_int_malloc` rather than as xz's own allocation error. Linux
+answers an unsatisfiable `brk` by returning the break **unchanged**, which is
+how glibc's `sbrk` detects failure. With that fixed, `xz -9` on a 512MB guest
+exits 1 cleanly, like native out of memory, and with room it compresses
+byte-identically.
+
+Only the end of guest RAM is enforced. The heap can still in principle grow
+into the mmap region 64MB above it — a separate pre-existing overlap, left
+alone because capping `brk` at `mmapBase` would limit every guest's heap to
+64MB.
+
+Breadth is now **26/26**, with `xz -9` and `xz -1` both byte-identical.
+
+Nothing else moved. GIMP's wide-script replay is unchanged after the fix
+(round interp 10,468 / 786 / 767, an exact match), and CPython still faults
+the same way at the same place (`0x5241f5`, 15.26M instructions, 3 bytes of
+stdout — "42\n"), so #35 is a genuinely separate bug and not another
+unbacked-heap symptom.

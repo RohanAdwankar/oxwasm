@@ -76,7 +76,11 @@ const CASES = [
   ['fold',    '/usr/bin/fold',    ['-w', '13', IN]],
   ['paste',   '/usr/bin/paste',   ['-d', ':', IN, IN]],
   ['bc',      '/usr/bin/bc',      ['-q']],
-  ['xz',      '/usr/bin/xz',      ['-9', '-c', IN]],
+  // xz -9 reserves a 512MB+ dictionary, more than the default guest. Give it
+  // room so this case tests compression; the out-of-memory path is covered by
+  // the brk fix, where it now exits 1 like native instead of faulting.
+  ['xz',      '/usr/bin/xz',      ['-9', '-c', IN], { memMB: 1536 }],
+  ['xz-1',    '/usr/bin/xz',      ['-1', '-c', IN]],
   ['gzip',    '/bin/gzip',        ['-9', '-c', IN]],
   ['diff',    '/usr/bin/diff',    ['-u', IN, IN]],
 ];
@@ -91,11 +95,11 @@ const native = (bin, args, stdin) => {
   catch (e) { return { out: e.stdout ?? Buffer.alloc(0), code: e.status ?? -1 }; }
 };
 
-const engine = (bin, args, stdin) => {
+const engine = (bin, args, stdin, opts = {}) => {
   add(bin, bin);
   const eng = new LinuxEngine(new Uint8Array(readFileSync(bin)),
     { argv: [bin, ...args], env: ['PATH=/usr/bin:/bin', 'HOME=/root', 'LANG=C'],
-      files, mtimes, memMB: 512, assembleWat, stdin });
+      files, mtimes, memMB: opts.memMB || 512, assembleWat, stdin });
 
   const t0 = process.hrtime.bigint();
   let err = null;
@@ -121,12 +125,12 @@ const engine = (bin, args, stdin) => {
 
 let pass = 0, fail = 0;
 const failures = [];
-for (const [name, bin, args] of CASES) {
+for (const [name, bin, args, opts] of CASES) {
   if (!pick(name)) continue;
   if (!existsSync(bin)) { console.log(`  SKIP ${name.padEnd(9)} (${bin} not present)`); continue; }
   const stdin = STDIN[name] || null;
   const nat = native(bin, args, stdin);
-  const eng = engine(bin, args, stdin);
+  const eng = engine(bin, args, stdin, opts);
   // compare the bytes, not a summary: a truncated stdout that happens to
   // share a prefix is exactly the failure a length check alone would miss
   const same = eng.code === nat.code && Buffer.compare(eng.out, nat.out) === 0;

@@ -1236,9 +1236,25 @@ export class LinuxEngine {
         const v = new DataView(this.wmem.buffer), o = this.RAMOFF + Number(a1 - this.base);
         v.setUint32(o, rfd, true); v.setUint32(o + 4, wfd, true);
         ret(0n); break; }
-      case 12:                                               // brk
-        if (a1 > this.brk) this.brk = align(a1, PAGE);
-        ret(this.brk); break;
+      case 12: {                                             // brk
+        // Linux answers a brk it cannot satisfy by returning the break
+        // UNCHANGED; glibc's sbrk compares what came back against what it
+        // asked for and reports ENOMEM. Accepting any value and echoing it
+        // back told malloc that memory past the end of the guest region was
+        // its to use, and it wrote chunk headers there - surfacing as a fault
+        // deep inside _int_malloc rather than the program's own allocation
+        // failure. xz -9 asking for 512MB+16 on a 512MB guest is how this was
+        // found; mmap already bounds-checked and returned -ENOMEM, brk did
+        // not.
+        //
+        // Only the end of guest RAM is enforced. The heap can still in
+        // principle grow into the mmap region that starts 64MB above it -
+        // that is a separate, pre-existing overlap, and narrowing brk to
+        // mmapBase here would cap every guest's heap at 64MB.
+        const lim = this.base + BigInt(this.ram.length);
+        const want = align(a1, PAGE);
+        if (a1 > this.brk && want <= lim) this.brk = want;
+        ret(this.brk); break; }
       case 9: {                                              // mmap(addr,len,prot,flags,fd,off)
         for (const t of this.threads) t.cpu.icache?.clear();  // new code may appear
         const len = align(a2, PAGE);
