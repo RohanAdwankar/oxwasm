@@ -1315,3 +1315,55 @@ backward-branch scan failed not because the *analysis* was too expensive to
 replace but because replacing it changed the answer. The right move was to
 compute the same answer more carefully. Two attempts, one negative and one
 positive, and the difference between them is whether the semantics moved.
+
+
+### Correction: the CSR rewrite did not measurably reduce tier-up
+
+The section above concluded, from four reps, that rewriting the SCC pass with
+CSR successors and typed-array traversal dropped the tier-up penalty "inside
+the noise". A seven-rep interleaved run says otherwise, and the earlier
+conclusion has to be withdrawn.
+
+| | startup (median of 7) |
+|---|---:|
+| baseline | 875ms |
+| inlining on | 991ms |
+
+**+116ms.** Before the rewrite the same measurement gave 873 -> 995, **+122ms**.
+The rewrite moved it by about 6ms, which is nothing.
+
+Two things were wrong with the earlier reading.
+
+**The isolation experiment was under-powered, and it said so if you looked.**
+Three reps gave baseline 872, analysis-only 962, full-inlining 943 — full
+inlining *cheaper* than the analysis alone, which is impossible and was the
+tell that the numbers were noise. The +90ms attributed to the SCC pass was
+never established.
+
+**And overlapping ranges are not evidence of absence.** The four-rep follow-up
+showed the arms overlapping and that was read as the cost being gone. Four
+reps of a +116ms effect on a ~900ms measurement with ±8% run-to-run variance
+cannot resolve it either way. The hedge in the text ("this measurement can no
+longer see it") was right; the conclusion drawn around it was not.
+
+The CSR rewrite stays — same selection, provably identical output, less
+allocation, and it is simply better code. It just is not a performance fix,
+and the tier-up cost of inlining remains about **+116ms** and unexplained.
+
+### The decisive steady-state number
+
+Seven reps, interleaved, 100MB:
+
+| arm | big | startup | steady state |
+|-----|----:|--------:|-------------:|
+| baseline | 5665ms | 875ms | **4790ms** |
+| inlining on | 5256ms | 991ms | **4265ms** |
+
+**B/A steady state 0.890x, +/-6%** — an 11% steady-state win, and 0.928x end to
+end. Two interleaved runs now agree within their error bars (0.937x +/-5% and
+0.890x +/-6%), so the honest range is roughly **6-11% off the steady state for
+a fixed +116ms of tier-up**.
+
+That is a real win for anything long-running and for the shipped page, which
+pays the tier-up at build time. It stays opt-in for short-lived processes,
+where +116ms is not repaid.
