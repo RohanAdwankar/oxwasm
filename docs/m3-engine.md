@@ -360,3 +360,42 @@ generation lists and finding an object whose `ob_type` is garbage, which means
 a GC-tracked object was freed without being untracked, or the list linkage was
 corrupted. `PYTHONMALLOC=debug` not firing fits: the block was reallocated and
 reused rather than merely freed, so no guard byte was ever violated.
+
+#### The corrupted object is a string, and that names the mechanism
+
+The object the GC trips over was created at that address with
+`ob_type = 0x9284e0`. Resolving it:
+
+```
+$ nm -D --defined-only /usr/bin/python3 | grep 9284e0
+00000000009284e0 D PyUnicode_Type
+```
+
+It is a **str**. Together with the traversal shape — a walk over 16-byte
+`{key, value}` entries testing `Py_TPFLAGS_HAVE_GC`, which is `dict_traverse`
+over a `PyDictUnicodeEntry` array — that points at CPython 3.11's interning.
+
+`PyUnicode_InternInPlace` stores the string in the interned dict twice, as key
+and as value, and then deliberately drops its refcount by two:
+
+```c
+/* The two references in interned dict (key and value) are not counted by
+   refcnt. unicode_dealloc() and _PyUnicode_ClearInterned() take care of this. */
+Py_SET_REFCNT(s, Py_REFCNT(s) - 2);
+```
+
+So every interned string in 3.11 carries an artificially low refcount and
+survives only because those two dict references are uncounted by agreement. A
+single lost INCREF anywhere on such a string kills it early — and the symptom
+is exactly what is observed: the interned dict left holding a dangling pointer
+to a block that is freed, reallocated and reused, with the GC's next traversal
+reading a recycled `ob_type`.
+
+That is the target: **an interned `str` whose refcount reaches zero during
+interpreter initialisation.** Not a class of instruction, not a subsystem — one
+object and one missing reference.
+
+Left here deliberately. CPython runs and prints correct output; this is a
+crash-at-exit on one binary, and the next step (find the DECREF with no
+matching INCREF) wants a reference execution to diff against, which does not
+exist yet. The cheaper win is elsewhere.
