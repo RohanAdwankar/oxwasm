@@ -286,3 +286,38 @@ the continuation carries its own address with no mnemonic rather than being a
 bare indented byte run — so every long instruction looked 7 bytes long. The
 mismatches were all "ours longer than real", which is the tell: a decoder that
 was really wrong would err in both directions.
+
+#### Correction: it is not specific to finalization
+
+The section above called this "a shutdown-path defect". That was inference
+from the fault site sitting in a GC walk, and a direct test refutes it.
+
+```
+python3 -S -c "import os; os._exit(0)"   fault: 0 @rip 0x63aa15 at 16.01M
+python3 -S -c "import sys; sys.exit(0)"  fault: 0xaf @rip 0x5241f5 at 15.33M
+```
+
+`os._exit` calls `exit_group` immediately and **skips `Py_FinalizeEx`
+entirely**. It still faults. So the corruption is already present before
+finalization runs; what finalization does is walk the GC lists and trip over
+it. Different subsequent code trips over it in different places — the two
+fault sites seen across runs, `0x5241f5` and `0x63aa15`, are both GC-list
+walks in different functions.
+
+What the reduction does establish:
+
+| invocation | outcome |
+|------------|---------|
+| `-S -V` | **exit 0**, 291,630 instructions |
+| `-S -c pass` / `-c 0` / `-SI -c pass` | fault, all at ~15.24M |
+| `-S -c "import os; os._exit(0)"` | fault, 16.01M |
+
+`-V` does a partial initialisation and exits cleanly. Every form that does a
+full initialisation faults, at the same site, regardless of what the program
+then does or whether it finalises. So the corruption accumulates during
+**interpreter initialisation**, and the search window is the 291k-to-15.2M gap
+rather than the teardown.
+
+Next instrument: walk the guest's frame-pointer chain at fault time. That names
+the CPython function we are in and who called it, which settles what phase this
+is in one run instead of another round of inference.
