@@ -231,6 +231,28 @@ if (process.env.WINDOWS) {
 
 // The same interaction N times. If the first is slower than the rest by more
 // than the run-to-run spread, the tiering policy is the reason and #31 is real.
+// PROFILE=1: during round 0 only, step one instruction at a time and record
+// the rip of every INTERPRETED step. 13,593 of them is a small enough
+// population to keep whole. The question it answers is which kind of gap this
+// is: code that has no compiled unit at all (a capture-coverage miss), or code
+// whose unit exists and simply was not dispatched.
+const profile = process.env.PROFILE ? new Map() : null;
+const profileRound = (ms) => {
+  const t0 = process.hrtime.bigint();
+  while (Number(process.hrtime.bigint() - t0) / 1e6 < ms) {
+    const rip = eng.cpu.rip, before = eng.stats.interpreted;
+    eng.run(1);
+    // WEIGHT BY THE DELTA. eng.run(1) is a step BUDGET, not a single step -
+    // interpreted can advance by a dozen instructions in one call. Counting
+    // one hit per call captured 1,106 of the round's 13,565 steps and would
+    // have been read as if it were the whole distribution.
+    const d = eng.stats.interpreted - before;
+    if (d > 0) profile.set(rip, (profile.get(rip) || 0) + d);
+    if (eng.blocked) { const dl = eng.blocked.deadline;
+      if (dl != null && eng.nowMs() >= dl) { eng.wake(); continue; } break; }
+  }
+};
+
 console.log('\n  n     ms   interp     aot   painted');
 const rows = [];
 for (let i = 0; i < N; i++) {
@@ -241,16 +263,20 @@ for (let i = 0; i < N; i++) {
   // window tree (WINDOWS=1) or it is not an interaction at all.
   const [CX, CY] = (process.env.CLICKAT || '434,382').split(',').map(Number);
   xs.injectMotion(CX, CY); xs.injectButton(1, true);
-  pump(1500, true);
+  // profile ALL THREE pumps of round 0, not just the first: the first run of
+  // this captured 888 of the round's 13,565 interpreted steps and the split by
+  // image would have been read as if it were the whole story.
+  const P0 = profile && i === 0;
+  if (P0) { eng.wake(); profileRound(1500); } else pump(1500, true);
   xs.injectButton(1, false);
-  pump(1500, true);
+  if (P0) { eng.wake(); profileRound(1500); } else pump(1500, true);
   // Escape, not a second click. A click somewhere else leaves the UI in a
   // different state each round - the first run of this loop collapsed to 4ms
   // by iteration 2 because it had walked into a state where nothing responded.
   // Escape closes a menu and returns to where the round started, which is what
   // makes first-vs-Nth a comparison of the same interaction.
   xs.injectKey(9, true); xs.injectKey(9, false);     // keycode 9 = Escape
-  pump(1500, true);
+  if (P0) { eng.wake(); profileRound(1500); } else pump(1500, true);
   const ms = Number(process.hrtime.bigint() - t0) / 1e6;
   const interp = eng.stats.interpreted - i0, aot = eng.stats.aotRuns - a0;
   let painted = 0;
@@ -258,6 +284,41 @@ for (let i = 0; i < N; i++) {
   rows.push({ ms, interp, aot });
   console.log(`  ${i}  ${ms.toFixed(0).padStart(5)}  ${String(interp).padStart(8)}  ${String(aot).padStart(6)}  ${painted}`);
 }
+if (profile) {
+  const byMap = new Map();
+  const top = [...profile].sort((a, b) => b[1] - a[1]);
+  let total = 0;
+  for (const [rip, n] of profile) {
+    total += n;
+    let where = 'main-binary';
+    for (const m of (eng.maps || []))
+      if (rip >= BigInt(m.at) && rip < BigInt(m.at) + BigInt(m.len)) { where = m.path.split('/').pop(); break; }
+    byMap.set(where, (byMap.get(where) || 0) + n);
+  }
+  console.log(`\ninterpreted in round 0: ${total} steps over ${profile.size} distinct addresses`);
+  console.log('  by image: ' + [...byMap].sort((a, b) => b[1] - a[1]).slice(0, 8)
+    .map(([k, v]) => `${k}:${v}`).join(' '));
+  console.log('  hottest interpreted addresses:');
+  for (const [rip, n] of top.slice(0, 10)) {
+    let where = 'main';
+    for (const m of (eng.maps || []))
+      if (rip >= BigInt(m.at) && rip < BigInt(m.at) + BigInt(m.len))
+        { where = `${m.path.split('/').pop()}+0x${(rip - BigInt(m.at) + BigInt(m.off ?? 0)).toString(16)}`; break; }
+    // CAREFUL with what this label means. The step budget is 1, so one call
+    // executes one dispatch OR one interpreted instruction - but a dispatch
+    // into a compiled function that DEOPTS runs x_deopt, which interprets a
+    // long stretch while the recorded rip stays the AOT entry. So a big count
+    // on an address that IS compiled does not mean dispatch missed it; it
+    // means the compiled function bailed out and the interpreter ran inside
+    // it. Distinguishing those needs the deopt landing rips (eng.ripTrace),
+    // not this histogram.
+    const known = eng.aotFns.has(rip) ? 'compiled: work is INSIDE it (deopt?)'
+                : eng.aotFailed.has(rip) ? 'POISONED'
+                : 'no compiled entry at this rip';
+    console.log(`    ${String(n).padStart(5)}  0x${rip.toString(16)}  ${where}  [${known}]`);
+  }
+}
+
 const rest = rows.slice(1);
 if (rest.length) {
   const med = [...rest].sort((a, b) => a.ms - b.ms)[rest.length >> 1];
