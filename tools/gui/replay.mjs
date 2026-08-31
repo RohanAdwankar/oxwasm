@@ -37,6 +37,15 @@ for (const [k, v] of state) {
   if (k.startsWith('file:')) files[k.slice(5)] = maybe(v);
   else if (k.startsWith('font:')) { try { fonts[k.slice(5)] = parsePCF(maybe(v)); } catch {} }
 }
+// app.rom carries the guest files the packer deduped OUT of the state
+// container - it is a file set, not a memory image (xpack.mjs:987 merges it
+// into `files` exactly like this). Without it the fills below have nothing to
+// reconstruct library pages from.
+let romFiles = 0;
+try { for (const [k, v] of container(gz('app.rom.gz')))
+        if (k.startsWith('file:') && !files[k.slice(5)]) { files[k.slice(5)] = maybe(v); romFiles++; } }
+catch (e) { console.log('no rom sidecar:', e.message); }
+
 const elf = files['/usr/bin/gimp'];
 if (!elf) { console.log('no /usr/bin/gimp in the state container'); process.exit(1); }
 
@@ -60,6 +69,25 @@ await restoreEngineCore(eng, xs,
   { json: json.toString('utf8'), blobs, mem: new Uint8Array(gz('app.mem.gz')) },
   CPU, (b) => maybe(b));
 
+// `fills`: the packer stores library pages ONCE, in the guest file, and
+// records where they belong in memory instead of writing them twice. Replaying
+// them is what puts library text back into the wasm memory after the snapshot
+// tiles land - skip it and the guest resumes with holes and faults on its
+// first call into one.
+{
+  const all = new Uint8Array(eng.wmem.buffer);
+  let filled = 0;
+  const fillsRaw = state.get('fills');
+  for (const [path, , runs] of (fillsRaw ? JSON.parse(Buffer.from(maybe(fillsRaw)).toString('utf8')) : [])) {
+    const fb = files[path]; if (!fb) continue;
+    for (const [wOff, fOff, rlen] of runs) {
+      const n = Math.max(0, Math.min(rlen, fb.length - fOff));
+      if (n > 0) { all.set(fb.subarray(fOff, fOff + n), wOff); filled += n; }
+    }
+  }
+  console.log(`rom files ${romFiles}, fills replayed ${(filled / 1048576).toFixed(1)} MB`);
+}
+
 // every captured unit, registered the way the page does it
 let units = 0, fns = 0;
 for (const [, bytes] of container(gz('app.units.gz'))) {
@@ -74,23 +102,35 @@ for (const [, bytes] of container(gz('app.units.gz'))) {
   } catch {}
 }
 console.log(`restored: ${units} units, ${fns} functions mapped, ftFull=${eng._ftFull || 0}`);
+console.log(`  rip 0x${eng.cpu.rip.toString(16)} rsp 0x${eng.cpu.regs[4].toString(16)} ` +
+            `threads ${eng.threads.length} ti ${eng.ti} states ${eng.threads.map(t=>t.state).join(',')} ` +
+            `blocked ${!!eng.blocked} exit ${eng.exitCode}`);
 
-// INCOMPLETE: the page does not restore memory from app.mem alone. It passes
-// mem: null, streams app.rom (library text, kept out of the snapshot so the
-// page can start before it lands) into the wasm memory, and then replays the
-// `fills` section, which reconstructs regions from the guest FILES rather than
-// storing them twice. Without those two steps the guest resumes with library
-// pages missing and faults on the first call into one - `fault: ca` here.
+// RESTORE IS COMPLETE: rom file set merged, 212MB of fills replayed, all four
+// guest threads land with the rips the snapshot recorded.
 //
-// Next: apply container(gz('app.rom.gz')) into eng.wmem at each section's
-// offset, then walk state.get('fills') as [path, _, runs] and copy
-// files[path][fOff..] to wasm offset wOff, exactly as xpack.mjs:1170 does.
+// WHAT IS LEFT is the pump, and it is a real difference from the single-
+// threaded harnesses. `if (eng.blocked) eng.wake()` is what xshot does and is
+// correct there, but this guest has four threads blocked on their own
+// conditions (futexes, poll on the X connection). Waking all of them resumes
+// threads whose condition was never satisfied, and one of them runs off into
+// rip 0 - a guest crash this harness caused, not one the engine has.
+//
+// Next: wake only when there is a reason to - after injecting input, or when
+// a thread's deadline has passed - the way the page's pump() does, rather
+// than unconditionally on every blocked slice.
 
 const pump = (ms) => {                      // run until idle or the budget is spent
   const t0 = process.hrtime.bigint();
   while (Number(process.hrtime.bigint() - t0) / 1e6 < ms) {
     const before = eng.stats.interpreted + eng.stats.aotRuns;
-    eng.run(2e6);
+    try { eng.run(2e6); }
+    catch (e) {
+      console.log(`  guest fault: ${e.message} rip 0x${eng.cpu.rip.toString(16)} ` +
+                  `ti ${eng.ti} states ${eng.threads.map(t => t.state).join(',')} ` +
+                  `rips ${eng.threads.map(t => '0x' + t.cpu.rip.toString(16)).join(',')}`);
+      throw e;
+    }
     if (eng.blocked) eng.wake();
     if (eng.stats.interpreted + eng.stats.aotRuns === before) break;   // quiescent
   }
