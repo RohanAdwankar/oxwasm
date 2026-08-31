@@ -706,3 +706,37 @@ That is the argument for capping unit size against the budget rather than
 leaving it unbounded: `unitMaxFuncs`/`unitMaxInsns` exist and truncation is
 already sound (calls to skipped functions chain through `$ftr`), but the
 page sets neither.
+
+### Capping the unit to the tier budget: built, measured, reverted
+
+The obvious response to "a 53ms unit lands against a 2ms budget" is to cap
+the closure at what the budget can pay for. That was implemented — a
+self-calibrating cap that tracks observed ms-per-WAT-byte and
+WAT-bytes-per-function (measured rather than baked in, since wabt.js in a
+page and `wat2wasm` as a subprocess differ by orders of magnitude) and
+scales `maxFuncs` down accordingly, with `?nocap` to bisect it. Suite green.
+
+A/B in Chromium, capped vs `?nocap`:
+
+| | units | sync tier work | median | **max** | largest WAT |
+|---|---:|---:|---:|---:|---:|
+| File>New>OK, capped | 18 | 86ms | 0.3ms | **41.2ms** | 0.23 MB |
+| File>New>OK, uncapped | 12 | 98ms | 2.7ms | **42.9ms** | 0.23 MB |
+| strokes, capped | 16 | **43ms** | 0.5ms | 12.5ms | 0.11 MB |
+| strokes, uncapped | 9 | **9ms** | 0.4ms | 3.7ms | 0.02 MB |
+
+It fails on the thing it was built for. The tail is unchanged — 41.2 vs
+42.9ms, and the largest WAT is 0.23 MB in both arms, so the cap never bit on
+the worst unit at all. Meanwhile the stroke path got about five times more
+expensive, 9ms of sync work becoming 43ms, because splitting closures forces
+more units and each one re-pays its fixed costs.
+
+The reason the cap misses is structural: `maxFuncs` bounds how many
+functions a closure pulls in, and the expensive units are not wide, they are
+*deep* — a few very large functions. Capping the count does nothing to a
+single huge one. A cap that worked would have to bound emitted bytes during
+emission and stop mid-closure, which the emitter is not built to do.
+
+Reverted rather than left behind an off-by-default flag. The measurement in
+the previous section stands; this fix does not, and the honest lever is
+still the 65%: emit wasm binary directly and delete the wabt parse.
