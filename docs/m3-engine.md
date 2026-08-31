@@ -321,3 +321,42 @@ rather than the teardown.
 Next instrument: walk the guest's frame-pointer chain at fault time. That names
 the CPython function we are in and who called it, which settles what phase this
 is in one run instead of another round of inference.
+
+#### The stack, finally read rather than inferred
+
+Two rounds of inference from the fault address produced one wrong answer and
+one wrong correction. `tools/gueststack.mjs` walks the guest's frame-pointer
+chain and resolves each return address against `nm`, and settles it in one run:
+
+```
+rip  PyObject_GC_Del+0x20b5      <- the faulting read
+ #0  PyObject_GC_Del+0x1abe
+ #1  PyObject_GC_Del+0xfe9
+ #2  PyStaticMethod_New+0xd0
+ #3  PyGC_Collect+0x75
+ #4  Py_FinalizeEx+0x140
+ #5  Py_RunMain+0x18e
+ #6  Py_BytesMain+0x2d
+ #7  libc __libc_start_main
+ #8  _start
+```
+
+(The symbol names are nearest-preceding exports, so `PyObject_GC_Del+0x1abe`
+and `PyStaticMethod_New+0xd0` are static functions inside the GC, not those
+functions themselves.)
+
+So for `-c pass` the fault **is** inside `Py_FinalizeEx` -> `PyGC_Collect`, and
+the first claim was right about this invocation. The correction was right too,
+about a different thing: `os._exit(0)` skips finalization and still faults, at
+a different site, because an earlier GC pass during `import os` trips the same
+corruption. Both statements were half of one picture:
+
+- the **corruption** is created during interpreter initialisation;
+- the **fault** happens in whichever garbage collection runs next, which for a
+  plain `-c` invocation is the one `Py_FinalizeEx` performs.
+
+That is a much sharper target than either version alone. The GC is walking its
+generation lists and finding an object whose `ob_type` is garbage, which means
+a GC-tracked object was freed without being untracked, or the list linkage was
+corrupted. `PYTHONMALLOC=debug` not firing fits: the block was reallocated and
+reused rather than merely freed, so no guard byte was ever violated.
