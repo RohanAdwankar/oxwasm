@@ -1138,3 +1138,41 @@ Also worth recording: startup is **48% of the big run even at 20MB**. gzip -1
 compresses 20MB in about a second of engine steady state here. Getting the
 startup share down further would need a much larger input or a way to time the
 compression loop directly.
+
+### Inlining everything: a trade, not a win
+
+Same harness, all callees rather than only gzip's four, 20MB input, medians of
+five:
+
+| arm | big | small (startup) | steady state |
+|-----|----:|----------------:|-------------:|
+| baseline | 1918ms | 891ms | **1027ms** |
+| all callees inlined | 1948ms | 1084ms | **864ms** |
+
+Steady state improves to **0.841x** — about 16%, against +/-9% noise, so the
+direction is real even if the magnitude is loose. But look at the other two
+columns. Startup goes **891ms -> 1084ms**, and the totals, 1918 vs 1948, are
+the same run.
+
+So inlining does not make gzip faster here. It **moves work out of the steady
+state and into compilation**, and at 20MB the two cancel almost exactly. The
+duplicated instructions have to be emitted as wat and compiled by V8, and 740
+copies is a lot of extra text and a lot of extra wasm — with the assembler
+cache warm in both arms, so this is not `wat2wasm` but the emitter and V8
+themselves.
+
+Which makes it a question about the workload, not about the optimisation:
+
+- **A long-running app pays the compile cost once.** GIMP tiers up during
+  startup and then runs for minutes; 16% off the steady state is 16%.
+- **A short command-line run pays it every time**, and gzip on a 20MB file is
+  still short enough that it does.
+- **The shipped page pays it at build time.** `demo/gimp` ships precompiled
+  units, so the emitter never runs in the browser at all — there the steady
+  state improvement is free.
+
+It also lands squarely on first-interaction latency, which is already its own
+open problem: making tier-up more expensive is the wrong direction for the
+one thing users feel most. That is the argument for keeping this opt-in until
+the tiering policy can decide *which* functions are worth inlining, rather
+than the emitter inlining whatever fits a budget.
