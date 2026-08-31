@@ -794,3 +794,45 @@ pixels 0 -> 1,153), units register (7,815-7,820), suite green.
 The lesson for the harness: a per-event probe whose *population* changes
 between arms cannot measure a per-item effect, however careful the
 statistics on top of it are. Fixing the input was worth more than more reps.
+
+### The emitter has no structural waste: two hypotheses, both wrong
+
+With the assembler off-thread, what is left on the main thread is
+`compileUnitWat` — 45-55% of tier-up and up to 77ms for a single unit.
+Reading it suggested two structural wastes:
+
+1. Emission runs in a retry loop (`for (let round = 0; ; round++)`) that
+   calls `texts.clear()` and re-emits **every** non-poisoned function
+   whenever any function poisons. A closure that takes several rounds would
+   pay several full emissions.
+2. Afterwards it decides whether the unit needs the funcref resolver with
+   `[...texts.values()].some(t => t.includes('(call $ftr '))` — a substring
+   scan over the entire emitted WAT.
+
+`OXWASM_PHASE=1` now attributes analyze, emit, inline and that scan, and
+counts emit rounds and re-emits; `replay.mjs` prints the totals, so a capture
+run doubles as a fixed-input emitter benchmark (same snapshot, same entry
+addresses, every run). Over the wide script's 123 units:
+
+| phase | ms | share |
+|---|---:|---:|
+| analyze (decode the closure) | 211 | 44% |
+| emit (build WAT text) | 262 | 55% |
+| inline (off by default) | 0 | 0% |
+| ftr scan of all texts | 3 | 1% |
+| **total** | **475** | |
+
+9.9M WAT characters over **123 emit rounds for 123 units — 1.00 per unit,
+and 0 function re-emits from retries.**
+
+Both hypotheses are wrong. The retry loop never retries on real input, so
+its worst case is theoretical; the `$ftr` scan is 1%. Neither is worth
+touching.
+
+What remains is intrinsic: decoding x86 and formatting text, split roughly
+evenly, averaging 3.9ms per unit. There is no waste to delete here — the
+only way to move the 55% is to stop producing text at all and emit wasm
+bytes directly, which skips the hex conversions and template formatting that
+string building costs. That is now the *correctly sized* case for a binary
+emitter: it targets 55% of 475ms of on-thread work, not the wabt parse,
+which is already off-thread.

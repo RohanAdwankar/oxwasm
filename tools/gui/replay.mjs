@@ -416,6 +416,21 @@ if (profile) {
   }
 }
 
+// OXWASM_PHASE=1 makes the emitter attribute its own time; print it here so a
+// capture run doubles as a fixed-input emission benchmark (same snapshot,
+// same entries, every run).
+if (process.env.OXWASM_PHASE === '1' && globalThis.__aotPhase) {
+  const p = globalThis.__aotPhase;
+  const tot = p.analyze + p.inline + p.emit + p.ftscan;
+  console.log(`\nemitter phases over ${p.units} units, ${tot.toFixed(0)}ms total`);
+  console.log(`  analyze (decode closure) ${p.analyze.toFixed(0)}ms (${(100*p.analyze/tot).toFixed(0)}%)`);
+  console.log(`  emit (wat text)          ${p.emit.toFixed(0)}ms (${(100*p.emit/tot).toFixed(0)}%)`);
+  console.log(`  inline                   ${p.inline.toFixed(0)}ms (${(100*p.inline/tot).toFixed(0)}%)`);
+  console.log(`  ftr scan of all texts    ${p.ftscan.toFixed(0)}ms (${(100*p.ftscan/tot).toFixed(0)}%)`);
+  console.log(`  WAT chars emitted ${(p.chars/1e6).toFixed(1)}M over ${p.rounds} emit rounds` +
+              ` (${(p.rounds/p.units).toFixed(2)} per unit); ${p.reemit} function re-emits from retries`);
+}
+
 if (CAPTURE && captured.length) {
   // same container shape as app.units: u32 index length, JSON index, bodies
   const idx = [], parts = []; let off = 0;

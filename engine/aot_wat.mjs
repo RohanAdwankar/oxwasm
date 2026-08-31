@@ -2260,7 +2260,8 @@ export function compileUnitWat(mem, entry, opts = {}) {
   // inlining tier-up cost is +116ms and unexplained; guessing at it from A/B
   // wall clock has already produced one withdrawn conclusion.
   const PHASE = typeof process !== 'undefined' && process.env?.OXWASM_PHASE === '1';
-  const PH = PHASE ? (globalThis.__aotPhase ??= { inline: 0, emit: 0, chars: 0 }) : null;
+  const PH = PHASE ? (globalThis.__aotPhase ??= { analyze: 0, inline: 0, emit: 0, ftscan: 0,
+                                                  chars: 0, rounds: 0, units: 0, reemit: 0 }) : null;
   // Note on what inlining can NOT reach. Closure pruning drops a callee the
   // host already has compiled and mapped, so a callee that tiered up before
   // its caller is invisible to the inliner. Un-pruning small callees to get
@@ -2274,6 +2275,7 @@ export function compileUnitWat(mem, entry, opts = {}) {
   const funcs = new Map();                       // addrStr -> analysis
   const poisoned = new Set();                    // addrStr -> engine-only (callout)
   const pending = [entry];
+  const ta0 = PHASE ? performance.now() : 0;
   while (pending.length && funcs.size < maxFuncs) {
     const a = pending.shift(); const k = a.toString();
     if (funcs.has(k) || poisoned.has(k)) continue;
@@ -2308,6 +2310,7 @@ export function compileUnitWat(mem, entry, opts = {}) {
       for (const c of an.calls) if (!funcs.has(c) && !poisoned.has(c)) pending.push(BigInt(c));
     } catch (e) { poisoned.add(k); if (k === entry.toString()) throw e; }
   }
+  if (PHASE) { PH.analyze += performance.now() - ta0; PH.units++; }
   const canDirect = (k) => funcs.has(k) && !poisoned.has(k);
   const ctx = { guestBase, ramBase, canDirect };
   // emit; a failure poisons that function and re-emits — its callers switch
@@ -2354,6 +2357,7 @@ export function compileUnitWat(mem, entry, opts = {}) {
         poisoned.add(k); repoison = true;
       }
     }
+    if (PHASE) { PH.rounds++; if (round > 0) PH.reemit += texts.size; }
     if (!repoison) break;
   }
   let wat = '(module\n  (import "js" "mem" (memory 4096))\n';
@@ -2362,7 +2366,10 @@ export function compileUnitWat(mem, entry, opts = {}) {
   wat += '  (import "env" "deopt" (func $x_deopt (param i64 i64) (result i64)))\n';
   // the global dispatch table + its in-wasm resolver, iff some site chains
   // through it (indirect call, out-of-unit static call, indirect tail jump)
-  if ([...texts.values()].some(t => t.includes('(call $ftr '))) {
+  const tf0 = PHASE ? performance.now() : 0;
+  const needsFtr = [...texts.values()].some(t => t.includes('(call $ftr '));
+  if (PHASE) PH.ftscan += performance.now() - tf0;
+  if (needsFtr) {
     wat += '  (import "js" "ftab" (table $ft 0 funcref))\n';
     wat += '  (type $uft (func (result i64)))\n';
     wat += FTR_WAT;
