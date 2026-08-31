@@ -57,6 +57,11 @@ const OPS2 = [   // op xmm0, xmm1
   'pcmpeqb','pcmpeqw','pcmpeqd','pcmpgtb','pcmpgtw','pcmpgtd',
   'pminub','pmaxub','pminsw','pmaxsw',
   'pand','pandn','por','pxor',
+  // The float-logical forms are SEPARATE opcodes (0F 54..57) from the integer
+  // ones above (0F DB/DF/EB/EF), so testing pand says nothing about andps.
+  // andnps has the same "which side gets inverted" trap as pandn.
+  'andps','andnps','orps','xorps',
+  'andpd','andnpd','orpd','xorpd',
   'psllw','pslld','psllq','psrlw','psrld','psrlq','psraw','psrad',
 ];
 const OPS_IMM = [   // [mnemonic, imm list, 3-operand form?]
@@ -65,6 +70,10 @@ const OPS_IMM = [   // [mnemonic, imm list, 3-operand form?]
   ['pslld', [1, 31, 32]], ['psrld', [1, 31, 32]], ['psrad', [1, 31, 32]],
   ['psllq', [1, 63, 64]], ['psrlq', [1, 63, 64]],
   ['pslldq', [1, 4, 15, 16]], ['psrldq', [1, 4, 15, 16]],
+  // shufps/shufpd select lanes from BOTH operands - low half from dst, high
+  // half from src - which is a different shape from the pshuf* family above
+  // and was untested.
+  ['shufps', [0x00, 0x1B, 0x4E, 0xE4], true], ['shufpd', [0x0, 0x1, 0x2, 0x3], true],
 ];
 const PAIRS = [['rand','rand'], ['alpha','recip'], ['bias','recip'], ['signs','signs'],
                ['ones','recip'], ['rand','zeros'], ['signs','recip']];
@@ -90,6 +99,8 @@ for (const [pa, pb] of PAIRS) {
   check(`pmovmskb ${pa}/${pb}`, harness('pmovmskb eax, xmm1', pa, pb));
   check(`pextrw ${pa}/${pb}`, harness('pextrw eax, xmm1, 3', pa, pb));
   check(`pinsrw ${pa}/${pb}`, harness('pinsrw xmm0, edx, 5', pa, pb));
+  check(`movmskps ${pa}/${pb}`, harness('movmskps eax, xmm1', pa, pb));
+  check(`movmskpd ${pa}/${pb}`, harness('movmskpd eax, xmm1', pa, pb));
 }
 
 for (const f of fails.slice(0, 12))

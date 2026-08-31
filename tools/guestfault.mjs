@@ -164,6 +164,12 @@ if (process.env.WATCH) {
   };
 }
 
+// SHADOW=libc.so.6 - run each compiled dispatch into that library BOTH ways,
+// interpreter first with a memory journal, then the unit, and report the first
+// register/memory divergence. This is what finds an AOT-only miscompile
+// without guessing which instruction is wrong.
+if (process.env.SHADOW) eng.shadowLib = process.env.SHADOW;
+
 let err = null;
 try { let g = 0; while (eng.exitCode === null) { eng.run(5e6); if (eng.blocked) eng.wake();
         if (++g > 40000) { err = 'no exit'; break; } } }

@@ -1169,3 +1169,69 @@ reverted gives the same failure at 559,918 and 560,126 instructions — so this
 is pre-existing and unrelated. It was invisible until `guestfault.mjs` started
 printing the guest's **stderr**: the exit code and fault address alone said
 only "exit 1, no output".
+
+### The AOT-only CPython failure: narrowed, not solved
+
+`tools/unitbisect.mjs` compiles only the first N translation units and
+interprets the rest, then binary searches N for the smallest value that
+reproduces a failure. This is how unit 134 was named for the earlier crash;
+it is a tool now because a second AOT-only failure needed the same search.
+
+The predicate matters: a run is GOOD only when the guest exits 0 with nothing
+error-shaped on stderr. An AOT bug that makes the guest raise its *own*
+exception exits non-zero with no fault at all, so a crash-only predicate
+would have called this one good.
+
+```
+all units   BAD   exit=1 stdout=0B units=337
+no units    GOOD  exit=0 stdout=3B units=2131
+bisecting over 337 units...
+  cap=326   GOOD      cap=327   BAD
+unit 327 is the culprit (unit 326 is clean)
+  entry rip 0x5ccce80  =  libc+0xbae80
+```
+
+That entry is inside libc's contiguous string-function block, and the code
+there is a reverse string search — `movups` / `pcmpeqb` / `pmovmskb` / `bsr`,
+with `bsr %eax,%eax` immediately followed by `je`. A wrong result from any of
+those gives a wrong string length, which is exactly the shape of
+`SystemError: Negative size passed to PyUnicode_New`.
+
+**`bsr` looks correct on inspection, so it stays a suspect rather than a
+conclusion.** The AOT stores the *source* into `$fr` before writing the
+destination and derives ZF from `$fr == 0`, which is the architectural
+behaviour (ZF ← src == 0, destination undefined when src is zero), and it is
+correct even for `bsr %eax,%eax` where destination and source are the same
+register.
+
+The engine's lockstep differential — `eng.shadowLib`, which runs each
+compiled dispatch into a named library both ways, interpreter first with a
+memory journal, and reports the first register or memory divergence — is now
+reachable as `SHADOW=libc.so.6` in `guestfault.mjs`. It reports **no
+divergence** on this run. So either the miscompiled function is not the
+unit's entry (a unit is a whole call closure, and only the entry was named by
+the bisect), or it is one the shadow declines to compare — the shadow aborts
+on any syscall and requires a clean return to the caller.
+
+Narrowing to a single unit is real progress from "CPython fails under AOT",
+but the faulty instruction is not identified, so nothing is claimed fixed.
+The next step is to shadow python3 rather than libc, and to list unit 327's
+functions so the closure can be searched rather than its entry assumed.
+
+### SSE coverage: the gap class that hid `movhlps`
+
+`movhlps` was wrong for the life of the project because `packedtest.mjs`
+never listed it. Auditing what else the interpreter implements but the
+hardware differential never exercises turned up three more groups, now added:
+
+- **`andps`/`andnps`/`orps`/`xorps`** and their `pd` forms. These are
+  *separate opcodes* (`0F 54`-`57`) from the integer `pand`/`pandn`/`por`/
+  `pxor` (`0F DB`/`DF`/`EB`/`EF`) that were already tested, so covering one
+  said nothing about the other — and `andnps` has the same "which side gets
+  inverted" trap as `pandn`.
+- **`shufps`/`shufpd`**, which select lanes from *both* operands and are a
+  different shape from the `pshuf*` family already covered.
+- **`movmskps`/`movmskpd`**, alongside the `pmovmskb` that was tested.
+
+591 cases became **685, all bit-exact against the real CPU**. No new bugs —
+but the class of silence that hid `movhlps` is closed, which was the point.
