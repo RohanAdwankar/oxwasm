@@ -35,7 +35,9 @@ const q=async(e)=>(await cmd('Runtime.evaluate',{expression:e,returnByValue:true
 // true and nothing tiers up, so measuring before it lands measures nothing
 for (let i=0;i<150;i++){ await new Promise(r=>setTimeout(r,200));
   if (await q('window.__ox && window.__ox.eng && window.__ox.eng.cacheOnly === false')) break; }
-console.log('wabt ready, cacheOnly =', await q('window.__ox.eng.cacheOnly'));
+const asyncAsm = await q('!!(window.__ox.eng.assembleWatAsync)');
+console.log('wabt ready, cacheOnly =', await q('window.__ox.eng.cacheOnly'),
+            '| assembler:', asyncAsm ? 'WORKER (off main thread)' : 'main thread');
 
 // Wrap in the page. assembleWat is a plain property; tierUpAot is a method,
 // so an own-property wrapper shadows the prototype's without patching it.
@@ -47,6 +49,13 @@ await q(`(() => {
   eng.assembleWat = function (wat) {
     watLen = wat.length; const t = performance.now();
     try { return origAsm.call(this, wat); } finally { asmMs = performance.now() - t; }
+  };
+  // With a worker the handoff is what the main thread pays; the parse itself
+  // is off-thread and correctly does NOT belong in the on-thread total.
+  const origAsync = eng.assembleWatAsync;
+  if (origAsync) eng.assembleWatAsync = function (wat) {
+    watLen = wat.length; const t = performance.now();
+    try { return origAsync.call(this, wat); } finally { asmMs = performance.now() - t; }
   };
   const origTier = eng.tierUpAot;
   eng.tierUpAot = function (entry) {
@@ -77,8 +86,9 @@ const report = async (label) => {
   const p = (a,f) => a[Math.min(a.length-1, Math.floor(a.length*f))];
   const sumTot = sum(t.map(r=>r.tot)), sumAsm = sum(t.map(r=>r.asm));
   console.log(`\n${label}: ${t.length} units, ${sumTot.toFixed(0)}ms total sync tier work`);
+  const asmLabel = asyncAsm ? 'handoff to worker' : 'assemble (wabt.js)';
   console.log(`  emit (compileUnitWat) ${(sumTot-sumAsm).toFixed(0)}ms (${(100*(sumTot-sumAsm)/sumTot).toFixed(0)}%)` +
-              ` | assemble (wabt.js) ${sumAsm.toFixed(0)}ms (${(100*sumAsm/sumTot).toFixed(0)}%)`);
+              ` | ${asmLabel} ${sumAsm.toFixed(0)}ms (${(100*sumAsm/sumTot).toFixed(0)}%)`);
   console.log(`  per unit ms: median ${p(tot,0.5).toFixed(1)}  p90 ${p(tot,0.9).toFixed(1)}  max ${tot[tot.length-1].toFixed(1)}`);
   console.log(`  WAT emitted: ${(sum(t.map(r=>r.wat))/1e6).toFixed(1)} MB, largest ${(Math.max(...t.map(r=>r.wat))/1e6).toFixed(2)} MB`);
   const over = t.filter(r => r.tot > r.budget);

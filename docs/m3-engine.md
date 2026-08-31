@@ -740,3 +740,57 @@ emission and stop mid-closure, which the emitter is not built to do.
 Reverted rather than left behind an off-by-default flag. The measurement in
 the previous section stands; this fix does not, and the honest lever is
 still the 65%: emit wasm binary directly and delete the wabt parse.
+
+### Assembling in a worker: 17x less main-thread blocking
+
+wabt.js is a pure text -> bytes transform over no engine state, so it can run
+off the main thread. `eng.assembleWatAsync` is that path: `tierUpAot` hands
+the text to a worker and finishes in the callback, the same shape
+`asyncCompile` already used for instantiation. The page builds the worker
+from the wabt source it already fetches, plus the assembler body it shares
+with the main-thread version. `?noasmworker` bisects it; if the worker can't
+be constructed (a `file://` page, a blocked `blob:` URL) the main-thread
+assembler stays and nothing changes.
+
+**The per-unit tier probe could not resolve this, and said so twice in
+opposite directions.** Two paired runs of `cdp_tier.mjs`:
+
+| | worker, max unit | main thread, max unit |
+|---|---:|---:|
+| run 1 | 18.3ms | 40.1ms |
+| run 2 | **77.0ms** | 34.1ms |
+
+Run 1 says the worker halves the worst unit; run 2 says it doubles it. The
+reason is that every page load compiles a *different* set of units — 10, 15,
+19 and 39 across four runs — so the worst unit in one arm and the worst in
+the other are not the same work. Comparing them compares unit sets. Emission
+also stays on the main thread in both arms, so a 77ms "worker" unit is a
+77ms *emit* that the other arm simply never compiled.
+
+`cdp_asmbench.mjs` removes that variance by assembling the **same texts both
+ways in the same page**, interleaved, reporting main-thread blocking — the
+whole parse for the sync path, the `postMessage` for the worker:
+
+| WAT bytes | sync (parse) | worker (postMessage) | ratio |
+|---:|---:|---:|---:|
+| 226,880 | 6.4ms | 0.30ms | 21x |
+| 94,513 | 2.9ms | 0.20ms | 15x |
+| 80,412 | 2.5ms | 0.10ms | 25x |
+| 20,665 | 0.9ms | 0.10ms | 9x |
+| 17,217 | 0.7ms | 0.10ms | 7x |
+| **total** | **17.2ms** | **1.00ms** | **17x** |
+
+This *understates* the win. These are repeat parses of the same text, so
+wabt is warm and V8 has already optimised it; the 53ms first-parse measured
+earlier is the cost the worker actually removes from a cold path. And the
+benefit is not really the median — it is that an unbounded main-thread cost
+becomes a bounded one. A multi-megabyte closure used to freeze the tab
+(the "30-second pump slices" the `unitBytes` comment records); now it
+compiles in the background while the interpreter keeps the app responsive.
+
+Verified functionally in Chromium with the worker on: strokes draw (ink
+pixels 0 -> 1,153), units register (7,815-7,820), suite green.
+
+The lesson for the harness: a per-event probe whose *population* changes
+between arms cannot measure a per-item effect, however careful the
+statistics on top of it are. Fixing the input was worth more than more reps.

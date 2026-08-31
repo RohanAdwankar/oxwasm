@@ -237,6 +237,9 @@ function sha1hex(str) {
   // ---- debug levers (URL params; no effect unless asked for) ----
   // ?noasync  — synchronous unit compilation (bisect asyncCompile)
   // ?nounits  — never dispatch AOT units (interp+loop tiers only)
+  // ?noasmworker — assemble units on the main thread instead of in a worker
+  //             (bisect the off-thread assembler; main-thread is the old
+  //             behaviour, where wabt.js parsing blocked the frame)
   // ?trap     — while window.__oxTrap is set, journal every AOT dispatch
   //             entry rip to localStorage; if the tab wedges inside one
   //             compiled unit, a second same-origin tab can read exactly
@@ -512,20 +515,55 @@ function sha1hex(str) {
         const src = await new Response(debody(await fetch('app.wabt' + EXT))).text();
         const WabtModule = new Function(src + '\n;return (typeof WabtModule !== "undefined" ? WabtModule : wabt);')();
         const wabt = await WabtModule();
-        eng.assembleWat = (wat) => {
-          // wabt.js's recursive-descent parser runs on a bounded wasm stack:
-          // ~150 levels of block nesting overflow it ('memory access out of
-          // bounds' from inside wabt). Refuse deep or huge texts cleanly —
-          // the entry poisons and the interpreter runs it.
-          if (wat.length > 1500000) throw new Error('unit too large for in-page assembler');
-          { let d = 0, mx = 0;
-            for (let i = 0; i < wat.length; i++) { const c = wat.charCodeAt(i);
-              if (c === 40) { if (++d > mx) mx = d; } else if (c === 41) d--; }
-            if (mx > 120) throw new Error('unit too deeply nested for in-page assembler'); }
-          const m = wabt.parseWat('unit.wat', wat, { tail_call: true });
-          const bin = m.toBinary({}).buffer; m.destroy();
-          return new Uint8Array(bin);
-        };
+        // The assembler body, shared by the main thread and the worker. It is
+        // a pure text -> bytes transform over no engine state, which is what
+        // makes running it off-thread possible at all.
+        //
+        // wabt.js's recursive-descent parser runs on a bounded wasm stack:
+        // ~150 levels of block nesting overflow it ('memory access out of
+        // bounds' from inside wabt). Refuse deep or huge texts cleanly —
+        // the entry poisons and the interpreter runs it.
+        const ASM_BODY = `
+          function oxAssemble(wabt, wat) {
+            if (wat.length > 1500000) throw new Error('unit too large for in-page assembler');
+            { let d = 0, mx = 0;
+              for (let i = 0; i < wat.length; i++) { const c = wat.charCodeAt(i);
+                if (c === 40) { if (++d > mx) mx = d; } else if (c === 41) d--; }
+              if (mx > 120) throw new Error('unit too deeply nested for in-page assembler'); }
+            const m = wabt.parseWat('unit.wat', wat, { tail_call: true });
+            const bin = m.toBinary({}).buffer; m.destroy();
+            return new Uint8Array(bin);
+          }`;
+        // eslint-disable-next-line no-new-func
+        const oxAssemble = new Function(ASM_BODY + '\n;return oxAssemble;')();
+        eng.assembleWat = (wat) => oxAssemble(wabt, wat);
+        // ?noasmworker — keep the assembler on the main thread (bisect)
+        // A worker runs the same wabt build on the same text, so the main
+        // thread pays only the postMessage of the string instead of the
+        // parse. Nothing else moves: the bytes come back and instantiate
+        // off-thread as before. If the worker cannot be constructed (a
+        // file:// page, a blocked blob: URL) the main-thread assembler above
+        // stays in place and the page just behaves as it did.
+        if (!new URLSearchParams(location.search).has('noasmworker')) try {
+          const wsrc = src + '\n' + ASM_BODY + `
+            let W = null;
+            const ready = (typeof WabtModule !== 'undefined' ? WabtModule : wabt)().then((w) => { W = w; });
+            self.onmessage = async (e) => {
+              await ready;
+              const { id, wat } = e.data;
+              try { const b = oxAssemble(W, wat); self.postMessage({ id, b }, [b.buffer]); }
+              catch (err) { self.postMessage({ id, err: String(err && err.message || err) }); }
+            };`;
+          const wk = new Worker(URL.createObjectURL(new Blob([wsrc], { type: 'text/javascript' })));
+          const pend = new Map(); let wid = 0;
+          wk.onmessage = (e) => { const p = pend.get(e.data.id); if (!p) return; pend.delete(e.data.id);
+            e.data.err ? p.rej(new Error(e.data.err)) : p.res(e.data.b); };
+          wk.onerror = () => { for (const p of pend.values()) p.rej(new Error('assembler worker died'));
+                               pend.clear(); eng.assembleWatAsync = null; };
+          eng.assembleWatAsync = (wat) => new Promise((res, rej) => {
+            const id = ++wid; pend.set(id, { res, rej }); wk.postMessage({ id, wat }); });
+          P.asmWorker = performance.now();
+        } catch (e) { console.warn('assembler worker unavailable; assembling on the main thread', e); }
         eng.cacheOnly = false;
         eng.aotFailed.clear();                        // cache-miss poisons get a real shot
         P.wabtReady = performance.now();

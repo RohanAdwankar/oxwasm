@@ -300,6 +300,17 @@ export class LinuxEngine {
       if (f && !f.jsStub) this.registerAotFn(a, f);
   }
 
+  // Register a unit's exports once its instance exists. Shared by both
+  // off-thread paths (async assemble, async compile): a placeholder null is
+  // already in aotFns for the entry, so `get` — not `has` — is what decides
+  // whether an address still needs registering.
+  finishAotUnit(unit, instance) {
+    for (const a of unit.funcs)
+      if (!this.aotFns.get(a)) this.registerAotFn(a, instance.exports['f_' + a.toString(16)]);
+    if (instance.exports.drive) this.aotDrive = instance.exports.drive;
+    this.stats.tiers.aot = (this.stats.tiers.aot || 0) + 1;
+  }
+
   tierUpAot(entry) {
     const k = entry;
     if (this.aotFns.has(k) || this.aotFailed.has(k)) return;
@@ -412,6 +423,25 @@ export class LinuxEngine {
         ...(this.unitMaxFuncs ? { maxFuncs: this.unitMaxFuncs } : {}),
         ...(this.unitMaxInsns ? { maxInsns: this.unitMaxInsns } : {}) });
       if (this.onUnitWat) this.onUnitWat(un, entry, unit);
+      // assembleWatAsync (browser): the assembler is 65% of the on-thread
+      // tier-up cost and is a pure text -> bytes transform with no engine
+      // state, so it can run in a worker. Hand the text over and finish in
+      // the callback; execution stays interpreted until the bytes come back,
+      // exactly as it already does for asyncCompile below. The null
+      // placeholder goes in BEFORE the handoff or profiling re-triggers this
+      // same entry on every call while the worker is busy.
+      if (this.assembleWatAsync) {
+        this.aotFns.set(k, null);
+        this.assembleWatAsync(unit.wat)
+          .then((bytes) => {
+            if (this.onUnitBytes) this.onUnitBytes(k, bytes);
+            return WebAssembly.instantiate(bytes, this.aotImports());
+          })
+          .then(({ instance }) => this.finishAotUnit(unit, instance))
+          .catch((e) => { this.aotFns.delete(k); this.aotFailed.add(k);
+                          if (this.onAotFail) this.onAotFail(entry, e.message); });
+        return;
+      }
       const bytes = this.assembleWat(unit.wat);
       if (this.onUnitBytes) this.onUnitBytes(k, bytes);   // manifest capture: entry -> compiled wasm
       // asyncCompile (browser): hand the bytes to the engine's off-thread
@@ -422,12 +452,7 @@ export class LinuxEngine {
       if (this.asyncCompile) {
         this.aotFns.set(k, null);
         WebAssembly.instantiate(bytes, this.aotImports())
-          .then(({ instance }) => {
-            for (const a of unit.funcs)
-              if (!this.aotFns.get(a)) this.registerAotFn(a, instance.exports['f_' + a.toString(16)]);
-            if (instance.exports.drive) this.aotDrive = instance.exports.drive;
-            this.stats.tiers.aot = (this.stats.tiers.aot || 0) + 1;
-          })
+          .then(({ instance }) => this.finishAotUnit(unit, instance))
           .catch((e) => { this.aotFns.delete(k); this.aotFailed.add(k);
                           if (this.onAotFail) this.onAotFail(entry, e.message); });
         return;
