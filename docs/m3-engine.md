@@ -541,3 +541,33 @@ the clean signal because it does not vary with load. And 3,023 interpreted
 steps remain, expected: the capture drove the interaction once, and the call
 threshold only compiles a function after four calls, so anything called three
 times or fewer during the capture is still uncovered.
+
+### The capture gap cost every stroke, not just the first one
+
+Driving a richer round — click, Escape, and an eight-step pointer drag — over
+eight rounds so the four-call tier-up threshold is crossed, then comparing the
+shipped manifest against the same manifest plus what that capture recorded:
+
+| | units | functions | round-0 interpreted | steady-state interpreted |
+|---|------:|----------:|--------------------:|-------------------------:|
+| shipped manifest | 7,653 | 13,173 | **14,360** | **854** |
+| + 15 captured units | 7,668 | 13,207 | **3,047** | **92** |
+
+The first-interaction number is the expected win: 79% less interpretation.
+The **steady-state** number was not expected and matters more. The baseline
+interprets 854 instructions on *every* round, and the captured units cut that
+to 92 — so the gap was not only a first-interaction problem, it was costing
+every paint stroke, forever, in the shipped product.
+
+Fifteen units, thirty-four functions, 0.2% more manifest. Merged into
+`demo/gimp/app.units.gz` and verified by replaying the repacked artifact:
+7,668 units, 13,207 functions, round-0 interpreted 3,047, steady 92 — an exact
+match for the EXTRA run, so the merge is faithful.
+
+`CFG.sizes.units` in the page is updated to match, though nothing reads it —
+only `mem` and `rom` are consumed. Stale shipped metadata is worth fixing
+anyway.
+
+Wall clock across these runs stays unusable (contended: the baseline's own
+median moved 147 -> 212ms between bursts). Interpreted counts are the signal
+here because they do not vary with machine load.

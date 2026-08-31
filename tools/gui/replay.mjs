@@ -334,6 +334,17 @@ for (let i = 0; i < N; i++) {
   // makes first-vs-Nth a comparison of the same interaction.
   xs.injectKey(9, true); xs.injectKey(9, false);     // keycode 9 = Escape
   if (P0) { eng.wake(); profileRound(1500); } else pump(1500, true);
+  // DRAG=x1,y1,x2,y2 adds a pointer stroke to the round. A click and a stroke
+  // reach different code - motion handling, tool state, the paint path - and
+  // the capture is only as good as the interactions that drive it.
+  if (process.env.DRAG) {
+    const [ax, ay, bx, by] = process.env.DRAG.split(',').map(Number);
+    xs.injectMotion(ax, ay); xs.injectButton(1, true);
+    for (let k = 1; k <= 8; k++)
+      xs.injectMotion(ax + ((bx - ax) * k / 8) | 0, ay + ((by - ay) * k / 8) | 0);
+    xs.injectButton(1, false);
+    if (P0) { eng.wake(); profileRound(1500); } else pump(1500, true);
+  }
   const ms = Number(process.hrtime.bigint() - t0) / 1e6;
   const interp = eng.stats.interpreted - i0, aot = eng.stats.aotRuns - a0;
   let painted = 0;
