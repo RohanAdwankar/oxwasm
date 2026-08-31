@@ -163,6 +163,7 @@ export class LinuxEngine {
     this.profile = new Map(); this.compiled = new Map();
     this.threshold = threshold;
     this.stats = { interpreted: 0, compiledRuns: 0, aotRuns: 0, tiers: {}, syscalls: {} };
+    this._ftFull = 0;                         // functions refused by the FTMAP_MAX ceiling
     this.exitCode = null;
     this.stdout = [];
     this.stdoutBytes = [];                    // raw chunks — binary-safe (gzip -c etc.)
@@ -249,10 +250,21 @@ export class LinuxEngine {
     this.aotFns.set(a, f);
     // __noFtab bisect lever: an empty map makes every $ftr miss, so all
     // sites take their pre-existing x_callout / x_deopt fallbacks
-    if (!f || globalThis.__noFtab || this._ftSeen.has(a) || this._ftCount >= FTMAP_MAX) return;
+    // Past FTMAP_MAX the function is never mapped, so every cross-unit call to
+    // it takes the x_callout JS round-trip forever. That is a silent cliff, so
+    // count it: the shipped GIMP demo has 13,173 distinct AOT functions across
+    // 7,653 units, which is 66% of the ceiling - close enough that a larger app
+    // could cross it, and there would otherwise be nothing to see.
+    //
+    // Raising FTMAP_MAX alone is not enough: $ftr probes the FTHASH table
+    // linearly and that table has FTSLOTS (32,768) entries, so past roughly
+    // 26,000 mapped functions the probe chains degrade and at 32,768 an
+    // unmapped lookup would never find an empty slot to stop on. The hash has
+    // to grow with the ceiling - it is 40% loaded today.
+    if (!f || globalThis.__noFtab || this._ftSeen.has(a)) return;
+    if (this._ftCount >= FTMAP_MAX) { this._ftFull = (this._ftFull || 0) + 1; return; }
     this._ftSeen.add(a);
     const idx = this._ftCount++;
-    if (idx >= this.ftab.length) this.ftab.grow(4096);   // only past FTMAP_MAX entries
     this.ftab.set(idx, f);
     const dv = new DataView(this.wmem.buffer);
     const au = BigInt.asUintN(64, a);

@@ -183,3 +183,33 @@ TCGETS` put 36 bytes of termios over the parent's stack canary, and
 `0x7374702f76656447`, that path in hex. The rest were latent, waiting for a
 program whose child happened to `read()` or `poll()` before exec.
 `engine/diff/jrnltest.mjs` pins the whole class.
+
+
+## Funcref table headroom, measured
+
+`FTMAP_MAX` caps the funcref table at 20,000 entries and the failure past it is
+silent: `registerAotFn` simply returns, and every cross-unit call to that
+function takes the `x_callout` JS round-trip forever with nothing to see.
+
+The shipped GIMP demo, counted from `demo/gimp/app.units.gz`:
+
+| | |
+|---|---:|
+| packed units | 7,653 |
+| distinct `f_` exports (mapped functions) | **13,173** |
+| share of the 20,000 ceiling | 66% |
+| FTHASH load factor (32,768 slots) | 40% |
+
+So the ceiling is not reached by the product today, but 1.5x of headroom on a
+silent cliff is not much. `registerAotFn` now counts refusals in `_ftFull`,
+which is the cheap half of the fix — the cliff becomes visible before anyone
+has to guess at it.
+
+Raising the ceiling is the other half, and it is coupled: `$ftr` probes FTHASH
+linearly over `FTSLOTS` = 32,768 entries, so past roughly 26,000 mapped
+functions the probe chains degrade, and at 32,768 a lookup for an unmapped
+address would never find an empty slot to terminate on. FTMAP_MAX cannot move
+without the hash moving with it. The dead space from `FTMAP+16` to `FTHASH`
+(about 320KB) is where that growth would come from, together with the 8-byte
+slot change — but none of it is worth doing until something actually crosses
+13,173.
