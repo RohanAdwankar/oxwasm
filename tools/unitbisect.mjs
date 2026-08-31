@@ -50,12 +50,29 @@ const assembleWat = (wat) => {
   return b;
 };
 
-const run = (cap) => {
-  const entries = new Map();                        // unit number -> entry rip
+// Bisect over ENTRY ADDRESSES, not unit numbers.
+//
+// The first version of this tool capped a unit COUNT, and that is not a stable
+// identifier: which functions get hot, and in what order, depends on what is
+// already compiled, so "unit 327" names a different function in every
+// configuration. Compiling only unit 327 produced a one-function closure at
+// 0x51fbe7 in python3, where the capped bisect had reported libc+0xbae80 - two
+// different functions under the same number. An address means the same thing
+// in every run.
+//
+// So: record the order in which entries are offered for compilation in a full
+// run, then bisect over a PREFIX of that address list. The filter admits an
+// address if it is in the allowed set, whatever unit number it lands on.
+const run = (allow) => {          // allow: null = compile all, else a Set of entry rips
+  const order = [];               // entry rips, in the order they were offered
+  const funcsOf = new Map();      // entry rip -> its closure
   const eng = new LinuxEngine(new Uint8Array(readFileSync(bin)),
     { argv: [bin, ...args], env: ['PATH=/usr/bin:/bin', 'LANG=C', 'HOME=/root'],
       files, mtimes, memMB: Number(process.env.MEMMB || 1024), assembleWat });
-  eng.unitFilter = (n, entry) => { entries.set(n, entry); return cap === null || n <= cap; };
+  if (process.env.SHADOW) eng.shadowLib = process.env.SHADOW;
+  if (process.env.SHADOWMAX) eng.shadowMax = Number(process.env.SHADOWMAX);
+  eng.onUnitWat = (n, entry, unit) => funcsOf.set(entry, unit.funcs);
+  eng.unitFilter = (n, entry) => { order.push(entry); return allow === null || allow.has(entry); };
   let err = null;
   try { let g = 0; while (eng.exitCode === null) { eng.run(5e6); if (eng.blocked) eng.wake();
           if (++g > 40000) { err = 'no exit'; break; } } }
@@ -63,8 +80,10 @@ const run = (cap) => {
   const se = (eng.stderr || []).join('');
   const out = (eng.stdoutBytes || []).reduce((a, b) => a + b.length, 0);
   const good = !err && eng.exitCode === 0 && !/Error|Traceback|error/.test(se);
-  return { good, err, exit: eng.exitCode, out, se, entries, units: eng._unitN || 0,
-           insns: eng.stats.interpreted };
+  if (eng._shadowStats) { const q = eng._shadowStats;
+    console.log(`  shadow: tried=${q.tried} compared=${q.compared} aborted=${q.aborted} diverged=${q.diverged}`); }
+  return { good, err, exit: eng.exitCode, out, se, order, funcsOf,
+           units: order.length, insns: eng.stats.interpreted };
 };
 
 const say = (tag, r) => console.log(
@@ -72,21 +91,39 @@ const say = (tag, r) => console.log(
   (r.err ? ` threw:${r.err}` : '') +
   (r.se ? `  stderr:${r.se.trim().split('\n').pop().slice(0, 70)}` : ''));
 
+// ADDR=0x5ccce80 - compile ONLY that entry and interpret everything else.
+// Unlike selecting by unit number (which names a different function in every
+// configuration), an address is stable, and with a single function compiled
+// every entry into it is a JS dispatch, so the lockstep shadow can compare it.
+if (process.env.ADDR) {
+  const a = BigInt(process.env.ADDR);
+  const r = run(new Set([a]));
+  say(`only 0x${a.toString(16)}`, r);
+  const fs = r.funcsOf.get(a);
+  if (fs) console.log(`  closure: ${fs.length} functions: ${fs.map(x=>'0x'+x.toString(16)).join(' ')}`);
+  else console.log('  that entry was never offered in this run');
+  process.exit(r.good ? 0 : 1);
+}
+
 const all = run(null);  say('all units', all);
 if (all.good) { console.log('\nnothing to bisect: the uncapped run is already good'); process.exit(0); }
-const none = run(0);    say('no units', none);
+const none = run(new Set());  say('no units', none);
 if (!none.good) { console.log('\nnothing to bisect: it fails with everything interpreted too, ' +
                               'so this is not an AOT-only bug'); process.exit(1); }
 
-// smallest cap that is BAD; lo is known good, hi is known bad
-let lo = 0, hi = all.units;
-console.log(`\nbisecting over ${hi} units...`);
+// The offer order is recorded from the FULL run; a prefix of it is a stable,
+// address-named set that means the same thing in every configuration.
+const order = [...new Set(all.order.map(String))].map(BigInt);
+let lo = 0, hi = order.length;
+console.log(`\nbisecting over ${hi} distinct entry addresses...`);
 while (hi - lo > 1) {
   const mid = (lo + hi) >> 1;
-  const r = run(mid);
-  say(`cap=${mid}`, r);
+  const r = run(new Set(order.slice(0, mid)));
+  say(`first ${mid}`, r);
   if (r.good) lo = mid; else hi = mid;
 }
-const entry = all.entries.get(hi);
-console.log(`\nunit ${hi} is the culprit (unit ${lo} is clean)`);
-console.log(`  entry rip 0x${entry ? entry.toString(16) : '?'}`);
+const culprit = order[hi - 1];
+console.log(`\nculprit entry: 0x${culprit.toString(16)}  (the first ${lo} addresses are clean)`);
+const fs = all.funcsOf.get(culprit);
+if (fs) { console.log(`  closure: ${fs.length} functions`);
+  for (const a of fs.slice(0, 40)) console.log(`   0x${a.toString(16)}`); }

@@ -549,6 +549,13 @@ export class LinuxEngine {
     try { retAddr = this.mem.read(rsp0, 8n); } catch { return this.dispatchAot(f); }
     const rspExit = rsp0 + 8n;
     const regs0 = cpu.regs.slice(), xmm0 = cpu.xmm.slice(), fs0 = cpu.fsBase, fl0 = { ...cpu.f };
+    // Count what the shadow actually did. Every bail below is silent - a
+    // syscall, the step cap, or an exit that is not a clean return - so a run
+    // that never compared anything looked exactly like a run that compared
+    // everything and found nothing. That is the worst failure mode a
+    // differential can have.
+    const st = (this._shadowStats ??= { tried: 0, aborted: 0, compared: 0, diverged: 0 });
+    st.tried++;
     this._shadowBusy = true; this._shadowInterp = true;
     const savedBudget = this.aotBudget; this.aotBudget = 0;
     this.mem.jrnl = [];
@@ -565,6 +572,7 @@ export class LinuxEngine {
     this.aotBudget = savedBudget;
     // capture interp outcome (before undo)
     const iRegs = cpu.regs.slice(), iXmm = cpu.xmm.slice();
+    const iFlags = { ...cpu.f }, iFs = cpu.fsBase;
     const iVals = ok ? jr.map(([a, n, _o, snap]) =>
       snap ? this.mem.view(a, BigInt(snap.length)).slice() : this.mem.read(a, n)) : null;
     // undo the journal in reverse
@@ -577,12 +585,21 @@ export class LinuxEngine {
     cpu.regs = regs0.slice(); cpu.xmm = xmm0.slice(); cpu.fsBase = fs0; cpu.f = { ...fl0 };
     cpu.rip = entryRip;
     const exitRip = this.dispatchAot(f);
+    if (!(ok && exitRip === retAddr && cpu.regs[4] === rspExit)) st.aborted++;
     if (ok && exitRip === retAddr && cpu.regs[4] === rspExit && (this._shadowDiverged ?? 0) < 12) {
+      st.compared++;
       const diffs = [];
       for (let r = 0; r < 16; r++) if (cpu.regs[r] !== iRegs[r])
         diffs.push(`r${r} aot=${cpu.regs[r].toString(16)} interp=${iRegs[r].toString(16)}`);
       for (let r = 0; r < 16; r++) if (cpu.xmm[r] !== iXmm[r])
         diffs.push(`xmm${r} aot=${cpu.xmm[r].toString(16)} interp=${iXmm[r].toString(16)}`);
+      // Flags and the fs base were saved to RESTORE entry state but never
+      // compared, so a compiled unit that returned the right registers and
+      // the wrong flags looked clean. Hand-written libc asm is exactly where
+      // that matters.
+      for (const k of Object.keys(iFlags)) if (cpu.f[k] !== iFlags[k])
+        diffs.push(`flag ${k} aot=${cpu.f[k]} interp=${iFlags[k]}`);
+      if (cpu.fsBase !== iFs) diffs.push(`fsBase aot=${cpu.fsBase?.toString(16)} interp=${iFs?.toString(16)}`);
       for (let i = 0; i < jr.length; i++) {
         const [a, n, _o, snap] = jr[i];
         if (snap) { const cur = this.mem.view(a, BigInt(snap.length)).slice();
@@ -593,6 +610,7 @@ export class LinuxEngine {
         }
       }
       if (diffs.length) {
+        st.diverged++;
         this._shadowDiverged = (this._shadowDiverged ?? 0) + 1;
         console.error(`<SHADOW-DIVERGE fn=0x${entryRip.toString(16)} steps=${steps} entry=[${regs0.map(v=>v.toString(16)).join(',')}]>`);
         for (const d of diffs.slice(0, 20)) console.error('  ' + d);
@@ -615,7 +633,12 @@ export class LinuxEngine {
       return this.dispatchAot(f);
     const k = this.cpu.rip;
     const n = (this._shadowClean ??= new Map()).get(k) ?? 0;
-    if (n >= 50) return this.dispatchAot(f);            // exonerated after 50 clean passes
+    // Exonerate after this many clean passes, so shadowing a hot function does
+    // not cost the whole run. 50 is right for a first sweep and wrong for a
+    // bug that needs a rare input: a libc string routine is called thousands
+    // of times, and a divergence on call 900 is invisible if shadowing stops
+    // at 50. shadowMax lifts the cap when hunting one.
+    if (n >= (this.shadowMax ?? 50)) return this.dispatchAot(f);
     this._shadowClean.set(k, n + 1);
     return this.shadowDispatch(f);
   }

@@ -1235,3 +1235,63 @@ hardware differential never exercises turned up three more groups, now added:
 
 591 cases became **685, all bit-exact against the real CPU**. No new bugs —
 but the class of silence that hid `movhlps` is closed, which was the point.
+
+### Unit numbers are not a stable identifier (and one function is enough)
+
+Compiling *only* unit 327 produced a one-function closure at `0x51fbe7` in
+python3 — where the capped bisect had reported `libc+0xbae80`. Two different
+functions under the same number, because which functions get hot, and in what
+order, depends on what is already compiled.
+
+So `unitbisect.mjs` now bisects over **entry addresses**: record the order in
+which entries are offered for compilation in a full run, then binary search a
+prefix of that address list. An address means the same thing in every
+configuration. The re-bisect **confirms the earlier answer** — culprit entry
+`0x5ccce80` = `libc+0xbae80` — so the published claim stands; only the
+select-by-number experiment was invalid.
+
+`ADDR=0x5ccce80` then gives a **minimal reproducer: compiling that single
+function, with everything else interpreted, is enough to break CPython.** Its
+closure is one function.
+
+### A differential that never looked, and then looked and found nothing
+
+The lockstep shadow reported no divergence, which could mean two very
+different things. Every bail inside `shadowDispatch` is silent — a syscall,
+the 5M-step cap, or an exit that is not a clean return — so a run that
+compared *nothing* looked exactly like a run that compared everything and
+found nothing. That is the worst failure mode a differential can have, so it
+now counts what it did:
+
+```
+shadow: tried=681 compared=681 aborted=0 diverged=0
+```
+
+It genuinely compared all 681 entries. Two gaps were closed on the way:
+`shadowMax` (the exoneration cap was a hardcoded 50 clean passes, useless for
+a libc routine called hundreds of times), and the comparison itself, which
+saved flags and the fs base only to *restore* entry state and never compared
+them — a unit returning the right registers and the wrong flags looked clean.
+
+With flags and `fsBase` compared and the cap lifted: still **681 compared, 0
+diverged**.
+
+So the defect is *not* in that function's observable effect at its entry
+boundary — not registers, xmm, flags, fs base, or journaled memory, on any of
+681 calls — and yet compiling it alone breaks the program. That is a real
+narrowing, and it rules out the obvious shape of the bug.
+
+What remains, testable next:
+
+- **Bulk writes are outside the journal.** `rep movs`/`stos` go through
+  `mem.view()` and `TypedArray.set` in the interpreter, and the AOT emits
+  `memory.copy` — neither goes through `Memory.write`, so neither is
+  journaled. A memory difference from a bulk operation is invisible to the
+  comparison *and* to the undo. `OXWASM_NOBULK=1` during shadowing would
+  settle it.
+- **Entry elsewhere than the entry point.** Only dispatches at the registered
+  entry are shadowed; a tail-jump into the body would not be.
+
+Nothing is claimed fixed. The previous entry's guess that the bad function
+was "elsewhere in unit 327's closure" is wrong: the closure is one function,
+and it compares clean.
