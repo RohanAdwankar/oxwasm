@@ -139,8 +139,28 @@ if (process.env.WATCH) {
   const [aS, nS] = process.env.WATCH.split(',');
   const wa = BigInt(aS.trim()), wn = BigInt(nS || 8);
   eng.mem.watchLo = wa; eng.mem.watchHi = wa + wn;
+  // WATCHSTR=1 also captures the object's PyUnicode payload at each write.
+  // A compact-ASCII str keeps its characters at sizeof(PyASCIIObject) = 0x28,
+  // so this reads out WHICH string is being refcounted - the one thing that
+  // identifies the same object in a native run, where the address will differ.
+  // Reading only the payload was not enough to identify the object: at
+  // construction the bytes are still the previous occupant's, and afterwards
+  // they read as empty. Dump the PyASCIIObject header too - length at +0x10,
+  // state at +0x20 - so what the object IS can be read off rather than
+  // guessed from characters that may not be there yet.
+  const STR = process.env.WATCHSTR ? 0x28n : null;
   eng.mem.watch = (addr, n, v) => {
-    if (watchLog.length < 100000) watchLog.push([eng.cpu.rip, addr, n, v, eng.stats.interpreted]);
+    let str = '';
+    if (STR !== null) {
+      try {
+        const len = eng.mem.read(wa + 0x10n, 8n), st = eng.mem.read(wa + 0x20n, 8n);
+        let chars = '';
+        for (let i = 0n; i < 20n && i < len; i++) { const c = Number(eng.mem.read(wa + STR + i, 1n));
+          chars += (c >= 32 && c < 127) ? String.fromCharCode(c) : `\\x${c.toString(16).padStart(2,'0')}`; }
+        str = `len=${len} state=0x${st.toString(16)} "${chars}"`;
+      } catch {}
+    }
+    if (watchLog.length < 100000) watchLog.push([eng.cpu.rip, addr, n, v, eng.stats.interpreted, str]);
   };
 }
 
@@ -204,9 +224,9 @@ if (process.env.WATCH) {
   console.log(`\n  writes to ${process.env.WATCH}: ${watchLog.length}`);
   const show = watchLog.slice(-Number(process.env.WATCHN || 30));
   if (watchLog.length > show.length) console.log(`   (last ${show.length})`);
-  for (const [rip, addr, n, v, ic] of show)
+  for (const [rip, addr, n, v, ic, str] of show)
     console.log(`   @${String(ic).padStart(10)}  0x${addr.toString(16)} <- ${n}B 0x${v.toString(16)}`.padEnd(52) +
-                `from ${locate(eng, rip).label}`);
+                `from ${locate(eng, rip).label}` + (str ? `   str="${str}"` : ''));
 }
 
 console.log('\n  frame chain (rbp walk):');

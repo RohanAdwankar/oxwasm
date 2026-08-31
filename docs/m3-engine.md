@@ -1049,3 +1049,44 @@ pointing at the corpse: one of the four decrefs released a reference it did
 not own. Which one still needs a native reference execution to diff against —
 gdb is available, but matching "the same object" across two heaps is the part
 that has to be built.
+
+### CPython: the object has a name — `_pyio.IOBase.__doc__`
+
+Identifying *which* object dies is what a native reference run needs, since
+addresses will not match across two heaps. `WATCHSTR=1` now dumps the
+`PyASCIIObject` header — length at `+0x10`, state at `+0x20`, payload at
+`+0x28` — at every watched write, and that names it:
+
+```
+@14603146  refcnt<-1   PyUnicode_FromString+0x130   len=<uninitialised>
+@14604658  refcnt<-2   PyDict_SetItem+0x32          len=1235 "…The abstract"
+@14604817  refcnt<-1   (eval loop)                  len=1235 "…The abstract"
+@14607803  refcnt<-2   PyDict_Copy+0x181            len=1235 "…The abstract"
+@14658820  refcnt<-3   PyDict_Copy+0x181            len=1235 "…The abstract"
+@14659132  refcnt<-2   …                            len=1235 "…The abstract"
+@14665071  refcnt<-1   …                            len=1235 "…The abstract"
+@14666480  refcnt<-0   …                            FREED
+```
+
+A 1,235-character string beginning `"The abstract"`. Searching the stdlib for
+a docstring with that prefix gives exactly one match:
+`/usr/lib/python3.11/_pyio.py`, the `IOBase` class docstring — *"The abstract
+base class for all I/O classes."* (1,239 characters in source; the small
+difference is where the payload starts for a non-compact string, and the
+prefix match is unique.)
+
+So the dying object is **`_pyio.IOBase.__doc__`**, and the live dict still
+pointing at it is `IOBase.__dict__`. That also explains the shape of the
+trace: `PyDict_SetItem` puts `__doc__` into the class dict, and the two
+`PyDict_Copy` increfs are the type machinery copying that dict.
+
+Reading the header rather than the characters alone was necessary. At the
+creation write the object is not yet initialised — the payload there is still
+the previous occupant's bytes (`\x93\x01d=d>…`, which looks like bytecode and
+would have sent this somewhere wrong), and the length field is garbage. Only
+from `PyDict_SetItem` onward does the object read as itself.
+
+This is the handle the native reference run needs: break when a string of
+that length and prefix is created, watch its refcount, and diff the rip
+sequence against the eight writes above. python3 is `ET_EXEC`, so its text
+addresses are identical under gdb — the rips transfer directly.
