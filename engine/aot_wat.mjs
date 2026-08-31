@@ -447,57 +447,80 @@ export function analyze(mem, entry, { maxInsns = 20000, noJtab = false } = {}) {
   return { blocks, bidx, M, calls, jtabs };
 }
 
-// Blocks that lie on a cycle in this function's CFG - iterative Tarjan, since
-// a 20,000-instruction function would blow the JS stack on the recursive one.
+// Blocks that lie on a cycle in this function's CFG.
+//
+// This pass is not incidental: measured by running it with the inline budget
+// set to zero, so it chooses and nothing is spliced, it is about 90ms of
+// gzip's 122ms tier-up penalty - more than the duplicated code it selects.
+// A looser, cheaper criterion was tried (backward-branch intervals) and lost,
+// because it selected twice as many sites and the extra duplication cost more
+// than the analysis saved. So: the same answer, computed without the garbage.
+//
+// Successors in CSR form (one flat Int32Array plus offsets) rather than an
+// array of arrays, and an iterative Tarjan over parallel typed arrays rather
+// than a stack of [node, childIndex] tuples. Iterative because a
+// 20,000-instruction function would blow the JS stack on the recursive one.
 // Call edges are deliberately not followed: the question is whether the CALL
 // SITE repeats, not whether the callee does.
 function cyclicBlocks(a0) {
   const M = a0.M, N = a0.blocks.length;
   const idx = (addr) => a0.bidx.has(addr.toString()) ? a0.bidx.get(addr.toString()) : -1;
   const ide = (e) => e == null ? -1 : (a0.bidx.has(e) ? a0.bidx.get(e) : -1);
-  const succ = [];
-  for (let i = 0; i < N; i++) {
+  // successors of block i, written straight into `flat` at off[i]
+  const succOf = (i, emit) => {
     const insns = a0.blocks[i].insns, last = insns[insns.length - 1], next = last.next;
-    let out;
-    if (last.inlineTo !== undefined) out = [ide(last.inlineTo)];
-    else if (last.inlineRet !== undefined) out = [ide(last.inlineRet)];
-    else if (last.edgeT !== undefined) out = last.edgeF !== undefined
-      ? [ide(last.edgeT), ide(last.edgeF)] : [ide(last.edgeT)];
-    else if (last.edgeN !== undefined) out = [ide(last.edgeN)];
-    else if (last.mnem === 'jcc') out = [idx((next + last.rel) & M), idx(next)];
-    else if (last.mnem === 'jmp') out = [idx((next + last.rel) & M)];
-    else if (last.mnem === 'jmpind') {
-      const ts = a0.jtabs?.get(last.rip.toString());
-      out = ts ? ts.map(idx) : [];
+    if (last.inlineTo !== undefined) return emit(ide(last.inlineTo));
+    if (last.inlineRet !== undefined) return emit(ide(last.inlineRet));
+    if (last.edgeT !== undefined) {
+      emit(ide(last.edgeT));
+      if (last.edgeF !== undefined) emit(ide(last.edgeF));
+      return;
     }
-    else if (last.mnem === 'ret' || last.mnem === 'retn' || last.mnem === 'udec') out = [];
-    else out = [idx(next)];
-    succ.push(out.filter(v => v >= 0));
-  }
+    if (last.edgeN !== undefined) return emit(ide(last.edgeN));
+    if (last.mnem === 'jcc') { emit(idx((next + last.rel) & M)); emit(idx(next)); return; }
+    if (last.mnem === 'jmp') return emit(idx((next + last.rel) & M));
+    if (last.mnem === 'jmpind') {
+      const ts = a0.jtabs?.get(last.rip.toString());
+      if (ts) for (const t of ts) emit(idx(t));
+      return;
+    }
+    if (last.mnem === 'ret' || last.mnem === 'retn' || last.mnem === 'udec') return;
+    return emit(idx(next));
+  };
+  const off = new Int32Array(N + 1);
+  for (let i = 0; i < N; i++) { let n = 0; succOf(i, (v) => { if (v >= 0) n++; }); off[i + 1] = off[i] + n; }
+  const flat = new Int32Array(off[N]);
+  for (let i = 0, w = 0; i < N; i++) succOf(i, (v) => { if (v >= 0) flat[w++] = v; });
+
   const index = new Int32Array(N).fill(-1), low = new Int32Array(N);
-  const onStack = new Uint8Array(N), stack = [], cyclic = new Set();
-  let counter = 0;
+  const onStack = new Uint8Array(N), stack = new Int32Array(N);
+  const wNode = new Int32Array(N), wEdge = new Int32Array(N);
+  const cyclic = new Set();
+  let counter = 0, sp = 0;
   for (let root = 0; root < N; root++) {
     if (index[root] >= 0) continue;
-    const work = [[root, 0]];
-    index[root] = low[root] = counter++; stack.push(root); onStack[root] = 1;
-    while (work.length) {
-      const frame = work[work.length - 1];
-      const [v, i] = frame;
-      if (i < succ[v].length) {
-        frame[1]++;
-        const w = succ[v][i];
+    let wp = 0;
+    index[root] = low[root] = counter++; stack[sp++] = root; onStack[root] = 1;
+    wNode[wp] = root; wEdge[wp] = off[root]; wp++;
+    while (wp) {
+      const v = wNode[wp - 1];
+      if (wEdge[wp - 1] < off[v + 1]) {
+        const w = flat[wEdge[wp - 1]++];
         if (index[w] < 0) {
-          index[w] = low[w] = counter++; stack.push(w); onStack[w] = 1;
-          work.push([w, 0]);
-        } else if (onStack[w]) low[v] = Math.min(low[v], index[w]);
+          index[w] = low[w] = counter++; stack[sp++] = w; onStack[w] = 1;
+          wNode[wp] = w; wEdge[wp] = off[w]; wp++;
+        } else if (onStack[w] && index[w] < low[v]) low[v] = index[w];
       } else {
-        work.pop();
-        if (work.length) { const u = work[work.length - 1][0]; low[u] = Math.min(low[u], low[v]); }
+        wp--;
+        if (wp) { const u = wNode[wp - 1]; if (low[v] < low[u]) low[u] = low[v]; }
         if (low[v] === index[v]) {
-          const comp = [];
-          for (;;) { const w = stack.pop(); onStack[w] = 0; comp.push(w); if (w === v) break; }
-          if (comp.length > 1 || succ[v].includes(v)) for (const w of comp) cyclic.add(w);
+          // a component is cyclic if it has more than one member, or one
+          // member with an edge to itself
+          let selfLoop = false;
+          for (let e = off[v]; e < off[v + 1]; e++) if (flat[e] === v) { selfLoop = true; break; }
+          const base = sp;
+          let w2; do { w2 = stack[--sp]; onStack[w2] = 0; } while (w2 !== v);
+          if (base - sp > 1 || selfLoop) for (let k = sp; k < base; k++) cyclic.add(stack[k]);
         }
       }
     }

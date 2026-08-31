@@ -1285,3 +1285,33 @@ What that leaves for anyone picking this up: the 90ms is real and the cheap
 scan was the right *idea*, but it has to reproduce SCC's selection rather than
 approximate it loosely — or the SCC has to be skipped for functions with no
 inlinable call sites, which is a cheaper thing to test first.
+
+### The 90ms was garbage, not graph theory
+
+The SCC pass costs what it costs because of how it was written, not because of
+what it computes. The first version built an array-of-arrays successor list
+with a `.filter()` per block, and drove Tarjan from a stack of `[node,
+childIndex]` tuples — an allocation per block and another per stack frame, on
+every function the emitter touches.
+
+Rewritten with successors in CSR form (one flat `Int32Array` plus offsets) and
+the traversal over parallel typed arrays, the selection is **provably
+identical** — same 71 functions, same 275 copies, same 93 dispatch-mode
+functions, same output hash — and the tier-up penalty drops from a clear
++71..90ms to inside the noise of a four-rep measurement:
+
+| configuration | tier-up (4 reps) |
+|---------------|------------------|
+| baseline | 910, 955, 977, 902 |
+| inlining on | 938, 893, 971, 1051 |
+| analysis only, nothing inlined | 938, 918, 898, 906 |
+
+The ranges now overlap completely. That is not a claim that the cost is zero —
+it is a claim that this measurement can no longer see it, which is a different
+and more honest statement.
+
+Worth drawing out, because the previous section got it wrong: the cheap
+backward-branch scan failed not because the *analysis* was too expensive to
+replace but because replacing it changed the answer. The right move was to
+compute the same answer more carefully. Two attempts, one negative and one
+positive, and the difference between them is whether the semantics moved.
