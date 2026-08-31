@@ -399,3 +399,42 @@ Left here deliberately. CPython runs and prints correct output; this is a
 crash-at-exit on one binary, and the next step (find the DECREF with no
 matching INCREF) wants a reference execution to diff against, which does not
 exist yet. The cheaper win is elsewhere.
+
+## First-interaction latency, measured on the shipped artifact
+
+`tools/gui/replay.mjs` restores `demo/gimp` — the actual packed page assets,
+not a rebuild — and drives the same interaction repeatedly: click into the
+GIMP window, Escape to return to where the round started.
+
+```
+  n     ms   interp     aot
+  0    703    13593    4000
+  1    147      107    1125
+  2    142      123    1135
+  3    154      123    1149
+  4    118       87    1143
+
+first 703ms vs median-of-rest 147ms = 4.79x, spread of the rest +/-24%
+first interp 13,593 vs median-of-rest 107
+```
+
+**The first interaction costs 4.8x the steady state**, and the mechanism is the
+one the task claimed: **13,593 interpreted instructions on the first round
+against ~107 afterwards**, a 127x difference. Code on the interactive path that
+the capture did not cover runs interpreted until the call threshold tiers it
+up, and every subsequent round gets it compiled.
+
+Two honest qualifications. The first round also does more genuine work — it
+allocates and realises widgets that later rounds reuse, which is why its AOT
+run count is higher too (4,000 vs ~1,140), so not all of the 4.8x is
+tiering. And the painted-pixel count does not change across rounds, so this
+click is exercising the event and widget path rather than a repaint.
+
+Getting here required three corrections worth remembering. The click target
+was originally a guessed coordinate that landed on the root window and moved
+GIMP 28 instructions; targets have to come from the window tree (`WINDOWS=1`
+lists them). The round originally ended with a second click somewhere else,
+which left the UI in a different state each time and collapsed to 4ms by the
+second round; Escape makes the round idempotent, which is what makes
+first-vs-Nth a comparison of the same thing. And none of it ran at all until
+the SPR2 memory-format bug above was fixed.

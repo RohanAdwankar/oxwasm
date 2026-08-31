@@ -206,6 +206,25 @@ const pump = (ms, kick = false) => {
     if (eng.stats.interpreted + eng.stats.aotRuns === before) break;
   }
 };
+// WINDOWS=1 lists the mapped windows with geometry. Clicking at a guessed
+// coordinate is how the first run of this harness "interacted" with GIMP and
+// moved it 28 instructions: pick the target from the window tree instead.
+if (process.env.WINDOWS) {
+  const res = (snap.x?.res || []);
+  const byId = new Map(res.map(w => [w.id, w]));
+  const abs = (w) => { let x = 0, y = 0, c = w;
+    while (c) { x += c.x; y += c.y; c = c.parent != null ? byId.get(c.parent) : null; }
+    return [x, y]; };
+  for (const w of res) {
+    if (!w.mapped || w.cls === 2 || w.w < 24 || w.h < 12) continue;   // skip input-only and slivers
+    const [x, y] = abs(w);
+    if (x < 0 || y < 0 || x > 1024 || y > 768) continue;
+    console.log(`  win 0x${w.id.toString(16)} at ${x},${y} ${w.w}x${w.h} mask 0x${(w.eventMask||0).toString(16)}` +
+                ` center ${x + (w.w >> 1)},${y + (w.h >> 1)}`);
+  }
+  process.exit(0);
+}
+
 // No settle pump. Every thread restores parked on its own syscall and there
 // is nothing to deliver yet; running an all-blocked engine is what sent a
 // thread off into rip 0. The first thing that should happen is input.
@@ -217,12 +236,20 @@ const rows = [];
 for (let i = 0; i < N; i++) {
   const i0 = eng.stats.interpreted, a0 = eng.stats.aotRuns;
   const t0 = process.hrtime.bigint();
-  xs.injectMotion(420, 30); xs.injectButton(1, true);
+  // CLICKAT=x,y. The default was a guess at (420,30) that landed on the ROOT
+  // window and moved GIMP 28 instructions - the point has to come from the
+  // window tree (WINDOWS=1) or it is not an interaction at all.
+  const [CX, CY] = (process.env.CLICKAT || '434,382').split(',').map(Number);
+  xs.injectMotion(CX, CY); xs.injectButton(1, true);
   pump(1500, true);
   xs.injectButton(1, false);
   pump(1500, true);
-  xs.injectMotion(420, 300);                 // close whatever opened
-  xs.injectButton(1, true); xs.injectButton(1, false);
+  // Escape, not a second click. A click somewhere else leaves the UI in a
+  // different state each round - the first run of this loop collapsed to 4ms
+  // by iteration 2 because it had walked into a state where nothing responded.
+  // Escape closes a menu and returns to where the round started, which is what
+  // makes first-vs-Nth a comparison of the same interaction.
+  xs.injectKey(9, true); xs.injectKey(9, false);     // keycode 9 = Escape
   pump(1500, true);
   const ms = Number(process.hrtime.bigint() - t0) / 1e6;
   const interp = eng.stats.interpreted - i0, aot = eng.stats.aotRuns - a0;
