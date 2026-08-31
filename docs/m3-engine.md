@@ -438,3 +438,40 @@ which left the UI in a different state each time and collapsed to 4ms by the
 second round; Escape makes the round idempotent, which is what makes
 first-vs-Nth a comparison of the same thing. And none of it ran at all until
 the SPR2 memory-format bug above was fixed.
+
+### What the first interaction deopts
+
+The engine keeps a deopt-landing histogram behind `eng.deoptLog`, which is the
+right instrument once the interpreted work is known to sit on addresses that
+are already compiled. Round 0 of the GIMP interaction:
+
+```
+  3,978 deopts over 16 distinct landings
+
+  3204  libc+0x97fc0                [landing compiled]
+   481  libc+0x946c2                [landing compiled]
+   159  libc+0x93192                [landing compiled]
+    66  libc+0x947ba                [landing compiled]
+    47  0x1c90631                   [NOT compiled - in no mapped image]
+     4  libX11+0x3f768              [NOT compiled]
+     4  libgdk-x11+0x59efb          [NOT compiled]
+     3  libgtk-x11+0x24832a         [NOT compiled]
+```
+
+Two facts worth separating.
+
+**The volume is concentrated and mostly stays in wasm.** 3,204 of 3,978 deopts
+land on one libc address that is itself compiled, so the chain continues
+wasm-to-wasm through the `deopt` handler rather than dropping to the
+interpreter. Those cost a round trip each, not an interpreted stretch.
+
+**Four landings are uncompiled**, and those are the ones the interpreter
+actually runs. The largest, 47 deopts at `0x1c90631`, is in **no mapped image
+at all** - not the main binary, whose exec range is `0x400000..` and whose file
+is 6MB, so an offset of 0x1890631 into it is past the end. An earlier version
+of this output labelled it `gimp+0x1890631`, which was a fallback branch
+asserting something the data did not support.
+
+What is still NOT established: that these deopts are what produce the 10,487
+interpreted steps attributed to `gtk+0x13adb0`. The attribution is by entry
+rip, the deopt log is by landing, and nothing yet connects one to the other.

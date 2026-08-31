@@ -237,6 +237,10 @@ if (process.env.WINDOWS) {
 // is: code that has no compiled unit at all (a capture-coverage miss), or code
 // whose unit exists and simply was not dispatched.
 const profile = process.env.PROFILE ? new Map() : null;
+// The engine already keeps a deopt-landing histogram behind a flag, which is
+// the instrument this needs: a big interpreted count on a COMPILED address
+// means the compiled code bailed out, and deoptLog says where it landed.
+if (profile) eng.deoptLog = new Map();
 const profileRound = (ms) => {
   const t0 = process.hrtime.bigint();
   while (Number(process.hrtime.bigint() - t0) / 1e6 < ms) {
@@ -298,6 +302,23 @@ if (profile) {
   console.log(`\ninterpreted in round 0: ${total} steps over ${profile.size} distinct addresses`);
   console.log('  by image: ' + [...byMap].sort((a, b) => b[1] - a[1]).slice(0, 8)
     .map(([k, v]) => `${k}:${v}`).join(' '));
+  // An address in no `maps` entry is NOT automatically the main binary.
+  // execRangesStatic[0] starts at 0x400000 here while the guest gimp is a PIE
+  // 6MB long, so labelling 0x1c90631 as "gimp+0x1890631" was nonsense - past
+  // the end of the file. Say unmapped and mean it.
+  console.log(`  main exec range 0x${(eng.execRangesStatic?.[0]?.[0] ?? 0n).toString(16)}` +
+              `..0x${(eng.execRangesStatic?.[0]?.[1] ?? 0n).toString(16)}`);
+  console.log(`  deopts in round 0: ${eng.stats.deopts || 0}` +
+              (eng.deoptLog ? ` over ${eng.deoptLog.size} distinct landings` : ''));
+  for (const [t, n] of [...(eng.deoptLog || new Map())].sort((a, b) => b[1] - a[1]).slice(0, 8)) {
+    let where = 'main';
+    for (const m of (eng.maps || []))
+      if (t >= BigInt(m.at) && t < BigInt(m.at) + BigInt(m.len))
+        { where = `${m.path.split('/').pop()}+0x${(t - BigInt(m.at) + BigInt(m.off ?? 0)).toString(16)}`; break; }
+    if (where === 'main') where = 'in no mapped image';
+    console.log(`    deopt ${String(n).padStart(6)}  0x${t.toString(16)}  ${where}` +
+                `  [${eng.aotFns.has(t) ? 'landing compiled' : 'landing NOT compiled - interpreter runs it'}]`);
+  }
   console.log('  hottest interpreted addresses:');
   for (const [rip, n] of top.slice(0, 10)) {
     let where = 'main';
