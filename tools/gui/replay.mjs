@@ -82,7 +82,13 @@ const eng = new LinuxEngine(elf, {
   // the engine allocates memMB plus its own two reserved megabytes, so the
   // snapshot's memLen is memMB + 2 - solve for it rather than guessing
   files, mtimes: {}, memMB: Math.round(Number(memLen) / (1 << 20)) - 2, xserver: xs,
-  ...(CAPTURE ? { assembleWat } : {}) });
+  // The page ships app.wabt.gz and sets eng.assembleWat once it loads, so the
+  // engine there CAN compile units at runtime; only ?nowabt matches a replay
+  // with no assembler. WABT=1 models the default page, so a manifest gap can
+  // be told apart from a permanent hole: with an assembler the engine tiers
+  // the missing functions up itself and the interpretation is a head-start
+  // cost, without one it is forever.
+  ...(CAPTURE || process.env.WABT ? { assembleWat } : {}) });
 if (CAPTURE) eng.onUnitWat = (n, entry, unit) => {
   try { captured.push([entry.toString(16), assembleWat(unit.wat)]); } catch {}
 };

@@ -624,3 +624,46 @@ WAT size, and 1% of it does not pay for the change. Not written.
 The `mem` class stays at 4.1x with its cause unlocated. What the dump does
 establish is that op count is not obviously the problem: the loop body is
 already close to what the x86 says.
+
+### Correction: the 287x was for a page that cannot compile
+
+The comparison above ran `replay.mjs` without an assembler, because the
+harness only passed `assembleWat` when capturing. The shipped page is not
+like that: it fetches `app.wabt.gz`, sets `eng.assembleWat` and clears
+`cacheOnly`, so the default page **can** compile units at runtime. Only
+`?nowabt` matches what was measured. `WABT=1` now models the default page,
+and re-running both manifests that way:
+
+| round | baseline 7,668 | + 142 units | baseline, no assembler |
+|---|---:|---:|---:|
+| 0 | 33,520 | 10,391 | 240,006 |
+| 1 | 4,361 | 720 | 225,209 |
+| 2 | 2,306 | 1,057 | 225,190 |
+| 3 | **841** | **1,050** | 225,190 |
+
+With an assembler the baseline **heals itself**: 33,520 -> 4,361 -> 2,306 ->
+841, converging on the same steady state as the repacked manifest. So the
+142 units do not remove a permanent 225k-per-round cost on the default page.
+They remove the *transient*: about 40,200 interpreted steps across the first
+three rounds become about 12,200, and the in-page wabt compiles that produced
+them do not have to happen.
+
+Both numbers are real, and they are answers to different questions:
+
+- **Default page:** the units buy a head start. Steady state was already
+  going to be ~800-1,000 either way; what they remove is the first few
+  interactions being slow while the engine tiers up — which is exactly the
+  first-interaction latency this was opened to fix.
+- **`?nowabt` page:** there is no runtime tiering to fall back on, so
+  manifest coverage is the whole story and the units are a permanent 287x.
+
+The earlier commit stated the 225,209 figure without this distinction. It is
+the no-assembler number, and reading it as the shipped page's steady state
+was wrong.
+
+The profile says where the gap is. Of 239,751 interpreted steps in round 0,
+88% (210,992) are in libgtk-x11-2.0.so.0, and 61% arrive through deopt or
+callout landings — the top six of which are all marked "never compiled, no
+unit covers it". Every one of those six is in the 142-unit capture; the two
+hot addresses NOT captured were already in the shipped manifest. The capture
+is exactly the gap set, which is the reason it works.
