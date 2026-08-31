@@ -447,6 +447,105 @@ export function analyze(mem, entry, { maxInsns = 20000, noJtab = false } = {}) {
   return { blocks, bidx, M, calls, jtabs };
 }
 
+// ---- inlining: splice a callee's blocks into the caller's analysis ---------
+// Why this exists, measured rather than assumed: the per-call charge is FIXED
+// at roughly 22 native instruction-times, and none of its three candidate
+// mechanisms turned out to be ours - not the funcref table, not the register
+// spill/reload, not the stack-budget check. What is left is the wasm frame and
+// V8's cost to enter a generated function, neither of which the translator
+// emits. So the only lever left is to emit fewer calls.
+//
+// What that is worth is entirely program-dependent: sha256sum's steady state
+// is 184,000 instructions per call and inlining would move it by nothing,
+// while gzip's is 77 and the charge is ~20% of its engine time. gzip's three
+// hot callees - 98.4% of every call it makes - are 66, 88 and 114 instructions
+// across 9, 19 and 32 BLOCKS. That last number is why this is a graph merge
+// and not a paste: splicing single-block leaf callees, the version that needs
+// no control-flow fixup, captures none of them.
+//
+// The merge produces a new analysis for ONE function's emission. The callee's
+// own standalone wasm function is untouched and still emitted, because callers
+// in other units reach it through the funcref table.
+//
+// Restriction that makes this safe rather than clever: a callee is spliced
+// only where it has exactly ONE call site in this function. Guest addresses
+// are block identity here, so a callee inlined twice would collide with
+// itself in bidx. One site also means the duplication cost is bounded by the
+// callee's size, which is the case the measurement actually found.
+export function inlineCallees(a0, fnAddr, resolve, opts = {}) {
+  const budget = opts.budget ?? 160;            // low HUNDREDS: a 64-insn cutoff
+  const M = a0.M;                               // excludes all three of gzip's
+  // OXWASM_INLINE_ONLY=hex,hex - diagnostic: splice only these targets, so a
+  // measurement can separate "the frame saving is real" from "merging graphs
+  // pushed the caller into the br_table relooper and that cost more".
+  const only = opts.only ?? null;
+  const sites = new Map();                      // targetStr -> {n, retTo}
+  for (const b of a0.blocks) for (const insn of b.insns) {
+    if (insn.mnem !== 'call') continue;
+    const t = ((insn.next + insn.rel) & M).toString();
+    const e = sites.get(t);
+    if (e) e.n++; else sites.set(t, { n: 1, retTo: insn.next });
+  }
+  const rej = opts.rej || null;                 // diagnostic: why a target was refused
+  const no = (t, why) => { if (rej) rej(t, why); };
+  const chosen = new Map();                     // targetStr -> {an, retTo}
+  const taken = new Set(a0.blocks.map(b => b.start.toString()));
+  for (const [t, site] of sites) {
+    if (only && !only.has(t)) continue;
+    if (site.n !== 1) { no(t, 'sites=' + site.n); continue; }   // see above: one site only
+    if (t === fnAddr.toString()) { no(t, 'self'); continue; }   // direct recursion has no fixed point
+    const c = resolve(t);
+    if (!c) { no(t, 'not-in-unit'); continue; }
+    if (c.jtabs && c.jtabs.size) { no(t, 'jtab'); continue; }   // a jump table needs the callee's own resolver
+    let size = 0, bad = false;
+    for (const b of c.blocks) for (const i of b.insns) {
+      size++;
+      // an undecodable byte compiles to a deopt that unwinds THIS frame, and
+      // an indirect jump deopts too - inlining either would unwind the
+      // caller's frame instead of the callee's, which is not the same program
+      if (i.mnem === 'udec' || i.mnem === 'jmpind') bad = true;
+    }
+    if (bad || size === 0 || size > budget) { no(t, bad ? 'deopt-insn' : 'size=' + size); continue; }
+    if (c.blocks.some(b => taken.has(b.start.toString()))) { no(t, 'addr-collision'); continue; }
+    for (const b of c.blocks) taken.add(b.start.toString());
+    chosen.set(t, { an: c, retTo: site.retTo });
+  }
+  if (!chosen.size) return null;
+
+  const blocks = [];
+  for (const b of a0.blocks) {
+    let cur = { start: b.start, insns: [] };
+    for (const insn of b.insns) {
+      if (insn.mnem === 'call') {
+        const t = ((insn.next + insn.rel) & M).toString();
+        if (chosen.has(t)) {
+          // the call still pushes its return address - guest memory stays
+          // byte-exact - but terminates its block and branches into the body
+          cur.insns.push({ ...insn, inlineTo: BigInt(t) });
+          blocks.push(cur);
+          cur = { start: insn.next, insns: [] };
+          continue;
+        }
+      }
+      cur.insns.push(insn);
+    }
+    // an empty tail means the call was already last in its block, so the
+    // continuation is a leader that a0 already carries - do not duplicate it
+    if (cur.insns.length) blocks.push(cur);
+  }
+  for (const [, { an, retTo }] of chosen)
+    for (const b of an.blocks)
+      blocks.push({ start: b.start, insns: b.insns.map(i =>
+        (i.mnem === 'ret' || i.mnem === 'retn') ? { ...i, inlineRet: retTo } : i) });
+
+  blocks.sort((x, y) => x.start < y.start ? -1 : x.start > y.start ? 1 : 0);
+  const bidx = new Map(blocks.map((b, i) => [b.start.toString(), i]));
+  if (bidx.size !== blocks.length) return null;            // duplicate leader: refuse
+  const calls = new Set(a0.calls);
+  for (const [t, { an }] of chosen) { calls.delete(t); for (const c of an.calls) calls.add(c); }
+  return { blocks, bidx, M, calls, jtabs: a0.jtabs, inlined: [...chosen.keys()] };
+}
+
 // ---- Stackifier: turn a reducible CFG into nested wasm loop/block scopes ----
 // Returns { open:[[scope,...] per block], closeAfter:[[label,...] per block] }
 // where scopes carry {type:'loop'|'block', label}. Throws on irreducible CFG.
@@ -514,6 +613,10 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   const succAddrIdx = (i) => {
     const insns = a0.blocks[i].insns, last = insns[insns.length-1], next = last.next;
     const idx = (addr) => a0.bidx.has(addr.toString()) ? a0.bidx.get(addr.toString()) : -1;
+    // an inlined call site and an inlined callee's ret are both plain edges
+    // inside this function now, not frame transitions
+    if (last.inlineTo !== undefined) return [idx(last.inlineTo)];
+    if (last.inlineRet !== undefined) return [idx(last.inlineRet)];
     if (last.mnem === 'jcc') return [idx((next+last.rel)&MM), idx(next)];
     if (last.mnem === 'jmp') return [idx((next+last.rel)&MM)];
     if (last.mnem === 'jmpind') {
@@ -557,7 +660,14 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   let hasDeopt = false;
   for (let i=0;i<N;i++) {
     const insns = blocks[i].insns, last = insns[insns.length-1], next = last.next;
-    if (last.mnem === 'jcc') { const ta = (next+last.rel)&MM, fa = next, t = idxOf(ta), f = idxOf(fa);
+    if (last.inlineTo !== undefined) { const t = idxOf(last.inlineTo);
+      if (t < 0) throw new Error('AOT: inlined callee entry not a block');
+      term.push({kind:'inlinecall', t, ta: last.inlineTo}); succs.push([t]); }
+    else if (last.inlineRet !== undefined) { const t = idxOf(last.inlineRet);
+      if (t < 0) throw new Error('AOT: inlined return site not a block');
+      term.push({kind:'inlineret', t, ta: last.inlineRet,
+                 pad: last.mnem === 'retn' ? Number(last.n) : 0}); succs.push([t]); }
+    else if (last.mnem === 'jcc') { const ta = (next+last.rel)&MM, fa = next, t = idxOf(ta), f = idxOf(fa);
       if (t < 0 || f < 0) hasDeopt = true;
       term.push({kind:'jcc', t, f, ta, fa}); succs.push([t, f]); }
     else if (last.mnem === 'jmp') { const ta = (next+last.rel)&MM, t = idxOf(ta);
@@ -597,6 +707,8 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     mode = 'dispatch';
   }
   const DISP = mode === 'dispatch';
+  { const st = globalThis.__inlStats = globalThis.__inlStats || { fns: 0, callees: 0 };
+    st[DISP ? 'disp' : 'struct'] = (st[DISP ? 'disp' : 'struct'] || 0) + 1; }
 
   // Width inference. A register may live in an i32 local only when every
   // access is 32-bit-or-less AND it is written at least once here — a register
@@ -1701,6 +1813,12 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           const target = (next + insn.rel) & MM;
           L.push(`(local.set $r4 (i64.sub (local.get $r4) (i64.const 8)))`,
                  `(i64.store ${wasmAddr({base:4,index:-1,disp:0n},next)} (i64.const ${hexs(next)}))`);
+          // An inlined call keeps the guest-visible push - the callee's body
+          // may read its own return address, and `ret` must pop something -
+          // but there is no wasm call, so no spill, no reload, no stack-budget
+          // check, and no frame. Removing the frame IS the optimisation; the
+          // three things around it were each measured to cost nothing.
+          if (insn.inlineTo !== undefined) break;
           L.push(...spillAll());
           if (canDirect(target.toString()))
             // stack-budget check even on direct calls: past it, x_callout
@@ -1865,9 +1983,15 @@ function emitUnitFunction(a0, fnAddr, ctx) {
         else if (T === i+1 && F !== i+1) L.push(`(br_if ${lbl(F)} (i32.eqz ${c}))`);
         else { L.push(`(br_if ${lbl(T)} ${c})`); L.push(`(br ${lbl(F)})`); }
       }
-    } else if (t.kind === 'jmp') {
+    } else if (t.kind === 'jmp' || t.kind === 'inlinecall') {
       if (t.t < 0) L.push(...deoptTo(t.ta));
       else { const b = brTo(t.t); if (b) L.push(b); }
+    } else if (t.kind === 'inlineret') {
+      // pop what the inlined call pushed. The continuation is known
+      // statically, so the popped address is discarded rather than returned:
+      // rsp moves exactly as it would natively, and control just falls on.
+      L.push(`(local.set $r4 (i64.add (local.get $r4) (i64.const ${8 + t.pad})))`);
+      const b = brTo(t.t); if (b) L.push(b);
     } else if (t.kind === 'ret') {
       // pop the return address, retire the frame, hand the exit rip back
       L.push(`(local.set $rex (i64.load ${wasmAddr({base:4,index:-1,disp:0n},lnext)}))`);
@@ -1955,7 +2079,19 @@ function emitUnitFunction(a0, fnAddr, ctx) {
 }
 
 // ---- unit driver -----------------------------------------------------------
+// Opt-in while it is measured: globalThis.__inline, or OXWASM_INLINE=1.
+// OXWASM_INLINE_BUDGET caps the callee size in instructions - the default is
+// in the low hundreds because gzip's three hot callees are 66, 88 and 114,
+// and a 64-instruction cutoff excludes all of them.
+const inlineEnabled = () => globalThis.__inline ??
+  (typeof process !== 'undefined' && process.env?.OXWASM_INLINE === '1');
+const inlineBudget = () => Number(
+  (typeof process !== 'undefined' && process.env?.OXWASM_INLINE_BUDGET) || 160);
+
 export function compileUnitWat(mem, entry, opts = {}) {
+  const INLINE = inlineEnabled(), INLINE_BUDGET = inlineBudget();
+  const ONLY = (typeof process !== 'undefined' && process.env?.OXWASM_INLINE_ONLY) || '';
+  const INLINE_ONLY = ONLY ? new Set(ONLY.split(',').map(h => BigInt('0x' + h.trim()).toString())) : null;
   const { guestBase, ramBase, maxFuncs = 96, maxInsns = 20000, skip } = opts;
   const funcs = new Map();                       // addrStr -> analysis
   const poisoned = new Set();                    // addrStr -> engine-only (callout)
@@ -2004,7 +2140,33 @@ export function compileUnitWat(mem, entry, opts = {}) {
     texts.clear(); let repoison = false;
     for (const [k, an] of funcs) {
       if (poisoned.has(k)) continue;
-      try { texts.set(k, emitUnitFunction(an, BigInt(k), ctx)); }
+      try {
+        // Inlining is opt-in while it is being measured. It never changes what
+        // the unit CONTAINS - the callee keeps its own standalone function for
+        // callers in other units - only how this one function reaches it.
+        let use = an;
+        if (INLINE) {
+          try {
+            const m = inlineCallees(an, BigInt(k), (t) =>
+              (funcs.has(t) && !poisoned.has(t)) ? funcs.get(t) : null,
+              { budget: INLINE_BUDGET, only: INLINE_ONLY,
+                rej: INLINE_ONLY ? (t, why) => {
+                  const st = globalThis.__inlStats = globalThis.__inlStats || { fns: 0, callees: 0 };
+                  (st.rej = st.rej || []).push(BigInt(t).toString(16) + ':' + why + ' in ' + k);
+                } : null });
+            if (m) { use = m;
+              globalThis.__inlStats = globalThis.__inlStats || { fns: 0, callees: 0 };
+              globalThis.__inlStats.fns++; globalThis.__inlStats.callees += m.inlined.length; }
+          } catch { /* a merge that does not hold: emit the function unmodified */ }
+        }
+        try { texts.set(k, emitUnitFunction(use, BigInt(k), ctx)); }
+        catch (e) {
+          // an inlined body that fails to emit must not poison a function that
+          // compiles perfectly well on its own
+          if (use === an) throw e;
+          texts.set(k, emitUnitFunction(an, BigInt(k), ctx));
+        }
+      }
       catch (e) {
         if (k === entry.toString()) throw e;
         poisoned.add(k); repoison = true;

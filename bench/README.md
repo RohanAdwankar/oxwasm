@@ -1043,3 +1043,44 @@ call site.
 
 Worth knowing before starting rather than after. The easy version would have
 compiled, passed the suite, and moved gzip by nothing.
+
+### v1 of the inliner, and why it is inert on the case it was built for
+
+The merge is written: `inlineCallees()` splices a callee's blocks into the
+caller's analysis, the call site keeps its guest-visible push of the return
+address but loses the spill, the wasm call, the stack-budget check and the
+reload, and each callee `ret` becomes an `rsp += 8` plus a branch to the
+continuation. gzip's output is byte-identical with it on and off, at two
+input sizes, and the full engine suite passes identically with it on and off
+(171 lines of output either way).
+
+It also does nothing for gzip, and the reason is a restriction I chose:
+splice a callee only where it has exactly **one** call site in the function.
+Guest addresses are block identity in this analysis, so a second copy of the
+same callee collides with the first in `bidx`. The measured rejections:
+
+| callee | call sites in one caller |
+|--------|-------------------------:|
+| `0x408ce0` | 8 |
+| `0x405190` | 5 |
+| `0x4048a0` | 3 |
+| `0x404420` | 2 |
+
+Every hot callee is excluded. The restriction that made v1 safe is exactly
+the one that makes it useless here — hot callees are hot partly *because*
+they are called from many places.
+
+Lifting it means decoupling block identity from the guest address: an
+explicit `id` per block, cloned terminators carrying explicit edge ids
+resolved within their copy (since `next + rel` would resolve to the original
+block), and `ta` kept as the real address so an out-of-function target still
+has somewhere real to deopt to.
+
+**And a measurement note, because this nearly went wrong the same way twice.**
+The first A/B showed inlining 2.5x faster. It was entirely cold `wat2wasm`
+cache: with the cache warm the two are within noise of each other. gzip on
+200KB and on 2MB both run about a second in this harness and barely differ,
+which says the run is dominated by startup and compilation rather than the
+compression loop — so this A/B cannot resolve a 20% steady-state effect at
+all. No performance claim is made here in either direction; the number will
+come from the startup-subtracting method or it will not come.
