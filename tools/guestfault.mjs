@@ -80,6 +80,15 @@ const syms = (path) => {
 const nearest = (list, off) => { let lo=0, hi=list.length-1, best=null;
   while (lo <= hi) { const mid = (lo+hi)>>1; if (list[mid][0] <= off) { best = list[mid]; lo = mid+1; } else hi = mid-1; }
   return best; };
+// A stripped binary leaves only its dynamic symbols - python3 has 1,699 for
+// 2.7MB of text - so "nearest preceding symbol" can be kilobytes away and
+// name a completely different function. Presenting that as a confident
+// `_Py_CheckFunctionResult+0x9e0` is how a wrong story starts, so anything
+// far from its symbol is labelled unreliable rather than trusted.
+const FAR = 0x1000n;
+const symLabel = (b, off) => !b ? '' :
+  (off - b[0] > FAR ? ` (>${FAR}B past ${b[1]} - name unreliable)`
+                    : ` (${b[1]}+0x${(off - b[0]).toString(16)})`);
 // which image an address is in, and where inside it. An address in NO map is
 // reported as such rather than attributed to the main binary - assuming it was
 // the main image once produced a symbol name past the end of a 6MB file.
@@ -87,15 +96,13 @@ const locate = (eng, addr) => {
   for (const m of (eng.maps || [])) if (addr >= m.at && addr < m.at + BigInt(m.len)) {
     const off = addr - m.at + BigInt(m.fileOff ?? 0);
     const b = nearest(syms(m.path), off);
-    return { path: m.path, off, label: `${m.path.split('/').pop()}+0x${off.toString(16)}` +
-             (b ? ` (${b[1]}+0x${(off - b[0]).toString(16)})` : '') };
+    return { path: m.path, off, label: `${m.path.split('/').pop()}+0x${off.toString(16)}` + symLabel(b, off) };
   }
   const bias = mainIsExec ? 0n : eng.base;
   if (addr >= eng.base && addr < bias + mainSpan) {
     const off = addr - bias;
     const b = nearest(syms(bin), off);
-    return { path: bin, off, label: `${bin.split('/').pop()}+0x${off.toString(16)}` +
-             (b ? ` (${b[1]}+0x${(off - b[0]).toString(16)})` : '') };
+    return { path: bin, off, label: `${bin.split('/').pop()}+0x${off.toString(16)}` + symLabel(b, off) };
   }
   return { path: null, off: null, label: `0x${addr.toString(16)} in no mapped image` };
 };

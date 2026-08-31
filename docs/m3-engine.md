@@ -998,3 +998,54 @@ addresses landed inside the binary and were labelled `python3+0x1728230
 (_end+0xc8eb10)`. A symbol offset past the end of the file is the tell, and
 this is the third time in these notes that assuming an address belongs to the
 main image has produced a confident wrong answer.
+
+### CPython, sharper: the dict is alive, and one symbol name was not trustworthy
+
+Two checks this round, one of which refuted a hypothesis of mine.
+
+**The dict is not the corrupt thing.** It was worth asking whether the whole
+story was one use-after-free of the *dict* rather than of the string — a
+freed dict would explain a stale key pointer without any refcount bug. It is
+not: at fault time the dict at `r15` reads
+
+```
++0   0x1              ob_refcnt = 1
++8   0x91e340         ob_type = PyDict_Type exactly
++16  0x4              ma_used
++32  0x5ebde30        ma_keys
+```
+
+A live, correctly typed dict. Its entries are 16-byte `PyDictUnicodeEntry`
+`{key, value}` pairs (the neighbouring values point into `_PyRuntime`, i.e.
+static objects), and `r14 = 5` is `dk_nentries`. So a **live** dict holds a
+key pointer to a freed string — which strengthens the premature-free
+conclusion rather than replacing it.
+
+**And a correction to the previous entry.** It named the faulting loop
+`PyObject_GC_Del+0x20b5`. That offset is 8,373 bytes past the symbol, and
+python3 is stripped to 1,699 dynamic symbols for 2.7MB of text, so "nearest
+preceding symbol" there is almost certainly a different function. The loop is
+in the GC's reference-subtraction pass — the `sub $0x4` on `_gc_prev` and the
+`Py_TPFLAGS_HAVE_GC` test say that much — but it should not have been given a
+name. The same applies to the `_Py_CheckFunctionResult+0x9e0` and `+0xf9`
+attributions of two decrefs.
+
+`locate()` now refuses to guess: past 4KB from the nearest symbol it prints
+`(>4096B past <sym> - name unreliable)` instead of a confident offset. Close
+symbols still resolve normally (`_exit+0x1d`), and a stripped binary's own
+frames come back as a bare `xz+0x54bc` rather than an invented name.
+
+The refcount rips whose symbols ARE close enough to trust:
+
+| | rip | symbol | instruction |
+|---|---|---|---|
+| create, refcnt=1 | 0x516060 | `PyUnicode_FromString+0x130` | `movq $0x1,(%r15)` |
+| ->2 | 0x51f342 | `PyDict_SetItem+0x32` | `addq $0x1,(%rdx)` |
+| ->2, ->3 | 0x52e5e1 | `PyDict_Copy+0x181` | `addq $0x1,(%rdx)` |
+
+So the dict took its reference through `PyDict_SetItem`, and the string was
+later freed anyway. Four increfs, four decrefs, and a live dict still
+pointing at the corpse: one of the four decrefs released a reference it did
+not own. Which one still needs a native reference execution to diff against —
+gdb is available, but matching "the same object" across two heaps is the part
+that has to be built.
