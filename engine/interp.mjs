@@ -80,6 +80,8 @@ export class Memory {
   }
 }
 
+const NOBULK = typeof process !== 'undefined' && process.env?.OXWASM_NOBULK === '1';
+
 export class CPU {
   constructor(mem) {
     this.mem = mem;
@@ -795,7 +797,10 @@ export class CPU {
         // bulk fast path (DF=0): one typed-array copy unless the ranges
         // overlap with dst above src, where x86's forward element copy differs
         // from memmove — fall back to the exact loop there.
-        if (insn.rep && this.regs[1] > 1n) {
+        // OXWASM_NOBULK=1 forces the exact per-element loop, so a suspected
+        // miscompare can be blamed on or cleared of the bulk path without
+        // reasoning about TypedArray.set overlap semantics.
+        if (insn.rep && this.regs[1] > 1n && !NOBULK) {
           const len = this.regs[1] * n;
           const src = this.mem.view(this.regs[6], len), dst = this.mem.view(this.regs[7], len);
           const overlapUp = this.regs[7] > this.regs[6] && this.regs[7] < this.regs[6] + len;
@@ -861,7 +866,7 @@ export class CPU {
           } while (insn.rep && this.regs[1] > 0n);
           break;
         }
-        if (insn.rep && this.regs[1] > 1n) {
+        if (insn.rep && this.regs[1] > 1n && !NOBULK) {
           const len = this.regs[1] * n;
           const dst = this.mem.view(this.regs[7], len);
           if (dst) {
