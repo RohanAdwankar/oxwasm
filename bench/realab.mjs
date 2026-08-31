@@ -40,24 +40,31 @@ const spread = (xs) => (Math.max(...xs) - Math.min(...xs)) / med(xs) * 100;
 const parseEnv = (s) => Object.fromEntries(s.split(/\s+/).filter(Boolean).map(kv => {
   const i = kv.indexOf('='); return [kv.slice(0, i), kv.slice(i + 1)]; }));
 
-const measure = (label, envStr) => {
-  const env = parseEnv(envStr);
-  // one warm-up per (config, size) so the assembler cache is populated for
-  // BOTH arms before anything is timed
-  once(env, BIG); once(env, SMALL);
-  const bigs = [], smalls = []; let exit = null, hash = null;
-  for (let i = 0; i < REPS; i++) {
-    const rb = once(env, BIG); bigs.push(rb.ms); exit = rb.exit; hash = rb.hash;
-    smalls.push(once(env, SMALL).ms);
+// Interleave the arms. Running all of A and then all of B lets any drift in
+// machine speed land entirely on one of them: a run of this A/B reported
+// +/-8% on the first arm and +/-5% on the second, which is not a difference
+// between configurations, it is the machine changing underneath. Alternating
+// rep by rep makes drift common-mode, the same fix the stack-guard A/B needed
+// when it was done by hand.
+const parsed = { A: parseEnv(A), B: parseEnv(B) };
+const bigs = { A: [], B: [] }, smalls = { A: [], B: [] }, meta = {};
+for (const k of ['A', 'B']) { once(parsed[k], BIG); once(parsed[k], SMALL); }   // warm both caches first
+for (let i = 0; i < REPS; i++) {
+  for (const k of ['A', 'B']) {
+    const rb = once(parsed[k], BIG); bigs[k].push(rb.ms); meta[k] = rb;
+    smalls[k].push(once(parsed[k], SMALL).ms);
   }
-  const b = med(bigs), s = med(smalls);
+}
+const report = (label, k) => {
+  const b = med(bigs[k]), s = med(smalls[k]);
   console.log(`${label.padEnd(28)} big ${b.toFixed(0).padStart(6)}ms  small ${s.toFixed(0).padStart(6)}ms` +
-              `  steady ${(b - s).toFixed(0).padStart(6)}ms  +/-${spread(bigs).toFixed(0)}%  exit=${exit} out=${hash}`);
-  return { steady: b - s, big: b, small: s, spread: spread(bigs), hash, exit };
+              `  steady ${(b - s).toFixed(0).padStart(6)}ms  +/-${spread(bigs[k]).toFixed(0)}%` +
+              `  exit=${meta[k].exit} out=${meta[k].hash}`);
+  return { steady: b - s, big: b, small: s, spread: spread(bigs[k]), hash: meta[k].hash, exit: meta[k].exit };
 };
 
-const ra = measure('A: ' + (A || '(baseline)'), A);
-const rb = measure('B: ' + (B || '(baseline)'), B);
+const ra = report('A: ' + (A || '(baseline)'), 'A');
+const rb = report('B: ' + (B || '(baseline)'), 'B');
 console.log('');
 if (ra.hash !== rb.hash || ra.exit !== rb.exit)
   console.log(`DIVERGED: A ${ra.exit}/${ra.hash} vs B ${rb.exit}/${rb.hash} - the two are not the same program`);
