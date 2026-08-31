@@ -1141,6 +1141,10 @@ compression loop directly.
 
 ### Inlining everything: a trade, not a win
 
+*(The 16% figure below was noise-inflated and is superseded by the 100MB run
+in the next section, which resolves the same effect at +/-2% and puts it at
+5.5%. The trade this section describes is real; the magnitude was not.)*
+
 Same harness, all callees rather than only gzip's four, 20MB input, medians of
 five:
 
@@ -1176,3 +1180,43 @@ open problem: making tier-up more expensive is the wrong direction for the
 one thing users feel most. That is the argument for keeping this opt-in until
 the tiering policy can decide *which* functions are worth inlining, rather
 than the emitter inlining whatever fits a budget.
+
+
+### The settled number: 5.5% steady state, at a fixed 129ms of compile time
+
+The 20MB run carried +/-9% noise and reported 16%. At 100MB, where startup is
+16% of the run instead of 46%, the same A/B resolves to +/-2%:
+
+| arm | big | small (startup) | steady state |
+|-----|----:|----------------:|-------------:|
+| baseline | 5687ms | 916ms | **4771ms** |
+| all callees inlined | 5553ms | 1045ms | **4508ms** |
+
+**B/A steady state: 0.945x, +/-2%.** Identical output. And end to end,
+5687ms -> 5553ms: at this size the compile cost is amortised and inlining is a
+net win of about 2.4%.
+
+Two things make this the number to keep rather than the 16%.
+
+**It agrees with an independent run.** Inlining only gzip's four hot callees,
+at 20MB, gave 0.945x as well. Two different configurations at two different
+input sizes landing on the same ratio is worth more than one noisy run
+claiming more.
+
+**And that agreement is itself the design conclusion.** Four callees deliver
+the entire benefit; inlining the other 234 adds compile time and nothing else.
+The lesson is not "inline more", it is *inline few, choose well* — which is an
+argument for the tiering policy picking targets from its call profile rather
+than the emitter taking whatever fits a byte budget.
+
+The cost is a fixed **+129ms** of startup (916 -> 1045). Against a 5.5%
+steady-state saving that breaks even at roughly **2.3 seconds** of steady-state
+work: above it inlining pays, below it does not. gzip on 20MB is below the
+line; gzip on 100MB is above it; a GUI app that runs for minutes is far above
+it, and the shipped page — which ships precompiled units and never runs the
+emitter in the browser — pays no startup cost at all.
+
+So the honest summary of this whole line of work: the call boundary was worth
+about 5% of one call-dense real program, the amortisation curve's *shape* was
+right and its coefficient was not, and the synthetic 8x never described
+anything a user runs.
