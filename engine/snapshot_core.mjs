@@ -35,6 +35,22 @@ export function restoreEngineCore(eng, xs, assets, CPUctor, inflate) {
   if (assets.mem) {
     const all = new Uint8Array(eng.wmem.buffer);
     const f = assets.mem, fv = dv(f);
+    // 'SPR2' (xpack.mjs:321): 'SPR2' + repeat [u48 wasm offset][u32 len][RAW
+    // bytes], page-granular and uncompressed. Recognising only 'SPRS' here was
+    // a SILENT failure, not an error: a SPR2 image fell into the dense branch,
+    // misread its first header as a length pair and applied essentially
+    // nothing - so a restore "succeeded" with every register and thread state
+    // exactly right and no anonymous memory at all. The symptom was a parked
+    // thread returning from its syscall to address 0, its stack never written.
+    const isSPR2 = f[0] === 0x53 && f[1] === 0x50 && f[2] === 0x52 && f[3] === 0x32;
+    if (isSPR2) {
+      let fo = 4;
+      while (fo + 10 <= f.length) {
+        const off = fv.getUint32(fo, true) + fv.getUint16(fo + 4, true) * 0x100000000;
+        const len = fv.getUint32(fo + 6, true); fo += 10;
+        all.set(f.subarray(fo, fo + len), off); fo += len;
+      }
+    } else {
     const isSparse = f[0] === 0x53 && f[1] === 0x50 && f[2] === 0x52 && f[3] === 0x53;   // 'SPRS'
     const tiles = [];
     if (isSparse) {
@@ -61,6 +77,7 @@ export function restoreEngineCore(eng, xs, assets, CPUctor, inflate) {
     } else {
       if (tiles.length) all.set(first, tiles[0][0]);
       for (let i = 1; i < tiles.length; i++) all.set(inflate(tiles[i][1]), tiles[i][0]);
+    }
     }
   }
   // The restored image may carry the CAPTURE engine's function-dispatch map

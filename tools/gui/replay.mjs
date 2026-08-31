@@ -12,6 +12,7 @@ import { XServer } from '../../engine/xserver.mjs';
 import { CPU } from '../../engine/interp.mjs';
 import { restoreEngineCore } from '../../engine/snapshot_core.mjs';
 import { parsePCF } from '../../engine/pcf.mjs';
+import { decode } from '../../engine/decode.mjs';
 import { readFileSync } from 'node:fs';
 import { gunzipSync } from 'node:zlib';
 
@@ -102,8 +103,29 @@ for (const [, bytes] of container(gz('app.units.gz'))) {
   } catch {}
 }
 console.log(`restored: ${units} units, ${fns} functions mapped, ftFull=${eng._ftFull || 0}`);
-console.log('  per-thread rips at restore: ' +
-  eng.threads.map((t, i) => `${i}:${t.state}:0x${t.cpu.rip.toString(16)}`).join(' '));
+// Decode at each parked rip. The engine's contract is that a blocking
+// syscall RE-EXECUTES on resume, which only holds if the saved rip points AT
+// the syscall instruction rather than past it.
+console.log('  per-thread rips at restore:');
+for (const [i, t] of eng.threads.entries()) {
+  let at = '?', before = '?';
+  try { at = decode((k) => Number(eng.mem.read(t.cpu.rip + BigInt(k), 1n)), t.cpu.rip).mnem; } catch (e) { at = 'undecodable'; }
+  // a syscall is 0f 05: if the rip is one instruction PAST it, the two bytes
+  // immediately before the rip are exactly that
+  try { const p = Number(eng.mem.read(t.cpu.rip - 2n, 2n)); before = p === 0x050f ? 'PRECEDED BY syscall' : ''; } catch {}
+  console.log(`    ${i} ${t.state.padEnd(4)} 0x${t.cpu.rip.toString(16)}  at=${at} ${before}`);
+}
+// Is each parked thread's STACK actually there? The rips and states matching
+// the snapshot says nothing about anonymous memory: fills reconstruct
+// file-backed pages, and a thread stack is anonymous, so it can only come from
+// the app.mem tiles. A ret that returns to 0 is what a zeroed stack looks
+// like.
+for (const [i, t] of eng.threads.entries()) {
+  const sp = t.cpu.regs[4];
+  let words = [];
+  for (let k = 0; k < 6; k++) { try { words.push(eng.mem.read(sp + BigInt(k * 8), 8n).toString(16)); } catch { words.push('unmapped'); } }
+  console.log(`    t${i} rsp 0x${sp.toString(16)} stack: ${words.join(' ')}`);
+}
 console.log(`  rip 0x${eng.cpu.rip.toString(16)} rsp 0x${eng.cpu.regs[4].toString(16)} ` +
             `threads ${eng.threads.length} ti ${eng.ti} states ${eng.threads.map(t=>t.state).join(',')} ` +
             `blocked ${!!eng.blocked} exit ${eng.exitCode}`);
@@ -128,6 +150,22 @@ console.log(`  rip 0x${eng.cpu.rip.toString(16)} rsp 0x${eng.cpu.regs[4].toStrin
 // instruction late with the syscall's return value never written, which is
 // exactly the shape of a thread that then walks off into rip 0.
 
+// Every parked rip decodes as `syscall`, so the resume contract holds and the
+// saved-rip hypothesis is dead. What the syscalls RETURN on re-execution is
+// the next suspect: a guest whose X connection reads EOF concludes the display
+// died and takes itself apart. Log the tail so the fault can name its cause.
+const trail = [], rips = [];
+{
+  const inner = eng.syscall.bind(eng);
+  eng.syscall = (cpu) => {
+    const nr = cpu.regs[0], t = eng.ti;
+    const r = inner(cpu);
+    if (trail.length > 40) trail.shift();
+    trail.push(`t${t} nr=${nr} -> ${BigInt.asIntN(64, cpu.regs[0])}`);
+    return r;
+  };
+}
+
 // Wake for a REASON. Unconditional wake() is right for a single-threaded
 // guest (xshot does it) and wrong here: GIMP has four threads parked on their
 // own futexes and X-connection polls, and resuming one whose condition was
@@ -139,7 +177,27 @@ const pump = (ms, kick = false) => {
   if (kick) eng.wake();                       // input landed: the poll has a result now
   while (Number(process.hrtime.bigint() - t0) / 1e6 < ms) {
     const before = eng.stats.interpreted + eng.stats.aotRuns;
-    eng.run(2e6);
+    // TRACE=1 steps one instruction at a time and keeps the last rips, so the
+    // instruction that jumps to zero can be named instead of guessed at. The
+    // syscall trail already narrowed it to "right after futex returns EAGAIN".
+    try { if (process.env.TRACE) { for (let k = 0; k < 2e6; k++) {
+            rips.push(`t${eng.ti}:0x${eng.cpu.rip.toString(16)}`);
+            if (rips.length > 60) rips.shift();
+            eng.run(1);
+            if (eng.blocked || eng.exitCode !== null) break;
+          } } else eng.run(2e6); }
+    catch (e) {
+      console.log('  last syscalls: ' + trail.slice(-16).join(' | '));
+      if (rips.length) console.log('  last rips: ' + rips.slice(-30).join(' '));
+      for (const r of new Set(rips.map(x => BigInt(x.split(':')[1]))))
+        for (const m of (eng.maps || []))
+          if (r >= BigInt(m.at) && r < BigInt(m.at) + BigInt(m.len))
+            console.log(`    0x${r.toString(16)} = ${m.path} + 0x${(r - BigInt(m.at) + BigInt(m.off ?? 0)).toString(16)}`);
+      console.log(`  fault ${e.message} ti ${eng.ti} ` +
+                  `rips ${eng.threads.map(t => '0x' + t.cpu.rip.toString(16)).join(',')} ` +
+                  `states ${eng.threads.map(t => t.state).join(',')}`);
+      throw e;
+    }
     if (eng.blocked) {
       const dl = eng.blocked.deadline;
       if (dl != null && eng.nowMs() >= dl) { eng.wake(); continue; }
