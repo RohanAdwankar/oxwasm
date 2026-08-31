@@ -571,3 +571,56 @@ anyway.
 Wall clock across these runs stays unusable (contended: the baseline's own
 median moved 147 -> 212ms between bursts). Interpreted counts are the signal
 here because they do not vary with machine load.
+
+### One click was not the interaction path: the wide script
+
+The fifteen-unit capture above was driven by one click, one Escape and one
+drag. That is a single interaction, and the manifest it produced covers a
+single interaction. Generalising `replay.mjs`'s round into a `SCRIPT` of
+`click:x,y` / `esc` / `drag:x1,y1,x2,y2` steps and driving nine actions
+across the tool box, the canvas and two menus shows how narrow the earlier
+capture was:
+
+| | units | functions | round-0 interpreted | steady-state interpreted |
+|---|------:|----------:|--------------------:|-------------------------:|
+| shipped manifest | 7,668 | 13,207 | **240,006** | **225,209** |
+| + 142 captured units | 7,810 | 13,487 | **10,468** | **786** |
+
+The shipped manifest — the one that had just been improved to 92 interpreted
+instructions per round — interprets **225,209** per round on the wider path.
+The single-click round was not representative of it. Steady-state falls
+**287x**; round-0 falls 23x.
+
+Note what this says about the earlier "92": it was not the product being
+nearly free of interpretation, it was the measurement covering one click.
+The number a capture reports is bounded by the script that drove it, and a
+narrow script reports a flattering number for a manifest that is only good
+at what the script does.
+
+142 units, 280 functions, 1.9% more manifest. Merged and verified by
+replaying the repacked directory: 7,810 units, 13,487 functions, round-0
+10,468, steady 786 — an exact match for the `EXTRA=` run, so the merge is
+faithful. `tools/gui/mergeunits.mjs` does the merge now instead of a
+throwaway script.
+
+Wall clock moved 1163 -> 538ms steady on the same contended machine, in the
+direction the step counts predict, but the baseline's own rounds spread
++/-27% so that ratio is not a measurement. The step counts are.
+
+### A peephole that was not worth writing
+
+Reading the emitted wasm for the `mem` kernel — ten x86 instructions,
+roughly 54 wasm ops — three redundancies are visible by eye: `(i64.add
+(i64.const 0) x)` from a zero displacement, `(i64.and x (i64.const
+0xFFFFFFFFFFFFFFFF))` from masking a 64-bit result to 64 bits, and
+`$fa`/`$fb` flag operands stored for a compare whose only consumer is a
+`jne` and needs ZF alone.
+
+Counting them in 148k lines of real emitted WAT before building anything:
+1,375 all-ones masks and 210 add-zeros, about 1% of lines. V8 folds all
+three away, so they were never a throughput cost; the only real cost was
+WAT size, and 1% of it does not pay for the change. Not written.
+
+The `mem` class stays at 4.1x with its cause unlocated. What the dump does
+establish is that op count is not obviously the problem: the loop body is
+already close to what the x86 says.
