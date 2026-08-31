@@ -241,6 +241,33 @@ const profile = process.env.PROFILE ? new Map() : null;
 // the instrument this needs: a big interpreted count on a COMPILED address
 // means the compiled code bailed out, and deoptLog says where it landed.
 if (profile) eng.deoptLog = new Map();
+// CONNECT the deopt landings to the interpreted steps instead of assuming the
+// link. Both DeoptUnwind catch sites (linux.mjs:488 and :730) and the
+// uncompiled-callout path all finish by calling interpUntil() with cpu.rip set
+// to where they landed - so wrapping interpUntil attributes interpretation to
+// the address that caused it. Whatever is left over is interpretation from the
+// main run loop, which is a different problem with a different fix.
+const viaInterpUntil = new Map();
+let viaTotal = 0;
+if (profile) {
+  const inner = eng.interpUntil.bind(eng);
+  // EXCLUSIVE attribution. interpUntil nests - a callout reached while
+  // interpreting calls it again - so charging each frame its full delta
+  // double-counts the inner ones and totals 112% of the round's interpreted
+  // steps. Each frame is charged its delta MINUS what its children took.
+  const stack = [];
+  eng.interpUntil = (done) => {
+    const at = eng.cpu.rip, before = eng.stats.interpreted;
+    stack.push(0);
+    try { return inner(done); }
+    finally {
+      const kids = stack.pop();
+      const excl = (eng.stats.interpreted - before) - kids;
+      if (stack.length) stack[stack.length - 1] += eng.stats.interpreted - before;
+      if (excl > 0) { viaInterpUntil.set(at, (viaInterpUntil.get(at) || 0) + excl); viaTotal += excl; }
+    }
+  };
+}
 const profileRound = (ms) => {
   const t0 = process.hrtime.bigint();
   while (Number(process.hrtime.bigint() - t0) / 1e6 < ms) {
@@ -318,6 +345,20 @@ if (profile) {
     if (where === 'main') where = 'in no mapped image';
     console.log(`    deopt ${String(n).padStart(6)}  0x${t.toString(16)}  ${where}` +
                 `  [${eng.aotFns.has(t) ? 'landing compiled' : 'landing NOT compiled - interpreter runs it'}]`);
+  }
+  console.log(`  interpreted VIA interpUntil (deopt/callout landings): ${viaTotal}` +
+              ` of ${total} = ${(viaTotal / (total || 1) * 100).toFixed(0)}%` +
+              ` over ${viaInterpUntil.size} landings`);
+  for (const [t, n] of [...viaInterpUntil].sort((a, b) => b[1] - a[1]).slice(0, 6)) {
+    let where = 'in no mapped image';
+    for (const m of (eng.maps || []))
+      if (t >= BigInt(m.at) && t < BigInt(m.at) + BigInt(m.len))
+        { where = `${m.path.split('/').pop()}+0x${(t - BigInt(m.at) + BigInt(m.off ?? 0)).toString(16)}`; break; }
+    // why is the interpreter running this at all?
+    const why = eng.aotFns.has(t) ? 'compiled (so this is a deopt INTO it)'
+              : eng.aotFailed.has(t) ? 'POISONED - compilation refused it'
+              : 'never compiled - no unit covers it';
+    console.log(`    ${String(n).padStart(6)}  0x${t.toString(16)}  ${where}  [${why}]`);
   }
   console.log('  hottest interpreted addresses:');
   for (const [rip, n] of top.slice(0, 10)) {

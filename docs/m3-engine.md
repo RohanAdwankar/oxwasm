@@ -475,3 +475,42 @@ asserting something the data did not support.
 What is still NOT established: that these deopts are what produce the 10,487
 interpreted steps attributed to `gtk+0x13adb0`. The attribution is by entry
 rip, the deopt log is by landing, and nothing yet connects one to the other.
+
+### #31 has a root cause: the capture missed the interactive path
+
+Attributing interpreted steps to the address that CAUSED them, rather than to
+whatever rip was current, settles it. Both `DeoptUnwind` catch sites and the
+uncompiled-callout path finish by calling `interpUntil()` with `cpu.rip` set to
+where they landed, so wrapping `interpUntil` charges interpretation to its
+cause. Charging each frame its delta minus its children's (the calls nest, and
+counting them inclusively totalled 112% of the round):
+
+```
+interpreted via deopt/callout landings: 12,489 of 13,565 = 92%, over 55 landings
+
+  7224  libgtk-x11+0x65040    [never compiled - no unit covers it]
+  1298  libgtk-x11+0x64f40    [never compiled]
+  1224  libgtk-x11+0x100a80   [never compiled]
+   444  libgtk-x11+0x677b0    [never compiled]
+   260  libgtk-x11+0x2452b0   [never compiled]
+   247  libgtk-x11+0x254a10   [never compiled]
+```
+
+**92% of the first interaction's interpreted work is code the pack-time capture
+never compiled**, and one function is 53% of it. Not a dispatch bug, not deopt
+quality, not the tiering threshold being wrong in principle: the manifest
+simply does not contain the interactive path these clicks take. Rounds 2+ drop
+to ~107 interpreted steps precisely because the call threshold compiles those
+functions after the first round pays for them.
+
+The fix is therefore capture coverage, and the tooling exists: a `guishot` run
+with `CLICK` driving this interaction and `UNITSOUT` recording the units it
+requests, repacked into the manifest.
+
+**And this is why the earlier reading had to be held.** The entry-attributed
+histogram put 77% of the work on `gtk+0x13adb0`, an address that IS compiled,
+which reads as "dispatch missed it". The causal attribution points at
+`gtk+0x65040`, a different function that was never compiled at all. One view
+counted where the engine happened to be; the other counts what caused the
+work. Acting on the first would have meant debugging a dispatch path that was
+working correctly.
