@@ -213,3 +213,41 @@ without the hash moving with it. The dead space from `FTMAP+16` to `FTHASH`
 (about 320KB) is where that growth would come from, together with the 8-byte
 slot change — but none of it is worth doing until something actually crosses
 13,173.
+
+## CPython 3.11: it runs, it just cannot exit
+
+The task tracking this said CPython "faults during startup", which was wrong,
+and the correction came from printing the guest's stdout rather than only its
+fault address.
+
+```
+python3 -S -c "print(6*7)"
+  pure interpreter : out: 42, then fault: 0xaf @rip 0x5241f5 after 15.28M insns
+  JIT (134 units)  : out: 42, then wasm "memory access out of bounds" at 4.30M
+```
+
+**It prints 42.** The `write` syscall is in both histograms. CPython loads its
+stdlib, compiles and executes Python code, produces correct output, and then
+crashes tearing the interpreter down. That is a shutdown-path defect, not a
+broken CPython, and the breadth story is much better than the task claimed.
+
+Two further facts narrow it hard.
+
+**Both tiers fail in the same function.** Bisecting the JIT on `unitFilter` -
+compile only the first N units, interpret the rest - names unit **134** exactly:
+133 is clean, 134 traps, and every point from 136 to 327 traps. Unit 134's
+entry is `0x524120`. The interpreter's fault is at `0x5241ee`, inside that same
+function - a walk over a 16-byte-stride table of object pointers, dereferencing
+`ob_type` and testing `Py_TPFLAGS_HAVE_GC`. One bug, two surfaces.
+
+**Which points at the decoder rather than at either executor.** The interpreter
+and the AOT emitter implement instruction semantics through entirely separate
+code paths, so a bug in one would normally show up as a divergence between
+them. They agree. What they share is `decode()` - and a misdecoded operand
+size or displacement would corrupt both identically.
+
+That makes the next tool a **decoder differential against objdump over whole
+binaries**, which tests the one component both tiers depend on and which the
+existing instruction-level differential (6,037 instructions against hardware)
+only samples. `shadowDispatch` is the wrong instrument here precisely because
+both sides would be wrong the same way.
