@@ -447,6 +447,64 @@ export function analyze(mem, entry, { maxInsns = 20000, noJtab = false } = {}) {
   return { blocks, bidx, M, calls, jtabs };
 }
 
+// Blocks that lie on a cycle in this function's CFG - iterative Tarjan, since
+// a 20,000-instruction function would blow the JS stack on the recursive one.
+// Call edges are deliberately not followed: the question is whether the CALL
+// SITE repeats, not whether the callee does.
+function cyclicBlocks(a0) {
+  const M = a0.M, N = a0.blocks.length;
+  const idx = (addr) => a0.bidx.has(addr.toString()) ? a0.bidx.get(addr.toString()) : -1;
+  const ide = (e) => e == null ? -1 : (a0.bidx.has(e) ? a0.bidx.get(e) : -1);
+  const succ = [];
+  for (let i = 0; i < N; i++) {
+    const insns = a0.blocks[i].insns, last = insns[insns.length - 1], next = last.next;
+    let out;
+    if (last.inlineTo !== undefined) out = [ide(last.inlineTo)];
+    else if (last.inlineRet !== undefined) out = [ide(last.inlineRet)];
+    else if (last.edgeT !== undefined) out = last.edgeF !== undefined
+      ? [ide(last.edgeT), ide(last.edgeF)] : [ide(last.edgeT)];
+    else if (last.edgeN !== undefined) out = [ide(last.edgeN)];
+    else if (last.mnem === 'jcc') out = [idx((next + last.rel) & M), idx(next)];
+    else if (last.mnem === 'jmp') out = [idx((next + last.rel) & M)];
+    else if (last.mnem === 'jmpind') {
+      const ts = a0.jtabs?.get(last.rip.toString());
+      out = ts ? ts.map(idx) : [];
+    }
+    else if (last.mnem === 'ret' || last.mnem === 'retn' || last.mnem === 'udec') out = [];
+    else out = [idx(next)];
+    succ.push(out.filter(v => v >= 0));
+  }
+  const index = new Int32Array(N).fill(-1), low = new Int32Array(N);
+  const onStack = new Uint8Array(N), stack = [], cyclic = new Set();
+  let counter = 0;
+  for (let root = 0; root < N; root++) {
+    if (index[root] >= 0) continue;
+    const work = [[root, 0]];
+    index[root] = low[root] = counter++; stack.push(root); onStack[root] = 1;
+    while (work.length) {
+      const frame = work[work.length - 1];
+      const [v, i] = frame;
+      if (i < succ[v].length) {
+        frame[1]++;
+        const w = succ[v][i];
+        if (index[w] < 0) {
+          index[w] = low[w] = counter++; stack.push(w); onStack[w] = 1;
+          work.push([w, 0]);
+        } else if (onStack[w]) low[v] = Math.min(low[v], index[w]);
+      } else {
+        work.pop();
+        if (work.length) { const u = work[work.length - 1][0]; low[u] = Math.min(low[u], low[v]); }
+        if (low[v] === index[v]) {
+          const comp = [];
+          for (;;) { const w = stack.pop(); onStack[w] = 0; comp.push(w); if (w === v) break; }
+          if (comp.length > 1 || succ[v].includes(v)) for (const w of comp) cyclic.add(w);
+        }
+      }
+    }
+  }
+  return cyclic;
+}
+
 // ---- inlining: splice a callee's blocks into the caller's analysis ---------
 // Why this exists, measured rather than assumed: the per-call charge is FIXED
 // at roughly 22 native instruction-times, and none of its three candidate
@@ -512,12 +570,28 @@ export function inlineCallees(a0, fnAddr, resolve, opts = {}) {
   }
   if (!cand.size) return null;
 
-  // Spend the duplication budget on the cheapest copies first, so a small
-  // callee at many sites wins over a large one at few.
+  // Choose call sites INSIDE LOOPS.
+  //
+  // The obvious idea was to rank by the engine's own call profile. It does
+  // not work, and the reason is worth writing down: aotCalls is a threshold
+  // detector, not a histogram. profileTarget stops counting at
+  // aotCallThreshold and stops entirely once a target is compiled - after
+  // which its calls run inside wasm where the interpreter never sees them.
+  // Dumped on gzip, every one of the top ten targets reads exactly 4. There
+  // is no ranking in it to use.
+  //
+  // A call site on a cycle in the caller's own CFG needs no profile at all,
+  // and it is the same population: gzip's hot callees are hot because they
+  // are called from the compression loop.
+  const inLoop = cyclicBlocks(a0);
+  const heat = (bi) => inLoop.has(bi) ? 1 : 0;
   const pick = new Map();                 // "bi:ii" -> { t, copy, retTo }
   let spent = 0, copyN = 0;
-  for (const site of sites.filter(x => cand.has(x.t))
-                          .sort((x, y) => cand.get(x.t).size - cand.get(y.t).size)) {
+  const loopOnly = opts.loopOnly !== false;
+  const ranked = sites.filter(x => cand.has(x.t) && (!loopOnly || heat(x.bi)))
+                      .sort((x, y) => (heat(y.bi) - heat(x.bi)) ||
+                                      (cand.get(x.t).size - cand.get(y.t).size));
+  for (const site of ranked) {
     const sz = cand.get(site.t).size;
     if (spent + sz > total) { no(site.t, 'over-total'); continue; }
     spent += sz;
@@ -2159,6 +2233,13 @@ const inlineTotal = () => Number(
 
 export function compileUnitWat(mem, entry, opts = {}) {
   const INLINE = inlineEnabled(), INLINE_BUDGET = inlineBudget(), INLINE_TOTAL = inlineTotal();
+  // Note on what inlining can NOT reach. Closure pruning drops a callee the
+  // host already has compiled and mapped, so a callee that tiered up before
+  // its caller is invisible to the inliner. Un-pruning small callees to get
+  // them back was tried and is far too expensive: it duplicates them into
+  // every unit that calls them, taking gzip from 380 emitted functions to 715
+  // and tier-up from 877ms to 4018ms. Pruning is worth more than inlining.
+  // The inliner works with what is in the closure.
   const ONLY = (typeof process !== 'undefined' && process.env?.OXWASM_INLINE_ONLY) || '';
   const INLINE_ONLY = ONLY ? new Set(ONLY.split(',').map(h => BigInt('0x' + h.trim()).toString())) : null;
   const { guestBase, ramBase, maxFuncs = 96, maxInsns = 20000, skip } = opts;

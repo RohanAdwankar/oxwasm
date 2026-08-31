@@ -392,6 +392,9 @@ export class LinuxEngine {
         // reach them via $ftr chaining, so re-including their bodies only
         // duplicates translation work and module bytes
         skip: (c) => this._ftSeen.has(BigInt(c)),
+        // the tiering call profile, so the inliner can pick targets by how
+        // often they are actually called rather than by what fits a budget
+        hot: this.aotCalls,
         // hosts whose assembler is wabt.js (itself wasm) choke on multi-MB
         // closure texts — child engines cap the unit size and chain instead
         ...(this.unitMaxFuncs ? { maxFuncs: this.unitMaxFuncs } : {}),

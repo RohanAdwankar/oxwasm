@@ -1220,3 +1220,31 @@ So the honest summary of this whole line of work: the call boundary was worth
 about 5% of one call-dense real program, the amortisation curve's *shape* was
 right and its coefficient was not, and the synthetic 8x never described
 anything a user runs.
+
+### Choosing what to inline: two ideas, one of which was wrong
+
+"Inline few, choose well" needs a way to choose. Two candidates, both tested
+before either was trusted.
+
+**The engine's own call profile does not work, and the reason is structural.**
+`aotCalls` looks like a frequency histogram and is not one — `profileTarget`
+stops counting at `aotCallThreshold` and stops entirely once a target is
+compiled, after which its calls run inside wasm where the interpreter never
+sees them. Dumped on gzip, every one of the top ten targets reads **exactly
+4**. There is no ranking in it. This killed the plan that had been written down
+as the obvious next step, in one command.
+
+**Call sites on a cycle in the caller's CFG work, and need no profile.** An
+iterative Tarjan SCC over the analysis (iterative because a 20,000-instruction
+function would blow the JS stack on the recursive one) marks the blocks that
+repeat; a call site in one of them is a call that repeats. On gzip this cuts
+inlining from 740 copies across 168 functions to **275 across 71** — 63% less
+duplicated code — and dispatch-mode functions from 112 back to 93.
+
+**And one thing inlining simply cannot reach.** Closure pruning drops a callee
+the host already compiled and mapped, so a callee that tiered up *before* its
+caller is invisible to the inliner. Un-pruning small callees to recover them
+was tried and is far worse than the problem: it duplicates them into every unit
+that calls them, taking gzip from 380 emitted functions to 715 and tier-up from
+877ms to 4018ms. Pruning is worth more than inlining. The inliner works with
+what is in the closure.
