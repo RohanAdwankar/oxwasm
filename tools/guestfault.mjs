@@ -34,6 +34,35 @@ if (!bin) { console.log('usage: guestfault.mjs <binary> [args...]'); process.exi
 add(bin, bin);
 for (const p of args) if (existsSync(p)) add(p, p);
 
+// How far the main image actually extends, from its PT_LOAD headers. Guessing
+// a fixed window instead put heap addresses inside the binary and labelled
+// them "_end+0xc8eb10" - a symbol offset past the end of the file, which is
+// the same mistake the CPython notes already record once.
+// ET_EXEC (2) loads at its own vaddrs, so the guest address IS the vaddr and
+// the load bias is 0; only ET_DYN is biased by the load base. Subtracting the
+// base unconditionally turned every python3 text address into a vaddr ~1.2MB
+// too low, which is why nothing resolved to a symbol and heap addresses came
+// back labelled "python3+... (_end+0xc8eb10)".
+const mainIsExec = (() => {
+  try { const b = readFileSync(bin); return new DataView(b.buffer, b.byteOffset, b.length).getUint16(16, true) === 2; }
+  catch { return false; }
+})();
+const mainSpan = (() => {
+  try {
+    const b = readFileSync(bin), dv = new DataView(b.buffer, b.byteOffset, b.length);
+    const phoff = Number(dv.getBigUint64(0x20, true));
+    const phentsize = dv.getUint16(0x36, true), phnum = dv.getUint16(0x38, true);
+    let end = 0n;
+    for (let i = 0; i < phnum; i++) {
+      const o = phoff + i * phentsize;
+      if (dv.getUint32(o, true) !== 1) continue;                 // PT_LOAD
+      const e = dv.getBigUint64(o + 0x10, true) + dv.getBigUint64(o + 0x28, true);
+      if (e > end) end = e;
+    }
+    return end || 0x2000000n;
+  } catch { return 0x2000000n; }
+})();
+
 const symCache = new Map();
 const syms = (path) => {
   if (symCache.has(path)) return symCache.get(path);
@@ -61,8 +90,9 @@ const locate = (eng, addr) => {
     return { path: m.path, off, label: `${m.path.split('/').pop()}+0x${off.toString(16)}` +
              (b ? ` (${b[1]}+0x${(off - b[0]).toString(16)})` : '') };
   }
-  if (addr >= eng.base && addr < eng.base + 0x2000000n) {
-    const off = addr - eng.base;
+  const bias = mainIsExec ? 0n : eng.base;
+  if (addr >= eng.base && addr < bias + mainSpan) {
+    const off = addr - bias;
     const b = nearest(syms(bin), off);
     return { path: bin, off, label: `${bin.split('/').pop()}+0x${off.toString(16)}` +
              (b ? ` (${b[1]}+0x${(off - b[0]).toString(16)})` : '') };
@@ -91,6 +121,22 @@ const eng = new LinuxEngine(new Uint8Array(readFileSync(bin)),
   { argv: [bin, ...args], env: ['PATH=/usr/bin:/bin', 'LANG=C', 'HOME=/root'],
     files, mtimes, memMB: Number(process.env.MEMMB || 512),
     ...(assembleWat ? { assembleWat } : {}) });
+// WATCH=0x1b29280,16 - log every write overlapping that range, with the rip
+// that made it. Memory's watchpoint fires before the store; the rep movs/stos
+// bulk fast paths go through mem.view() and TypedArray.set instead of
+// Memory.write, so OXWASM_NOBULK=1 is forced on here or a bulk copy over the
+// watched word would be invisible.
+const watchLog = [];
+if (process.env.WATCH) {
+  process.env.OXWASM_NOBULK = '1';
+  const [aS, nS] = process.env.WATCH.split(',');
+  const wa = BigInt(aS.trim()), wn = BigInt(nS || 8);
+  eng.mem.watchLo = wa; eng.mem.watchHi = wa + wn;
+  eng.mem.watch = (addr, n, v) => {
+    if (watchLog.length < 100000) watchLog.push([eng.cpu.rip, addr, n, v, eng.stats.interpreted]);
+  };
+}
+
 let err = null;
 try { let g = 0; while (eng.exitCode === null) { eng.run(5e6); if (eng.blocked) eng.wake();
         if (++g > 40000) { err = 'no exit'; break; } } }
@@ -101,15 +147,18 @@ console.log(`  exit=${eng.exitCode} stdout=${(eng.stdoutBytes||[]).reduce((a,b)=
             (assembleWat ? ` aotFns=${eng.aotFns.size}` : ' (pure interpreter)'));
 const at = locate(eng, eng.cpu.rip);
 console.log(`  rip -> ${at.label}`);
-console.log('  regs: ' + ['rax','rcx','rdx','rbx','rsp','rbp','rsi','rdi'].map(
-  (n,i)=>`${n}=${eng.cpu.regs[i].toString(16)}`).join(' '));
+const RN = ['rax','rcx','rdx','rbx','rsp','rbp','rsi','rdi',
+            'r8','r9','r10','r11','r12','r13','r14','r15'];
+for (let i = 0; i < 16; i += 4)
+  console.log('  ' + RN.slice(i, i+4).map((n,j)=>
+    `${n}=0x${eng.cpu.regs[i+j].toString(16)}`.padEnd(24)).join(''));
 
 // Disassemble a window around the faulting rip straight out of guest memory,
 // so a wrong instruction is read rather than guessed at.
 if (at.path) {
-  const lo = eng.cpu.rip - 32n, buf = Buffer.alloc(80);
+  const lo = eng.cpu.rip - 48n, buf = Buffer.alloc(112);
   try {
-    for (let i = 0; i < 80; i++) buf[i] = Number(eng.mem.read(lo + BigInt(i), 1n));
+    for (let i = 0; i < 112; i++) buf[i] = Number(eng.mem.read(lo + BigInt(i), 1n));
     const f = `/tmp/gf_dis_${process.pid}.bin`; writeFileSync(f, buf);
     const dis = execFileSync('bash', ['-c',
       `objdump -D -b binary -m i386:x86-64 --adjust-vma=0x${lo.toString(16)} ${f} 2>/dev/null | tail -n +8`],
@@ -122,6 +171,35 @@ if (at.path) {
     }
     unlinkSync(f);
   } catch (e) { console.log('  (disassembly unavailable:', e.message + ')'); }
+}
+
+// DUMP=r13,8 or DUMP=0x1b29280,8 - qwords around an address at fault time.
+// Whether a bad ob_type means the OBJECT was corrupted or the POINTER to it
+// was off is not decidable from registers alone; the neighbouring words say
+// which.
+for (const spec of (process.env.DUMP || '').split(';').filter(Boolean)) {
+  const [where, nS] = spec.split(',');
+  const n = Number(nS || 8);
+  const ri = RN.indexOf(where.trim());
+  let addr; try { addr = ri >= 0 ? eng.cpu.regs[ri] : BigInt(where.trim()); } catch { continue; }
+  console.log(`\n  memory at ${where.trim()} = 0x${addr.toString(16)}:`);
+  for (let i = -2; i < n; i++) {
+    const a = addr + BigInt(i * 8);
+    let v; try { v = eng.mem.read(a, 8n); } catch { console.log(`   +${i*8}  <unreadable>`); continue; }
+    const l = locate(eng, v);
+    console.log(`   ${(i*8 >= 0 ? '+' : '') + (i*8)}`.padEnd(8) +
+                `0x${a.toString(16)}  =  0x${v.toString(16)}`.padEnd(40) +
+                (l.path ? l.label : ''));
+  }
+}
+
+if (process.env.WATCH) {
+  console.log(`\n  writes to ${process.env.WATCH}: ${watchLog.length}`);
+  const show = watchLog.slice(-Number(process.env.WATCHN || 30));
+  if (watchLog.length > show.length) console.log(`   (last ${show.length})`);
+  for (const [rip, addr, n, v, ic] of show)
+    console.log(`   @${String(ic).padStart(10)}  0x${addr.toString(16)} <- ${n}B 0x${v.toString(16)}`.padEnd(52) +
+                `from ${locate(eng, rip).label}`);
 }
 
 console.log('\n  frame chain (rbp walk):');

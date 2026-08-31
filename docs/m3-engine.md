@@ -932,3 +932,69 @@ Nothing else moved. GIMP's wide-script replay is unchanged after the fix
 the same way at the same place (`0x5241f5`, 15.26M instructions, 3 bytes of
 stdout — "42\n"), so #35 is a genuinely separate bug and not another
 unbacked-heap symptom.
+
+### CPython: the mechanism, finally named
+
+`guestfault.mjs` grew what the parked note said it needed — all 16 registers,
+`DUMP=` for memory around an address, and `WATCH=addr,len` on the engine's
+existing write-watchpoint (forcing `OXWASM_NOBULK=1`, since the `rep
+movs`/`stos` fast paths bypass `Memory.write` and would hide a bulk copy over
+the watched word).
+
+**The faulting instruction, exactly.** `testb $0x40,0xa9(%rax)` with
+`rax = 6` — address `0xaf`, matching the reported fault. `0xa8` is `tp_flags`
+and bit 14 is `Py_TPFLAGS_HAVE_GC`, so this reads `obj->ob_type` and gets the
+integer 6. The enclosing loop, disassembled from the binary at its true
+address:
+
+```
+5241c4:  mov    -0x8(%r13),%rax      ; _gc_prev
+5241c8:  test   $0x2,%al             ; _PyGC_PREV_MASK_COLLECTING
+5241cc:  sub    $0x4,%rax            ; gc_decref: gc_refs live above _PyGC_PREV_SHIFT=2
+5241d0:  mov    %rax,-0x8(%r13)
+5241d4:  add    $0x1,%rbx            ; i++
+5241d8:  add    $0x10,%r12           ; entry += 16  (PyDictUnicodeEntry)
+5241e1:  mov    (%r12),%r13          ; obj = entry->key
+5241ea:  mov    0x8(%r13),%rax       ; obj->ob_type
+5241ee:  testb  $0x40,0xa9(%rax)     ; Py_TPFLAGS_HAVE_GC
+```
+
+`PyObject_GC_Del+0x20b5` — the GC's `subtract_refs` pass walking a dict.
+
+**The write history settles what happened.** Watching
+`[0x1b29280, 0x1b29290)` across the whole run, 23 writes:
+
+```
+@14592725  +8  <- 0x9284e0    (ob_type set: object created)
+@14592731  +0  <- 1           (refcount 1)
+           ... 2, 1, 2, 3, 2, 1 ...
+@14655717  +0  <- 0           refcount reaches ZERO
+@14655900  16B <- free-list   libc free() writes its links
+@14664677  16B <- 0           the block is REUSED
+@14667529  +0  <- 0x5efb4b0
+@15258914  +8  <- 6           written by THIS gc pass, from 0x5241d0
+```
+
+So: the object is freed at 14.65M instructions, the block is reallocated at
+14.66M, and at 15.26M the GC walks a dict that **still holds a pointer to
+it**. The 6 it reads as `ob_type` is a `gc_prev` word this very loop wrote on
+an earlier iteration, for the object now living 16 bytes higher. A textbook
+use-after-free, from a refcount that reached zero while a dict still
+referenced the object.
+
+That is the mechanism, which was not known before. What is still not known is
+**which** of the eight refcount writes is the wrong one — that needs a
+reference execution to diff against, so the reopen condition in the original
+note stands, now with the exact addresses and rips to diff.
+
+**Two tool bugs found and fixed on the way, both of the same family.**
+Disassembling a window from `rip-48` out of guest memory starts mid-instruction:
+it rendered `5241c4 mov -0x8(%r13),%rax` as `5241c5 mov -0x8(%rbp),%eax`, a
+32-bit load from a different register, which would have supported an entirely
+wrong story. And `locate()` subtracted the load base unconditionally, but
+python3 is **ET_EXEC** — non-PIE, loaded at its own vaddrs with bias 0 — so
+every text address came out ~1.2MB low and resolved to nothing, while heap
+addresses landed inside the binary and were labelled `python3+0x1728230
+(_end+0xc8eb10)`. A symbol offset past the end of the file is the tell, and
+this is the third time in these notes that assuming an address belongs to the
+main image has produced a confident wrong answer.
