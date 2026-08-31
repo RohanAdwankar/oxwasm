@@ -836,3 +836,43 @@ bytes directly, which skips the hex conversions and template formatting that
 string building costs. That is now the *correctly sized* case for a binary
 emitter: it targets 55% of 475ms of on-thread work, not the wabt parse,
 which is already off-thread.
+
+## Breadth: 24 of 25 unmodified system binaries, byte-identical
+
+`tools/breadth.mjs` runs unmodified dynamic PIE binaries from the system and
+requires stdout **and** exit status to match running them natively, byte for
+byte. Not a speed test — a generality test.
+
+```
+ok  wc head sort sort-n uniq grep grep-re sed tr cut base64 md5sum sha256
+ok  od seq factor expr printf nl fold paste bc gzip diff
+FAIL xz   threw: memory access out of bounds
+
+24/25 unmodified binaries byte-identical to native
+```
+
+These are all dynamically linked PIE executables, so every case also
+exercises the `ld.so` lane. `gzip -9` reproducing native's 7,815 output bytes
+exactly, and `md5sum`/`sha256sum` agreeing, are strong end-to-end checks —
+DEFLATE and the hash cores have no tolerance for a single wrong bit.
+
+**Two of the first four "failures" were the harness, and one was a real
+engine gap.** Worth recording, because a generality harness that corrupts its
+own evidence is worse than none:
+
+- `gzip` was reported as differing *from byte 1*. It was not. The harness
+  compared `eng.stdout`, the **string** view, which mangles every non-UTF-8
+  byte; `eng.stdoutBytes` holds the raw bytes. Binary output must be compared
+  as bytes. The tell was 0xFD replacement characters in the diff.
+- `tr` and `bc` produced nothing, which looks like a miscompile. **The engine
+  had no stdin at all** — fd 0 was hardcoded to an empty buffer, so every
+  filter reading stdin saw immediate EOF. fd 0 was already an ordinary read
+  handle over a byte buffer, so this was one line: a `stdin` option that
+  fills it. Both pass now, and so does any pipeline filter.
+
+**`xz` is a real bug, and it is not in the AOT.** Run with no assembler at
+all, the pure interpreter faults identically: rip `0x553f771`, fault address
+`0x21464d88`, after 282,115 instructions — early, during startup, long
+before any compression happens. Both tiers failing the same way is the same
+signature as the CPython case, and points below both executors at what they
+share.

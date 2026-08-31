@@ -38,7 +38,8 @@ export class LinuxEngine {
   // the tier's own test suites.
   constructor(elfBytes, { argv = ['prog'], env = [], memMB = 256, threshold = Infinity, files = {},
                           assembleWat = null, aotCallThreshold = 4, aotLoopThreshold = 12,
-                          xserver = null, mtimes = {}, tty = false, ttyRows = 24, ttyCols = 80 } = {}) {
+                          xserver = null, mtimes = {}, tty = false, ttyRows = 24, ttyCols = 80,
+                          stdin = null } = {}) {
     this.files = files;                       // path -> Uint8Array (read-only)
     // Terminal mode: with it off, ioctl answers ENOTTY for everything, so
     // isatty() is false, `tty` prints "not a tty", stty fails outright and a
@@ -61,7 +62,12 @@ export class LinuxEngine {
     // close(0); open(file) landing the file on fd 0.
     this.fds = new Map();
     this.cloexec = new Set();                 // fd numbers with FD_CLOEXEC (per-descriptor, not per-handle)
-    this.fds.set(0, { bytes: new Uint8Array(0), pos: 0 });
+    // fd 0 is an ordinary read handle over a byte buffer, so giving the guest
+    // real stdin is just filling it in. Without this every filter that reads
+    // stdin (tr, bc, and most of a shell pipeline) saw EOF immediately and
+    // produced nothing - which reads as a miscompile until you notice the
+    // program was handed no input.
+    this.fds.set(0, { bytes: stdin ? new Uint8Array(stdin) : new Uint8Array(0), pos: 0 });
     this.fds.set(1, { sink: 'out' });
     this.fds.set(2, { sink: 'err' });
 
