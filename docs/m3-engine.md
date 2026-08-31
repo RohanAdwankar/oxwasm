@@ -251,3 +251,38 @@ binaries**, which tests the one component both tiers depend on and which the
 existing instruction-level differential (6,037 instructions against hardware)
 only samples. `shadowDispatch` is the wrong instrument here precisely because
 both sides would be wrong the same way.
+
+### The decoder is not the CPython bug
+
+The reasoning that pointed at `decode()` — both tiers fail identically, and
+`decode()` is what they share — was sound, and wrong. `engine/diff/decodetest.mjs`
+now checks every instruction objdump finds in a real binary for the property
+that matters: **length**. A wrong length makes the next fetch start
+mid-instruction and desynchronises execution silently and identically in both
+tiers, which is exactly the shape `shadowDispatch` cannot see.
+
+| binary | lengths exact | wrong |
+|--------|--------------:|------:|
+| `/bin/true`, `/bin/gzip`, `/usr/bin/sha256sum` | 21,410 | **0** |
+| `/usr/bin/python3` | 691,630 | **0** |
+| `libc.so.6` | 374,515 | **0** |
+
+**1,066,145 instructions, zero length errors.** The hypothesis is dead, cheaply,
+and the suite gains a differential that covers the decoder rather than sampling
+it — the existing hardware differential checks 6,037 instructions.
+
+libc's 10,924 unsupported encodings are all AVX/AVX-512 (`vmovdqu`,
+`vpcmpeqb`, `kmovd`). They never execute: glibc selects implementations by
+IFUNC from CPUID, and the engine does not advertise AVX, so the SSE2 paths are
+taken. Unsupported is also the safe outcome — those become `udec` and deopt.
+
+One caveat, stated because it bounds the result: this checks length, not
+operand semantics. A misdecoded register or displacement keeps the length right
+and still corrupts. What it rules out is the desynchronisation class.
+
+**And it cost one probe bug to learn.** The first run reported 766 decoder
+errors. objdump splits an instruction longer than 7 bytes across two lines, and
+the continuation carries its own address with no mnemonic rather than being a
+bare indented byte run — so every long instruction looked 7 bytes long. The
+mismatches were all "ours longer than real", which is the tell: a decoder that
+was really wrong would err in both directions.
