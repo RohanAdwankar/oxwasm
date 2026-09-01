@@ -1587,3 +1587,44 @@ Against the project's goal — run unmodified binaries at native speed in wasm
 — this is the strongest statement the kernels can make: the translation, in
 the tier the platform gives hot code, is not the bottleneck anywhere but
 calls.
+
+### Decomposing the call tax: the platform floor is 2x, the protocol doubles it
+
+Both prior hypotheses died measured (funcref table; caller spill narrowing on
+a 4%-resolution harness). `bench/kernels/idealcall.mjs` measures what was
+never isolated — the call machinery itself — with five interleaved arms of
+the same k_call loop (`s += leaf(i) ^ leaf(s)`), every wasm callee carrying a
+never-taken branch of dead stores so V8's inliner cannot fold it away:
+
+| arm | 10M calls | vs native |
+|---|---:|---:|
+| native | 12.4ms | — |
+| plain (wasm param/result call) | 25.7ms | **2.08x** |
+| + stack-budget check per call | 23.5ms | 1.90x |
+| args through regfile slots | 23.1ms | 1.87x |
+| faithful (full spill protocol) | 43.8ms | **3.54x** |
+
+Three conclusions, sized against spreads of ±17–61%:
+
+1. **A bare non-inlined wasm call costs 2x native.** That is the platform
+   floor; no calling-convention change can beat it. It is also why opt-in
+   inlining measured 6–11% on real call-dense programs — inlining is the
+   only mechanism that removes the floor itself.
+2. **The budget check and memory-slot argument passing are free** within
+   noise — well-predicted branch, store-forwarded slots. Counting emitted
+   ops has now mispredicted three times.
+3. **The full protocol roughly doubles the floor** (3.54x): the part that
+   costs is the bulk regfile load/store at callee entry/exit plus the wide
+   caller spill, not any single component small experiments could see. The
+   engine's measured 6.4–8x still exceeds this reconstruction — the prime
+   suspect for the remainder is the xmm half of spillAll ("every touched
+   register plus all xmm"), which this model omits, plus real units' frame
+   size.
+
+The strategic consequence: straight-line code is at parity, calls are
+floored at 2x by V8 itself, so the remaining call-tax levers are (a)
+narrowing the *callee-side* protocol for direct in-unit calls — never
+tested; the dead experiment narrowed only the caller — and (b) promoting
+inlining from opt-in, whose main objection (+116ms tier-up, 55ms of it
+emission) is halved now that assembly runs off the main thread. Both are
+measurable next steps, not claims.
