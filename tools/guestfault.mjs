@@ -170,6 +170,48 @@ if (process.env.WATCH) {
 // without guessing which instruction is wrong.
 if (process.env.SHADOW) eng.shadowLib = process.env.SHADOW;
 
+// The rbp walk, reusable: it is as useful at a syscall trap as at a fault.
+const frames = () => {
+  const out = []; let rbp = eng.cpu.regs[5];
+  for (let i = 0; i < 20; i++) {
+    let ret, next;
+    try { next = eng.mem.read(rbp, 8n); ret = eng.mem.read(rbp + 8n, 8n); } catch { break; }
+    if (!ret || ret > 0x800000000n) break;
+    out.push(`#${i} ret 0x${ret.toString(16)} -> ${locate(eng, ret).label}`);
+    if (next <= rbp || next === 0n) break;
+    rbp = next;
+  }
+  return out;
+};
+
+// ONLYADDR=0x... - compile ONLY that entry, everything else interpreted. The
+// minimal reproducer for an AOT-only bug.
+if (process.env.ONLYADDR) {
+  const only = BigInt(process.env.ONLYADDR);
+  eng.unitFilter = (n, entry) => entry === only;
+}
+
+// BIGMMAP=<bytes> - when the guest asks mmap for more than this, print the
+// registers and the guest stack right there. A wrong LENGTH is computed by
+// the caller, not by the string routine that returned a bad pointer, so the
+// frame chain at the allocation names the code that actually went wrong -
+// which the faulting address alone never does.
+if (process.env.BIGMMAP) {
+  const lim = BigInt(process.env.BIGMMAP);
+  const orig = eng.syscall.bind(eng);
+  let fired = 0;
+  eng.syscall = (cpu) => {
+    if (cpu.regs[0] === 9n && cpu.regs[6] >= lim && fired < 3) {
+      fired++;
+      console.log(`\n*** mmap(len=0x${cpu.regs[6].toString(16)} = ${BigInt.asIntN(32, cpu.regs[6])} as i32) ` +
+                  `at rip 0x${cpu.rip.toString(16)} -> ${locate(eng, cpu.rip).label}`);
+      for (const l of frames()) console.log('    ' + l);
+    }
+    return orig(cpu);
+  };
+  eng.cpu.onSyscall = (cpu) => eng.syscall(cpu);
+}
+
 let err = null;
 try { let g = 0; while (eng.exitCode === null) { eng.run(5e6); if (eng.blocked) eng.wake();
         if (++g > 40000) { err = 'no exit'; break; } } }
@@ -241,12 +283,4 @@ if (process.env.WATCH) {
 }
 
 console.log('\n  frame chain (rbp walk):');
-let rbp = eng.cpu.regs[5];
-for (let i = 0; i < 20; i++) {
-  let ret, next;
-  try { next = eng.mem.read(rbp, 8n); ret = eng.mem.read(rbp + 8n, 8n); } catch { break; }
-  if (!ret || ret > 0x800000000n) break;
-  console.log(`   #${i} ret 0x${ret.toString(16)} -> ${locate(eng, ret).label}`);
-  if (next <= rbp || next === 0n) break;
-  rbp = next;
-}
+for (const l of frames()) console.log('   ' + l);

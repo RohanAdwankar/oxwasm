@@ -1333,3 +1333,44 @@ once execution is inside compiled code, a guest call or tail-jump to an
 address in the funcref table dispatches in wasm without returning to JS, and
 the shadow only sees JS-side dispatches. Counting actual entries to that rip
 against the 681 shadow attempts would confirm it, and is the next step.
+
+### The call site, named: `str.rpartition` in importlib's path handling
+
+`BIGMMAP=<bytes>` traps the moment the guest asks `mmap` for more than a
+threshold and walks the guest stack right there. A wrong *length* is computed
+by the caller, not by the string routine that returned a bad pointer, so the
+frame chain at the allocation names the code that actually went wrong — which
+a faulting address never does:
+
+```
+*** mmap(len=0xff6a8000 = -9797632 as i32) at mmap64+0x2c
+    #2 malloc+0x1a2
+    #3 _PyUnicode_FromASCII+0x172
+    #4 PyUnicode_RPartition+0x16c
+    #5 _PyObject_Call_Prepend ... #11 PyImport_ImportModuleLevelObject+0x8a4
+```
+
+`PyUnicode_RPartition` — `str.rpartition` — is a **reverse** partition, and
+the compiled function at `0x5ccce80` is a reverse string search. The chain is
+therefore: rpartition asks for the last occurrence of a separator, the
+compiled search returns a pointer below the start of the string, and
+`_PyUnicode_FromASCII` is handed `p - start` as a negative length.
+
+`str.rpartition` is not in the test program. Running
+`print('a/b/c'.rpartition('/'))`, `'hello world'.rsplit(' ')` and a plain
+string concatenation all fail **identically**, at the same
+`_install_external_importers` frame and within 13k instructions of each
+other — the rpartition is importlib's own path splitting during startup, so
+there is no smaller Python-level reproducer. The minimal reproducer stays the
+one at the engine level: compile that single function and CPython cannot
+import.
+
+What is still unexplained is the contradiction with the shadow, which
+compared 681 entries to that function and found register, xmm, flag, fs-base
+and journaled-memory equality every time. Either the failing call is not
+among those 681, or the difference is in something none of those cover. The
+next experiment does not go through `shadowDispatch` at all: log
+`(rdi, rsi, rdx) -> rax` on every dispatch of `0x5ccce80` in the compiled run
+and compare against the same call sequence interpreted. That answers "does
+this function ever return the wrong thing" directly, without depending on the
+machinery whose blind spots are the open question.
