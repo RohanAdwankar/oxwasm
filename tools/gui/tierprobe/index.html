@@ -1,0 +1,33 @@
+<!doctype html><meta charset="utf-8"><title>tier test</title>
+<pre id="out">running...</pre>
+<script>
+// The engine's dispatch shape: enter a wasm function ONCE and loop tens of
+// millions of iterations inside it. In node 22 this stays in Liftoff and
+// runs ~2.7x slower than TurboFan. Does Chrome behave the same? Three
+// probes, all timed per call of run(30M):
+//   calls 1..6 on a compileStreaming'd module   - does per-call time drop
+//     (call-count tiering), stay flat-slow (stuck in Liftoff), or start
+//     fast (OSR / synchronous top-tier)?
+// A reload of this page answers the code-cache half: compileStreaming from
+// the SAME URL should hit Chrome's implicit code cache and start top-tier.
+const N = 30000000n;
+const log = [];
+(async () => {
+  const t0 = performance.now();
+  const { module } = await WebAssembly.instantiateStreaming(
+    fetch('faithful.wasm'), { js: { mem: new WebAssembly.Memory({ initial: 256 }) } });
+  const compileMs = performance.now() - t0;
+  const mem = new WebAssembly.Memory({ initial: 256 });
+  const inst = await WebAssembly.instantiate(module, { js: { mem } });
+  const runs = [];
+  for (let i = 0; i < 6; i++) {
+    new Uint8Array(mem.buffer, 1 << 20, 8192).fill(0);
+    const t = performance.now();
+    inst.exports.run(N);
+    runs.push(+(performance.now() - t).toFixed(1));
+  }
+  const r = { compileMs: +compileMs.toFixed(1), runs };
+  document.getElementById('out').textContent = JSON.stringify(r);
+  window.__result = r;
+})().catch(e => { document.getElementById('out').textContent = 'ERR ' + e; window.__result = { err: String(e) }; });
+</script>

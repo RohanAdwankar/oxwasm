@@ -16,7 +16,11 @@ import { gzipSync } from 'node:zlib';
 
 const [dir, port = '8080', mbpsS = '0'] = process.argv.slice(2);
 if (!dir) { console.error('usage: serve.mjs DIR [port] [throttleMbps]'); process.exit(1); }
-const TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.mjs': 'text/javascript' };
+// application/wasm is load-bearing: WebAssembly.compileStreaming refuses any
+// other content-type, and streaming compilation is the form Chrome's implicit
+// code cache applies to - the tier-occupancy lever depends on it.
+const TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.mjs': 'text/javascript',
+                '.wasm': 'application/wasm' };
 
 const bps = +mbpsS * 125000;                     // Mbit/s -> bytes/s
 let tokens = 0, lastRefill = Date.now();

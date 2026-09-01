@@ -1501,3 +1501,33 @@ units in its top tier. On the product side the candidate is compiled-module
 caching across visits (Chrome preserves TurboFan code for structured-cloned
 `WebAssembly.Module`s in IndexedDB), which the page's existing IndexedDB
 unit store could carry; that is a follow-up, not a claim.
+
+### The tier question, answered on the product platform
+
+`tools/gui/tierprobe/` runs the emitter-shaped loop in real Chromium: a cold
+visit and a reload in one profile, six timed calls of `run(30M)` each.
+
+```
+cold  : compile 10.7ms  runs [70.2, 14.6, 16.6, 16.3, 14.5, 14.7]
+reload: compile  4.5ms  runs [15.8, 14.4, 14.5, 16.9, 16.9, 17.9]
+```
+
+**Chrome tiers a wasm function after one call.** The first call runs its 30M
+iterations in Liftoff (~3.5x); every later call is top-tier. No OSR rescues
+a first call mid-loop, in Chrome or node. **And a reload starts top-tier
+from call 1** — same-URL `compileStreaming` hits Chrome's implicit code
+cache (`serve.mjs` now sends `application/wasm`, which that API requires).
+
+This also dissolves the node/engine discrepancy: the kernels harness calls
+`k_mem` **once** per process, so its only call is the Liftoff call — the
+4.1x row measured the pathological once-called shape, and node's dynamic
+tiering never got a second call to act on. Real programs re-enter their hot
+functions, get top-tier code from the second call on, and their exposure is
+one Liftoff pass per function — the same first-use transient the capture
+work already targets — not a permanent multiple.
+
+The remaining shippable lever is the reload path: the page compiles units
+from bytes out of `app.units.gz`, and buffer compiles get no implicit code
+cache. Serving units as streamed same-URL `.wasm` would start repeat visits
+top-tier, at the cost of a packaging change. Follow-up, with the measurement
+above as its justification.
