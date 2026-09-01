@@ -130,6 +130,16 @@ const CASES = [
   ['strings', '/usr/bin/strings', [IN]],
   ['cksum',   '/usr/bin/cksum',   [IN]],
   ['sha512',  '/usr/bin/sha512sum', [IN]],
+  // a real repo, read paths: object walk + index + worktree stat. The
+  // fixture at /tmp/breadth_repo is committed with pinned dates so the
+  // hash is stable; safe.directory silences ownership checks that would
+  // otherwise depend on who stat() says owns the files.
+  ['git-log',   '/usr/bin/git', ['-C', '/tmp/breadth_repo', '-c', 'safe.directory=*', 'log', '--format=%H %s'],
+                { tree: '/tmp/breadth_repo' }],
+  ['git-status','/usr/bin/git', ['-C', '/tmp/breadth_repo', '-c', 'safe.directory=*', 'status', '--porcelain'],
+                { tree: '/tmp/breadth_repo' }],
+  // the write path: init creates the .git tree from nothing
+  ['git-init',  '/usr/bin/git', ['init', '-q', '/tmp/fresh_repo']],
 ];
 const STDIN = { tr: readFileSync(IN), bc: Buffer.from('scale=20\n7/3\n2^64\nsqrt(2)\nquit\n'),
                 jq: Buffer.from('{"a": 3, "b": 4}\n{"a": 10, "b": -2}\n'),
