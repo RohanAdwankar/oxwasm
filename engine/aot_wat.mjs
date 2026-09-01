@@ -756,6 +756,12 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   // are cached (a miss cached forever would pin a later-registered callee
   // onto the x_callout path); fti is stored +1 so the zero-filled empty
   // slot reads back as a miss even against a zero key.
+  // A miss on an OCCUPIED slot is evidence the site is polymorphic (perl's
+  // runloop dispatches every pp_* op through one callind site); refilling
+  // would thrash - probe + full $ftr + stores every call measured 10% WORSE
+  // than no cache. One collision demotes the site for good: key becomes -1,
+  // which matches no real target, and the site pays one buffered store per
+  // call on top of the plain probe it would have paid anyway.
   const icResolve = (keyExpr) => {
     const ic = icAlloc && icAlloc();
     if (!ic) return `(local.set $fti (call $ftr ${keyExpr}))`;
@@ -763,8 +769,10 @@ function emitUnitFunction(a0, fnAddr, ctx) {
         (then (local.set $fti (i32.sub (i32.load (i32.const ${ic + 8})) (i32.const 1))))
         (else (local.set $fti (call $ftr ${keyExpr}))
               (if (i32.ge_s (local.get $fti) (i32.const 0))
-                (then (i64.store (i32.const ${ic}) ${keyExpr})
-                      (i32.store (i32.const ${ic + 8}) (i32.add (local.get $fti) (i32.const 1)))))))`;
+                (then (if (i64.eqz (i64.load (i32.const ${ic})))
+                  (then (i64.store (i32.const ${ic}) ${keyExpr})
+                        (i32.store (i32.const ${ic + 8}) (i32.add (local.get $fti) (i32.const 1))))
+                  (else (i64.store (i32.const ${ic}) (i64.const -1))))))))`;
   };
   const MM = a0.M;
   // successors (by address-order index) for each block

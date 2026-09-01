@@ -32,6 +32,10 @@ for (const d of ['/lib/x86_64-linux-gnu', '/usr/lib/x86_64-linux-gnu', '/lib64']
     if (lstatSync(r).isFile()) add(join(d, f), r); } catch {} }
 }
 add('/etc/ld.so.cache', '/etc/ld.so.cache');
+const walk = (d) => { let e; try { e = readdirSync(d); } catch { return; }
+  for (const f of e) { const hp = join(d, f); let st; try { st = lstatSync(hp); } catch { continue; }
+    if (st.isDirectory()) walk(hp); else { try { add(hp, realpathSync(hp)); } catch {} } } };
+for (const d of (process.env.TREE || '').split(':').filter(Boolean)) walk(d);
 const bin = process.argv[2], args = process.argv.slice(3);
 add(bin, bin);
 for (const p of (process.env.INFILE || '').split(':').filter(Boolean)) add(p, p);
