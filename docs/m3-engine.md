@@ -1929,3 +1929,25 @@ buckets attribute the ~32ms to neither wait nor work (both ~0), so
 what those two frames actually contain — rAF pipelining, compositor
 latency, or instrumentation gap — is unmeasured, and it is the next
 question the stroke number depends on.
+
+### The stroke's 32ms, accounted for
+
+`cdp_latprof.mjs` (page lever `?latprof`) splits the previously
+unattributed input→paint span — cdp_draw's wait/work buckets turned out
+to be vestigial fields the page no longer fills. Median decomposition
+over a 24-step stroke:
+
+```
+input -> inject   4.3ms   the event waiting for a pump slice to pick it up
+inject -> blit   17.5ms   guest brush work (~9ms, ≈3x native - the standing
+                          engine band) + rAF alignment (~8ms)
+total            27.2ms   (tail samples to ~113ms: tier-up/GC bursts)
+```
+
+Native GIMP spends ~3ms of brush work inside a ~16ms vsync frame; the
+page pays the same work at engine speed plus one rAF alignment. The two
+levers this exposes, in order of cheapness: blit on damage instead of
+waiting for the next rAF (~8ms, at the cost of decoupling from the
+compositor), and the call-dense 3x itself (the pack-time linking
+project). The 4.3ms pickup could also shrink by injecting motion on
+event arrival rather than at the next slice boundary.

@@ -254,6 +254,7 @@ function sha1hex(str) {
     if (qs.has('nojtab')) globalThis.__noJtab = true;  // organic compiles without jump tables
     if (qs.has('noftab')) globalThis.__noFtab = true;  // no wasm-to-wasm chaining
     if (qs.has('noinline')) globalThis.__inline = false; // runtime units without hot-callee inlining (bisect lever; inlining is on by default)
+    if (qs.has('latprof')) window.__oxLatProf = true;  // per-input {in,inject} + {in,blit} pairs: where a stroke's latency lives
     if (qs.has('trap')) {
       const od = eng.dispatchAot.bind(eng);
       let n = 0, last = 0;
@@ -343,6 +344,7 @@ function sha1hex(str) {
   // so Nth-interaction latency is a measured number, not a feeling.
   const t0 = performance.now();
   const LAT = window.__oxLat = { samples: 0, sumMs: 0, maxMs: 0, hist: new Array(12).fill(0), pumpMaxMs: 0 };
+  if (window.__oxLatProf) LAT.trace = [];
   const inputQ = []; let lastInputT = 0;
   let blitPending = false;
   // zero-delay re-arm: nested setTimeout(0) is clamped to ~4ms by the
@@ -361,6 +363,8 @@ function sha1hex(str) {
       blit();
       const now = performance.now();
       while (inputQ.length) {
+        const tIn = inputQ[0];
+        if (LAT.trace) LAT.trace.push({ in: +tIn.toFixed(1), blit: +now.toFixed(1) });
         const dt = now - inputQ.shift();
         LAT.samples++; LAT.sumMs += dt; if (dt > LAT.maxMs) LAT.maxMs = dt;
         LAT.hist[Math.min(11, Math.max(0, Math.floor(Math.log2(Math.max(1, dt)))))]++;
@@ -380,7 +384,9 @@ function sha1hex(str) {
     { if (inputQ.length) lastInputT = inputQ[inputQ.length - 1];
       const busy = (typeof pendingMove !== 'undefined' && pendingMove != null) || start - lastInputT < 2000;
       eng.tierMsMax = busy ? 2 : (xs.ptr.buttons ? 2 : 8); }   // never 0: a hot uncompiled entry must be able to compile its way out mid-interaction
-    if (typeof pendingMove !== 'undefined' && pendingMove) { if (pendingMove.t !== undefined) inputQ.push(pendingMove.t); xs.injectMotion(pendingMove[0], pendingMove[1]); pendingMove = null; }
+    if (typeof pendingMove !== 'undefined' && pendingMove) { if (pendingMove.t !== undefined) { inputQ.push(pendingMove.t);
+        if (LAT.trace) LAT.trace.push({ in: +pendingMove.t.toFixed(1), inject: +performance.now().toFixed(1) }); }
+      xs.injectMotion(pendingMove[0], pendingMove[1]); pendingMove = null; }
     eng.sliceDeadline = start + 12;                  // honored INSIDE run(): deep callouts preempt too
     eng.chainFuel = 2048;                            // in-wasm chains re-check the clock every ~2k calls
     let mode = 'ran', deadline = null;
