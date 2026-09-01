@@ -1374,3 +1374,61 @@ next experiment does not go through `shadowDispatch` at all: log
 and compare against the same call sequence interpreted. That answers "does
 this function ever return the wrong thing" directly, without depending on the
 machinery whose blind spots are the open question.
+
+## The AOT CPython bug: `bsr` clobbered a destination hardware preserves
+
+The chase ended one layer deeper than every probe so far, and the probes'
+blind spots were half the story.
+
+**Resolving the shadow contradiction.** The lockstep shadow compared 681
+entries of the culprit function and found them identical — while the failing
+call never went through it. Three dispatch paths execute a compiled
+function's wasm without touching `dispatchAot`: the PLT-stub wasm's `$ftr`
+tail-call chain, the JS-closure stub's direct `cachedFn()`, and the
+deopt/callout chains. The shadow and every rip-keyed probe watched the JS
+boundary; the actual traffic flowed in-wasm through the stubs. The chain of
+eliminations that proved it: `NOFTAB` (empty funcref table) still failed;
+compile-but-`DISCARD` passed; `CHAINSLOW` still failed; and wrapping the
+registered export (`REGWRAP`) caught **one call** once `NOFTAB` forced all
+traffic through the JS map:
+
+```
+BAD rdi=0x958870 rsi=0x2e rdx=0x1a -> rax=0xffffffff expected 0x0
+```
+
+Twenty-six bytes searched backwards for `'.'` — importlib splitting a dotted
+module name — with **no dot present**. Correct answer: NULL. Compiled
+answer: `0xffffffff`. And `0xffffffff - 0x958870 = 0xff6a778f`, the exact
+neighbourhood of the 4GB mmap.
+
+**The bug.** Intel documents `bsf`/`bsr`'s destination as undefined when the
+source is zero; real Intel and AMD silicon leave it **unmodified**, and
+glibc's hand-written string asm depends on that: `__memrchr` ends its scan
+with `bsr %eax,%eax; je ret`, returning the untouched rax as its not-found
+NULL. The interpreter already guarded the write (`if (v !== 0n)`); the AOT
+emitted `31 - clz(0) = -1` unconditionally. One tier preserved the register,
+the other wrote `0xffffffff` into it — which is why CPython imported cleanly
+interpreted and could not import compiled.
+
+Fixed by skipping the write entirely when the source is zero, preserving the
+full 64-bit destination exactly as the silicon does. The rewrite incidentally
+fixed a second latent bug the regression test then surfaced on old code:
+16-bit `bsr` scanned the full 32-bit register and could report a bit above
+bit 15 (`0x1f` where hardware says `0xf`).
+
+**Regression test** (`engine/diff/bsrtest.mjs`, in the suite): part 1 pins
+the silicon behaviour itself via `./stepper` — including zero-source
+destination preservation, which the manuals refuse to promise — 36/36; part
+2 pins AOT == interpreter on the same cases, 36/36 with the fix and 23/36
+without it.
+
+**Result: CPython 3.11 runs end-to-end in BOTH tiers.** Full AOT: exit 0,
+"42" on stdout, 2,265 compiled functions, 897k interpreted instructions —
+against 20.7M interpreted in the pure-interpreter run, so the compiled tier
+is carrying the run. Suite green, breadth 26/26.
+
+Two morals worth keeping. Every differential in this engine compares what
+its author thought the boundary was — the shadow's boundary was JS dispatch,
+and three busier doorways bypassed it; instrumentation now counts what it
+did NOT compare. And "architecturally undefined" is not "unused": real
+software is written against what the silicon does.

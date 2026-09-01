@@ -191,6 +191,90 @@ if (process.env.ONLYADDR) {
   eng.unitFilter = (n, entry) => entry === only;
 }
 
+// NOFTAB=1 - register compiled functions for JS dispatch only, skipping the
+// funcref table and the FTMAP/FTHASH map (the engine's own __noFtab bisect
+// lever). With JS dispatches of the culprit measured at ZERO and the run
+// still failing, this splits the remaining world in two: if the failure
+// disappears, the vector is the in-wasm side of registration; if it stays,
+// neither executing nor mapping the function explains it.
+if (process.env.NOFTAB) globalThis.__noFtab = true;
+
+// NOJTAB=1 - analyze() without jump-table discovery (the page's ?nojtab
+// lever). If compiling the unit breaks the program even though the unit is
+// never executed, the compile step's own side effects are the suspects, and
+// jtab discovery is the analyzer's most invasive phase.
+if (process.env.NOJTAB) globalThis.__noJtab = true;
+
+// CHAINSLOW=1 - the engine's own diagnostic: disable the wasm-to-wasm
+// fastpaths in x_callout chaining and deopt-landing chaining. The PLT stub
+// closure's direct cachedFn() call is NOT gated by it, so this splits the
+// three dispatchAot-bypassing entry paths into two testable halves.
+if (process.env.CHAINSLOW) eng.chainSlow = true;
+
+// REGWRAP=1 (with TRACEFN=<addr>): after the unit registers, replace the
+// aotFns entry for that address with a logging wrapper around the raw wasm
+// export. The funcref table keeps the RAW function (a JS wrapper is not a
+// funcref), but the paths that bypassed every earlier probe - the PLT stub
+// closure's cachedFn() and the deopt/callout chains - all consult aotFns, so
+// they get the wrapper. When it fires, guest registers live in the wasm
+// REGFILE (dispatchAot's syncOut already ran), so args are read from
+// regview, not cpu.regs. And because the callee is a reverse byte search,
+// the EXPECTED result is computable in JS from guest memory right here:
+// scan [rdi, rdi+rdx) for the byte in rsi from the top. A recorded mismatch
+// is the miscompile, caught in the act with its inputs.
+const wrapLog = [];
+if (process.env.REGWRAP && process.env.TRACEFN) {
+  const target = BigInt(process.env.TRACEFN);
+  const origReg = eng.registerAotFn.bind(eng);
+  eng.registerAotFn = (a, f) => {
+    origReg(a, f);
+    if (a !== target || typeof f !== 'function') return;
+    const raw = eng.aotFns.get(a);
+    eng.aotFns.set(a, (...xs) => {
+      const rv = eng.regview;
+      const rdi = BigInt.asUintN(64, rv[7]), rsi = BigInt.asUintN(64, rv[6]), rdx = BigInt.asUintN(64, rv[2]);
+      const out = raw(...xs);
+      const rax = BigInt.asUintN(64, eng.regview[0]);
+      let expect = null;
+      if (rdx > 0n && rdx < 65536n) {
+        try { expect = 0n;
+          for (let i = rdx - 1n; i >= 0n; i--)
+            if (Number(eng.mem.read(rdi + i, 1n)) === Number(rsi & 0xFFn)) { expect = rdi + i; break; }
+        } catch { expect = null; }
+      }
+      if (wrapLog.length < 100000)
+        wrapLog.push({ rdi, rsi, rdx, rax, expect, bad: expect !== null && rax !== expect });
+      return out;
+    });
+  };
+}
+
+// DISCARD=1 - let compileUnitWat run for the allowed unit, then fail its
+// assembly so nothing registers. Splits "analyzing/emitting the function"
+// from "having it registered": if this run still fails, the compile step
+// corrupts shared state all by itself.
+if (process.env.DISCARD) {
+  const orig = eng.assembleWat;
+  if (orig) eng.assembleWat = (wat) => {
+    if (process.env.ONLYADDR && wat.includes('f_' + BigInt(process.env.ONLYADDR).toString(16)))
+      throw new Error('discarded by DISCARD=1');
+    return orig(wat);
+  };
+}
+
+// REGLOG=1 - log every registerAotFn: which address, whether the function
+// object is the traced unit's (a PLT-stub ALIAS registers the callee's wasm
+// under the stub's own address, which is an entry door TRACEFN by rip would
+// never see).
+if (process.env.REGLOG) {
+  const orig = eng.registerAotFn.bind(eng);
+  eng.registerAotFn = (a, f) => {
+    const tf = process.env.TRACEFN ? eng.aotFns.get(BigInt(process.env.TRACEFN)) : null;
+    console.log(`  [reg] 0x${a.toString(16)}${f === tf && tf ? '  <- ALIAS of traced fn' : ''}${f && f.jsStub ? ' (jsStub)' : ''}`);
+    return orig(a, f);
+  };
+}
+
 // BIGMMAP=<bytes> - when the guest asks mmap for more than this, print the
 // registers and the guest stack right there. A wrong LENGTH is computed by
 // the caller, not by the string routine that returned a bad pointer, so the
@@ -210,6 +294,37 @@ if (process.env.BIGMMAP) {
     return orig(cpu);
   };
   eng.cpu.onSyscall = (cpu) => eng.syscall(cpu);
+}
+
+// TRACEFN=0x... - log every JS-side dispatch of that entry: argument
+// registers in, rax out, and HOW it was reached (top-level vs nested under a
+// shadow's compiled side). This funnels through dispatchAot, which both the
+// plain path and the shadow's compiled side call, so comparing its count
+// against the shadow's tried-count answers the open question directly: are
+// there executions the shadow never compared? Only in-wasm drive re-entries
+// can escape this counter.
+const fnTrace = [];
+if (process.env.TRACEFN) {
+  // Trace by the WASM FUNCTION's identity, not by the entry rip. A PLT stub
+  // in another image aliases to the same compiled function and dispatches at
+  // the STUB's rip - filtering on rip missed every aliased entry, and a
+  // shadow scoped to libc's address range missed the aliases living in
+  // python3. Function identity catches them all; the rip column then shows
+  // which door each call came through.
+  const target = BigInt(process.env.TRACEFN);
+  const orig = eng.dispatchAot.bind(eng);
+  eng.dispatchAot = (f) => {
+    const tf = eng.aotFns.get(target);
+    const hit = f === tf || (f && f.jsStub && eng.cpu.rip !== target);
+    if (!tf || !hit) return orig(f);
+    const r = eng.cpu.regs;
+    const rec = { rip: eng.cpu.rip, rdi: r[7], rsi: r[6], rdx: r[2], rcx: r[1],
+                  nested: !!eng._shadowBusy };
+    const exit = orig(f);
+    rec.out = eng.cpu.regs[0]; rec.exit = exit;
+    if (fnTrace.length < 200000) fnTrace.push(rec);
+    return exit;
+  };
 }
 
 let err = null;
@@ -271,6 +386,34 @@ for (const spec of (process.env.DUMP || '').split(';').filter(Boolean)) {
                 `0x${a.toString(16)}  =  0x${v.toString(16)}`.padEnd(40) +
                 (l.path ? l.label : ''));
   }
+}
+
+if (process.env.REGWRAP && process.env.TRACEFN) {
+  const bad = wrapLog.filter(t => t.bad);
+  console.log(`\n  wrapped calls of ${process.env.TRACEFN}: ${wrapLog.length}, MISMATCHES: ${bad.length}`);
+  for (const t of bad.slice(0, 8))
+    console.log(`   BAD rdi=0x${t.rdi.toString(16)} rsi=0x${t.rsi.toString(16)} rdx=0x${t.rdx.toString(16)}` +
+                ` -> rax=0x${t.rax.toString(16)} expected 0x${t.expect.toString(16)}`);
+  for (const t of wrapLog.slice(-5))
+    console.log(`   last rdi=0x${t.rdi.toString(16)} rsi=0x${t.rsi.toString(16)} rdx=0x${t.rdx.toString(16)}` +
+                ` -> rax=0x${t.rax.toString(16)}${t.expect !== null ? ` (exp 0x${t.expect.toString(16)})` : ''}`);
+}
+
+if (process.env.TRACEFN) {
+  const nested = fnTrace.filter(t => t.nested).length;
+  console.log(`\n  dispatches of ${process.env.TRACEFN}: ${fnTrace.length} via dispatchAot ` +
+              `(${nested} nested under a shadow)` +
+              (eng._shadowStats ? `; shadow tried=${eng._shadowStats.tried}` : ''));
+  const doors = new Map();
+  for (const t of fnTrace) { const k = t.rip.toString(16); doors.set(k, (doors.get(k) || 0) + 1); }
+  console.log('  entry rips: ' + [...doors].map(([k, n]) => `0x${k} x${n}`).join('  '));
+  // the interesting ones: a reverse search returning a pointer BELOW the
+  // haystack makes the caller's p - start negative
+  const bad = fnTrace.filter(t => t.out !== 0n && t.out < t.rdi);
+  console.log(`  results below rdi (suspect for p - start < 0): ${bad.length}`);
+  for (const t of fnTrace.slice(-10))
+    console.log(`   rdi=0x${t.rdi.toString(16)} rsi=0x${t.rsi.toString(16)} rdx=0x${t.rdx.toString(16)}` +
+                ` -> rax=0x${t.out.toString(16)}${t.nested ? '  [nested]' : ''}`);
 }
 
 if (process.env.WATCH) {

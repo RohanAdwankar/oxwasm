@@ -1749,15 +1749,25 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           break; }
         case 'bsf': case 'bsr': {
           // dst = index of lowest (bsf) / highest (bsr) set bit; ZF <- src==0.
-          // For src==0 the result is architecturally undefined — wasm ctz/clz
-          // give the width, harmless since the consumer branches on ZF.
+          // For src==0 Intel documents the destination as undefined, but real
+          // Intel and AMD hardware LEAVE IT UNMODIFIED — and glibc's
+          // hand-written string asm relies on that: __memrchr does
+          // `bsr %eax,%eax; je ret`, returning the untouched rax as its
+          // not-found NULL. Writing 31-clz(0) = -1 here instead sent
+          // 0xffffffff back as a "found" pointer, str.rpartition computed a
+          // negative length from it, and CPython could not import a module
+          // under the AOT tier. The interpreter already guarded this write;
+          // the emitter must too: skip the write entirely when src is zero,
+          // which also preserves the full 64-bit destination exactly as the
+          // hardware does.
+          const t = T();
+          L.push(`(local.set ${t} ${rd(insn.src, S, next)})`);
           const S8 = S === 8;
-          const s = rd(insn.src, S, next);
           const e = insn.mnem === 'bsf'
-            ? (S8 ? `(i64.ctz ${s})` : `(i64.extend_i32_u (i32.ctz ${rd32(insn.src,next)}))`)
-            : (S8 ? `(i64.sub (i64.const 63) (i64.clz ${s}))` : `(i64.extend_i32_u (i32.sub (i32.const 31) (i32.clz ${rd32(insn.src,next)})))`);
-          if (producers.has(ii)) { L.push(`(local.set $fr ${s})`); flagState = { kind: 'logic', size: S }; }
-          L.push(wr(insn.dst, S, e, next));
+            ? (S8 ? `(i64.ctz (local.get ${t}))` : `(i64.extend_i32_u (i32.ctz (i32.wrap_i64 (local.get ${t}))))`)
+            : (S8 ? `(i64.sub (i64.const 63) (i64.clz (local.get ${t})))` : `(i64.extend_i32_u (i32.sub (i32.const 31) (i32.clz (i32.wrap_i64 (local.get ${t})))))`);
+          if (producers.has(ii)) { L.push(`(local.set $fr (local.get ${t}))`); flagState = { kind: 'logic', size: S }; }
+          L.push(`(if (i64.ne (local.get ${t}) (i64.const 0)) (then ${wr(insn.dst, S, e, next)}))`);
           break; }
         case 'bswap': {
           const bs32 = (e) => `(i32.or (i32.or (i32.shl ${e} (i32.const 24)) (i32.and (i32.shl ${e} (i32.const 8)) (i32.const 16711680))) (i32.or (i32.and (i32.shr_u ${e} (i32.const 8)) (i32.const 65280)) (i32.shr_u ${e} (i32.const 24))))`;

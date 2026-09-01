@@ -40,5 +40,6 @@ node enginetest.mjs
 node atomictest.mjs
 node fcmptest.mjs
 node cmppstest.mjs
+node bsrtest.mjs
 node strtest.mjs
 node decodetest.mjs
