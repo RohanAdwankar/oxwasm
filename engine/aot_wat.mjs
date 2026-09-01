@@ -749,8 +749,12 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   // probe miss (chain collision or unregistered target, the hash is 40%
   // loaded) falls back to the full $ftr walk, whose result is bit-identical
   // by construction: same hash, same table, same sentinel.
+  // On by default: full gate green with it on (suite both states, breadth
+  // 31/31), and perl steady state measured 0.934x/0.871x across two
+  // independent A/B runs - a 7-13% win on call-dense code. Opt out with
+  // OXWASM_FASTDISP=0 or globalThis.__fastDisp = false.
   const fastDisp = globalThis.__fastDisp ??
-    (typeof process !== 'undefined' && process.env?.OXWASM_FASTDISP === '1');
+    !(typeof process !== 'undefined' && process.env?.OXWASM_FASTDISP === '0');
   let usesIcp = false;
   const icResolve = (keyExpr) => {
     if (!fastDisp) return `(local.set $fti (call $ftr ${keyExpr}))`;

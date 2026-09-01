@@ -1802,6 +1802,39 @@ questions before building: whether registerAotFn can re-register an
 address with a different table slot (would need a generation word to
 gate ICs), and where the IC slots live (the 128KB between FTHASH's end
 at 0xE0000 and RAMOFF).
+
+### From inline caches to an inlined probe — and default-on
+
+The IC was built, and reality corrected the design twice:
+
+1. **The perl A/B caught the megamorphic failure mode**: perl's runloop
+   dispatches every pp_* op through ONE callind site, so the 1-entry
+   cache missed, refilled, and thrashed — 1.100x, 10% *worse* than no
+   cache. First-collision demotion (key ← −1, permanently) brought it
+   back to noise. The general lesson: interpreter-style guests funnel
+   calls through few megamorphic sites, where per-site caching cannot
+   win by construction.
+2. **The six-arm idealdisp then showed the IC was the wrong shape
+   entirely**: ftr 7.58x, IC hit path 5.60x, the same first probe
+   *inlined at the site* 4.85x, bare call_indirect 3.17x. The largest
+   single cost was the `$ftr` wasm call boundary itself (~3.7ns/call),
+   not the probe.
+
+So the IC machinery was removed and every resolution site — callind,
+out-of-unit direct calls, tailJmp — now inlines the hash and first
+probe, with the full `$ftr` walk as the first-probe-miss fallback
+(chain collision or unregistered target; the hash is 40% loaded).
+Bit-identical by construction: same hash, same table, same sentinel.
+Stateless, invalidation-free, and it works for megamorphic sites.
+
+Measured on perl (two-N, reps of 5): **0.934x and 0.871x across two
+independent runs** (second outside its ±8% spread) — a 7–13%
+steady-state win on call-dense code; fastdisp+narrow combined measured
+0.864x, i.e. narrowing still adds nothing on top. Full gate green
+(suite both lever states, breadth 31/31), so `fastDisp` is now
+**default-on**; opt out with `OXWASM_FASTDISP=0` /
+`globalThis.__fastDisp = false`. Packed pages pick it up on their next
+repack, since the pack pipeline shares `compileUnitWat`.
 3. Narrowing stays **opt-in**: perf-neutral steady state at current
    resolution, and its on-thread analysis costs ~+25% startup in
    realab (perl small runs: 14.7s vs 11.6s). If it is ever promoted,
