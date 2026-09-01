@@ -1951,3 +1951,67 @@ waiting for the next rAF (~8ms, at the cost of decoupling from the
 compositor), and the call-dense 3x itself (the pack-time linking
 project). The 4.3ms pickup could also shrink by injecting motion on
 event arrival rather than at the next slice boundary.
+
+### Slice-end paint is the default
+
+The cheap lever landed: the pump now blits at the end of the slice that
+dirtied the framebuffer instead of scheduling the next rAF, and drains
+the input queue at the same point (which also removes the 4.3ms pickup —
+the next motion event is consumed the moment the previous paint is on
+screen). `?rafblit` restores the compositor-aligned path.
+
+Paired latprof A/B, twice, second time on a quiet box (load 0.14):
+
+```
+                 first pair     quiet-box rerun
+slice-end paint    19.8ms          18.3ms   (1.4ms pickup + 16.6 work)
+?rafblit           35.5ms          34.2ms   (4.7ms pickup + 28.6 work)
+```
+
+A verification round between the two degraded across BOTH arms (box load
+3.1 from an unrelated tenant, partial ink even under `?rafblit`) and is
+recorded as box noise, not evidence — the same lesson as the wall-clock
+kernel runs: on this box only same-run paired arms mean anything. At
+~18ms input→paint the stroke sits at about 1.2x a native 16ms frame;
+what remains is the ~9ms guest brush work (≈3x native, the standing
+call-dense band) that pack-time linking would address.
+
+### Breadth 60: epoll, and what a guest's stderr is worth
+
+Eight new cases: four coreutils lanes the sweep lacked (`sum`, `pr`,
+`ptx`, `shuf` — the last with `--random-source=` pinned to the input
+file, making the permutation a pure function of provisioned bytes), two
+busybox applets, and two more real interpreters, ruby 3.3 and php 8.4.
+busybox is the sweep's first statically linked binary — entry straight
+at `_start`, no PT_INTERP, no ld.so — and it passed untouched, which
+retroactively certifies a whole lane the dynamic cases never exercise.
+
+ruby and php both failed on the first run, and the fix that mattered was
+to the harness before the engine: breadth now prints the guest's own
+stderr, the syscalls that hit the ENOSYS default, and (under
+`BREADTH_STRACE=1`) a ring of the last 400 syscalls with decoded paths.
+That turned two identical "exit 127 vs native 0" lines into three
+distinct root causes in one run each:
+
+- **ruby**: `[BUG] epoll_create (errno:38)` — the engine had no epoll at
+  all. It now implements create/create1/ctl/wait/pwait as a
+  level-triggered scan over the same readiness sources poll uses
+  (EPOLLET accepted and ignored — with the whole machine in one JS
+  thread, a level scan at each wait is observationally close enough).
+- **ruby, second failure**: a silent exit 1 that the strace ring decoded
+  as `clone3=ENOSYS` (glibc falls back to clone — harmless) followed by
+  a run of `mmap=-ENOMEM` at ~500MB: ruby reserves that much address
+  space at boot and gives up quietly when refused. Case config, not
+  engine: `memMB: 1024`.
+- **php**: `*** buffer overflow detected ***` — a glibc fortify abort
+  immediately after `openat("/usr/share/zoneinfo/")=-ENOENT`. php scans
+  the system tzdata at startup; with the directory unprovisioned it
+  takes a fallback that aborts. Provisioning the tree (2MB, the same
+  files native scans) makes it byte-identical. The fallback-path abort
+  itself is a reproducible lead — drop the tree and it returns — that
+  could yet be an engine miscompile in code native rarely runs; parked,
+  since the provisioned path is the faithful comparison.
+
+The pattern across all three: the failure printout that names the
+guest's complaint (a [BUG] line, an errno, a path) converts a debugging
+session into a diff read. Suite green, breadth 60/60.
