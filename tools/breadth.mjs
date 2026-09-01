@@ -36,7 +36,11 @@ add('/etc/group', '/etc/group');
 // /usr/lib/file - provision the path the guest OPENS, not the target)
 add('/etc/magic', '/etc/magic');
 add('/etc/magic.mime', '/etc/magic.mime');
+add('/etc/localtime', '/etc/localtime');
 add('/usr/share/misc/magic.mgc', '/usr/share/misc/magic.mgc');
+// ruby finds libruby through its RUNPATH (/opt/rbenv/...), a directory the
+// standard lib-dir sweep never visits - provision the path its ld.so opens
+add('/opt/rbenv/versions/3.3.6/lib/libruby.so.3.3', '/opt/rbenv/versions/3.3.6/lib/libruby.so.3.3');
 
 // A shared input, written once so native and engine see identical bytes.
 const IN = '/tmp/breadth_in.txt';
@@ -130,6 +134,25 @@ const CASES = [
   ['strings', '/usr/bin/strings', [IN]],
   ['cksum',   '/usr/bin/cksum',   [IN]],
   ['sha512',  '/usr/bin/sha512sum', [IN]],
+  ['sum',     '/usr/bin/sum',     [IN]],
+  ['pr',      '/usr/bin/pr',      ['-t', '-2', '-w', '80', IN]],
+  ['ptx',     '/usr/bin/ptx',     ['-w', '60', IN]],
+  // --random-source pinned to the input file makes the permutation a pure
+  // function of provisioned bytes - byte-identical native vs engine
+  ['shuf',    '/usr/bin/shuf',    ['--random-source=' + IN, IN]],
+  // statically linked: the no-ld.so lane end to end (entry straight at
+  // _start, static TLS, no PT_INTERP), which nothing else in the sweep hits
+  ['busybox-sh',  '/usr/bin/busybox', ['sh', '-c', 'i=0; while [ $i -lt 10 ]; do echo bb$i; i=$((i+1)); done']],
+  ['busybox-md5', '/usr/bin/busybox', ['md5sum', IN]],
+  // ruby's VM reserves ~500MB of address space at boot and exits 1 (silently)
+  // when mmap says ENOMEM - it needs headroom above breadth's 512MB default
+  ['ruby',    '/opt/ruby-3.3.6/bin/ruby', ['--disable-gems', '-e', 'puts 6*7; puts (1..100).sum; puts "breadth".chars.sort.join'],
+              { memMB: 1024 }],
+  // php scans the system tzdata at startup; with the directory missing it
+  // takes a fallback that dies in a fortify abort ("buffer overflow
+  // detected") - provision the tree so engine and native walk the same world
+  ['php',     '/usr/bin/php8.4', ['-n', '-r', 'echo 6*7, "\n", array_sum(range(1,100)), "\n", strrev("breadth"), "\n";'],
+              { tree: '/usr/share/zoneinfo' }],
   // a real repo, read paths: object walk + index + worktree stat. The
   // fixture at /tmp/breadth_repo is committed with pinned dates so the
   // hash is stable; safe.directory silences ownership checks that would
@@ -161,6 +184,7 @@ const engine = (bin, args, stdin, opts = {}) => {
     { argv: [bin, ...args], env: ['PATH=/usr/bin:/bin', 'HOME=/root', 'LANG=C'],
       files, mtimes, memMB: opts.memMB || 512, assembleWat, stdin });
 
+  if (process.env.BREADTH_STRACE) eng.strace = [];
   const t0 = process.hrtime.bigint();
   let err = null;
   try {
@@ -178,7 +202,8 @@ const engine = (bin, args, stdin, opts = {}) => {
   const raw = eng.stdoutBytes && eng.stdoutBytes.length
     ? Buffer.concat(eng.stdoutBytes.map(b => Buffer.from(b)))
     : Buffer.from(eng.stdout.join(''), 'binary');
-  return { out: raw, code: eng.exitCode,
+  return { out: raw, code: eng.exitCode, stderr: (eng.stderr || []).join(''),
+           unknown: [...(eng.unknown || [])], strace: eng.strace,
            ms: Number(process.hrtime.bigint() - t0) / 1e6,
            units: eng.aotFns.size, insns: eng.stats.interpreted, err };
 };
@@ -204,6 +229,11 @@ for (const [name, bin, args, opts] of CASES) {
       : `stdout ${eng.out.length}B vs native ${nat.out.length}B`;
     failures.push([name, why]);
     console.log(`  FAIL ${name.padEnd(9)} ${why}`);
+    // the guest's own words first: "error while loading shared libraries:
+    // libfoo" is a provisioning gap, a fault address is an engine bug
+    if (eng.stderr) console.log(`         guest stderr: ${JSON.stringify(eng.stderr.slice(0, 300))}`);
+    if (eng.unknown.length) console.log(`         ENOSYS syscalls: ${eng.unknown.join(' ')}`);
+    if (eng.strace) console.log(`         last syscalls:\n           ${eng.strace.slice(-60).join('\n           ')}`);
     if (!eng.err && eng.out.length && nat.out.length) {
       let i = 0; while (i < eng.out.length && i < nat.out.length && eng.out[i] === nat.out[i]) i++;
       console.log(`         first difference at byte ${i}`);

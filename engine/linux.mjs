@@ -1192,7 +1192,17 @@ export class LinuxEngine {
     const nr = Number(cpu.regs[0]);
     const [a1, a2, a3] = [cpu.regs[7], cpu.regs[6], cpu.regs[2]];   // rdi rsi rdx
     this.stats.syscalls[nr] = (this.stats.syscalls[nr] || 0) + 1;
-    const ret = (v) => { cpu.regs[0] = BigInt.asUintN(64, v); };
+    // strace ring: the last few hundred (nr, args, ret) tuples, kept only when
+    // switched on - reading a silent exit 1 out of a guest needs the tail of
+    // its syscall history, not a fault address
+    const ret = this.strace
+      ? (v) => { cpu.regs[0] = BigInt.asUintN(64, v);
+                 let ps = '';   // decode the path argument of the fs family
+                 try { if (nr === 257 || nr === 262) ps = ' "' + this.readPath(a2) + '"';
+                       else if (nr === 2 || nr === 21 || nr === 89 || nr === 4 || nr === 6) ps = ' "' + this.readPath(a1) + '"'; } catch {}
+                 this.strace.push(`${nr}(${a1.toString(16)},${a2.toString(16)},${a3.toString(16)})=${BigInt.asIntN(64, v)}${ps}`);
+                 if (this.strace.length > 400) this.strace.shift(); }
+      : (v) => { cpu.regs[0] = BigInt.asUintN(64, v); };
     // resolve a write target: stdout / stderr sink, or a pipe buffer
     const defSink = (fd) => this.fds.get(fd) ?? (fd === 1 ? { sink: 'out' } : fd === 2 ? { sink: 'err' } : undefined);
     const writeChunk = (fd, addr, len) => {
@@ -1878,6 +1888,54 @@ export class LinuxEngine {
         const fd = this.allocFd();
         this.fds.set(fd, { ev: { count: BigInt(Number(a1)), nonblock: !!(Number(a2) & 0x800), sem: !!(Number(a2) & 1) } });
         ret(BigInt(fd)); break; }
+      // ---- epoll: level-triggered readiness over the same sources poll sees.
+      // EPOLLET/ONESHOT are accepted and ignored - with the whole machine in
+      // one thread of JS, a level scan at each wait is observationally close
+      // enough. ruby 3.3 aborts at boot ([BUG] epoll_create errno:38) if this
+      // family is missing, which is what forced it to exist.
+      case 213: case 291: {                                   // epoll_create / epoll_create1
+        const fd = this.allocFd();
+        this.fds.set(fd, { ep: { interest: new Map() } });
+        ret(BigInt(fd)); break; }
+      case 233: {                                             // epoll_ctl(epfd, op, fd, event*)
+        const h = this.fds.get(Number(a1));
+        if (!h?.ep) { ret(-9n); break; }                      // EBADF
+        const op = Number(a2), tfd = Number(a3);
+        if (op === 2) { h.ep.interest.delete(tfd); ret(0n); break; }   // DEL
+        // epoll_event is packed on x86-64: u32 events + u64 data = 12 bytes
+        const v = new DataView(this.wmem.buffer), o = this.RAMOFF + Number(cpu.regs[10] - this.base);
+        const events = v.getUint32(o, true), data = v.getBigUint64(o + 4, true);
+        if (op === 1 && h.ep.interest.has(tfd)) { ret(-17n); break; }  // ADD -> EEXIST
+        if (op === 3 && !h.ep.interest.has(tfd)) { ret(-2n); break; }  // MOD -> ENOENT
+        h.ep.interest.set(tfd, { events, data }); ret(0n); break; }
+      case 232: case 281: {                                   // epoll_wait / epoll_pwait
+        const h = this.fds.get(Number(a1));
+        if (!h?.ep) { ret(-9n); break; }
+        const maxev = Number(a3);
+        const timeoutMs = Number(BigInt.asIntN(32, cpu.regs[10] & 0xFFFFFFFFn));
+        const readyR = (t) => !t ? false
+          : t.sock ? !!(t.sock.conn && t.sock.conn.readable())
+          : t.pipe ? (t.pipe.chunks.length > 0 || !!t.pipe.weof)
+          : t.ev ? t.ev.count > 0n
+          : !!t.bytes;
+        this.jsnap(a2, maxev * 12);
+        const v = new DataView(this.wmem.buffer), base = this.RAMOFF + Number(a2 - this.base);
+        let n = 0;
+        for (const [tfd, it] of h.ep.interest) {
+          if (n >= maxev) break;
+          const t = this.fds.get(tfd);
+          if (!t) continue;                                   // closed while registered: dropped, like real epoll
+          let re = 0;
+          if ((it.events & 1) && readyR(t)) re |= 1;          // EPOLLIN
+          if (it.events & 4) re |= 4;                         // EPOLLOUT: always writable
+          if (re) { v.setUint32(base + n * 12, re, true); v.setBigUint64(base + n * 12 + 4, it.data, true); n++; }
+        }
+        const now = this.nowMs();
+        if (n > 0 || timeoutMs === 0 || (this._deadline != null && now >= this._deadline)) {
+          this._deadline = null; ret(BigInt(n)); break;
+        }
+        this._deadline ??= (timeoutMs < 0 ? Infinity : now + timeoutMs);
+        this.block(this._deadline === Infinity ? null : this._deadline); break; }
       case 13: case 14: ret(0n); break;                       // rt_sigaction / rt_sigprocmask
       case 131: ret(0n); break;                               // sigaltstack
       case 99: {                                              // sysinfo: modest plausible box
