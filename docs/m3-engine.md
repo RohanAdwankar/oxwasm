@@ -1432,3 +1432,25 @@ its author thought the boundary was — the shadow's boundary was JS dispatch,
 and three busier doorways bypassed it; instrumentation now counts what it
 did NOT compare. And "architecturally undefined" is not "unused": real
 software is written against what the silicon does.
+
+## Breadth: 31/31, with CPython, perl, openssl and a shell script in the sweep
+
+With both silicon-semantics bugs fixed, the sweep grew the binaries most
+likely to keep them honest:
+
+- **python3** `-S -c` with the full stdlib tree, runs the two-tier pipeline
+  that took `movhlps` and `bsr` to make work. It stays in the sweep so
+  neither can regress silently. 2,315 compiled functions, byte-identical.
+- **perl** — which found the next gap immediately: it opens `/dev/null`
+  during startup and exits 2 when it cannot, and the engine had no
+  `/dev/null`. (Printing guest stderr made this a one-line diagnosis:
+  "Can't open /dev/null".) Added as a device in `openat`: empty backing
+  bytes make read (EOF), fstat and lseek behave through the ordinary file
+  paths, and write gets a one-line discard case. Not a miscompile — a
+  filesystem hole.
+- **openssl** `dgst -sha256` and `enc -base64`, and **sh** with a loop.
+
+`tree:` is now a per-case option (an interpreter is not one file; without
+its stdlib CPython would measure its own startup failure).
+
+**31/31 unmodified binaries byte-identical to native**, suite green.

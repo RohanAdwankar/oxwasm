@@ -53,6 +53,16 @@ const assembleWat = (wat) => {
   return b;
 };
 
+// tree: provision a whole directory (an interpreter is not one file - without
+// its stdlib CPython never reaches main, and the case would measure its own
+// startup failure). Walked once per distinct tree.
+const walked = new Set();
+const walk = (d) => { if (walked.has(d)) return; walked.add(d);
+  let e; try { e = readdirSync(d); } catch { return; }
+  for (const f of e) { const hp = join(d, f);
+    let st; try { st = lstatSync(hp); } catch { continue; }
+    if (st.isDirectory()) walk(hp); else { try { add(hp, realpathSync(hp)); } catch {} } } };
+
 const CASES = [
   ['wc',      '/usr/bin/wc',      ['-l', '-w', '-c', IN]],
   ['head',    '/usr/bin/head',    ['-n', '5', IN]],
@@ -83,6 +93,15 @@ const CASES = [
   ['xz-1',    '/usr/bin/xz',      ['-1', '-c', IN]],
   ['gzip',    '/bin/gzip',        ['-9', '-c', IN]],
   ['diff',    '/usr/bin/diff',    ['-u', IN, IN]],
+  ['sh',      '/bin/sh',          ['-c', 'echo start; for i in 1 2 3; do echo line $i; done; echo done']],
+  ['perl',    '/usr/bin/perl',    ['-e', 'my $s=0; $s+=$_ for 1..100; print "sum=$s\n"; print join(",", map { $_*$_ } 1..8), "\n"']],
+  ['openssl', '/usr/bin/openssl', ['dgst', '-sha256', IN]],
+  ['openssl-b64', '/usr/bin/openssl', ['enc', '-base64', '-in', IN]],
+  // The two-tier CPython case that took two silicon-semantics bugs to make
+  // pass (movhlps moving the wrong half, bsr clobbering a preserved
+  // destination). It stays in the sweep so neither can regress silently.
+  ['python3', '/usr/bin/python3', ['-S', '-c', 'print(6*7); print(sorted("breadth")); print(sum(range(100)))'],
+              { tree: '/usr/lib/python3.11', memMB: 1024 }],
 ];
 const STDIN = { tr: readFileSync(IN), bc: Buffer.from('scale=20\n7/3\n2^64\nsqrt(2)\nquit\n') };
 
@@ -129,6 +148,7 @@ for (const [name, bin, args, opts] of CASES) {
   if (!pick(name)) continue;
   if (!existsSync(bin)) { console.log(`  SKIP ${name.padEnd(9)} (${bin} not present)`); continue; }
   const stdin = STDIN[name] || null;
+  if (opts && opts.tree) walk(opts.tree);
   const nat = native(bin, args, stdin);
   const eng = engine(bin, args, stdin, opts);
   // compare the bytes, not a summary: a truncated stdout that happens to

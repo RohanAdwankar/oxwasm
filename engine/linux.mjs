@@ -1211,6 +1211,7 @@ export class LinuxEngine {
         let v = 0n; for (let i = 7; i >= 0; i--) v = (v << 8n) | BigInt(bytes[i] ?? 0);
         h.ev.count += v; this.wakeAllBlk(); return;
       }
+      if (h?.devnull) return;                                // /dev/null: discard, count as written
       if (h && h.bytes !== undefined && h.writable) {        // regular file opened for writing
         if (h.path) (this.dirtyFiles ??= new Set()).add(h.path);
         const end = h.pos + bytes.length;
@@ -1611,6 +1612,15 @@ export class LinuxEngine {
         // and `tty` reports its name. Only present in terminal mode.
         {
           const np = this.norm(p);
+          if (np === '/dev/null') {
+            // Empty backing bytes make read (EOF), fstat (size 0) and lseek
+            // behave through the ordinary file paths; only write needs its
+            // discard case in writeChunk. Found by perl, which opens
+            // /dev/null during startup and exits 2 when it cannot.
+            const fd = this.allocFd();
+            this.fds.set(fd, { bytes: new Uint8Array(0), pos: 0, writable: true, devnull: true });
+            ret(BigInt(fd)); break;
+          }
           if (np === '/dev/ptmx') {                          // allocate a pty pair
             const fd = this.allocFd();
             this.fds.set(fd, this.ptmxHandle(this.newPty()));
