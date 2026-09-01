@@ -1880,6 +1880,15 @@ a same-day standing check:
   Same-day interleaved or paired arms remain the only trusted
   comparison, as every corrected claim in this document keeps
   re-learning.
+- **perl, defaults vs ALL levers off: 0.985x inside ±5%** (startup 5%
+  of the big run — the cleanest perl measurement yet). Read together
+  with fastdisp-alone at 0.87–0.93x, the levers pull opposite ways on
+  perl: fast dispatch wins ~10% and inlining gives most of it back
+  (perl's call sites are indirect, so inlining can only duplicate code
+  it cannot devirtualize). On gzip the roles reverse. The defaults are
+  a net win on call-direct workloads and a wash on indirect-dispatch
+  interpreters — a future refinement could gate inlining on the
+  direct-call share of the profile.
 3. Narrowing stays **opt-in**: perf-neutral steady state at current
    resolution, and its on-thread analysis costs ~+25% startup in
    realab (perl small runs: 14.7s vs 11.6s). If it is ever promoted,
