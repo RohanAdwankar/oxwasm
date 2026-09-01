@@ -1557,3 +1557,33 @@ strokes almost certainly landed on no open image, so the stroke-path flush
 cadence went unmeasured here. The conclusion stands on the menu data, since
 a flush recomposites everything regardless of what changed, making its cost
 shape-independent.
+
+### The full kernel table under the top tier: straight-line parity
+
+The `--no-liftoff` table was reported abandoned when its 66-minute timeout
+expired — wrongly: the harness buffers output until it exits, and the
+completed table was sitting in the pipe. It is the definitive version of the
+per-class picture (N auto-calibrated per kernel, up to 52 *billion*
+iterations for `alu`, reps interleaved, startup under 11% everywhere):
+
+| kernel | default tiers | TurboFan forced | spread |
+|---|---:|---:|---:|
+| alu | 2.7x | **0.87x** | ±4% |
+| mem | 4.1x | **1.01x** | ±9% |
+| subw | 3.4x | **1.07x** | ±4% |
+| branch | 1.8x | **1.07x** | ±4% |
+| muldiv | 1.6x | **1.02x** | ±5% |
+| call | 9.5x | **6.37x** | ±3% |
+
+**Every straight-line class runs at native parity under the top tier** —
+`alu` measurably faster than the gcc -O2 binary. The whole 1.6–4.1x
+straight-line gap in the standing table was Liftoff occupancy, and per the
+Chromium probe, top-tier code is what real programs get from the second call
+of each function onward. The one remaining gap with a mechanism of its own
+is the call tax: 6.37x even in TurboFan, consistent with the earlier finding
+that it is a fixed ~22-instruction charge per call.
+
+Against the project's goal — run unmodified binaries at native speed in wasm
+— this is the strongest statement the kernels can make: the translation, in
+the tier the platform gives hot code, is not the bottleneck anywhere but
+calls.
