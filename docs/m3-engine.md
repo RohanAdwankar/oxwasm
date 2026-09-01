@@ -1653,3 +1653,47 @@ box contention, worth its own investigation, not a miscompile.
 `inlineEnabled` now defaults to true; opt out with `OXWASM_INLINE=0` or
 `globalThis.__inline = false` (page lever `?noinline`). The suite was
 re-run on the shipped default path after the flip.
+
+### Sizing the callee-side narrowing lever
+
+Lever (a) — narrowing the callee's regfile protocol — was sized before
+building it, with two new idealcall arms: `calleeonly` (the bulk
+8-load/8-store callee under a minimal caller + budget) and `narrowed`
+(the full 9-spill faithful caller over a callee that loads only the
+register it reads and stores only the one it writes — the shape a
+def/use-narrowed callee would emit). Two interleaved runs of 9 reps,
+10M calls each:
+
+| arm | run A | run B | spread |
+|---|---:|---:|---:|
+| plain | 22.3ms | 22.2ms | ±20–22% |
+| budget | 40.3ms | 40.2ms | ±9% |
+| regmem | 33.3ms | 34.0ms | ±12–58% |
+| faithful | 107.0ms | 81.8ms | ±4–7% |
+| calleeonly | 80.0ms | 80.8ms | ±5–12% |
+| narrowed | 66.1ms | 65.6ms | ±3–4% |
+
+(native ≈13.5ms at ±87% spread — this box regime is not the one the
+original five-arm table ran in; cross-run absolutes are incomparable,
+within-run interleaved deltas are the signal.)
+
+Three findings:
+
+1. **The bulk callee protocol is the largest stable cost**: over the
+   budget+minimal-caller base (40.2ms), it adds +40.6ms — and a
+   def/use-narrowed callee under an even *heavier* caller adds only
+   +25.4ms. Every callee-narrowing comparison wins by ≥15ms/10M calls
+   (≥1.5ns/call) in both runs. The lever is real; the emitter already
+   narrows to `touched(r)`, so the buildable refinement is dataflow:
+   entry-load only read-before-def registers, spill only dirty ones at
+   interior calls, reload only live ones after — and the same for xmm,
+   where `xSpillAll` spills every used register at every call site.
+2. **The faithful arm is bimodal across runs** (107.0 vs 81.8 at ±4–7%
+   within-run spread) — the 9-store caller spill costs 27ms in one
+   regime and ~nothing in the other. Conclusions that depend on it are
+   recorded per-run, not averaged.
+3. **Correction: the budget wrap is not free.** The five-arm table
+   measured budget within noise of plain; in this regime it reproduces
+   at +18ms/10M calls (~0.9ns per wrap) twice, outside both arms'
+   spreads. The earlier "free within noise" was a property of that
+   run's regime, not of the check.

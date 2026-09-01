@@ -14,6 +14,12 @@
 //   faithful  the emitter's full protocol: caller spills 9 regs + budget
 //             check, callee loads 8 regs at entry and stores 8 at exit,
 //             caller reloads 9 - the shape the README's dump shows
+//   calleeonly  faithful's callee (8 loads in, 8 stores out) under regmem's
+//             minimal caller + budget - isolates the callee half
+//   narrowed  faithful's caller over a callee that loads only the register
+//             it reads and stores only the one it writes - the shape a
+//             def/use-narrowed callee protocol for direct in-unit calls
+//             would emit, so faithful-vs-narrowed is that lever's ceiling
 //
 // Every wasm callee carries a never-taken branch full of dead stores so V8's
 // wasm inliner cannot fold it into the caller - otherwise "plain" would
@@ -94,6 +100,56 @@ faithful: `(module (import "js" "mem" (memory 256))
     (i64.store (i32.const 16) (local.get $r2)) (i64.store (i32.const 24) (local.get $r3))
     (i64.store (i32.const 48) (local.get $r6)) (i64.store (i32.const 56) (local.get $r7))
     (i64.store (i32.const 64) (local.get $r8)) (i64.store (i32.const 72) (local.get $r9)))
+  (func (export "run") (param $n i64) (result i64)
+    (local $i i64) (local $s i64) (local $a i64) (local $fts i32)
+    (loop $l
+      (i64.store (i32.const 0) (local.get $s))  (i64.store (i32.const 8) (local.get $i))
+      (i64.store (i32.const 16) (local.get $a)) (i64.store (i32.const 24) (local.get $n))
+      (i64.store (i32.const 32) (local.get $s)) (i64.store (i32.const 40) (local.get $i))
+      (i64.store (i32.const 48) (local.get $a)) (i64.store (i32.const 56) (local.get $i))
+      (i64.store (i32.const 64) (local.get $n))
+      ${BUDGET(`(call $leaf)`)}
+      (local.set $a (i64.load (i32.const 0)))
+      (i64.store (i32.const 56) (local.get $s))
+      ${BUDGET(`(call $leaf)`)}
+      (local.set $s (i64.add (local.get $s) (i64.xor (local.get $a) (i64.load (i32.const 0)))))
+      (local.set $i (i64.add (local.get $i) (i64.const 1)))
+      (br_if $l (i64.ne (local.get $i) (local.get $n))))
+    (local.get $s)))`,
+
+calleeonly: `(module (import "js" "mem" (memory 256))
+  (func $leaf
+    (local $r0 i64) (local $r1 i64) (local $r2 i64) (local $r3 i64)
+    (local $r6 i64) (local $r7 i64) (local $r8 i64) (local $r9 i64) (local $x i64)
+    (local.set $r0 (i64.load (i32.const 0)))  (local.set $r1 (i64.load (i32.const 8)))
+    (local.set $r2 (i64.load (i32.const 16))) (local.set $r3 (i64.load (i32.const 24)))
+    (local.set $r6 (i64.load (i32.const 48))) (local.set $r7 (i64.load (i32.const 56)))
+    (local.set $r8 (i64.load (i32.const 64))) (local.set $r9 (i64.load (i32.const 72)))
+    (local.set $x (local.get $r7))
+    ${DEAD}
+    (local.set $r0 (i64.add (i64.mul (local.get $x) (i64.const ${C})) (i64.const 1)))
+    (i64.store (i32.const 0) (local.get $r0))  (i64.store (i32.const 8) (local.get $r1))
+    (i64.store (i32.const 16) (local.get $r2)) (i64.store (i32.const 24) (local.get $r3))
+    (i64.store (i32.const 48) (local.get $r6)) (i64.store (i32.const 56) (local.get $r7))
+    (i64.store (i32.const 64) (local.get $r8)) (i64.store (i32.const 72) (local.get $r9)))
+  (func (export "run") (param $n i64) (result i64)
+    (local $i i64) (local $s i64) (local $a i64) (local $fts i32)
+    (loop $l
+      (i64.store (i32.const 56) (local.get $i))
+      ${BUDGET(`(call $leaf)`)}
+      (local.set $a (i64.load (i32.const 0)))
+      (i64.store (i32.const 56) (local.get $s))
+      ${BUDGET(`(call $leaf)`)}
+      (local.set $s (i64.add (local.get $s) (i64.xor (local.get $a) (i64.load (i32.const 0)))))
+      (local.set $i (i64.add (local.get $i) (i64.const 1)))
+      (br_if $l (i64.ne (local.get $i) (local.get $n))))
+    (local.get $s)))`,
+
+narrowed: `(module (import "js" "mem" (memory 256))
+  (func $leaf (local $x i64)
+    (local.set $x (i64.load (i32.const 56)))
+    ${DEAD}
+    (i64.store (i32.const 0) (i64.add (i64.mul (local.get $x) (i64.const ${C})) (i64.const 1))))
   (func (export "run") (param $n i64) (result i64)
     (local $i i64) (local $s i64) (local $a i64) (local $fts i32)
     (loop $l
