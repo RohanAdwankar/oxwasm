@@ -8,7 +8,7 @@ import { CPU, Memory } from './interp.mjs';
 import { compileLoop } from './jit2.mjs';
 import { compileVectorLoop } from './jitsimd.mjs';
 import { compileUnitWat, pltStubWat, FTMAP, FTMAP_MAX, FTDLIMIT, FTFUEL,
-         FTHASH, FTHBITS, FTHMASK, FTHBYTES, ICBASE, ICEND } from './aot_wat.mjs';
+         FTHASH, FTHBITS, FTHMASK, FTHBYTES } from './aot_wat.mjs';
 import { decode } from './decode.mjs';
 
 const PAGE = 4096n;
@@ -301,9 +301,6 @@ export class LinuxEngine {
     // open addressing has no in-place delete: clearing and reinserting is
     // the only way to drop an entry (a blacklisted unit, a restored image)
     new Uint8Array(this.wmem.buffer, FTHASH, FTHBYTES).fill(0);
-    // dispatch ICs cache {target, table slot}: the reinserted map hands out
-    // NEW slots, so every cached pair is stale - zero them with the hash
-    new Uint8Array(this.wmem.buffer, ICBASE, ICEND - ICBASE).fill(0);
     this._ftCount = 0; this._ftSeen = new Set();
     for (const [a, f] of this.aotFns)
       if (f && !f.jsStub) this.registerAotFn(a, f);
@@ -420,11 +417,6 @@ export class LinuxEngine {
     if (this.unitFilter && !this.unitFilter(un, entry)) { this.aotFailed.add(k); return; }
     try {
       const unit = compileUnitWat(this.mem, entry, { guestBase: this.base, ramBase: this.RAMOFF,
-        // per-call-site dispatch IC slots; 0 when the 128KB region is spent,
-        // which falls that site back to the plain $ftr probe. Slots are never
-        // reclaimed (re-emit rounds may burn a few) - 8k sites of headroom.
-        icAlloc: () => { const a = this._icNext ??= ICBASE;
-          if (a + 16 > ICEND) return 0; this._icNext = a + 16; return a; },
         // prune the closure at functions already in the dispatch map: calls
         // reach them via $ftr chaining, so re-including their bodies only
         // duplicates translation work and module bytes

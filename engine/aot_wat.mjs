@@ -36,12 +36,6 @@ export const FTHASH = 0x60000;       // hash slots: i64 key (guest addr, 0 = emp
 export const FTHBITS = 15, FTSLOTS = 1 << FTHBITS;   // 32768 slots * 16B = 512KB, ends below RAMOFF
 export const FTHMASK = FTSLOTS * 16 - 1;
 export const FTHBYTES = FTSLOTS * 16;
-// Per-call-site dispatch inline caches live between the hash table's end and
-// guest RAM at 1MB: 16-byte slots {key i64, fti+1 i32, pad}. fti is stored
-// PLUS ONE so the zero-filled empty state reads back as -1 (miss) even for a
-// zero key - and only HITS are cached, so an address registered later
-// self-heals on the next probe. rebuildFtmap zeroes the region.
-export const ICBASE = FTHASH + FTHBYTES, ICEND = 1 << 20;
 // registered entries, capped to keep the load factor (here 61%) low enough
 // that linear probing stays short
 export const FTMAP_MAX = 20000;
@@ -745,34 +739,28 @@ function structure(N, succs) {
 //                              the frame exits (rsp rises above rsp0) — jmpind
 function emitUnitFunction(a0, fnAddr, ctx) {
   const { guestBase, ramBase, canDirect } = ctx;
-  // dispatch inline caches: opt-in and only when the engine provides slots
-  const icAlloc = ((globalThis.__ic ?? (typeof process !== 'undefined' && process.env?.OXWASM_IC === '1'))
-    && ctx.icAlloc) ? ctx.icAlloc : null;
-  // The $ftr probe is a data-dependent latency chain on the call target
-  // (hash multiply -> probe load -> compare -> index) that idealdisp priced
-  // at +6.3ns/call - most of the 7.6x call-dense gap. Guest call sites are
-  // overwhelmingly monomorphic, so a per-site {key, fti+1} slot turns the
-  // common case into two constant-address loads and one compare. Only hits
-  // are cached (a miss cached forever would pin a later-registered callee
-  // onto the x_callout path); fti is stored +1 so the zero-filled empty
-  // slot reads back as a miss even against a zero key.
-  // A miss on an OCCUPIED slot is evidence the site is polymorphic (perl's
-  // runloop dispatches every pp_* op through one callind site); refilling
-  // would thrash - probe + full $ftr + stores every call measured 10% WORSE
-  // than no cache. One collision demotes the site for good: key becomes -1,
-  // which matches no real target, and the site pays one buffered store per
-  // call on top of the plain probe it would have paid anyway.
+  // Fast dispatch: inline the $ftr hash's FIRST probe at each resolution
+  // site. idealdisp priced the out-of-line $ftr call at 7.6x native per call
+  // against 4.9x for the same probe inlined - the wasm call boundary itself
+  // is the largest single cost - and unlike a per-site inline cache (5.6x,
+  // and 10% WORSE than no cache on perl's megamorphic runloop site before
+  // demotion) the inline probe carries no per-site state, needs no
+  // invalidation, and behaves identically for polymorphic sites. A first-
+  // probe miss (chain collision or unregistered target, the hash is 40%
+  // loaded) falls back to the full $ftr walk, whose result is bit-identical
+  // by construction: same hash, same table, same sentinel.
+  const fastDisp = globalThis.__fastDisp ??
+    (typeof process !== 'undefined' && process.env?.OXWASM_FASTDISP === '1');
+  let usesIcp = false;
   const icResolve = (keyExpr) => {
-    const ic = icAlloc && icAlloc();
-    if (!ic) return `(local.set $fti (call $ftr ${keyExpr}))`;
-    return `(if (i64.eq (i64.load (i32.const ${ic})) ${keyExpr})
-        (then (local.set $fti (i32.sub (i32.load (i32.const ${ic + 8})) (i32.const 1))))
-        (else (local.set $fti (call $ftr ${keyExpr}))
-              (if (i32.ge_s (local.get $fti) (i32.const 0))
-                (then (if (i64.eqz (i64.load (i32.const ${ic})))
-                  (then (i64.store (i32.const ${ic}) ${keyExpr})
-                        (i32.store (i32.const ${ic + 8}) (i32.add (local.get $fti) (i32.const 1))))
-                  (else (i64.store (i32.const ${ic}) (i64.const -1))))))))`;
+    if (!fastDisp) return `(local.set $fti (call $ftr ${keyExpr}))`;
+    usesIcp = true;
+    return `(local.set $icp (i32.add (i32.const ${FTHASH})
+        (i32.shl (i32.shr_u (i32.mul (i32.wrap_i64 ${keyExpr}) (i32.const 0x9E3779B1))
+                            (i32.const ${32 - FTHBITS})) (i32.const 4))))
+      (if (i64.eq (i64.load (local.get $icp)) ${keyExpr})
+        (then (local.set $fti (i32.load (i32.add (local.get $icp) (i32.const 8)))))
+        (else (local.set $fti (call $ftr ${keyExpr}))))`;
   };
   const MM = a0.M;
   // successors (by address-order index) for each block
@@ -1580,7 +1568,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   const ftSave = () => { usesFts = true; return `(local.set $fts (i32.load (i32.const ${FTDEPTH})))`; };
   const ftRestore = `(i32.store (i32.const ${FTDEPTH}) (local.get $fts))`;
   const tailJmp = () => { usesFtr = true; return [
-    `(local.set $fti (call $ftr (local.get $rex)))`,
+    icResolve('(local.get $rex)'),
     `(if ${ftHit}`,
     `  (then ${ftBurn} ${ftDec} (return_call_indirect $ft (type $uft) (local.get $fti))))`,
   ]; };
@@ -2442,6 +2430,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   if (DISP) wat += '    (local $pc i32)\n';
   if (usesFtr) wat += '    (local $fti i32)\n';
   if (usesFts) wat += '    (local $fts i32)\n';
+  if (usesIcp) wat += '    (local $icp i32)\n';
   for (const r of xUsed) wat += `    (local ${xreg(r)} v128)\n`;
   for (const t of tmps) wat += `    (local ${t} i64)\n`;
   for (const t of vtmps) wat += `    (local ${t} v128)\n`;
@@ -2562,7 +2551,7 @@ export function compileUnitWat(mem, entry, opts = {}) {
   }
   if (PHASE) { PH.analyze += performance.now() - ta0; PH.units++; }
   const canDirect = (k) => funcs.has(k) && !poisoned.has(k);
-  const ctx = { guestBase, ramBase, canDirect, icAlloc: opts.icAlloc };
+  const ctx = { guestBase, ramBase, canDirect };
   // emit; a failure poisons that function and re-emits — its callers switch
   // from direct wasm calls to callout escapes
   const texts = new Map();
