@@ -1531,3 +1531,29 @@ from bytes out of `app.units.gz`, and buffer compiles get no implicit code
 cache. Serving units as streamed same-URL `.wasm` would start repeat visits
 top-tier, at the cost of a packaging change. Follow-up, with the measurement
 above as its justification.
+
+### Dirty-rect compositing: measured, refuted as a latency lever
+
+`tools/gui/cdp_flushcost.mjs` wraps `xs.flush` (with a full framebuffer diff
+against the previous frame) and `putImageData` in the live page, then drives
+a menu open and strokes. On the File>New>OK sequence, 18 flushes:
+
+```
+flush (full recomposite of the window tree)  med 0.7ms  max 1.9ms
+putImageData (full 1024x768 canvas)          med 0.4ms  max 0.5ms
+damage: ~13% of the screen per frame (bbox and changed-pixel count agree)
+```
+
+A complete paint — clear, recomposite every window, blit the whole canvas —
+costs about **1.1ms**, against an input-to-paint median of ~40ms. Dirty-rect
+compositing would cut that to perhaps 0.2ms: under 3% of the frame. It is
+not a latency lever, which also agrees with the earlier rAF finding that the
+stroke latency is wait-dominated, not work-dominated. Parked as at most a
+battery nicety; the task is closed as refuted by measurement rather than
+implemented.
+
+Caveat kept honest: the probe's stroke phase recorded zero flushes — the
+strokes almost certainly landed on no open image, so the stroke-path flush
+cadence went unmeasured here. The conclusion stands on the menu data, since
+a flush recomposites everything regardless of what changed, making its cost
+shape-independent.
