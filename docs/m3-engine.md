@@ -1835,6 +1835,32 @@ steady-state win on call-dense code; fastdisp+narrow combined measured
 **default-on**; opt out with `OXWASM_FASTDISP=0` /
 `globalThis.__fastDisp = false`. Packed pages pick it up on their next
 repack, since the pack pipeline shares `compileUnitWat`.
+
+### The dispatch residue, fully decomposed — and where it ends
+
+Nine idealdisp arms close the investigation (box spreads large; arm
+ordering across repeated runs is the signal):
+
+| arm | ms | note |
+|---|---:|---|
+| direct call | 36–39 | |
+| call_indirect | 43 | +0.7ns/call over direct |
+| + guard, constant index | 61 | the ftHit + fuel/depth dance: **+1.8ns/call** |
+| + guard minus fuel check | 67≈61 | fuel and the duplicate depth load are free |
+| + inlined probe | 68–72 | the probe itself: ~1ns |
+| probe as one v128 load | 71≈70 | fusing the two loads buys nothing |
+| per-site IC | 75–80 | worse than the inlined probe |
+| out-of-line `$ftr` | 102–104 | the wasm call boundary: ~3.7ns |
+
+Conclusions: the shipped inlined probe sits ~2.8ns/call above bare
+call_indirect, of which ~1.8ns is the guard — and the guard's cost is
+*structural* (the conditional wrap and the stores bracketing the call),
+not any single load or check, so no cheap tweak removes it. Below that
+lies V8's own indirect floor. The remaining lever for call-dense code
+is **pack-time direct linking** — resolving cross-unit calls to direct
+wasm calls (and statically bounding depth to drop the guard) when all
+units exist at pack time — a build-pipeline project, not an emitter
+tweak, parked with this note as its justification.
 3. Narrowing stays **opt-in**: perf-neutral steady state at current
    resolution, and its on-thread analysis costs ~+25% startup in
    realab (perl small runs: 14.7s vs 11.6s). If it is ever promoted,
