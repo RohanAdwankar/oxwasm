@@ -1861,6 +1861,25 @@ is **pack-time direct linking** — resolving cross-unit calls to direct
 wasm calls (and statically bounding depth to drop the guard) when all
 units exist at pack time — a build-pipeline project, not an emitter
 tweak, parked with this note as its justification.
+
+### Checkpoint after the three shipped levers
+
+With inlining, fast dispatch, and the repacked container all default-on,
+a same-day standing check:
+
+- **Default-tier kernel table unchanged** (alu 3.43x, mem 4.34x, call
+  11.6x, branch 1.75x, muldiv 1.62x) — matching the standing
+  default-tier column; the straight-line gap remains Liftoff occupancy,
+  not codegen.
+- **Top-tier `call`, same-day lever A/B: levers OFF 9.14x ±5%, levers
+  ON 7.8–8.0x — a ~14% improvement** from inlining+fastdisp on the
+  call-densest kernel. The previously published 6.37x is NOT comparable
+  to either number: the box's native calibration runs swung 2x between
+  arms measured minutes apart (1504ms vs 3363ms for the same kernel),
+  so cross-day absolute ratios on this machine carry that swing.
+  Same-day interleaved or paired arms remain the only trusted
+  comparison, as every corrected claim in this document keeps
+  re-learning.
 3. Narrowing stays **opt-in**: perf-neutral steady state at current
    resolution, and its on-thread analysis costs ~+25% startup in
    realab (perl small runs: 14.7s vs 11.6s). If it is ever promoted,
