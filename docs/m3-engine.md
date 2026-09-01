@@ -1770,6 +1770,38 @@ protocol memory traffic moved nothing. Conclusions:
    and the second `$ftr` lookup on the return path (`tailJmp`). The
    next idealcall arm should price exactly that: direct call vs
    hash-lookup + call_indirect through a funcref table.
+
+### The dispatch price, measured — and it is the whole gap
+
+`idealdisp.mjs` isolates how a callee is reached, identical minimal
+protocol in every arm (median of 9, 10M calls, interleaved):
+
+| arm | ms | vs native |
+|---|---:|---:|
+| direct call | 33.7 | 2.46x |
+| call_indirect, constant index | 42.2 | 3.08x |
+| call_indirect, alternating targets | 41.3 | 3.01x |
+| the engine's callind shape (verbatim `$ftr` probe + ftHit guard + fuel/depth) | **104.7** | **7.64x** |
+
+7.64x is perl's measured 7.0x. The full out-of-unit dispatch nearly
+triples the call: +6.3ns/call over a bare call_indirect. This squares
+with the narrowing null: spill/reload stores are independent and
+store-buffered, but the ftr sequence is a *data-dependent latency
+chain on the call target itself* (hash multiply → probe load →
+compare → index load → call_indirect) that nothing can hide.
+Polymorphism, notably, is free — V8's call_indirect doesn't care that
+the target alternates.
+
+The lever this points at is **per-site inline caches**: guest indirect
+call sites are overwhelmingly monomorphic (perl's op-function pointers
+are stable per site), so a per-site {key, fti} word pair turns the
+common case into two loads and a compare; and the `!canDirect` direct
+targets have *constant* keys, whose fti is stable once the callee is
+registered — those can cache the resolved index outright. Open
+questions before building: whether registerAotFn can re-register an
+address with a different table slot (would need a generation word to
+gate ICs), and where the IC slots live (the 128KB between FTHASH's end
+at 0xE0000 and RAMOFF).
 3. Narrowing stays **opt-in**: perf-neutral steady state at current
    resolution, and its on-thread analysis costs ~+25% startup in
    realab (perl small runs: 14.7s vs 11.6s). If it is ever promoted,
