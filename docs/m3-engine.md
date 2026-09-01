@@ -1893,3 +1893,39 @@ a same-day standing check:
    resolution, and its on-thread analysis costs ~+25% startup in
    realab (perl small runs: 14.7s vs 11.6s). If it is ever promoted,
    the analysis belongs off the critical path first.
+
+### Where the goal stands (session checkpoint, 2026-09-01)
+
+The target is "any unmodified Linux binary, same-or-faster than native."
+Today's honest ledger:
+
+**Correctness** — 52/52 unmodified binaries byte-identical to native
+(coreutils through xz/gzip/zstd/bzip2, three interpreters — perl, python
+with its stdlib, mawk — jq, openssl, git log/status/init against a real
+repo, file(1) with its magic database, sh and dash). The verification
+suite carries hardware differentials for every silicon-semantics bug
+found this session (movhlps, bsf/bsr, leave's implicit rbp, narrowing's
+RMW ordering), each of which fails on the pre-fix emitter.
+
+**Straight-line compute** — parity under V8's top tier (alu 0.87x–muldiv
+1.02x); the default-tier gap (1.6–4.3x) is Liftoff occupancy, revisited
+and confirmed unchanged today. On a page, Chrome tiers after one call
+and the implicit code cache starts repeat visits at the top tier.
+
+**Call-dense compute** — the residue. The protocol memory traffic is
+exonerated (narrowing null), dispatch is fixed to the inlined first
+probe (7–13% on perl; default-on), and the decomposition bottoms out at
+V8's own floors: bare call 2.1–2.5x, call_indirect ~3x, plus ~1.8ns of
+structural guard. perl sits near 6x. The one unplayed lever is
+pack-time direct linking (a build-pipeline project, justified in the
+section above); nothing smaller moves this number.
+
+**The shipped product** — the GIMP page draws at 29–36ms warm-stroke
+medians on the repacked container (fast dispatch in all 4,058
+recompilable units, exact export parity), with the measurement stack
+now window-relative and retry-hardened: zero dead runs across the final
+verification set. One honest open question: the probe's own latency
+buckets attribute the ~32ms to neither wait nor work (both ~0), so
+what those two frames actually contain — rAF pipelining, compositor
+latency, or instrumentation gap — is unmeasured, and it is the next
+question the stroke number depends on.
