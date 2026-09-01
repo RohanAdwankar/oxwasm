@@ -36,6 +36,12 @@ export const FTHASH = 0x60000;       // hash slots: i64 key (guest addr, 0 = emp
 export const FTHBITS = 15, FTSLOTS = 1 << FTHBITS;   // 32768 slots * 16B = 512KB, ends below RAMOFF
 export const FTHMASK = FTSLOTS * 16 - 1;
 export const FTHBYTES = FTSLOTS * 16;
+// Per-call-site dispatch inline caches live between the hash table's end and
+// guest RAM at 1MB: 16-byte slots {key i64, fti+1 i32, pad}. fti is stored
+// PLUS ONE so the zero-filled empty state reads back as -1 (miss) even for a
+// zero key - and only HITS are cached, so an address registered later
+// self-heals on the next probe. rebuildFtmap zeroes the region.
+export const ICBASE = FTHASH + FTHBYTES, ICEND = 1 << 20;
 // registered entries, capped to keep the load factor (here 61%) low enough
 // that linear probing stays short
 export const FTMAP_MAX = 20000;
@@ -739,6 +745,27 @@ function structure(N, succs) {
 //                              the frame exits (rsp rises above rsp0) — jmpind
 function emitUnitFunction(a0, fnAddr, ctx) {
   const { guestBase, ramBase, canDirect } = ctx;
+  // dispatch inline caches: opt-in and only when the engine provides slots
+  const icAlloc = ((globalThis.__ic ?? (typeof process !== 'undefined' && process.env?.OXWASM_IC === '1'))
+    && ctx.icAlloc) ? ctx.icAlloc : null;
+  // The $ftr probe is a data-dependent latency chain on the call target
+  // (hash multiply -> probe load -> compare -> index) that idealdisp priced
+  // at +6.3ns/call - most of the 7.6x call-dense gap. Guest call sites are
+  // overwhelmingly monomorphic, so a per-site {key, fti+1} slot turns the
+  // common case into two constant-address loads and one compare. Only hits
+  // are cached (a miss cached forever would pin a later-registered callee
+  // onto the x_callout path); fti is stored +1 so the zero-filled empty
+  // slot reads back as a miss even against a zero key.
+  const icResolve = (keyExpr) => {
+    const ic = icAlloc && icAlloc();
+    if (!ic) return `(local.set $fti (call $ftr ${keyExpr}))`;
+    return `(if (i64.eq (i64.load (i32.const ${ic})) ${keyExpr})
+        (then (local.set $fti (i32.sub (i32.load (i32.const ${ic + 8})) (i32.const 1))))
+        (else (local.set $fti (call $ftr ${keyExpr}))
+              (if (i32.ge_s (local.get $fti) (i32.const 0))
+                (then (i64.store (i32.const ${ic}) ${keyExpr})
+                      (i32.store (i32.const ${ic + 8}) (i32.add (local.get $fti) (i32.const 1)))))))`;
+  };
   const MM = a0.M;
   // successors (by address-order index) for each block
   const succAddrIdx = (i) => {
@@ -2011,7 +2038,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
             // out-of-unit target: it may be compiled in ANOTHER unit — chain
             // through the global dispatch table without a JS round-trip
             usesFtr = true;
-            L.push(`(local.set $fti (call $ftr (i64.const ${hexs(target)})))`,
+            L.push(icResolve(`(i64.const ${hexs(target)})`),
                    ftSave(),
                    `(if ${ftHit}`,
                    `  (then ${ftBurn} (drop (call_indirect $ft (type $uft) (local.get $fti))) ${ftRestore})`,
@@ -2025,7 +2052,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
                  `(i64.store ${wasmAddr({base:4,index:-1,disp:0n},next)} (i64.const ${hexs(next)}))`);
           L.push(SA_MARK);
           usesFtr = true;
-          L.push(`(local.set $fti (call $ftr (local.get ${t})))`,
+          L.push(icResolve(`(local.get ${t})`),
                  ftSave(),
                  `(if ${ftHit}`,
                  `  (then ${ftBurn} (drop (call_indirect $ft (type $uft) (local.get $fti))) ${ftRestore})`,
@@ -2527,7 +2554,7 @@ export function compileUnitWat(mem, entry, opts = {}) {
   }
   if (PHASE) { PH.analyze += performance.now() - ta0; PH.units++; }
   const canDirect = (k) => funcs.has(k) && !poisoned.has(k);
-  const ctx = { guestBase, ramBase, canDirect };
+  const ctx = { guestBase, ramBase, canDirect, icAlloc: opts.icAlloc };
   // emit; a failure poisons that function and re-emits — its callers switch
   // from direct wasm calls to callout escapes
   const texts = new Map();
