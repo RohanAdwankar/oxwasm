@@ -1454,3 +1454,50 @@ likely to keep them honest:
 its stdlib CPython would measure its own startup failure).
 
 **31/31 unmodified binaries byte-identical to native**, suite green.
+
+## The `mem` 4.1x was mostly V8's Liftoff tier, not the translation
+
+`bench/kernels/idealmem.mjs` runs the same loop three ways, interleaved:
+native (the kernels binary, two iteration counts so startup cancels), a
+hand-written WAT in the **emitter's exact shape** — all state in i64 locals,
+address = wrap(base + (i<<3)) + negative constant, lazy-flag compare at the
+back edge — and an **idiomatic** WAT (i32 index, offset immediate). The
+result contradicted the standing 4.1x outright:
+
+| arm | steady 30M iters | vs native |
+|---|---:|---:|
+| native | 21.9ms | — |
+| faithful (emitter shape) | 20.6ms | **0.94x** |
+| ideal | 19.8ms | 0.90x |
+
+The emitter's code shape costs ~4% against ideal and runs at parity with
+native — while the engine, running a unit whose loop body is line-for-line
+identical (checked by dumping it again; the only deltas are two constants V8
+folds), measured 2.71x the same day. The counters say the gap is *inside*
+the wasm: interp/deopt/dispatch counts are identical between the two
+iteration counts, so the extra 30M iterations run entirely in compiled code.
+
+The difference between the two contexts is **which V8 tier executes the
+loop**. The engine enters a unit a handful of times and each entry loops for
+millions of iterations — a shape that never earns call-count tier-up, so the
+hot loop runs in Liftoff. The standalone module was warmed by whole calls
+into TurboFan. Both directions flip on command:
+
+- engine under `node --no-liftoff`: **2.71x → 1.66x**
+- faithful/ideal under `node --liftoff-only`: **0.94x/0.90x → 3.32x/2.73x**,
+  reproducing the engine's gap exactly.
+
+So for straight-line memory streaming, the translation itself is at parity
+(loop body, TurboFan) to 1.66x (whole engine, TurboFan); the rest of the
+observed 2.7-4.1x is Liftoff occupancy. V8's dynamic tiering did not rescue
+the loop within a 30M-iteration run in node 22 — whatever back-edge budget
+exists, the measured steady state stayed at Liftoff speed.
+
+What this means for #26: the emitter is no longer the main residual for
+straight-line code, and "rewrite the translator" is even less justified than
+the call-tax finding already made it. The remaining levers are the call tax
+(9.5x, fixed per call) and **tier occupancy** — getting the VM to run hot
+units in its top tier. On the product side the candidate is compiled-module
+caching across visits (Chrome preserves TurboFan code for structured-cloned
+`WebAssembly.Module`s in IndexedDB), which the page's existing IndexedDB
+unit store could carry; that is a follow-up, not a claim.
