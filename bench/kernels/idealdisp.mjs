@@ -204,6 +204,73 @@ ${FTR}
          '(local $fti i32) (local $fts i32) (local $p1 i32) (local $k1 i64) (local $p2 i32) (local $k2 i64)')})`,
 };
 
+// ---- cross-instance import arms: what pack/late-unit DIRECT LINKING would
+// pay. The leafs live in a separate module instance sharing the memory; the
+// caller imports them and calls directly - the shape a unit could emit for a
+// closure-pruned constant target once the owning unit exists. impcall is the
+// bare call; impdepth adds the depth bracket direct cross-unit links still
+// need (unbounded guest recursion must deopt, not blow the wasm stack);
+// impsplit puts each leaf in its OWN instance so alternate calls switch
+// instance context every iteration.
+const IMPDEPTH = (fn) => `
+      (local.set $fts (i32.load (i32.const ${FTDEPTH})))
+      (if (i32.lt_u (local.get $fts) (i32.const ${FTDLIMIT}))
+        (then (i32.store (i32.const ${FTDEPTH}) (i32.add (local.get $fts) (i32.const 1)))
+              (drop (call ${fn}))
+              (i32.store (i32.const ${FTDEPTH}) (local.get $fts)))
+        (else (unreachable)))`;
+const CALLEE_ONE = `(module (import "js" "mem" (memory 256))
+  (func (export "leaf") (result i64) (local $x i64)
+    (local.set $x (i64.load (i32.const 56)))
+    ${DEAD('$ileaf')}
+    (i64.store (i32.const 0) (i64.add (i64.mul (local.get $x) (i64.const ${C})) (i64.const 1)))
+    (i64.const 0))
+  (func (export "leaf2") (result i64) (local $x i64)
+    (local.set $x (i64.load (i32.const 56)))
+    ${DEAD('$ileaf2')}
+    (i64.store (i32.const 0) (i64.add (i64.mul (local.get $x) (i64.const ${C})) (i64.const 1)))
+    (i64.const 0)))`;
+const IMP_HEAD = `(module (import "js" "mem" (memory 256))
+  (import "x" "leaf" (func $ileaf (result i64)))
+  (import "y" "leaf2" (func $ileaf2 (result i64)))`;
+// the same depth bracket with depth in a MUTABLE GLOBAL instead of linear
+// memory - if global traffic is register-class in V8, the guard tax that the
+// decomposition called structural is actually the memory round-trips
+const GDEPTH = (fn) => `
+      (local.set $fts (global.get $gd))
+      (if (i32.lt_u (local.get $fts) (i32.const ${FTDLIMIT}))
+        (then (global.set $gd (i32.add (local.get $fts) (i32.const 1)))
+              (drop (call ${fn}))
+              (global.set $gd (local.get $fts)))
+        (else (unreachable)))`;
+// full shipped guard shape (depth AND fuel) on globals, wrapping the
+// call_indirect exactly as GUARDCALL does
+const GGUARD = (idx) => `
+      (local.set $fti (i32.const ${idx}))
+      (local.set $fts (global.get $gd))
+      (if (i32.and (i32.ge_s (local.get $fti) (i32.const 0))
+                   (i32.and (i32.lt_u (local.get $fts) (i32.const ${FTDLIMIT}))
+                            (i32.ne (global.get $gf) (i32.const 0))))
+        (then (global.set $gf (i32.sub (global.get $gf) (i32.const 1)))
+              (drop (call_indirect $ft (type $uft) (local.get $fti)))
+              (global.set $gd (local.get $fts)))
+        (else (unreachable)))`;
+const GLOB_IMP = `(import "g" "depth" (global $gd (mut i32))) (import "g" "fuel" (global $gf (mut i32)))`;
+const impMods = {
+impcall: { callees: 'one', main: `${IMP_HEAD}
+  ${LOOP('(drop (call $ileaf))', '(drop (call $ileaf2))')})` },
+impdepth: { callees: 'one', main: `${IMP_HEAD}
+  ${LOOP(IMPDEPTH('$ileaf'), IMPDEPTH('$ileaf2'), '(local $fts i32)')})` },
+impsplit: { callees: 'two', main: `${IMP_HEAD}
+  ${LOOP('(drop (call $ileaf))', '(drop (call $ileaf2))')})` },
+impgdep: { callees: 'one', main: `${IMP_HEAD} ${GLOB_IMP}
+  ${LOOP(GDEPTH('$ileaf'), GDEPTH('$ileaf2'), '(local $fts i32)')})` },
+gguard: { callees: 'table', main: `${IMP_HEAD} ${GLOB_IMP}
+  (type $uft (func (result i64)))
+  (table $ft (import "g" "tab") 8 funcref)
+  ${LOOP(GGUARD(1), GGUARD(2), '(local $fti i32) (local $fts i32)')})` },
+};
+
 const slotOf = (a) => FTHASH + ((((Math.imul(a, 0x9E3779B1) >>> (32 - FTHBITS)) << 4)) & FTHMASK);
 const build = (wat, name) => {
   const w = `/tmp/id_${name}.wat`;
@@ -228,14 +295,42 @@ const timeNative = (n) => { const t0 = process.hrtime.bigint();
   return { ms: Number(process.hrtime.bigint() - t0) / 1e6, out }; };
 const timeWasm = (f, n) => {
   f.dv.setUint32(FTFUEL, 0x7fffffff, true);    // refuel: the guard burns one per call
+  if (f.gf) f.gf.value = 0x7fffffff;           // global-fuel arms burn from the Global
   const t0 = process.hrtime.bigint();
   const r = f.run(BigInt(n));
   return { ms: Number(process.hrtime.bigint() - t0) / 1e6, out: `s=${BigInt.asUintN(64, r)}` }; };
 
+// build an import arm: callee instance(s) first, their exports feed the main
+// module's imports; everything shares one memory
+const buildImp = ({ callees, main }, name) => {
+  const mem = new WebAssembly.Memory({ initial: 256 });
+  const compile = (wat, tag) => {
+    const w = `/tmp/id_${name}_${tag}.wat`;
+    writeFileSync(w, wat);
+    execFileSync('wat2wasm', ['--enable-tail-call', w, '-o', w + '.wasm']);
+    const mod = new WebAssembly.Module(readFileSync(w + '.wasm'));
+    unlinkSync(w); unlinkSync(w + '.wasm');
+    return mod;
+  };
+  const cmod = compile(CALLEE_ONE, 'c');
+  const c1 = new WebAssembly.Instance(cmod, { js: { mem } });
+  const c2 = callees === 'two' ? new WebAssembly.Instance(cmod, { js: { mem } }) : c1;
+  const gd = new WebAssembly.Global({ value: 'i32', mutable: true }, 0);
+  const gf = new WebAssembly.Global({ value: 'i32', mutable: true }, 0x7fffffff);
+  const tab = new WebAssembly.Table({ element: 'anyfunc', initial: 8 });
+  if (callees === 'table') { tab.set(1, c1.exports.leaf); tab.set(2, c1.exports.leaf2); }
+  const inst = new WebAssembly.Instance(compile(main, 'm'),
+    { js: { mem }, x: { leaf: c1.exports.leaf }, y: { leaf2: c2.exports.leaf2 },
+      g: { depth: gd, fuel: gf, tab } });
+  const dv = new DataView(mem.buffer);
+  dv.setUint32(FTDEPTH, 0, true); dv.setUint32(FTFUEL, 0x7fffffff, true);
+  return { run: inst.exports.run, dv, gf };
+};
+
 const arms = {};
 let want = null;
-for (const [name, wat] of Object.entries(mods)) {
-  const f = build(wat, name);
+for (const [name, spec] of Object.entries({ ...mods, ...impMods })) {
+  const f = typeof spec === 'string' ? build(spec, name) : buildImp(spec, name);
   timeWasm(f, 1e6); timeWasm(f, 1e6);           // warm to top tier
   const got = timeWasm(f, 1e5).out;
   if (want === null) want = got;

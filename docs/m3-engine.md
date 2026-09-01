@@ -2015,3 +2015,41 @@ distinct root causes in one run each:
 The pattern across all three: the failure printout that names the
 guest's complaint (a [BUG] line, an errno, a path) converts a debugging
 session into a diff read. Suite green, breadth 60/60.
+
+### Direct linking priced — and the dispatch story ends
+
+Five new idealdisp arms measure what direct linking (pack-time or
+incremental runtime) would actually buy for the closure-pruned
+constant-target call sites that today pay the inlined probe. The callee
+lives in a separate module instance sharing the memory; the caller
+imports it and calls it directly — exactly the shape a unit could emit
+once the owning unit exists:
+
+| arm | ms | note |
+|---|---:|---|
+| impcall | 37.8–39.2 | bare cross-instance import call ≈ direct (33) |
+| impsplit | 38.2–38.7 | alternating between two instances: the switch is free |
+| impdepth | 59.3–59.5 | + the depth bracket a linked call must keep |
+| impgdep | 58.3 | same bracket on a mutable Global: **identical** |
+| gguard | 76.8 | full guard on globals + imported table: worse |
+
+The bracket is structural, now proven from a second angle: linear
+memory vs `WebAssembly.Global` for depth/fuel measure the same, so the
+cost is the conditional wrap and the stores, not where the counters
+live. And the bracket is load-bearing — it is what turns unbounded
+guest recursion into a deopt at a spilled, coherent call site instead
+of a wasm stack trap mid-frame, where the guest state is unrecoverable.
+The shipped intra-unit direct call already pays it (the emitter guards
+direct calls too), so a linked cross-unit call lands at impdepth ≈ the
+intra-unit direct call ≈ the guard arm (58.8). All linking can remove
+is the probe: inlprobe 66.8 → 59.5, **~11% on the pure-call kernel**,
+single digits once real code dilutes the call fraction.
+
+Decision: pack-time direct linking moves from "parked" to **closed,
+priced** — an import-graph build pipeline (instantiation order, cycle
+handling, funcref plumbing) buys less than one box-noise band. The
+dispatch avenue is exhausted end to end: probe shipped (fastdisp),
+IC tried and beaten by it, v128 fusion null, guard structural twice
+over, linking ≤11% ceiling. What remains of the call-dense band lives
+in the frames themselves (inlining, which ships) and in tier
+occupancy, not in how calls are reached.
