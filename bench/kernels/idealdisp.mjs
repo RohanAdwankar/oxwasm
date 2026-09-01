@@ -64,6 +64,40 @@ const FTCALL = (keyExpr) => `
               (i32.store (i32.const ${FTDEPTH}) (local.get $fts)))
         (else (unreachable)))`;
 
+// IC hit-path shape: key/fti in a per-site slot, then the verbatim guard
+const ICCALL = (ic, keyExpr) => `
+      (if (i64.eq (i64.load (i32.const ${ic})) ${keyExpr})
+        (then (local.set $fti (i32.sub (i32.load (i32.const ${ic + 8})) (i32.const 1))))
+        (else (local.set $fti (call $ftr ${keyExpr}))
+              (i64.store (i32.const ${ic}) ${keyExpr})
+              (i32.store (i32.const ${ic + 8}) (i32.add (local.get $fti) (i32.const 1)))))
+      (local.set $fts (i32.load (i32.const ${FTDEPTH})))
+      (if (i32.and (i32.ge_s (local.get $fti) (i32.const 0))
+                   (i32.and (i32.lt_u (i32.load (i32.const ${FTDEPTH})) (i32.const ${FTDLIMIT}))
+                            (i32.ne (i32.load (i32.const ${FTFUEL})) (i32.const 0))))
+        (then (i32.store (i32.const ${FTFUEL}) (i32.sub (i32.load (i32.const ${FTFUEL})) (i32.const 1)))
+              (drop (call_indirect $ft (type $uft) (local.get $fti)))
+              (i32.store (i32.const ${FTDEPTH}) (local.get $fts)))
+        (else (unreachable)))`;
+
+// hash + FIRST probe inlined at the site; $ftr call only on slot mismatch
+const INLCALL = (keyExpr, pl, kl) => `
+      (local.set ${pl} (i32.add (i32.const ${FTHASH})
+        (i32.shl (i32.shr_u (i32.mul (i32.wrap_i64 ${keyExpr}) (i32.const 0x9E3779B1))
+                            (i32.const ${32 - FTHBITS})) (i32.const 4))))
+      (local.set ${kl} (i64.load (local.get ${pl})))
+      (if (i64.eq (local.get ${kl}) ${keyExpr})
+        (then (local.set $fti (i32.load (i32.add (local.get ${pl}) (i32.const 8)))))
+        (else (local.set $fti (call $ftr ${keyExpr}))))
+      (local.set $fts (i32.load (i32.const ${FTDEPTH})))
+      (if (i32.and (i32.ge_s (local.get $fti) (i32.const 0))
+                   (i32.and (i32.lt_u (i32.load (i32.const ${FTDEPTH})) (i32.const ${FTDLIMIT}))
+                            (i32.ne (i32.load (i32.const ${FTFUEL})) (i32.const 0))))
+        (then (i32.store (i32.const ${FTFUEL}) (i32.sub (i32.load (i32.const ${FTFUEL})) (i32.const 1)))
+              (drop (call_indirect $ft (type $uft) (local.get $fti)))
+              (i32.store (i32.const ${FTDEPTH}) (local.get $fts)))
+        (else (unreachable)))`;
+
 const LOOP = (callA, callB, extraLocals = '') => `(func (export "run") (param $n i64) (result i64)
     (local $i i64) (local $s i64) (local $a i64) ${extraLocals}
     (loop $l
@@ -98,6 +132,19 @@ ftr: `${HEAD}
 ${FTR}
   ${LOOP(FTCALL(`(i64.const ${KEYA})`), FTCALL(`(i64.const ${KEYB})`),
          '(local $fti i32) (local $fts i32)')})`,
+
+// the IC hit path: two constant-address loads + compare feeding the same guard
+icarm: `${HEAD}
+${FTR}
+  ${LOOP(ICCALL(0xE0000, `(i64.const ${KEYA})`), ICCALL(0xE0010, `(i64.const ${KEYB})`),
+         '(local $fti i32) (local $fts i32)')})`,
+
+// the $ftr body's FIRST probe inlined at the site (no wasm call), with the
+// out-of-line $ftr only as the chain-miss fallback that never fires here
+inlprobe: `${HEAD}
+${FTR}
+  ${LOOP(INLCALL(`(i64.const ${KEYA})`, '$p1', '$k1'), INLCALL(`(i64.const ${KEYB})`, '$p2', '$k2'),
+         '(local $fti i32) (local $fts i32) (local $p1 i32) (local $k1 i64) (local $p2 i32) (local $k2 i64)')})`,
 };
 
 const slotOf = (a) => FTHASH + ((((Math.imul(a, 0x9E3779B1) >>> (32 - FTHBITS)) << 4)) & FTHMASK);
