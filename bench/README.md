@@ -1181,6 +1181,12 @@ one thing users feel most. That is the argument for keeping this opt-in until
 the tiering policy can decide *which* functions are worth inlining, rather
 than the emitter inlining whatever fits a budget.
 
+*(Update: the tiering policy now picks inline targets from its call profile,
+the assembler worker halved the on-thread tier-up cost, and a full gate —
+suite, breadth 31/31, browser stroke A/B — passed with inlining on, so it has
+since been promoted to default-on; `OXWASM_INLINE=0` / `?noinline` opt out.
+See "Inlining promoted to default-on" in docs/m3-engine.md.)*
+
 
 ### The settled number: 5.5% steady state, at a fixed 129ms of compile time
 
@@ -1366,7 +1372,9 @@ a fixed +116ms of tier-up**.
 
 That is a real win for anything long-running and for the shipped page, which
 pays the tier-up at build time. It stays opt-in for short-lived processes,
-where +116ms is not repaid.
+where +116ms is not repaid. *(Since promoted to default-on after the full
+gate passed — the short-lived-process cost is now borne for uniformity and
+can be reclaimed with `OXWASM_INLINE=0`.)*
 
 ### Where the +116ms goes, measured instead of inferred
 

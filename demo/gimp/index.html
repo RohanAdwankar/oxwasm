@@ -252,7 +252,7 @@ function sha1hex(str) {
     if (qs.has('nowabt')) CFG.hasWabt = false;         // manifest units only: no in-browser compiles
     if (qs.has('nojtab')) globalThis.__noJtab = true;  // organic compiles without jump tables
     if (qs.has('noftab')) globalThis.__noFtab = true;  // no wasm-to-wasm chaining
-    if (qs.has('inline')) globalThis.__inline = true;  // inline hot callees into runtime-compiled units (opt-in while its tier-up cost is weighed; steady-state win on call-dense code is 6-11%)
+    if (qs.has('noinline')) globalThis.__inline = false; // runtime units without hot-callee inlining (bisect lever; inlining is on by default)
     if (qs.has('trap')) {
       const od = eng.dispatchAot.bind(eng);
       let n = 0, last = 0;

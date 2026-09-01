@@ -2255,12 +2255,15 @@ function emitUnitFunction(a0, fnAddr, ctx) {
 }
 
 // ---- unit driver -----------------------------------------------------------
-// Opt-in while it is measured: globalThis.__inline, or OXWASM_INLINE=1.
+// On by default: suite + breadth (31/31 byte-identical, incl. two-tier
+// CPython) pass with it, steady-state on call-dense code is 6-11% faster,
+// and the tier-up cost objection is halved by the assembler worker.
+// Opt out with OXWASM_INLINE=0 or globalThis.__inline = false.
 // OXWASM_INLINE_BUDGET caps the callee size in instructions - the default is
 // in the low hundreds because gzip's three hot callees are 66, 88 and 114,
 // and a 64-instruction cutoff excludes all of them.
 const inlineEnabled = () => globalThis.__inline ??
-  (typeof process !== 'undefined' && process.env?.OXWASM_INLINE === '1');
+  !(typeof process !== 'undefined' && process.env?.OXWASM_INLINE === '0');
 const inlineBudget = () => Number(
   (typeof process !== 'undefined' && process.env?.OXWASM_INLINE_BUDGET) || 160);
 // Per-function cap on duplicated instructions. A callee at 8 sites is 8

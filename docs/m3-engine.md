@@ -818,7 +818,7 @@ addresses, every run). Over the wide script's 123 units:
 |---|---:|---:|
 | analyze (decode the closure) | 211 | 44% |
 | emit (build WAT text) | 262 | 55% |
-| inline (off by default) | 0 | 0% |
+| inline (off at the time; default-on since) | 0 | 0% |
 | ftr scan of all texts | 3 | 1% |
 | **total** | **475** | |
 
@@ -1628,3 +1628,28 @@ tested; the dead experiment narrowed only the caller — and (b) promoting
 inlining from opt-in, whose main objection (+116ms tier-up, 55ms of it
 emission) is halved now that assembly runs off the main thread. Both are
 measurable next steps, not claims.
+
+### Inlining promoted to default-on
+
+Lever (b) was taken. The gate, all with inlining forced on:
+
+- **Full suite green** (hardware differentials, decode lengths, engine
+  tests — `set -e`, ends at decodetest: 21,410 lengths exact, 0 wrong).
+- **Breadth 31/31 byte-identical** to native, including two-tier CPython
+  (124s) and openssl.
+- **Browser A/B on the packed GIMP page**, interleaved `?inline` vs
+  default, warm-stroke input→paint medians over clean reps: default
+  ≈32.5ms (32.1/32.6/32.4/33.8), inline ≈30.3ms (30.3/29.0/39.4) —
+  parity to slight win; the stroke path is not call-dense enough to show
+  the 6–11%. Sync tier work for File>New: 132ms vs 121ms (+9%, absorbed
+  by the async pipeline).
+
+One run per arm failed with a shared, arm-independent signature — the
+probe's ink region non-empty *before* any stroke, zero paints, then a
+multi-second catch-up — including a **default-arm** failure (ink 3522→0),
+which exonerates inlining: it is a page-load/window-placement flake under
+box contention, worth its own investigation, not a miscompile.
+
+`inlineEnabled` now defaults to true; opt out with `OXWASM_INLINE=0` or
+`globalThis.__inline = false` (page lever `?noinline`). The suite was
+re-run on the shipped default path after the flip.
