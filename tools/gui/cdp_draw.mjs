@@ -62,16 +62,32 @@ const wdump = async (tag) => { if (process.env.WINS) console.log('wins', tag, JS
 const mainWin = (ws) => ws.filter(w => w.w >= 400 && w.h >= 150)
   .sort((a, b) => (b.w * b.h) - (a.w * a.h))[0];
 await wdump('boot');
+const sleep = (ms) => new Promise(r=>setTimeout(r,ms));
+// each step clicks, then VERIFIES the window it should produce exists,
+// retrying up to three times - GIMP occasionally eats a click while a
+// tier-up burst holds the main thread, and a fixed sleep turned that
+// race into a dead run
+const clickUntil = async (what, doClick, pred, settleMs) => {
+  for (let t = 0; t < 3; t++) {
+    await doClick(); await sleep(settleMs);
+    const w = (await wins()).find(pred);
+    if (w) return w;
+    await sleep(1500);
+  }
+  console.log(`${what} never appeared`); process.exit(1);
+};
 let main = mainWin(await wins());
 if (!main) { console.log('no main window found'); process.exit(1); }
-await click(main.x + 20, main.y + 13); await new Promise(r=>setTimeout(r,1200));   // File
+// the File menu popup is a tall narrow window titled like the app
+const menu = await clickUntil('File menu',
+  () => click(main.x + 20, main.y + 13),
+  w => w.h > 250 && w.h < 500 && w.w < 320 && w.x >= main.x && w.x < main.x + main.w, 1200);
 await wdump('file');
-await click(main.x + 48, main.y + 52); await new Promise(r=>setTimeout(r,2500));   // New...
+const dlg = await clickUntil('New Image dialog',
+  () => click(menu.x + 45, menu.y + 27),
+  w => /New Image/.test(w.n), 2500);
 await wdump('dialog');
-let dlg = (await wins()).find(w => /New Image/.test(w.n));
-if (!dlg) { await new Promise(r=>setTimeout(r,2000)); dlg = (await wins()).find(w => /New Image/.test(w.n)); }
-if (!dlg) { console.log('New Image dialog never appeared'); process.exit(1); }
-await click(dlg.x + 328, dlg.y + 238); await new Promise(r=>setTimeout(r,4000));   // OK
+await click(dlg.x + 328, dlg.y + 238); await sleep(4000);   // OK
 await wdump('image');
 main = mainWin(await wins());                    // the image window (grown main)
 inkRegion = [main.x + 66, main.y + 80, 240, 80];
