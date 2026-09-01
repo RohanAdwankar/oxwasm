@@ -1697,3 +1697,50 @@ Three findings:
    at +18ms/10M calls (~0.9ns per wrap) twice, outside both arms'
    spreads. The earlier "free within noise" was a property of that
    run's regime, not of the check.
+
+### Spill narrowing: the store half, built and measured
+
+The store half of the lever is implemented: every spill site (calls,
+syscalls, deopts, exits) is emitted as a marker and expanded after the
+whole CFG exists, skipping registers whose local provably equals their
+regfile slot. Cleanliness is tracked mechanically over the emitted text
+(any `local.set` of a synced local dirties it; the exact protocol reload
+pattern cleans it), with a per-block bit-vector fixpoint over `succs`
+(jump-table edges included via jtabUnion; the entry block joins an
+all-clean function-entry state with its back edges). Opt-in via
+`OXWASM_NARROW=1` / `globalThis.__narrow`; a surviving marker throws
+rather than poisoning the unit.
+
+Static effect is large — on sha256sum it skips 61,959 of 119,448 spill
+stores (52%) across 7,088 sites. Gate: full suite green in both lever
+states, breadth 31/31 byte-identical with it on. Steady state, measured
+with realab's two-N subtraction:
+
+- gzip: **1.008x, inside ±9%** — expected, since default-on inlining
+  already removed gzip's hot call sites.
+- perl (arithmetic loop; opcode dispatch is indirect calls inlining can
+  never remove): **0.970x, inside ±4%** at the best measurement quality
+  (startup 46% of the big run). A mid-quality run (startup 71%) showed
+  0.803x and did not replicate — recorded as the artifact it was.
+
+Verdict: the store half is roughly free but not a measured win. That is
+consistent with the idealmem finding that stores are the cheap,
+well-buffered half; the loads — the 8-register entry reload and the
+full post-call reload — are untouched and sit on the critical path.
+
+Two facts sharpen the next increment:
+
+- **perl steady state is 7.0x native** (0.554µs vs 0.079µs per
+  iteration), with only 107k interpreted instructions in a whole run —
+  99.99% of it executes in wasm units. perl is pure call-tax, not an
+  interpreter-coverage problem. (An earlier cold-cache reading of
+  "185x" was first-run wat2wasm of 1,147 functions — precisely the
+  artifact realab exists to subtract.)
+- **Reload narrowing needs a third state.** Eliding a post-call reload
+  of a register never read before its next def leaves the local stale
+  while the slot is authoritative; the forward spill pass must then
+  treat that register as *stale* — never spill it until a real def —
+  or a later spill site would overwrite the callee's fresh slot with
+  the stale local. Backward liveness (uses = `local.get` occurrences in
+  the post-narrowing text) composed with that stale state is the next
+  increment of the lever.
