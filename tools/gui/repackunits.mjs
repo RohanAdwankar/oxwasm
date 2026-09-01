@@ -104,7 +104,7 @@ const assemble = (wat) => {
 };
 const seen = new Set();          // the live engine's _ftSeen shape, in ship order
 const out = new Map();
-let ok = 0, failed = 0, oldBytes = 0, newBytes = 0;
+let ok = 0, failed = 0, keptCoverage = 0, oldBytes = 0, newBytes = 0;
 const failures = [];
 const t0 = Date.now();
 for (const [name, bytes] of old) {
@@ -121,8 +121,22 @@ for (const [name, bytes] of old) {
     // during emit, and seeding those into seen pruned them from every later
     // unit without anything exporting them - 1,432 functions vanished from
     // the first repack and the page re-tiered the hot ones all session
-    for (const e of WebAssembly.Module.exports(new WebAssembly.Module(nb)))
-      if (e.name.startsWith('f_')) seen.add(BigInt('0x' + e.name.slice(2)).toString());
+    const fnames = (b) => WebAssembly.Module.exports(new WebAssembly.Module(b))
+      .filter(e => e.name.startsWith('f_')).map(e => e.name);
+    const newEx = new Set(fnames(nb));
+    // A recompile that LOSES any export keeps the old bytes: 1,116 of the
+    // old exports are register-jmpind entries the capture-time analyzer
+    // resolved through jump tables it discovered then; offline that
+    // discovery fails, the guard rightly refuses them standalone, and a
+    // container without them makes the page re-tier on the main thread all
+    // session. Exact per-unit coverage parity beats a partially-probed unit.
+    const lostHere = fnames(new Uint8Array(bytes)).filter(f => !newEx.has(f));
+    if (lostHere.length) {
+      out.set(name, new Uint8Array(bytes)); newBytes += bytes.length; keptCoverage++;
+      for (const f of fnames(new Uint8Array(bytes))) seen.add(BigInt('0x' + f.slice(2)).toString());
+      continue;
+    }
+    for (const f of newEx) seen.add(BigInt('0x' + f.slice(2)).toString());
     out.set(name, nb); newBytes += nb.length; ok++;
   } catch (e) {
     out.set(name, new Uint8Array(bytes)); newBytes += bytes.length; failed++;
@@ -177,7 +191,7 @@ for (const [name, bytes] of old) {
 }
 const packed = gzipSync(writeContainer(out), { level: 9 });
 writeFileSync(OUT, packed);
-console.log(`\n${ok} recompiled, ${failed} kept old bytes${failures.length ? ':' : ''}`);
+console.log(`\n${ok} recompiled, ${failed} kept old bytes (compile failure), ${keptCoverage} kept old bytes (would lose exports)${failures.length ? ':' : ''}`);
 for (const f of failures) console.log('  ' + f);
 console.log(`raw ${(oldBytes / 1048576).toFixed(1)} -> ${(newBytes / 1048576).toFixed(1)} MB, ` +
             `container ${packed.length} bytes gz -> ${OUT}`);
