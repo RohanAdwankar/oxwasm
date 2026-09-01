@@ -20,7 +20,7 @@ import { XServer } from '../../engine/xserver.mjs';
 import { CPU } from '../../engine/interp.mjs';
 import { restoreEngineCore } from '../../engine/snapshot_core.mjs';
 import { parsePCF } from '../../engine/pcf.mjs';
-import { compileUnitWat } from '../../engine/aot_wat.mjs';
+import { compileUnitWat, pltStubWat } from '../../engine/aot_wat.mjs';
 import { readFileSync, writeFileSync, unlinkSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { gzipSync, gunzipSync } from 'node:zlib';
@@ -85,6 +85,13 @@ await restoreEngineCore(eng, xs,
 }
 
 // ---- recompile every unit in index order ----------------------------------
+// Inlining stays OFF for the offline repack: there is no call profile here to
+// pick targets, and a callee inlined away is no longer EXPORTED - the first
+// repack shipped 12,138 functions where the old container had 13,487, and the
+// engine re-tiered the missing 1,349 on the main thread all session (stroke
+// medians 5x worse from the churn alone). The inlined dispatch probe is the
+// point of the repack and does not change coverage.
+globalThis.__inline = false;
 const old = container(gz('app.units.gz'));
 let an = 0;
 const assemble = (wat) => {
@@ -109,7 +116,13 @@ for (const [name, bytes] of old) {
       skip: (c) => seen.has(BigInt(c).toString()),
       hot: eng.aotCalls });
     const nb = assemble(unit.wat);
-    for (const a of unit.funcs) seen.add(BigInt(a).toString());
+    // grow seen from the module's ACTUAL exports, the way runtime _ftSeen
+    // grows from registration: unit.funcs also lists functions poisoned
+    // during emit, and seeding those into seen pruned them from every later
+    // unit without anything exporting them - 1,432 functions vanished from
+    // the first repack and the page re-tiered the hot ones all session
+    for (const e of WebAssembly.Module.exports(new WebAssembly.Module(nb)))
+      if (e.name.startsWith('f_')) seen.add(BigInt('0x' + e.name.slice(2)).toString());
     out.set(name, nb); newBytes += nb.length; ok++;
   } catch (e) {
     out.set(name, new Uint8Array(bytes)); newBytes += bytes.length; failed++;
@@ -118,6 +131,49 @@ for (const [name, bytes] of old) {
   }
   if ((ok + failed) % 500 === 0)
     console.log(`  ${ok + failed}/${old.size} units, ${((Date.now() - t0) / 1000).toFixed(0)}s`);
+}
+// ---- coverage sweep -------------------------------------------------------
+// Closure discovery under the offline seen-set does not reproduce the
+// multi-session capture's overlaps exactly: the first repack lost 1,432
+// functions the old container exported, and the page re-tiered the hot ones
+// on the main thread all session. Guarantee coverage parity by construction:
+// every function the old container exported that no new unit exports gets
+// its own appended unit, compiled at that entry.
+{
+  const oldFns = new Set(), newFns = new Set();
+  const exportsOf = (b) => { try {
+    return WebAssembly.Module.exports(new WebAssembly.Module(new Uint8Array(b)))
+      .filter(e => e.name.startsWith('f_')).map(e => e.name); } catch { return []; } };
+  for (const [, b] of old) for (const f of exportsOf(b)) oldFns.add(f);
+  for (const [, b] of out) for (const f of exportsOf(b)) newFns.add(f);
+  const lost = [...oldFns].filter(f => !newFns.has(f));
+  let recovered = 0, stubbed = 0, unrecoverable = 0;
+  for (const f of lost) {
+    const name = f.slice(2), entry = BigInt('0x' + name);
+    try {
+      const unit = compileUnitWat(eng.mem, entry, {
+        guestBase: eng.base, ramBase: eng.RAMOFF,
+        skip: (c) => seen.has(BigInt(c).toString()),
+        hot: eng.aotCalls });
+      const nb = assemble(unit.wat);
+      for (const e of WebAssembly.Module.exports(new WebAssembly.Module(nb)))
+        if (e.name.startsWith('f_')) seen.add(BigInt('0x' + e.name.slice(2)).toString());
+      out.set(name, nb); newBytes += nb.length; recovered++;
+    } catch {
+      // most refusals are mid-closure PLT stubs the trampoline guard rightly
+      // rejects as static units: ship them as live-GOT pltStubWat modules,
+      // the same form the engine builds at runtime - without this the page
+      // regenerated ~1,100 of them one wat2wasm at a time, mid-session
+      try {
+        const gotAddr = eng.trampolineGotAddr(entry);
+        if (gotAddr === null) throw 0;
+        const gotOff = Number(BigInt.asUintN(32, gotAddr - eng.base + BigInt(eng.RAMOFF)));
+        const nb = assemble(pltStubWat(entry, gotOff).wat);
+        out.set(name, nb); newBytes += nb.length; seen.add(entry.toString()); stubbed++;
+      } catch { unrecoverable++; }
+    }
+  }
+  console.log(`coverage sweep: ${lost.length} lost functions, ${recovered} recovered as units, ${stubbed} as live-GOT plt stubs, ${unrecoverable} unrecoverable`);
 }
 const packed = gzipSync(writeContainer(out), { level: 9 });
 writeFileSync(OUT, packed);
