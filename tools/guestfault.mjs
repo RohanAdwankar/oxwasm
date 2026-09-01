@@ -253,6 +253,17 @@ if (process.env.REGWRAP && process.env.TRACEFN) {
 // assembly so nothing registers. Splits "analyzing/emitting the function"
 // from "having it registered": if this run still fails, the compile step
 // corrupts shared state all by itself.
+// WATDUMP=<file> - save the WAT of the unit whose entry is ONLYADDR
+if (process.env.WATDUMP) {
+  const orig = eng.assembleWat;
+  const { writeFileSync } = await import('node:fs');
+  if (orig) eng.assembleWat = (wat) => {
+    if (process.env.ONLYADDR && wat.includes('f_' + BigInt(process.env.ONLYADDR).toString(16)))
+      writeFileSync(process.env.WATDUMP, wat);
+    return orig(wat);
+  };
+}
+
 if (process.env.DISCARD) {
   const orig = eng.assembleWat;
   if (orig) eng.assembleWat = (wat) => {

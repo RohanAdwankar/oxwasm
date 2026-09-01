@@ -925,7 +925,14 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       case 'push': noteRW(insn.src && insn.src.kind==='mem' ? insn.src : null, false); break;   // reg push/pop go via regfile
       case 'pop':  noteRW(insn.dst && insn.dst.kind==='mem' ? insn.dst : null, true); break;
       case 'lea':  seenR[insn.dst.r]=true; any64[insn.dst.r]=true; noteRW(insn.src, false); break;
-      case 'call': case 'leave': case 'ret': case 'retn': break;
+      case 'call': case 'ret': case 'retn': break;          // implicit r4 only, always seen
+      // leave reads AND writes rbp with no explicit operand. A unit whose
+      // entry is the bare `leave; ret` tail of a computed-goto function (jq's
+      // jv_free) never saw r5 anywhere else, got no entry reload for it, and
+      // set rsp from a zero-initialised local - the pop then walked off the
+      // wasm memory. Every other implicit-register mnem below already marks
+      // its registers; this one was lumped in with call/ret.
+      case 'leave': seenR[5] = true; any64[5] = true; break;
       case 'callind': case 'jmpind': noteRW(insn.src, false); break;
       case 'syscall': for (const r of [0,7,6,2,10,8,9]) { seenR[r]=true; any64[r]=true; } break;
       case 'div1': case 'idiv1': case 'mul1': case 'imul1':

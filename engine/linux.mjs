@@ -1094,6 +1094,17 @@ export class LinuxEngine {
     return BigInt(n); }
 
   // fill a struct stat (the by-path shape: dev/ino/nlink/mode/size/times)
+  // Regular files stat with a mode derived from content: ELF binaries and
+  // shebang scripts are 0755, everything else 0644. All-0755 was the old
+  // answer and tar archived data files with the execute bit set - native
+  // headers say 0644 - while a blanket 0644 would break shells probing
+  // PATH entries with access(X_OK).
+  fileMode(bytes) {
+    return bytes && bytes.length >= 2 &&
+      ((bytes[0] === 0x7f && bytes[1] === 0x45 && bytes[2] === 0x4c && bytes[3] === 0x46) ||
+       (bytes[0] === 0x23 && bytes[1] === 0x21)) ? 0o100755 : 0o100644;
+  }
+
   writeStat(buf, path, size, mode, rdev = 0n, ino = null) {
     this.jsnap(buf, 144);
     const off = this.RAMOFF + Number(buf - this.base);
@@ -1723,7 +1734,7 @@ export class LinuxEngine {
           const p = this.atPath(a1, a2);
           if (p === '' && (cpu.regs[10] & 0x1000n)) {         // AT_EMPTY_PATH: stat the fd
             const h = this.fds.get(Number(a1));
-            if (h) { size = h.bytes.length; mode = 0o100755; statPath = h.path ?? null; }
+            if (h) { size = h.bytes.length; mode = this.fileMode(h.bytes); statPath = h.path ?? null; }
           } else if ((cpu.regs[10] & 0x100n) && !p.endsWith('/') &&   // AT_SYMLINK_NOFOLLOW
                      this._fsMeta().links.has(this.norm(p))) {
             statPath = this.norm(p);
@@ -1732,7 +1743,7 @@ export class LinuxEngine {
             this.writeStat(cpu.regs[2], '/dev/pts/0', 0, 0o020620, 0x8800n, 1001n); ret(0n); break;
           } else {
             const f = this.lookup(p);
-            if (f !== undefined) { size = f.length; mode = 0o100755; }
+            if (f !== undefined) { size = f.length; mode = this.fileMode(f); }
             else if (this.isDir(p)) { size = 4096; mode = 0o040755; }
             else { ret(-2n); break; }                         // ENOENT
             statPath = p;
@@ -1741,7 +1752,7 @@ export class LinuxEngine {
           const h = this.fds.get(Number(a1));
           if (this.tty && (Number(a1) <= 2 || h?.istty)) {     // terminal: match stat("/dev/pts/0")
             this.writeStat(a2, '/dev/pts/0', 0, 0o020620, 0x8800n, 1001n); ret(0n); break; }
-          if (h?.bytes) { size = h.bytes.length; mode = 0o100755; statPath = h.path ?? null; }  // regular file
+          if (h?.bytes) { size = h.bytes.length; mode = this.fileMode(h.bytes); statPath = h.path ?? null; }  // regular file
           else if (h?.pipe) { size = 0; mode = 0o010600; }                 // FIFO
           else if (h?.sock) { size = 0; mode = 0o140777; }                 // socket
           else if (h?.isdir) { size = 4096; mode = 0o040755; statPath = h.path; }
@@ -1784,7 +1795,7 @@ export class LinuxEngine {
           this.writeStat(a2, '/dev/pts/0', 0, 0o020620, 0x8800n, 1001n); ret(0n); break; }
         const f = this.lookup(p);
         if (f === undefined && !this.isDir(p)) { ret(-2n); break; }   // ENOENT
-        this.writeStat(a2, p, f ? f.length : 4096, f ? 0o100755 : 0o040755);
+        this.writeStat(a2, p, f ? f.length : 4096, f ? this.fileMode(f) : 0o040755);
         ret(0n); break; }
       case 17: {                                              // pread64(fd, buf, count, off)
         const h = this.fds.get(Number(a1));

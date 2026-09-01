@@ -102,8 +102,18 @@ const CASES = [
   // destination). It stays in the sweep so neither can regress silently.
   ['python3', '/usr/bin/python3', ['-S', '-c', 'print(6*7); print(sorted("breadth")); print(sum(range(100)))'],
               { tree: '/usr/lib/python3.11', memMB: 1024 }],
+  ['jq',      '/usr/bin/jq',      ['-c', '{n: (.a + .b), l: [.a, .b] | map(. * 2)}']],
+  ['zstd',    '/usr/bin/zstd',    ['-19', '-c', IN]],
+  ['bzip2',   '/bin/bzip2',       ['-9', '-c', IN]],
+  ['tar',     '/bin/tar',         ['-cf', '-', IN]],
+  ['dash',    '/bin/dash',        ['-c', 'x=1; while [ $x -le 20 ]; do echo "n$x"; x=$((x+1)); done']],
+  ['rev',     '/usr/bin/rev',     [IN]],
+  ['tac',     '/usr/bin/tac',     [IN]],
+  ['expand',  '/usr/bin/expand',  ['-t', '3', IN]],
+  ['fmt',     '/usr/bin/fmt',     ['-w', '40', IN]],
 ];
-const STDIN = { tr: readFileSync(IN), bc: Buffer.from('scale=20\n7/3\n2^64\nsqrt(2)\nquit\n') };
+const STDIN = { tr: readFileSync(IN), bc: Buffer.from('scale=20\n7/3\n2^64\nsqrt(2)\nquit\n'),
+                jq: Buffer.from('{"a": 3, "b": 4}\n{"a": 10, "b": -2}\n') };
 
 const only = process.argv.slice(2);
 const pick = (n) => !only.length || only.some(o => n.includes(o));
