@@ -1100,12 +1100,15 @@ function emitUnitFunction(a0, fnAddr, ctx) {
                                   : `(i64.store (i32.const ${r*8}) (local.get $r${r}))`;
   const reloadR = (r) => isI32(r) ? `(local.set $r${r} (i32.load (i32.const ${r*8})))`
                                   : `(local.set $r${r} (i64.load (i32.const ${r*8})))`;
-  const spillAll  = () => [...Array.from({length:16},(_,r)=>touched(r)?spillR(r):null).filter(Boolean), ...xSpillAll()];
   const reloadAll = () => [...Array.from({length:16},(_,r)=>touched(r)?reloadR(r):null).filter(Boolean), ...xReloadAll()];
-  // Exit spill: a disciplined savedI32 reg's slot was just refreshed by its
-  // epilogue pop (the full 64-bit caller value) — don't clobber it with the
-  // truncated working value. All xmm are caller-saved: always write back.
-  const spillExit = () => [...Array.from({length:16},(_,r)=>(touched(r)&&!savedI32(r))?spillR(r):null).filter(Boolean), ...xSpillAll()];
+  // Spill sites are emitted as markers and expanded by the narrowing pass
+  // after all blocks exist (it needs whole-CFG dataflow). SA is the full
+  // spill (every touched reg + used xmm); SX is the exit spill, which skips
+  // disciplined savedI32 regs — their slot was just refreshed by the epilogue
+  // pop (the full 64-bit caller value), and the truncated working value must
+  // not clobber it. With the lever off the expansion is the full spill list,
+  // identical to the pre-narrowing emitter's output up to whitespace.
+  const SA_MARK = '\x00SA\x00', SX_MARK = '\x00SX\x00';
 
   // ---- operand / instruction emit (identical semantics to the dispatch version) ----
   const hexs = (v) => BigInt.asIntN(64, v).toString();
@@ -1928,7 +1931,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
               const bad = sgn
                 ? `(i64.ne ${rd(rdx,8,next)} (i64.shr_s ${rd(rax,8,next)} (i64.const 63)))`
                 : `(i64.ne ${rd(rdx,8,next)} (i64.const 0))`;
-              L.push(`(if ${bad} (then`, ...spillAll(),
+              L.push(`(if ${bad} (then`, SA_MARK,
                      `(return (call $x_deopt (i64.const ${hexs(insn.rip)}) (local.get $rsp0)))))`);
             }
             const d = rd(insn.src,8,next), n = rd(rax,8,next);
@@ -1978,7 +1981,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           L.push(wr(insn.dst,S,`(local.get ${tr})`,next));
           break; }
         case 'rdtsc':   // synthetic timestamp lives in the interpreter: deopt to it
-          L.push(...spillAll(), `(return (call $x_deopt (i64.const ${hexs(insn.rip)}) (local.get $rsp0)))`);
+          L.push(SA_MARK, `(return (call $x_deopt (i64.const ${hexs(insn.rip)}) (local.get $rsp0)))`);
           break;
         case 'leave':    // mov rsp,rbp ; pop rbp
           L.push(`(local.set $r4 ${rd({kind:'reg',r:5,size:8},8,next)})`);
@@ -1995,7 +1998,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           // check, and no frame. Removing the frame IS the optimisation; the
           // three things around it were each measured to cost nothing.
           if (insn.inlineTo !== undefined) break;
-          L.push(...spillAll());
+          L.push(SA_MARK);
           if (canDirect(target.toString()))
             // stack-budget check even on direct calls: past it, x_callout
             // interprets the callee instead of nesting another wasm frame
@@ -2019,7 +2022,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           const t = T(); L.push(`(local.set ${t} ${rd(insn.src,8,next)})`);
           L.push(`(local.set $r4 (i64.sub (local.get $r4) (i64.const 8)))`,
                  `(i64.store ${wasmAddr({base:4,index:-1,disp:0n},next)} (i64.const ${hexs(next)}))`);
-          L.push(...spillAll());
+          L.push(SA_MARK);
           usesFtr = true;
           L.push(`(local.set $fti (call $ftr (local.get ${t})))`,
                  ftSave(),
@@ -2032,7 +2035,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           // pass this syscall's guest rip: a BLOCKING syscall (poll/select/
           // read) suspends the whole engine by unwinding the wasm frames and
           // recording this rip so resume re-executes the syscall exactly here
-          L.push(...spillAll(), `(call $x_syscall (i64.const ${hexs(insn.rip)}))`, ...reloadAll());
+          L.push(SA_MARK, `(call $x_syscall (i64.const ${hexs(insn.rip)}))`, ...reloadAll());
           break;
         case 'cld': break;                                                    // DF stays 0 (bulk ops assume it)
         case 'stos': {
@@ -2139,7 +2142,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     // resumes in the interpreter at that address, which faults exactly as
     // native would if the bytes are truly garbage.
     const deoptTo = (addr) => [`(local.set $rex (i64.const ${hexs(addr)}))`,
-      ...spillAll(), `(return (call $x_deopt (local.get $rex) (local.get $rsp0)))`];
+      SA_MARK, `(return (call $x_deopt (local.get $rex) (local.get $rsp0)))`];
     if (t.kind === 'jcc') {
       const c = cond(last.cond);
       const T = t.t, F = t.f;
@@ -2172,7 +2175,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       // pop the return address, retire the frame, hand the exit rip back
       L.push(`(local.set $rex (i64.load ${wasmAddr({base:4,index:-1,disp:0n},lnext)}))`);
       L.push(`(local.set $r4 (i64.add (local.get $r4) (i64.const ${8 + t.pad})))`);
-      L.push(...spillExit());
+      L.push(SX_MARK);
       L.push(`(return (local.get $rex))`);
     } else if (t.kind === 'jtab') {
       // indirect jump through a discovered jump table: resolve the COMPUTED
@@ -2183,14 +2186,14 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       L.push(`(local.set $rex ${rd(t.src,8,lnext)})`);
       L.push(`(local.set $pc (call $jtr_${fnAddr.toString(16)} (local.get $rex)))`);
       L.push(`(br_if $L_disp (i32.ge_s (local.get $pc) (i32.const 0)))`);
-      L.push(...spillAll());
+      L.push(SA_MARK);
       L.push(...tailJmp());
       L.push(`(return (call $x_deopt (local.get $rex) (local.get $rsp0)))`);
     } else if (t.kind === 'deopt') {
       // indirect jump (jump table / tail call) or undecodable byte:
       // hand the frame to the engine at the computed target / that rip
       L.push(`(local.set $rex ${t.src ? rd(t.src,8,lnext) : `(i64.const ${hexs(t.at)})`})`);
-      L.push(...spillAll());
+      L.push(SA_MARK);
       if (t.src) L.push(...tailJmp());
       L.push(`(return (call $x_deopt (local.get $rex) (local.get $rsp0)))`);
     } else {                                              // fall-through
@@ -2201,6 +2204,94 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   }
 
   const bodies = []; for (let i=0;i<N;i++) bodies.push(emitBlock(i));
+
+  // ---- spill narrowing -------------------------------------------------------
+  // A register whose local provably equals its regfile slot ("clean") need not
+  // be written back at a spill site. Cleanliness is tracked MECHANICALLY over
+  // the emitted text — any (local.set $rN/$xN …) dirties the register unless
+  // it is exactly the protocol reload pattern, which cleans it — so soundness
+  // does not rest on hand-listing which instructions write which registers.
+  // Protocol reloads only appear unconditionally on the mainline (after
+  // calls/syscalls); a write inside a conditional only over-dirties, which
+  // costs a store, never correctness. State crosses blocks by bit-vector
+  // fixpoint over succs (jump-table edges are present via jtabUnion; the
+  // entry block's function-entry path contributes an all-clean state on top
+  // of any back edges, since the prologue reload runs once, not per re-entry).
+  // With the lever off every marker expands to the full spill, identical to
+  // the unnarrowed emitter up to whitespace.
+  {
+    const narrowOn = globalThis.__narrow ??
+      (typeof process !== 'undefined' && process.env?.OXWASM_NARROW === '1');
+    const expandFull = (sx) => [
+      ...Array.from({length: 16}, (_, r) => r).filter(r => touched(r) && !(sx && savedI32(r))).map(spillR),
+      ...[...xUsed].map(xSpill),
+    ].join('\n      ');
+    if (!narrowOn) {
+      // off: every marker becomes the full spill; no scan, no dataflow
+      const sa = expandFull(false), sX = expandFull(true);
+      for (let b = 0; b < N; b++) if (bodies[b].indexOf('\x00') !== -1)
+        bodies[b] = bodies[b].replaceAll(SA_MARK, sa).replaceAll(SX_MARK, sX);
+    } else {
+    const bit = new Map();                      // '$rN'/'$xN' -> dirty-mask bit
+    for (let r = 0; r < 16; r++) if (touched(r)) bit.set('$r'+r, 1 << r);
+    for (const x of xUsed) bit.set('$x'+x, (0x10000 << x) | 0);
+    const cleanPat = new Map();                 // '$rN'/'$xN' -> exact reload text
+    for (let r = 0; r < 16; r++) if (touched(r)) cleanPat.set('$r'+r, reloadR(r));
+    for (const x of xUsed) cleanPat.set('$x'+x, xReload(x));
+    const RE = /\x00S[AX]\x00|\(local\.set (\$[rx]\d+)/g;
+    // per-block transfer as (kill, gen): OUT = (IN & ~kill) | gen, and every
+    // marker's mask as a snapshot of (kill, gen) at its position
+    const kills = new Array(N).fill(0), gens = new Array(N).fill(0);
+    const marks = Array.from({length: N}, () => []);
+    for (let b = 0; b < N; b++) {
+      let kill = 0, gen = 0, m;
+      RE.lastIndex = 0;
+      while ((m = RE.exec(bodies[b])) !== null) {
+        if (m[0][0] === '\x00') { marks[b].push({ at: m.index, sx: m[0][2] === 'X', kill, gen }); continue; }
+        const name = m[1], bb = bit.get(name);
+        if (bb === undefined) continue;         // a local we don't sync (never here, by construction)
+        const pat = cleanPat.get(name);
+        if (bodies[b].startsWith(pat, m.index)) { kill |= bb; gen &= ~bb; }
+        else gen |= bb;
+      }
+      kills[b] = kill; gens[b] = gen;
+    }
+    const predsN = Array.from({length: N}, () => []);
+    for (let b = 0; b < N; b++) for (const s of succs[b]) if (s >= 0) predsN[s].push(b);
+    const IN = new Array(N).fill(0), OUT = new Array(N).fill(0);
+    for (let pass = 0, changed = true; changed && pass < 33 * N + 2; pass++) {
+      changed = false;
+      for (let b = 0; b < N; b++) {
+        let inm = 0; for (const p of predsN[b]) inm |= OUT[p];
+        const o = (inm & ~kills[b]) | gens[b];
+        if (inm !== IN[b] || o !== OUT[b]) { IN[b] = inm; OUT[b] = o; changed = true; }
+      }
+    }
+    const expand = (sx, mask) => [
+      ...Array.from({length: 16}, (_, r) => r).filter(r =>
+        touched(r) && !(sx && savedI32(r)) && (mask & (1 << r))).map(spillR),
+      ...[...xUsed].filter(x => mask & ((0x10000 << x) | 0)).map(xSpill),
+    ].join('\n      ');
+    const stats = globalThis.__narrowStats ??= { sites: 0, spills: 0, skipped: 0 };
+    const nStores = (s) => { let n = 0, i = -1; while ((i = s.indexOf('.store', i + 1)) !== -1) n++; return n; };
+    for (let b = 0; b < N; b++) {
+      if (!marks[b].length) continue;
+      let out = '', last = 0;
+      for (const mk of marks[b]) {
+        const mask = (IN[b] & ~mk.kill) | mk.gen;
+        const txt = expand(mk.sx, mask);
+        stats.sites++; const k = nStores(txt);
+        stats.spills += k; stats.skipped += nStores(expandFull(mk.sx)) - k;
+        out += bodies[b].slice(last, mk.at) + txt;
+        last = mk.at + 4;                       // marker is 4 chars
+      }
+      bodies[b] = out + bodies[b].slice(last);
+    }
+    }
+    // a marker that survives would poison the unit at wat2wasm; fail loudly
+    for (let b = 0; b < N; b++) if (bodies[b].indexOf('\x00') !== -1)
+      throw new Error('AOT: unexpanded spill marker in block ' + b + ' of ' + fnAddr.toString(16));
+  }
 
   const name = 'f_' + fnAddr.toString(16);
   let wat = `  (func $${name} (export "${name}") (result i64)\n`;
