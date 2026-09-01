@@ -98,6 +98,50 @@ const INLCALL = (keyExpr, pl, kl) => `
               (i32.store (i32.const ${FTDEPTH}) (local.get $fts)))
         (else (unreachable)))`;
 
+// the guard alone: constant table index, full ftHit + fuel/depth dance -
+// prices the guard separately from any probe
+const GUARDCALL = (idx) => `
+      (local.set $fti (i32.const ${idx}))
+      (local.set $fts (i32.load (i32.const ${FTDEPTH})))
+      (if (i32.and (i32.ge_s (local.get $fti) (i32.const 0))
+                   (i32.and (i32.lt_u (i32.load (i32.const ${FTDEPTH})) (i32.const ${FTDLIMIT}))
+                            (i32.ne (i32.load (i32.const ${FTFUEL})) (i32.const 0))))
+        (then (i32.store (i32.const ${FTFUEL}) (i32.sub (i32.load (i32.const ${FTFUEL})) (i32.const 1)))
+              (drop (call_indirect $ft (type $uft) (local.get $fti)))
+              (i32.store (i32.const ${FTDEPTH}) (local.get $fts)))
+        (else (unreachable)))`;
+
+// the guard minus the fuel check, reusing the already-loaded depth for the
+// compare - NOT shippable semantics (chains unbounded), it prices what the
+// fuel load/compare/store and the duplicate depth load cost
+const GUARDMIN = (idx) => `
+      (local.set $fti (i32.const ${idx}))
+      (local.set $fts (i32.load (i32.const ${FTDEPTH})))
+      (if (i32.and (i32.ge_s (local.get $fti) (i32.const 0))
+                   (i32.lt_u (local.get $fts) (i32.const ${FTDLIMIT})))
+        (then (drop (call_indirect $ft (type $uft) (local.get $fti)))
+              (i32.store (i32.const ${FTDEPTH}) (local.get $fts)))
+        (else (unreachable)))`;
+
+// inlined probe as ONE 16-byte v128 load: key and fti arrive in a single
+// load instead of two dependent ones - lane 0 is the key, lane 2 the fti
+const V128CALL = (keyExpr, pl, vl) => `
+      (local.set ${pl} (i32.add (i32.const ${FTHASH})
+        (i32.shl (i32.shr_u (i32.mul (i32.wrap_i64 ${keyExpr}) (i32.const 0x9E3779B1))
+                            (i32.const ${32 - FTHBITS})) (i32.const 4))))
+      (local.set ${vl} (v128.load (local.get ${pl})))
+      (if (i64.eq (i64x2.extract_lane 0 (local.get ${vl})) ${keyExpr})
+        (then (local.set $fti (i32x4.extract_lane 2 (local.get ${vl}))))
+        (else (local.set $fti (call $ftr ${keyExpr}))))
+      (local.set $fts (i32.load (i32.const ${FTDEPTH})))
+      (if (i32.and (i32.ge_s (local.get $fti) (i32.const 0))
+                   (i32.and (i32.lt_u (i32.load (i32.const ${FTDEPTH})) (i32.const ${FTDLIMIT}))
+                            (i32.ne (i32.load (i32.const ${FTFUEL})) (i32.const 0))))
+        (then (i32.store (i32.const ${FTFUEL}) (i32.sub (i32.load (i32.const ${FTFUEL})) (i32.const 1)))
+              (drop (call_indirect $ft (type $uft) (local.get $fti)))
+              (i32.store (i32.const ${FTDEPTH}) (local.get $fts)))
+        (else (unreachable)))`;
+
 const LOOP = (callA, callB, extraLocals = '') => `(func (export "run") (param $n i64) (result i64)
     (local $i i64) (local $s i64) (local $a i64) ${extraLocals}
     (loop $l
@@ -138,6 +182,19 @@ icarm: `${HEAD}
 ${FTR}
   ${LOOP(ICCALL(0xE0000, `(i64.const ${KEYA})`), ICCALL(0xE0010, `(i64.const ${KEYB})`),
          '(local $fti i32) (local $fts i32)')})`,
+
+guard: `${HEAD}
+${FTR}
+  ${LOOP(GUARDCALL(1), GUARDCALL(2), '(local $fti i32) (local $fts i32)')})`,
+
+guardmin: `${HEAD}
+${FTR}
+  ${LOOP(GUARDMIN(1), GUARDMIN(2), '(local $fti i32) (local $fts i32)')})`,
+
+v128probe: `${HEAD}
+${FTR}
+  ${LOOP(V128CALL(`(i64.const ${KEYA})`, '$p1', '$v1'), V128CALL(`(i64.const ${KEYB})`, '$p2', '$v2'),
+         '(local $fti i32) (local $fts i32) (local $p1 i32) (local $v1 v128) (local $p2 i32) (local $v2 v128)')})`,
 
 // the $ftr body's FIRST probe inlined at the site (no wasm call), with the
 // out-of-line $ftr only as the chain-miss fallback that never fires here
