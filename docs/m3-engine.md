@@ -1736,11 +1736,41 @@ Two facts sharpen the next increment:
   interpreter-coverage problem. (An earlier cold-cache reading of
   "185x" was first-run wat2wasm of 1,147 functions — precisely the
   artifact realab exists to subtract.)
-- **Reload narrowing needs a third state.** Eliding a post-call reload
-  of a register never read before its next def leaves the local stale
-  while the slot is authoritative; the forward spill pass must then
-  treat that register as *stale* — never spill it until a real def —
-  or a later spill site would overwrite the callee's fresh slot with
-  the stale local. Backward liveness (uses = `local.get` occurrences in
-  the post-narrowing text) composed with that stale state is the next
-  increment of the lever.
+- **Reload narrowing does not need a third state** — the design fear
+  above dissolved on closer inspection: expanding spills *before* the
+  backward liveness pass makes each expanded spill's `local.get` a use,
+  which forces the reload on any path that could later spill the
+  register; an elided reload therefore proves the local dead until a
+  full redefinition, and the forward pass's post-call "clean" stays
+  exactly right (slot authoritative, spills suppressed).
+
+### Reload narrowing: built, one real miscompile, and a decisive null
+
+The load half is implemented (reload markers + backward liveness, defs
+firing at the local.set's *closing* paren after its expression's uses —
+the first cut ordered events by text position and a read-modify-write
+first instruction killed its own entry liveness, eliding ld.so's
+incoming rdi reload; bisected with the per-function
+`OXWASM_NARROW_ONLY` lever, pinned by `narrowtest.mjs`, which fails
+2/4 with the bug reinstated). On sha256sum the two passes skip 52% of
+spill stores and 55% of reload loads. Full gate green both lever
+states; breadth 31/31.
+
+The measurement, though, is a decisive null: perl steady state with
+BOTH halves is **0.993x, inside ±8%** — cutting more than half of all
+protocol memory traffic moved nothing. Conclusions:
+
+1. **The call-tax remainder is not regfile memory traffic.** The
+   regfile is L1-hot and V8 hides those accesses. This also exonerates
+   the long-standing xmm-spillAll suspect for the 6.4–8x engine gap —
+   xmm spills/reloads were narrowed along with the rest.
+2. The surviving suspects for call-dense code are the **dispatch
+   machinery**: the `$ftr` hash lookup per indirect call, the
+   megamorphic `call_indirect` (which V8 cannot inline or predict),
+   and the second `$ftr` lookup on the return path (`tailJmp`). The
+   next idealcall arm should price exactly that: direct call vs
+   hash-lookup + call_indirect through a funcref table.
+3. Narrowing stays **opt-in**: perf-neutral steady state at current
+   resolution, and its on-thread analysis costs ~+25% startup in
+   realab (perl small runs: 14.7s vs 11.6s). If it is ever promoted,
+   the analysis belongs off the critical path first.
