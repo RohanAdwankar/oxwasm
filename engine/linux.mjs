@@ -1605,6 +1605,17 @@ export class LinuxEngine {
         if (now >= deadline) { this._deadline = null; ret(0n); break; }
         this._deadline = deadline; this.block(deadline); break; }
       case 39: ret(1n); break;                               // getpid
+      case 62: case 200: case 234: {                         // kill / tkill / tgkill
+        // signal delivery to SELF with a fatal signal takes the default
+        // action: terminate with the shell-convention 128+sig status. No
+        // handler machinery exists (rt_sigaction is a stored no-op), so the
+        // default is the faithful approximation - php's fortify abort used
+        // to reach exit 127 via tgkill=ENOSYS + glibc's fallback exit,
+        // where native dies 134. sig 0 stays a liveness probe.
+        const sig = Number(nr === 62 ? a2 : a3);
+        if (sig === 0) { ret(0n); break; }
+        if (Number(a1) <= 1) { this.exitCode = 128 + sig; cpu.halted = true; }
+        ret(0n); break; }
       case 102: case 104: case 107: case 108: ret(0n); break; // getuid/getgid/geteuid/getegid
       // Credentials and ownership are single-user here: everything runs as
       // one uid, so these succeed rather than reporting ENOSYS. xterm calls

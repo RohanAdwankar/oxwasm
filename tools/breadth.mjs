@@ -143,6 +143,9 @@ const CASES = [
   // statically linked: the no-ld.so lane end to end (entry straight at
   // _start, static TLS, no PT_INTERP), which nothing else in the sweep hits
   ['busybox-sh',  '/usr/bin/busybox', ['sh', '-c', 'i=0; while [ $i -lt 10 ]; do echo bb$i; i=$((i+1)); done']],
+  // the abort lane: a self-delivered fatal signal must terminate with the
+  // default action (128+sig), the path php's fortify abort takes
+  ['abort',   '/bin/dash',        ['-c', 'echo before; kill -ABRT $$; echo unreachable']],
   ['busybox-md5', '/usr/bin/busybox', ['md5sum', IN]],
   // ruby's VM reserves ~500MB of address space at boot and exits 1 (silently)
   // when mmap says ENOMEM - it needs headroom above breadth's 512MB default
@@ -172,10 +175,15 @@ const STDIN = { tr: readFileSync(IN), bc: Buffer.from('scale=20\n7/3\n2^64\nsqrt
 const only = process.argv.slice(2);
 const pick = (n) => !only.length || only.some(o => n.includes(o));
 
+// a native process killed by a signal has status null in node; normalize to
+// the shell's 128+sig so it compares against the engine's default-action code
+const SIGN = { SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGILL: 4, SIGTRAP: 5, SIGABRT: 6,
+               SIGBUS: 7, SIGFPE: 8, SIGKILL: 9, SIGSEGV: 11, SIGPIPE: 13, SIGTERM: 15 };
 const native = (bin, args, stdin) => {
   try { const out = execFileSync(bin, args, { input: stdin, maxBuffer: 1 << 28 });
         return { out, code: 0 }; }
-  catch (e) { return { out: e.stdout ?? Buffer.alloc(0), code: e.status ?? -1 }; }
+  catch (e) { return { out: e.stdout ?? Buffer.alloc(0),
+                       code: e.status ?? (e.signal ? 128 + (SIGN[e.signal] || 0) : -1) }; }
 };
 
 const engine = (bin, args, stdin, opts = {}) => {

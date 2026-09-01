@@ -2008,9 +2008,19 @@ distinct root causes in one run each:
   the system tzdata at startup; with the directory unprovisioned it
   takes a fallback that aborts. Provisioning the tree (2MB, the same
   files native scans) makes it byte-identical. The fallback-path abort
-  itself is a reproducible lead — drop the tree and it returns — that
-  could yet be an engine miscompile in code native rarely runs; parked,
-  since the provisioned path is the faithful comparison.
+  was then closed by the decisive experiment: native php 8.4 in a
+  minimal chroot without zoneinfo aborts with the identical fortify
+  message (exit 134) — the engine was faithfully reproducing a real php
+  bug, instruction for instruction, in a code path that php's own
+  developers presumably never run. The one infidelity was the exit
+  code: the guest reached 127 through tgkill=ENOSYS plus glibc's
+  fallback exit where the kernel says 134, so kill/tkill/tgkill now
+  take the default action for self-delivered fatal signals (terminate
+  with 128+sig; sig 0 stays a liveness probe), breadth normalizes
+  node's signal-death status to the same convention, and an `abort`
+  case (dash `kill -ABRT $$`) pins the lane — it fails on the pre-fix
+  engine with exit 0 and a shell error, and runs the `echo unreachable`
+  that native never reaches.
 
 The pattern across all three: the failure printout that names the
 guest's complaint (a [BUG] line, an errno, a path) converts a debugging
