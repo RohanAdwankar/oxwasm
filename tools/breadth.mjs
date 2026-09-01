@@ -32,6 +32,11 @@ add('/etc/ld.so.cache', '/etc/ld.so.cache');
 // while native says root - a provisioning gap, not an engine one
 add('/etc/passwd', '/etc/passwd');
 add('/etc/group', '/etc/group');
+// file(1) probes /etc/magic then /usr/share/misc/magic.mgc (a symlink into
+// /usr/lib/file - provision the path the guest OPENS, not the target)
+add('/etc/magic', '/etc/magic');
+add('/etc/magic.mime', '/etc/magic.mime');
+add('/usr/share/misc/magic.mgc', '/usr/share/misc/magic.mgc');
 
 // A shared input, written once so native and engine see identical bytes.
 const IN = '/tmp/breadth_in.txt';
@@ -116,9 +121,20 @@ const CASES = [
   ['tac',     '/usr/bin/tac',     [IN]],
   ['expand',  '/usr/bin/expand',  ['-t', '3', IN]],
   ['fmt',     '/usr/bin/fmt',     ['-w', '40', IN]],
+  ['awk',     '/usr/bin/mawk',    ['{ s += $1; n++ } END { print s, n, NR }', IN]],
+  ['git-hash','/usr/bin/git',     ['hash-object', '--stdin']],
+  ['file',    '/usr/bin/file',    [IN]],
+  ['comm',    '/usr/bin/comm',    [IN, IN]],
+  ['join',    '/usr/bin/join',    [IN, IN]],
+  ['tsort',   '/usr/bin/tsort',   []],
+  ['strings', '/usr/bin/strings', [IN]],
+  ['cksum',   '/usr/bin/cksum',   [IN]],
+  ['sha512',  '/usr/bin/sha512sum', [IN]],
 ];
 const STDIN = { tr: readFileSync(IN), bc: Buffer.from('scale=20\n7/3\n2^64\nsqrt(2)\nquit\n'),
-                jq: Buffer.from('{"a": 3, "b": 4}\n{"a": 10, "b": -2}\n') };
+                jq: Buffer.from('{"a": 3, "b": 4}\n{"a": 10, "b": -2}\n'),
+                'git-hash': readFileSync(IN),
+                tsort: Buffer.from('a b\nb c\nc d\na d\n') };
 
 const only = process.argv.slice(2);
 const pick = (n) => !only.length || only.some(o => n.includes(o));
