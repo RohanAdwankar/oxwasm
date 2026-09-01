@@ -2546,9 +2546,18 @@ export function compileUnitWat(mem, entry, opts = {}) {
       // jump in wasm, deopt, and unwind the CALLER's live frame every time.
       // Poisoning it makes callers reach it via x_callout, which runs it to
       // completion (dispatching the real target) and returns — frame intact.
-      { const b0 = an.blocks[0].insns; let tramp = false;
-        for (const insn of b0) { if (insn.mnem === 'nop') continue; tramp = insn.mnem === 'jmpind'; break; }
-        if (tramp && an.blocks.length === 1) throw new Error('trampoline -> callout'); }
+      // A rip-relative jmpind at entry is a trampoline REGARDLESS of block
+      // count: when the analyzer manages to follow the slot's current value
+      // (target not pruned), the compile would bake a MUTABLE GOT binding in
+      // as static control flow — repacking the GIMP container did exactly
+      // that to stub 0x7dbbec0 and the page's stroke path died on the stale
+      // binding. Register/indexed jmpind (a computed goto) keeps the
+      // single-block rule, since a jtab-resolved entry is a real function.
+      { const b0 = an.blocks[0].insns; let t0 = null;
+        for (const insn of b0) { if (insn.mnem === 'nop') continue; t0 = insn; break; }
+        if (t0?.mnem === 'jmpind' &&
+            ((t0.src?.kind === 'mem' && t0.src.ripRel) || an.blocks.length === 1))
+          throw new Error('trampoline -> callout'); }
       funcs.set(k, an);
       for (const c of an.calls) if (!funcs.has(c) && !poisoned.has(c)) pending.push(BigInt(c));
     } catch (e) { poisoned.add(k); if (k === entry.toString()) throw e; }
