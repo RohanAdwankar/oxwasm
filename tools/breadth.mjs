@@ -27,6 +27,11 @@ for (const d of ['/lib/x86_64-linux-gnu', '/usr/lib/x86_64-linux-gnu', '/lib64']
   for (const f of e) { try { const r = realpathSync(join(d, f)); if (lstatSync(r).isFile()) add(join(d, f), r); } catch {} }
 }
 add('/etc/ld.so.cache', '/etc/ld.so.cache');
+// tar resolves uname/gname through getpwuid/getgrgid: without these the
+// engine's archive carries empty owner names (and a checksum to match)
+// while native says root - a provisioning gap, not an engine one
+add('/etc/passwd', '/etc/passwd');
+add('/etc/group', '/etc/group');
 
 // A shared input, written once so native and engine see identical bytes.
 const IN = '/tmp/breadth_in.txt';
