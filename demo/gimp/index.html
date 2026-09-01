@@ -255,6 +255,7 @@ function sha1hex(str) {
     if (qs.has('noftab')) globalThis.__noFtab = true;  // no wasm-to-wasm chaining
     if (qs.has('noinline')) globalThis.__inline = false; // runtime units without hot-callee inlining (bisect lever; inlining is on by default)
     if (qs.has('latprof')) window.__oxLatProf = true;  // per-input {in,inject} + {in,blit} pairs: where a stroke's latency lives
+    window.__oxFastBlit = !qs.has('rafblit'); // paint at slice end (default; ~13ms off stroke latency); ?rafblit restores rAF-aligned painting
     if (qs.has('trap')) {
       const od = eng.dispatchAot.bind(eng);
       let n = 0, last = 0;
@@ -409,7 +410,24 @@ function sha1hex(str) {
         di: s2.interpreted - (window.__oxPI || 0), da: s2.aotRuns - (window.__oxPA || 0) });
       window.__oxPI = s2.interpreted; window.__oxPA = s2.aotRuns;
       if (window.__oxPump.length > 4096) window.__oxPump.splice(0, 2048); }
-    if (xs.dirty) scheduleBlit();
+    if (xs.dirty) {
+      // Paint at slice end instead of waiting for the next rAF (default).
+      // latprof put the rAF alignment at ~8ms of the ~27ms stroke median,
+      // and the paired A/B measured 19.8ms vs 35.5ms; painting immediately
+      // trades compositor alignment for that latency. ?rafblit restores
+      // the aligned path.
+      if (window.__oxFastBlit) {
+        blit();
+        const nowB = performance.now();
+        while (inputQ.length) {
+          const tIn = inputQ[0];
+          if (LAT.trace) LAT.trace.push({ in: +tIn.toFixed(1), blit: +nowB.toFixed(1) });
+          const dt = nowB - inputQ.shift();
+          LAT.samples++; LAT.sumMs += dt; if (dt > LAT.maxMs) LAT.maxMs = dt;
+          LAT.hist[Math.min(11, Math.max(0, Math.floor(Math.log2(Math.max(1, dt)))))]++;
+        }
+      } else scheduleBlit();
+    }
     const s = eng.stats;
     stat.textContent = `interp ${s.interpreted.toLocaleString()} · aot units ${s.tiers.aot||0} · ${((performance.now()-t0)/1000).toFixed(0)}s`;
     pumping = false;
