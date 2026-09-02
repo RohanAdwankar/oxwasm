@@ -2270,3 +2270,28 @@ is not its original, with AOT on. Four passes in, this is a genuine
 multi-layer bug; it is parked with a seconds-long repro and an exact
 corrupted-structure identification so a focused session can close it
 without re-deriving any of the above.
+
+**Fifth pass — it is a REGISTER, not the table.** A snapshot/diff of the
+whole exit-handler data region (`.data`+`.bss`, `__exit_funcs` and the
+static `initial` block) across the vfork window shows **zero changes** —
+the table is intact. What is wrong is `%r15`: at the fault it holds `1`
+(so does `%rbx`), so the `call *0x10(%r15)` reads a non-pointer and
+jumps to garbage. So the corruption is the parent's **callee-saved
+registers not surviving the vfork+AOT boundary**, not any store to
+memory. This flips the mechanism back toward regfile/spill handling:
+the parent runs a tiered `hot()` after the vfork window, and either the
+window's `aotBudget`/regfile save-restore or the second AOT dispatch's
+`syncOut`/`syncIn` leaves `%rbx`/`%r15` clobbered where the guest code
+expects them preserved. The decisive remaining datum is a straight
+compare of the parent's callee-saved registers at three points —
+entering vfork, resuming after the child execs, and at the fault — to
+pin which transition zeroes them; a focused session should take that
+comparison first.
+
+After five localization passes across several autonomous check-ins
+without a landed fix, this is explicitly handed off to a dedicated
+debugging session rather than continued in hourly bursts: the repro is
+seconds long, the corruption is now known to be register (r15/rbx), the
+table is proven intact, and the scheduler is ruled out. Continuing to
+probe it one hour at a time has low expected value; the breadth and
+perf lanes ship reliably and should take the bursts.
