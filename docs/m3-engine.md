@@ -2127,7 +2127,19 @@ constantly) would keep dispatching into stale translations of bytes
 that no longer exist. munmap now drops every compiled artifact whose
 entry lies in the range and rebuilds the dispatch hash without them —
 skipped entirely for data-buffer munmaps that intersect nothing.
-Remaining known gaps, queued: a targeted recycle regression (tier a
-page, munmap, map different code at the same address, prove the new
-code runs — the sweep cannot catch this), and in-place patching of
-still-mapped code (V8's IC updates), which no munmap ever announces.
+The recycle regression now exists: `tools/fixtures/recycle.asm` is a
+120-line hand-rolled static ELF that tiers a hot function at a fixed
+rwx page (12 calls through the call profile), munmaps it, maps a
+different function at the same address, and prints which one actually
+ran. With the invalidation neutered the engine prints "A\n" — the
+stale translation, exactly the bug — and with it, "B\n" byte-identical
+to hardware. It runs in the sweep as case `recycle` (built from the
+committed asm when nasm is present). 69/69.
+
+Still open, documented rather than half-fixed: in-place patching of
+still-mapped code (V8's deopt and IC rewrites), which no munmap ever
+announces. A faithful catch needs write tracking on pages that hold
+translations (QEMU's approach: write-protect and trap) or a per-entry
+prologue byte-check, both of which tax the hot dispatch path; the
+full-JIT stress passing suggests V8's write-once discipline makes this
+rare in practice, but it is a real hole and stays on the ledger.

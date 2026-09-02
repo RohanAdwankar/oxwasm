@@ -51,6 +51,17 @@ if (!existsSync(IN)) {
 }
 add(IN, IN);
 
+// The page-recycle fixture (tools/fixtures/recycle.asm): tier code at a
+// fixed rwx page, munmap it, map different code at the same address - an
+// engine that keeps address-keyed translations across munmap prints the
+// stale answer. Built from the committed asm when nasm is present.
+const RECYCLE = '/tmp/breadth_recycle';
+if (!existsSync(RECYCLE)) {
+  try { execFileSync('nasm', ['-f', 'bin', '-o', RECYCLE,
+                              new URL('./fixtures/recycle.asm', import.meta.url).pathname]);
+        execFileSync('chmod', ['+x', RECYCLE]); } catch {}
+}
+
 // wat2wasm for the AOT tier; cached by text hash so repeat cases are cheap
 const CACHE = new URL('../bench/kernels/watcache/', import.meta.url).pathname;
 mkdirSync(CACHE, { recursive: true });
@@ -185,6 +196,9 @@ const CASES = [
                 { tree: '/tmp/breadth_repo' }],
   // the write path: init creates the .git tree from nothing
   ['git-init',  '/usr/bin/git', ['init', '-q', '/tmp/fresh_repo']],
+  // self-modifying-code lane: must print B (the recycled page's NEW code),
+  // never A (a stale translation of the munmapped bytes)
+  ['recycle',   '/tmp/breadth_recycle', []],
 ];
 const STDIN = { tr: readFileSync(IN), bc: Buffer.from('scale=20\n7/3\n2^64\nsqrt(2)\nquit\n'),
                 jq: Buffer.from('{"a": 3, "b": 4}\n{"a": 10, "b": -2}\n'),
