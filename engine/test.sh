@@ -43,5 +43,6 @@ node cmppstest.mjs
 node bsrtest.mjs
 node narrowtest.mjs
 node implicittest.mjs
+node rottest.mjs
 node strtest.mjs
 node decodetest.mjs

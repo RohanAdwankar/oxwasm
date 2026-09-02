@@ -1868,7 +1868,11 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           const rot = insn.mnem === 'rol';
           if (S === 8) { const a=rd(insn.dst,8,next);
             const c=`(i32.and ${rd32(insn.src,next)} (i32.const 63))`;
-            L.push(`(local.set ${reg(insn.dst.r)} (i64.${rot?'rotl':'rotr'} ${a} (i64.extend_i32_u ${c})))`); }
+            // wr, not a hardcoded local.set: rol/ror qword [mem], n has a
+            // memory destination (dst.r is undefined -> $rundefined), which
+            // wat2wasm rejects, dropping the whole unit to interp. cc1's
+            // switch dispatch rotates jump-table words in place.
+            L.push(wr(insn.dst, 8, `(i64.${rot?'rotl':'rotr'} ${a} (i64.extend_i32_u ${c}))`, next)); }
           else if (S === 4) { const c=shmask32(rd32(insn.src,next), 31);
             if (insn.dst.kind === 'reg') L.push(wr32reg(insn.dst.r, `(i32.${rot?'rotl':'rotr'} ${rd32(insn.dst,next)} ${c})`));
             else L.push(wr(insn.dst,4,`(i64.and (i64.extend_i32_u (i32.${rot?'rotl':'rotr'} ${rd32(insn.dst,next)} ${c})) (i64.const ${m}))`,next)); }

@@ -41,4 +41,46 @@ for (const op of ['rol', 'ror']) for (const w of [1,2,4,8]) for (const cnt of [0
   }
 }
 console.log(`\n${pass}/${pass+fail} rol/ror results bit-exact (AOT vs interpreter)`);
+
+// Unit-mode rol/ror with a MEMORY destination. The unit emitter's S===8
+// branch hardcoded `local.set $r<dst.r>`, but `rol qword [mem], n` has no
+// register dst - dst.r is undefined, so it emitted `$rundefined`, which
+// wat2wasm rejects, silently dropping the whole unit to interp. cc1's switch
+// dispatch rotates jump-table words in place and hit exactly this.
+{ const { compileUnitWat } = await import('../aot_wat.mjs');
+  let mpass = 0, mfail = 0;
+  writeFileSync('/tmp/rm.asm', 'BITS 64\nrol qword [rdi], 5\nror qword [rdi+8], 3\nrol qword [rdi+16], 40\nret\n');
+  execFileSync('nasm', ['-f', 'bin', '-o', '/tmp/rm.bin', '/tmp/rm.asm']);
+  const code = new Uint8Array(0x1000); code.set(readFileSync('/tmp/rm.bin'));
+  const u = compileUnitWat(new Memory([{ base: CODE, bytes: code }]), CODE, { guestBase: CODE, ramBase: 0 });
+  if (/\$rundefined/.test(u.wat)) { console.log('rol/ror [mem]: emitted $rundefined (unit dropped to interp)'); process.exit(1); }
+  writeFileSync('/tmp/rm.wat', u.wat);
+  execFileSync('wat2wasm', ['--enable-tail-call', '/tmp/rm.wat', '-o', '/tmp/rm.wasm']);
+  const mod = new WebAssembly.Module(readFileSync('/tmp/rm.wasm'));
+  const entry = 'f_' + CODE.toString(16);
+  for (const seed of [0x123456789ABCDEF6n, 1n, 0xFFFFFFFFFFFFFFFFn, 0x80n]) {
+    const m = new Memory([{ base: CODE, bytes: code.slice() }]); const cpu = new CPU(m);
+    for (let i = 0; i < 16; i++) cpu.regs[i] = 0n;
+    const BUF = CODE + 0x600n;
+    cpu.regs[7] = BUF; for (let k = 0; k < 3; k++) m.write(BUF + BigInt(k*8), 8n, seed + BigInt(k));
+    cpu.regs[4] = CODE + 0x800n; m.write(cpu.regs[4], 8n, SENT); cpu.rip = CODE;
+    let g = 0; while (cpu.rip !== SENT) { cpu.step(); if (++g > 40) throw new Error('runaway'); }
+    const want = [0,1,2].map(k => BigInt.asUintN(64, m.read(BUF + BigInt(k*8), 8n)));
+
+    const wmem = new WebAssembly.Memory({ initial: 4096 });
+    const stub = () => { throw new Error('escape'); };
+    const inst = new WebAssembly.Instance(mod, { js: { mem: wmem }, env: { syscall: stub, callout: stub, deopt: stub } });
+    const rv = new BigInt64Array(wmem.buffer, 0, 16);
+    for (let i = 0; i < 16; i++) rv[i] = 0n;
+    const dv = new DataView(wmem.buffer);
+    rv[7] = BigInt.asIntN(64, BUF); for (let k = 0; k < 3; k++) dv.setBigUint64(Number(BUF - CODE) + k*8, seed + BigInt(k), true);
+    rv[4] = BigInt.asIntN(64, CODE + 0x800n); dv.setBigUint64(Number(0x800n), SENT, true);
+    inst.exports[entry]();
+    const got = [0,1,2].map(k => dv.getBigUint64(Number(BUF - CODE) + k*8, true));
+    if (got.every((v, i) => v === want[i])) mpass++;
+    else { mfail++; console.log(`MEM MISMATCH seed=${seed.toString(16)}: interp=${want.map(x=>x.toString(16))} aot=${got.map(x=>x.toString(16))}`); }
+  }
+  console.log(`${mpass}/${mpass+mfail} rol/ror [mem64] bit-exact (unit AOT vs interpreter)`);
+  if (mfail) process.exit(1);
+}
 if (fail) process.exit(1);

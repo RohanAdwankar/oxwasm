@@ -2143,3 +2143,36 @@ translations (QEMU's approach: write-protect and trap) or a per-entry
 prologue byte-check, both of which tax the hot dispatch path; the
 full-JIT stress passing suggests V8's write-once discipline makes this
 rare in practice, but it is a real hole and stays on the ledger.
+
+### gcc/cc1: a masked codegen bug, and an execve-child lead
+
+Pointing the sweep at the C toolchain (gcc's driver spawning cc1) split
+into two findings, one fixed and one parked.
+
+**Fixed — rol/ror qword [mem] miscompiled in unit mode.** cc1 run
+directly (skipping the driver) compiles hello-world to byte-correct
+assembly, but its tier-up emitted units full of `$rundefined`, which
+wat2wasm rejects — so every unit containing the offending instruction
+silently fell back to the interpreter and never tiered. Root cause: the
+unit emitter's 64-bit rol/ror branch hardcoded `local.set
+$r<dst.r>`, assuming a register destination. cc1's switch dispatch does
+`rol qword [table + idx*4], n` — a memory destination, so `dst.r` was
+undefined and the local name came out `$rundefined`. The 32-bit branch
+right beside it already split register vs memory through `wr()`; the
+64-bit branch never did. One-line fix (route through `wr`, which emits
+`i64.store` for a memory operand), pinned by a unit-mode `rol/ror
+[mem64]` case in rottest that emits `$rundefined` and fails on the
+pre-fix emitter. Correctness was never at risk — wat2wasm's rejection is
+a hard stop, not silent corruption — but the tiering hole was real:
+these units ran interpreted.
+
+**Parked — the execve-child fault.** Through the gcc *driver*, cc1
+faults with `unsupported opcode 2f at 155f4c0`, an address whose real
+byte is 0x48 and which sits mid-instruction inside a valid `add
+rax,[rip+d]`. The engine is decoding memory that does not hold cc1's
+bytes, and it happens only when cc1 is an execve child, not when cc1 is
+the top-level guest — so it is a corruption in the execve child's
+mapping of a 30MB, four-PT_LOAD binary, not a decoder gap. Left as a
+documented lead with the exact fault address and the direct-vs-execve
+bisection; chasing it needs a segment-by-segment diff of the child's
+mapped image against the file.
