@@ -62,6 +62,17 @@ if (!existsSync(RECYCLE)) {
         execFileSync('chmod', ['+x', RECYCLE]); } catch {}
 }
 
+// The vfork+AOT fixture (tools/fixtures/vforkexec.c): tier a function, vfork,
+// have the child execve a static binary, keep running in the parent. Before
+// the interpUntil-depth fork guard, the tiered parent resumed corrupt after
+// the child's execve unwound the nested interpreter and faulted. Built static
+// from the committed source when gcc is present.
+const VFORK = '/tmp/breadth_vforkexec';
+if (!existsSync(VFORK)) {
+  try { execFileSync('gcc', ['-O1', '-static', '-no-pie', '-o', VFORK,
+                             new URL('./fixtures/vforkexec.c', import.meta.url).pathname]); } catch {}
+}
+
 // wat2wasm for the AOT tier; cached by text hash so repeat cases are cheap
 const CACHE = new URL('../bench/kernels/watcache/', import.meta.url).pathname;
 mkdirSync(CACHE, { recursive: true });
@@ -208,6 +219,10 @@ const CASES = [
   // self-modifying-code lane: must print B (the recycled page's NEW code),
   // never A (a stale translation of the munmapped bytes)
   ['recycle',   '/tmp/breadth_recycle', []],
+  // the vfork-from-a-tiered-frame lane: prints "survived" only if the parent
+  // is not corrupted when its vfork child execs. busybox is the child's exec.
+  ['vforkexec', '/tmp/breadth_vforkexec', [],
+                { bins: ['/usr/bin/busybox'] }],
 ];
 const STDIN = { tr: readFileSync(IN), bc: Buffer.from('scale=20\n7/3\n2^64\nsqrt(2)\nquit\n'),
                 jq: Buffer.from('{"a": 3, "b": 4}\n{"a": 10, "b": -2}\n'),

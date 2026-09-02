@@ -646,6 +646,15 @@ export class LinuxEngine {
   // Interpret (dispatching into compiled functions when rip lands on one)
   // until `done()` — used by the callout escape.
   interpUntil(done) {
+    // Depth of nested interpretation under a live wasm callout. fork/vfork
+    // must not spawn a child from here: the child would run on the shared
+    // stack UNDER the parent's suspended wasm frame, and unwinding that frame
+    // on the child's execve leaves the parent resuming into corrupt state
+    // (traced: gcc's vfork of cc1, and a minimal vfork+exec repro, both landed
+    // the parent in __execve's error tail). The guard in case 56/57/58 deopts
+    // to _run1 so the fork re-executes at top level with no frame beneath it.
+    this._iuDepth = (this._iuDepth | 0) + 1;
+    try {
     let guard = 0;
     let branched = true;      // compiled entries are branch targets: only look up after a branch
     while (!done()) {
@@ -700,6 +709,7 @@ export class LinuxEngine {
       }
       if (++guard > 5e9) throw new Error('escape runaway');
     }
+    } finally { this._iuDepth--; }
   }
 
   aotEnv() {
@@ -1437,6 +1447,17 @@ export class LinuxEngine {
       case 56: case 57: case 58: {                           // clone / fork / vfork
         const flags = nr === 56 ? Number(a1 & 0xffffffffn) : 0;
         if (!(flags & 0x100)) {
+          // Reached nested under a live wasm callout (a tiered caller reached
+          // fork through interpUntil): spawning the child here runs it on the
+          // shared stack beneath the parent's suspended wasm frame, and the
+          // child's execve-unwind resumes that frame corrupt. Deopt to _run1
+          // and re-execute the fork at top level, where no frame is beneath
+          // it. cpu.rip is one past the 2-byte syscall; rewind to it.
+          if ((this._iuDepth | 0) > 0) {
+            this.cpu.rip = BigInt.asUintN(64, this.cpu.rip - 2n);
+            this.syncOut();
+            throw new DeoptUnwind(this.cpu.rip);
+          }
           // fork/vfork: VFORK SEMANTICS — the child shares this memory image
           // and runs with a copy of the fd table; the parent thread is
           // suspended until the child execve()s (which moves it into its own
