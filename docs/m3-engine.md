@@ -2331,28 +2331,36 @@ pipe / git / interpreter subprocess case still passes. Six passes to a
 five-line fix, but each pass genuinely eliminated a wrong hypothesis
 (scheduler, memory table, registers) before the nesting clue landed.
 
-### The compiler lane: compile+assemble byte-perfect, link one bug from done
+### The compiler lane: a whole C toolchain, byte-perfect and runnable
 
 With the fork guard in, the full gcc pipeline runs end to end — the
 driver vforks `cc1`, `as`, and `collect2` (which vforks `ld`), all four
 executing as translated guest code. `gcc -c` and `gcc -S` produce output
-byte-identical to native (`gcc-c` / `gcc-S` in breadth, 81/81). The full
-link — `gcc -O1 hello.c -o a.out` — completes with exit 0 and produces a
-**15968-byte PIE, the exact size of native's**, with byte-identical
-program headers, sections, symbols, relocations and `.dynamic` — the
-whole ELF structure matches. `readelf -a` diffs to a single line: the
-build-id.
+byte-identical to native. The full link — `gcc -O1 hello.c -o a.out` —
+completes with exit 0 and produces a **15968-byte PIE byte-for-byte
+identical to native gcc's**, build-id included, and that binary **runs
+under the engine** and prints its output. `gcc-S` / `gcc-c` / `gcc-link`
+in breadth cover the three stages; the engine is now a C compiler that
+builds runnable native executables entirely inside wasm.
 
-But the produced binary segfaults, and the reason is sharp: the engine's
-`ld` leaves **`_start` zero-filled** (0x1060–0x1085, the 38 bytes from
-`Scrt1.o`) while every other object — `main`, `crti`/`crtn`, `crtbeginS`
-— links correctly. The 53 differing bytes are exactly the zeroed `_start`
-plus the build-id that hashes over it. So the crt object that supplies
-the entry point is the one input `ld` mis-handles under the engine;
-everything downstream is already correct. That is the single remaining
-step to a C compiler that builds runnable native executables entirely
-inside the wasm engine. Next instrument: trace `ld`'s read/mmap of
-`Scrt1.o` specifically (the 400-entry strace ring rotates past it on a
-link this size — widen it or filter by the fd `Scrt1.o`'s open returns)
-to tell a bad file read from a bad section copy. Repro:
+**The one bug that stood between compile and link was in `read`, not the
+linker.** The full link completed and produced a structurally perfect ELF,
+but `ld` left **`_start` zero-filled** (0x1060–0x1085, the 38 bytes from
+`Scrt1.o`) while every other object linked correctly. The section-copy of
+`_start` landed at file offset **1036 instead of 4192**. The trail:
+`glibc`'s buffered stdio, about to write a partial block of the still-sparse
+output file, first `read`s a block ahead at offset 4096 — but the file was
+only 940 bytes long at that moment. The engine's `read` computed
+`n = min(count, bytes.length − pos) = min(count, 940 − 4096) = −3156`, a
+**negative** short-read count, then did `h.pos += n` and **rewound the file
+position** from 4096 back to 940. The next `lseek(SEEK_CUR, +96)` — glibc
+seeking to the section's write offset relative to where it believed the
+position was — therefore landed at 1036, and `_start`'s bytes were written
+there. A real kernel `read` at or past EOF returns 0 and leaves the position
+untouched; the fix is a single `Math.max(0, …)` clamp on the read count
+(`pread64` already had it). A position-only corruption in the most basic
+syscall, surfaced only by a linker writing a sparse file through glibc's
+block-buffered stdio. `pwrite64` (nr 18) was ENOSYS and is now implemented
+too (honouring its explicit offset without moving `h.pos`), though this
+`ld` reached `_start` through `lseek`+`write`, not `pwrite`. Repro:
 `scratchpad/trylink.mjs`.

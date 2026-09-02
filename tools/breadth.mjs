@@ -243,6 +243,21 @@ const CASES = [
                      '/usr/bin/x86_64-linux-gnu-as'],
               tree: ['/usr/include', '/usr/lib/gcc/x86_64-linux-gnu/13/include'],
               outFile: '/tmp/breadth_hello.o', memMB: 1024 }],
+  // the whole toolchain end to end: driver -> cc1 -> as -> collect2 -> ld,
+  // producing a dynamic PIE byte-compared to native gcc's (build-id included,
+  // since the output is bit-reproducible). This exercised the read-past-EOF
+  // position bug that left ld's _start zero-filled — glibc's stdio reads a
+  // block ahead of a still-sparse output file, and a negative short-read
+  // count used to rewind the file position under the next section write.
+  ['gcc-link', '/usr/bin/gcc', ['-O1', '-o', '/tmp/breadth_hello_aout', HELLO_C],
+            { bins: ['/usr/libexec/gcc/x86_64-linux-gnu/13/cc1', '/usr/bin/as',
+                     '/usr/bin/x86_64-linux-gnu-as',
+                     '/usr/libexec/gcc/x86_64-linux-gnu/13/collect2',
+                     '/usr/bin/ld', '/usr/bin/x86_64-linux-gnu-ld',
+                     '/usr/bin/x86_64-linux-gnu-ld.bfd'],
+              tree: ['/usr/include', '/usr/lib/gcc/x86_64-linux-gnu/13/include',
+                     '/usr/lib/gcc/x86_64-linux-gnu/13'],
+              outFile: '/tmp/breadth_hello_aout', memMB: 1024 }],
 ];
 const STDIN = { tr: readFileSync(IN), bc: Buffer.from('scale=20\n7/3\n2^64\nsqrt(2)\nquit\n'),
                 jq: Buffer.from('{"a": 3, "b": 4}\n{"a": 10, "b": -2}\n'),

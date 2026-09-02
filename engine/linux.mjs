@@ -1770,7 +1770,13 @@ export class LinuxEngine {
           }
           ret(BigInt(got)); break;
         }
-        const n = Math.min(Number(a3), h.bytes.length - h.pos);
+        // A read at or past EOF returns 0 and must NOT move the position.
+        // Without the max(0,...), a read whose offset is beyond the current
+        // file length (h.pos > h.bytes.length — routine while a linker writes
+        // a sparse output and glibc's stdio reads a block ahead) yields a
+        // NEGATIVE count and rewinds h.pos, so the next SEEK_CUR lands the
+        // following write at the wrong offset (ld left _start zero-filled).
+        const n = Math.max(0, Math.min(Number(a3), h.bytes.length - h.pos));
         this.jsnap(a2, n);
         this.ram.set(h.bytes.subarray(h.pos, h.pos + n), Number(a2 - this.base));
         h.pos += n; ret(BigInt(n)); break; }
@@ -1863,6 +1869,30 @@ export class LinuxEngine {
         const n = Math.min(Number(a3), Math.max(0, h.bytes.length - fo));
         if (n > 0) { this.jsnap(a2, n); this.ram.set(h.bytes.subarray(fo, fo + n), Number(a2 - this.base)); }
         ret(BigInt(n)); break; }
+      case 18: {                                              // pwrite64(fd, buf, count, off)
+        const h = this.fds.get(Number(a1));
+        if (!h) { ret(-9n); break; }                          // EBADF
+        // Only regular files honour an explicit offset. A pwrite writes at
+        // `off` and does NOT move the file position (unlike write). ld uses
+        // it to backfill sections (e.g. _start from Scrt1.o) after computing
+        // final layout; falling through to ENOSYS zero-fills those bytes.
+        if (h.bytes === undefined || !h.writable) {
+          writeChunk(Number(a1), a2, Number(a3)); ret(a3); break;   // pipe/sink: sequential
+        }
+        const len = Number(a3);
+        if (len <= 0) { ret(0n); break; }
+        this.guardRange(a2, len);
+        const bytes = this.ram.slice(Number(a2 - this.base), Number(a2 - this.base) + len);
+        const off = Number(cpu.regs[10]);
+        const end = off + len;
+        if (end > h.bytes.length) {
+          const nb = new Uint8Array(end);
+          nb.set(h.bytes); h.bytes = nb;
+          this.files[h.path] = nb;
+        }
+        if (h.path) (this.dirtyFiles ??= new Set()).add(h.path);
+        h.bytes.set(bytes, off);                              // position unchanged
+        ret(a3); break; }
       case 21: { const p = this.readPath(a1); ret(this.lookup(p) !== undefined || this.isDir(p) ? 0n : -2n); break; }   // access
       case 269: { const p = this.atPath(a1, a2); ret(this.lookup(p) !== undefined || this.isDir(p) ? 0n : -2n); break; }  // faccessat
       case 63: {                                              // uname
