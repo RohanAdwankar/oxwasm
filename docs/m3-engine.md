@@ -2519,6 +2519,42 @@ runs first, so a race the parent would normally win natively (closing its
 end of a pipe before the child writes) resolves the other way. Semantics
 are POSIX-legal either way; fixtures are written order-independent.
 
+### The syscall surface, surveyed — and a synthetic /proc
+
+Breadth now prints, for every case, each `ioctl` request answered ENOTTY
+and each syscall answered ENOSYS, aggregated over the whole engine tree.
+Across the 94-case sweep the ledger is short: the ENOTTY requests are
+`TCGETS` on pipes and files (the right answer — that is `isatty()`
+probing) and a single `FIOCLEX`; the ENOSYS list is `clone3` (glibc falls
+back to `clone`), `io_uring_setup` (correctly unsupported, libuv probes
+it), and three cheap misses now implemented — `clock_getres`, `capget`,
+`mincore` — alongside `FIOCLEX`/`FIONCLEX`, `FIONBIO` and `FIONREAD`,
+which are descriptor-generic and now answered before the tty gate.
+
+The larger gap the survey did not show — because nothing in the sweep
+read it — was `/proc`: only `readlink` of `/proc/self/exe` and
+`/proc/self/fd/N` existed, so every `open` under `/proc` was ENOENT.
+`lookup` now falls through to `_synth(path)`, which generates the files
+real programs read, from live engine state: `/proc/self/{cmdline, environ,
+exe, comm, maps, status, stat, statm, mounts, mountinfo, limits}`,
+`/proc/{cpuinfo, meminfo, mounts, filesystems, version, uptime, loadavg,
+stat}` and `/proc/sys/{kernel/*, vm/*, fs/*}`; the synthetic directories
+answer `isDir`. `maps` matters most: glibc's `pthread_getattr_np` walks it
+for the `[stack]` line containing the current stack pointer (Rust's
+runtime and anything sizing the main thread's stack go through it), so
+that line spans the guest stack and `[heap]` spans `brk`. `/dev/zero` and
+`/dev/urandom` are generator descriptors (reads produce zeros or random
+bytes, `mmap` of `/dev/zero` is anonymous, writes are discarded), and
+`open("/proc/self/fd/N")` reopens descriptor N — a regular file with its
+own offset, a pipe end shared — which is what bash's `<(...)` and `>(...)`
+substitute. `tools/fixtures/procfs.c` (`procfs`) checks all of it with
+output that is invariant across machines: cmdline equals argv, environ
+carries PATH, maps has a `[stack]` containing a local's address, `[heap]`
+and the executable, status names the program, `/proc/self/fd/N` reads the
+same bytes as N, `/dev/zero` is zeros, `/dev/urandom` fills, and
+`pthread_getattr_np` reports a stack containing a local — byte-identical
+to native.
+
 
 **The one bug that stood between compile and link was in `read`, not the
 linker.** The full link completed and produced a structurally perfect ELF,

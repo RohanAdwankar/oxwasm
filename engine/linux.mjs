@@ -23,6 +23,8 @@ const BRANCHY = new Set(['jmp','jcc','call','ret','retn','jmpind','callind','sys
 // stack. This is what keeps escape handling O(1) in stack depth (a hot loop
 // containing a jump table would otherwise grow the stack on every trip).
 const PIPE_CAP = 65536;                       // Linux default pipe capacity
+const SYNTH_DIRS = new Set(['/proc', '/proc/self', '/proc/self/fd', '/proc/self/task', '/proc/sys', '/proc/sys/kernel',
+                            '/proc/sys/kernel/random', '/proc/sys/vm', '/proc/sys/fs', '/dev', '/dev/pts']);
 class DeoptUnwind { constructor(rip) { this.rip = rip; } }
 // A blocking syscall (poll/select/read with nothing ready, nanosleep) suspends
 // the guest the same way a deopt escapes compiled code: every register is
@@ -115,7 +117,7 @@ export class LinuxEngine {
       loadEnd = interp.loads.reduce((m, s) => { const e = s.vaddr + interpBase + BigInt(s.memsz); return e > m ? e : m; }, loadEnd);
     }
     this.base = lo;
-    this.brk = align(loadEnd, PAGE);
+    this.brk = align(loadEnd, PAGE); this._brk0 = this.brk;
     this.mmapNext = align(this.brk + (64n << 20n), PAGE);      // anon mmaps above the heap
     const total = BigInt(memMB) << 20n;
     this.stackTop = lo + total - 4096n;
@@ -1037,7 +1039,95 @@ export class LinuxEngine {
     }
     return p;                                    // link loop: leave it dangling
   }
-  lookup(p) { p = this.resolve(this.norm(p)); return this.files[p]; }
+  lookup(p) { p = this.resolve(this.norm(p)); return this.files[p] ?? this._synth(p); }
+  // ---- synthetic /proc and /dev ------------------------------------------------
+  // Generated on every lookup (cheap, always current). Only the files real
+  // programs read: glibc's pthread_getattr_np walks /proc/self/maps for the
+  // [stack] line holding rsp; runtimes read cpuinfo/meminfo/status; shells
+  // open /proc/self/fd/N; scripts read cmdline/environ and sys/kernel/*.
+  _synth(p) {
+    if (!p.startsWith('/proc') && !p.startsWith('/dev')) return undefined;
+    const enc = (t) => new TextEncoder().encode(t);
+    const argv = this._ctor?.argv ?? [this.argv0 ?? 'prog'];
+    const comm = (this.argv0 ?? 'prog').split('/').pop().slice(0, 15);
+    const memKB = Number((BigInt(this._ctor?.memMB ?? 256) << 20n) / 1024n);
+    const self = p.replace(/^\/proc\/(self|\d+)(\/|$)/, '/proc/self$2');
+    switch (self) {
+      case '/proc/self/cmdline': return enc(argv.join('\0') + '\0');
+      case '/proc/self/environ': return enc((this.env ?? []).join('\0') + '\0');
+      case '/proc/self/exe': return this._ctor?.elfBytes;
+      case '/proc/self/comm': return enc(comm + '\n');
+      case '/proc/self/maps': case '/proc/self/smaps': {
+        const hx = (v) => BigInt.asUintN(64, v).toString(16).padStart(12, '0');
+        const lines = [];
+        for (const [a, b] of (this.execRangesStatic ?? this.execRanges ?? []))
+          lines.push(`${hx(a)}-${hx(b)} r-xp 00000000 00:00 0                          ${this.argv0 ?? ''}`);
+        for (const m of this.maps ?? [])
+          lines.push(`${hx(m.at)}-${hx(m.at + m.len)} rw-p ${m.fileOff.toString(16).padStart(8, '0')} 00:00 0                          ${m.path}`);
+        const heap0 = this._brk0 ?? this.brk;
+        if (this.brk > heap0) lines.push(`${hx(heap0)}-${hx(this.brk)} rw-p 00000000 00:00 0                          [heap]`);
+        const top = this.stackTop + 4096n, bot = top - (8n << 20n);
+        lines.push(`${hx(bot)}-${hx(top)} rw-p 00000000 00:00 0                          [stack]`);
+        return enc(lines.join('\n') + '\n');
+      }
+      case '/proc/self/status': {
+        const threads = this.threads.filter(t => t.state !== 'dead').length;
+        const rss = Math.min(memKB, Number(this.brk - this.base) / 1024 | 0);
+        return enc(`Name:\t${comm}\nUmask:\t0022\nState:\tR (running)\nTgid:\t1\nNgid:\t0\nPid:\t1\nPPid:\t0\n` +
+          `TracerPid:\t0\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nFDSize:\t64\nGroups:\t0\nNStgid:\t1\nNSpid:\t1\nNSpgid:\t1\nNSsid:\t1\n` +
+          `VmPeak:\t${memKB} kB\nVmSize:\t${memKB} kB\nVmLck:\t0 kB\nVmPin:\t0 kB\nVmHWM:\t${rss} kB\nVmRSS:\t${rss} kB\n` +
+          `RssAnon:\t${rss} kB\nRssFile:\t0 kB\nRssShmem:\t0 kB\nVmData:\t${rss} kB\nVmStk:\t132 kB\nVmExe:\t4 kB\nVmLib:\t0 kB\nVmPTE:\t4 kB\nVmSwap:\t0 kB\n` +
+          `Threads:\t${threads}\nSigQ:\t0/1024\nSigPnd:\t0000000000000000\nShdPnd:\t0000000000000000\nSigBlk:\t0000000000000000\n` +
+          `SigIgn:\t0000000000000000\nSigCgt:\t0000000000000000\nCapInh:\t0000000000000000\nCapPrm:\t000001ffffffffff\nCapEff:\t000001ffffffffff\n` +
+          `CapBnd:\t000001ffffffffff\nCapAmb:\t0000000000000000\nNoNewPrivs:\t0\nSeccomp:\t0\nSeccomp_filters:\t0\nSpeculation_Store_Bypass:\tvulnerable\n` +
+          `Cpus_allowed:\t1\nCpus_allowed_list:\t0\nMems_allowed:\t1\nMems_allowed_list:\t0\nvoluntary_ctxt_switches:\t0\nnonvoluntary_ctxt_switches:\t0\n`);
+      }
+      case '/proc/self/stat': {
+        const rssPages = Math.max(1, Number(this.brk - this.base) / 4096 | 0);
+        return enc(`1 (${comm}) R 0 1 1 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 ${this.threads.filter(t => t.state !== 'dead').length} 0 0 ${memKB * 1024} ${rssPages} 18446744073709551615 ` +
+          `${this.base} ${this.brk} ${this.stackTop} 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n`);
+      }
+      case '/proc/self/statm': return enc(`${memKB / 4 | 0} ${Number(this.brk - this.base) / 4096 | 0} 0 1 0 ${Number(this.brk - this.base) / 4096 | 0} 0\n`);
+      case '/proc/self/mounts': case '/proc/mounts':
+        return enc('rootfs / rootfs rw 0 0\nproc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\ndevtmpfs /dev devtmpfs rw 0 0\n');
+      case '/proc/self/mountinfo':
+        return enc('1 1 0:1 / / rw - rootfs rootfs rw\n2 1 0:2 / /proc rw - proc proc rw\n3 1 0:3 / /dev rw - devtmpfs devtmpfs rw\n');
+      case '/proc/self/limits':
+        return enc('Limit                     Soft Limit           Hard Limit           Units     \nMax stack size            8388608              unlimited            bytes     \nMax open files            4096                 1048576              files     \n');
+      case '/proc/cpuinfo':
+        return enc('processor\t: 0\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 85\nmodel name\t: oxwasm x86-64\nstepping\t: 4\n' +
+          'microcode\t: 0x1\ncpu MHz\t\t: 2000.000\ncache size\t: 8192 KB\nphysical id\t: 0\nsiblings\t: 1\ncore id\t\t: 0\ncpu cores\t: 1\napicid\t\t: 0\n' +
+          'fpu\t\t: yes\nfpu_exception\t: yes\ncpuid level\t: 13\nwp\t\t: yes\n' +
+          'flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx lm constant_tsc nopl pni ssse3 cx16 sse4_1 sse4_2 popcnt\n' +
+          'bogomips\t: 4000.00\nclflush size\t: 64\ncache_alignment\t: 64\naddress sizes\t: 46 bits physical, 48 bits virtual\n\n');
+      case '/proc/meminfo':
+        return enc(`MemTotal:       ${memKB} kB\nMemFree:        ${memKB >> 1} kB\nMemAvailable:   ${memKB >> 1} kB\nBuffers:               0 kB\nCached:                0 kB\n` +
+          `SwapCached:            0 kB\nActive:                0 kB\nInactive:              0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nDirty:                 0 kB\n` +
+          `Shmem:                 0 kB\nCommitLimit:    ${memKB} kB\nCommitted_AS:   ${memKB >> 1} kB\nHugepagesize:       2048 kB\n`);
+      case '/proc/filesystems': return enc('nodev\tproc\nnodev\tdevtmpfs\nnodev\ttmpfs\n\text4\n');
+      case '/proc/version': return enc('Linux version 6.1.0 (oxwasm) (gcc) #1 oxwasm\n');
+      case '/proc/uptime': return enc(`${(this.nowMs() / 1000).toFixed(2)} ${(this.nowMs() / 1000).toFixed(2)}\n`);
+      case '/proc/loadavg': return enc('0.00 0.00 0.00 1/1 2\n');
+      case '/proc/stat': return enc('cpu  0 0 0 0 0 0 0 0 0 0\ncpu0 0 0 0 0 0 0 0 0 0 0\nintr 0\nctxt 0\nbtime 1700000000\nprocesses 1\nprocs_running 1\nprocs_blocked 0\n');
+      case '/proc/sys/kernel/osrelease': return enc('6.1.0\n');
+      case '/proc/sys/kernel/ostype': return enc('Linux\n');
+      case '/proc/sys/kernel/version': return enc('#1 oxwasm\n');
+      case '/proc/sys/kernel/hostname': return enc('oxwasm\n');
+      case '/proc/sys/kernel/pid_max': return enc('4194304\n');
+      case '/proc/sys/kernel/threads-max': return enc('65536\n');
+      case '/proc/sys/kernel/ngroups_max': return enc('65536\n');
+      case '/proc/sys/kernel/cap_last_cap': return enc('40\n');
+      case '/proc/sys/kernel/random/boot_id': return enc('9d5a2e42-0f1c-4a7e-b0f6-6d5c1e0a1b2c\n');
+      case '/proc/sys/kernel/random/uuid': { const h = [...crypto.getRandomValues(new Uint8Array(16))].map(b => b.toString(16).padStart(2, '0')).join('');
+        return enc(`${h.slice(0,8)}-${h.slice(8,12)}-${h.slice(12,16)}-${h.slice(16,20)}-${h.slice(20)}\n`); }
+      case '/proc/sys/vm/overcommit_memory': return enc('0\n');
+      case '/proc/sys/vm/max_map_count': return enc('65530\n');
+      case '/proc/sys/fs/file-max': return enc('1048576\n');
+      case '/proc/sys/fs/nr_open': return enc('1048576\n');
+      case '/proc/sys/fs/pipe-max-size': return enc('1048576\n');
+    }
+    return undefined;
+  }
   // Shared fs metadata rides on the files object itself (non-enumerable, so
   // path listings skip it): child engines share `files` by reference, and a
   // busybox NOEXEC applet runs inside the PARENT engine — a per-engine dir
@@ -1055,6 +1145,7 @@ export class LinuxEngine {
   isDir(p) {
     p = this.resolve(this.norm(p));
     if (p === '/' ) return true;
+    if (SYNTH_DIRS.has(p) || /^\/proc\/\d+(\/(fd|task))?$/.test(p)) return true;
     const pre = p.endsWith('/') ? p : p + '/';
     const m = this._fsMeta();
     if (this._dirset === undefined || this._dirsetV !== m.v) {
@@ -1276,7 +1367,7 @@ export class LinuxEngine {
         let v = 0n; for (let i = 7; i >= 0; i--) v = (v << 8n) | BigInt(bytes[i] ?? 0);
         h.ev.count += v; this.wakeAllBlk(); return;
       }
-      if (h?.devnull) return;                                // /dev/null: discard, count as written
+      if (h?.devnull || h?.gen) return;                      // /dev/null, /dev/zero, /dev/urandom: discard, count as written
       if (h && h.bytes !== undefined && h.writable) {        // regular file opened for writing
         if (h.path) (this.dirtyFiles ??= new Set()).add(h.path);
         const end = h.pos + bytes.length;
@@ -1364,6 +1455,7 @@ export class LinuxEngine {
         const off0 = Number(at - this.base);
         if (off0 < 0 || off0 + Number(len) > this.ram.length) { ret(-12n); break; }   // ENOMEM
         this.ram.fill(0, off0, off0 + Number(len));          // fresh mapping is zeroed
+        if (!(flags & ANON) && this.fds.get(fdArg)?.gen === 'zero') { ret(at); break; }   // /dev/zero: anonymous
         if (!(flags & ANON)) {
           const h = this.fds.get(fdArg);
           if (!h) { ret(-9n); break; }                       // EBADF
@@ -1432,7 +1524,21 @@ export class LinuxEngine {
         const req = Number(a2 & 0xffffffffn), h = this.fds.get(Number(a1));
         const pty = h?.ptm ?? h?.pts;                        // a pty end, either side
         // a pty pair works whether or not the session has a console tty
-        if (!pty && !(this.tty && (Number(a1) <= 2 || h?.istty))) { ret(-25n); break; }   // ENOTTY
+        // descriptor-generic requests, valid on any fd kind
+        if (req === 0x5451 || req === 0x5450) {              // FIOCLEX / FIONCLEX
+          if (!h) { ret(-9n); break; }
+          if (req === 0x5451) this.cloexec.add(Number(a1)); else this.cloexec.delete(Number(a1));
+          ret(0n); break; }
+        if (req === 0x5421) {                                 // FIONBIO: O_NONBLOCK on/off
+          if (!h) { ret(-9n); break; }
+          h.nonblock = !!Number(this.mem.read(a3, 4n)); if (h.sock) h.sock.nonblock = h.nonblock; if (h.ev) h.ev.nonblock = h.nonblock;
+          ret(0n); break; }
+        if (req === 0x541B) {                                 // FIONREAD: bytes readable now
+          if (!h) { ret(-9n); break; }
+          const avail = h.pipe ? (h.pipe.size ?? 0) : h.bytes !== undefined ? Math.max(0, h.bytes.length - h.pos) : 0;
+          this.jsnap(a3, 4); this.mem.write(a3, 4n, BigInt(avail)); ret(0n); break; }
+        if (!pty && !(this.tty && (Number(a1) <= 2 || h?.istty))) {   // ENOTTY
+          this._noteIoctl(req, h); ret(-25n); break; }
         const v = new DataView(this.wmem.buffer);
         const off = a3 ? this.RAMOFF + Number(a3 - this.base) : 0;
         const T = pty ? pty.termios : this.termios;
@@ -1486,7 +1592,7 @@ export class LinuxEngine {
           case 0x5410: ret(0n); break;                                      // TIOCSPGRP
           case 0x540B: ret(0n); break;                                      // TCFLSH
           case 0x5409: ret(0n); break;                                      // TCSBRK
-          default: ret(-25n); break;
+          default: this._noteIoctl(req, h); ret(-25n); break;
         }
         break; }
       case 158:                                              // arch_prctl
@@ -1683,6 +1789,16 @@ export class LinuxEngine {
         v.setBigUint64(o + 8, BigInt(Math.floor((ms % 1000) * 1e6)), true);
         ret(0n); break; }
       case 201: ret(BigInt(Math.floor(Date.now() / 1000))); break;   // time
+      case 229: {                                             // clock_getres(clk, res*): 1ns
+        if (a2) { this.jsnap(a2, 16); this.mem.write(a2, 8n, 0n); this.mem.write(a2 + 8n, 8n, 1n); }
+        ret(0n); break; }
+      case 125: {                                             // capget: no capabilities
+        if (a2) { this.jsnap(a2, 24); for (let o = 0n; o < 24n; o += 4n) this.mem.write(a2 + o, 4n, 0n); }
+        ret(0n); break; }
+      case 27: {                                              // mincore: everything resident
+        const n = Math.ceil(Number(a2) / 4096);
+        this.jsnap(a3, n); this.ram.fill(1, Number(a3 - this.base), Number(a3 - this.base) + n);
+        ret(0n); break; }
       case 35: case 230: {                                   // nanosleep / clock_nanosleep
         const req = nr === 35 ? a1 : cpu.regs[2];            // rdx for clock_nanosleep
         const abs = nr === 230 && (Number(a2) & 1);          // TIMER_ABSTIME
@@ -1772,6 +1888,24 @@ export class LinuxEngine {
           this.fds.set(fd, { sink: 'out', istty: true, path: '/dev/pts/0' });
           ret(BigInt(fd)); break;
         }
+        {
+          const np = this.norm(p);
+          if (np === '/dev/zero' || np === '/dev/urandom' || np === '/dev/random') {
+            const fd = this.allocFd();
+            this.fds.set(fd, { gen: np === '/dev/zero' ? 'zero' : 'rand', pos: 0, path: np, writable: true, devnull: np === '/dev/zero' ? false : false });
+            ret(BigInt(fd)); break;
+          }
+          // /proc/self/fd/N reopens descriptor N (bash's <(...) and >(...)):
+          // a regular file gets its own offset, a pipe end is shared
+          const m = /^\/proc\/(?:self|\d+)\/fd\/(\d+)$/.exec(np);
+          if (m) {
+            const src = this.fds.get(Number(m[1]));
+            if (!src) { ret(-2n); break; }
+            const fd = this.allocFd();
+            this.fds.set(fd, src.bytes !== undefined ? { bytes: src.bytes, pos: 0, path: src.path, writable: (flags & 3) !== 0 } : src);
+            ret(BigInt(fd)); break;
+          }
+        }
         let f = this.lookup(p);
         if (f === undefined) {
           if (this.isDir(p)) {                                // O_DIRECTORY / readdir scans
@@ -1835,6 +1969,12 @@ export class LinuxEngine {
           }
           ret(BigInt(got)); break;
         }
+        if (h.gen) {                                          // /dev/zero, /dev/urandom
+          const n = Number(a3); this.jsnap(a2, n);
+          const dst = this.ram.subarray(Number(a2 - this.base), Number(a2 - this.base) + n);
+          if (h.gen === 'zero') dst.fill(0); else for (let i = 0; i < n; i += 65536) crypto.getRandomValues(dst.subarray(i, Math.min(n, i + 65536)));
+          h.pos += n; ret(BigInt(n)); break;
+        }
         // A read at or past EOF returns 0 and must NOT move the position.
         // Without the max(0,...), a read whose offset is beyond the current
         // file length (h.pos > h.bytes.length — routine while a linker writes
@@ -1852,6 +1992,7 @@ export class LinuxEngine {
       case 8: {                                               // lseek
         const h = this.fds.get(Number(a1));
         if (!h) { ret(-9n); break; }
+        if (h.gen) { ret(0n); break; }
         if (!h.bytes) { ret(-29n); break; }                   // pipe/sink/socket: ESPIPE
         const w = Number(a3);                                 // rdx = whence
         const off = BigInt.asIntN(64, a2);
@@ -1882,7 +2023,8 @@ export class LinuxEngine {
           const h = this.fds.get(Number(a1));
           if (this.tty && (Number(a1) <= 2 || h?.istty)) {     // terminal: match stat("/dev/pts/0")
             this.writeStat(a2, '/dev/pts/0', 0, 0o020620, 0x8800n, 1001n); ret(0n); break; }
-          if (h?.bytes) { size = h.bytes.length; mode = this.fileMode(h.bytes); statPath = h.path ?? null; }  // regular file
+          if (h?.gen) { size = 0; mode = 0o020666; }                        // /dev/zero, /dev/urandom
+          else if (h?.bytes) { size = h.bytes.length; mode = this.fileMode(h.bytes); statPath = h.path ?? null; }  // regular file
           else if (h?.pipe) { size = 0; mode = 0o010600; }                 // FIFO
           else if (h?.sock) { size = 0; mode = 0o140777; }                 // socket
           else if (h?.isdir) { size = 4096; mode = 0o040755; statPath = h.path; }
@@ -2525,6 +2667,14 @@ export class LinuxEngine {
         (this.unknown ||= new Set()).add(nr);
     }
     if (this._sigAny) this._sigExit(cpu);                   // signal delivery on return to user
+  }
+
+  // survey aid: every ioctl request answered ENOTTY, keyed by request and
+  // the kind of descriptor it was aimed at (breadth prints the union)
+  _noteIoctl(req, h) {
+    const kind = !h ? 'nofd' : h.pipe ? 'pipe' : h.sock ? 'sock' : h.bytes !== undefined ? 'file' : h.isdir ? 'dir' : h.ev ? 'evfd' : h.ptm || h.pts ? 'pty' : h.sink ? 'sink' : 'other';
+    const k = req.toString(16) + '@' + kind;
+    (this.unknownIoctl ??= new Map()).set(k, (this.unknownIoctl.get(k) || 0) + 1);
   }
 
   // ---- shared file mappings ---------------------------------------------------

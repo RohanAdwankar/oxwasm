@@ -107,6 +107,11 @@ if (!existsSync(FORKBLOCK)) {
   try { execFileSync('gcc', ['-O1', '-o', FORKBLOCK,
                              new URL('./fixtures/forkblock.c', import.meta.url).pathname]); } catch {}
 }
+const PROCFS = '/tmp/breadth_procfs';
+if (!existsSync(PROCFS)) {
+  try { execFileSync('gcc', ['-O1', '-pthread', '-o', PROCFS,
+                             new URL('./fixtures/procfs.c', import.meta.url).pathname]); } catch {}
+}
 const EPIPE = '/tmp/breadth_epipe';
 if (!existsSync(EPIPE)) {
   try { execFileSync('gcc', ['-O1', '-o', EPIPE,
@@ -290,6 +295,9 @@ const CASES = [
   // past 64KB; reads before the parent writes) becomes a real child engine
   // instead of freezing its parent; memory is private both ways.
   ['forkblock', '/tmp/breadth_forkblock', []],
+  // synthetic /proc and /dev: cmdline/environ/maps/status/fd/N, /dev/zero,
+  // /dev/urandom, cpuinfo/meminfo/sys; glibc's pthread_getattr_np walks maps
+  ['procfs',    '/tmp/breadth_procfs', ['alpha']],
   // the same through busybox: a NOEXEC applet's 170KB command substitution
   ['bb-subst',  '/usr/bin/busybox', ['sh', '-c', 'x=$(seq 1 30000); echo ${#x}'],
                 { bins: ['/usr/bin/busybox'] }],
@@ -403,6 +411,9 @@ const engine = (bin, args, stdin, opts = {}) => {
       : Buffer.from(eng.stdout.join(''), 'binary');
   return { out: raw, code: eng.exitCode, stderr: (eng.stderr || []).join(''),
            unknown: [...(eng.unknown || [])], strace: eng.strace,
+           ioctls: (() => { const m = new Map(); const walk = (e) => { for (const [k, n] of e.unknownIoctl ?? []) m.set(k, (m.get(k) || 0) + n);
+                            for (const c of e.children ?? []) if (c.eng) walk(c.eng); };
+                            walk(eng); return [...m].map(([k, n]) => `${k}x${n}`); })(),
            ms: Number(process.hrtime.bigint() - t0) / 1e6,
            units: eng.aotFns.size, insns: eng.stats.interpreted, err };
 };
@@ -424,7 +435,9 @@ for (const [name, bin, args, opts] of CASES) {
   const same = eng.code === nat.code && Buffer.compare(eng.out, nat.out) === 0;
   if (same) { pass++;
     console.log(`  ok   ${name.padEnd(9)} ${String(nat.out.length).padStart(8)}B out, ` +
-                `${eng.units} fns, ${(eng.ms).toFixed(0)}ms`); }
+                `${eng.units} fns, ${(eng.ms).toFixed(0)}ms`);
+    if (eng.unknown.length) console.log(`         ENOSYS syscalls: ${eng.unknown.join(' ')}`);
+    if (eng.ioctls.length) console.log(`         ENOTTY ioctls: ${eng.ioctls.join(' ')}`); }
   else { fail++;
     const why = eng.err ? `threw: ${eng.err}`
       : eng.code !== nat.code ? `exit ${eng.code} vs native ${nat.code}`
@@ -435,6 +448,7 @@ for (const [name, bin, args, opts] of CASES) {
     // libfoo" is a provisioning gap, a fault address is an engine bug
     if (eng.stderr) console.log(`         guest stderr: ${JSON.stringify(eng.stderr.slice(0, 300))}`);
     if (eng.unknown.length) console.log(`         ENOSYS syscalls: ${eng.unknown.join(' ')}`);
+    if (eng.ioctls.length) console.log(`         ENOTTY ioctls: ${eng.ioctls.join(' ')}`);
     if (eng.strace) console.log(`         last syscalls:\n           ${eng.strace.slice(-60).join('\n           ')}`);
     if (!eng.err && eng.out.length && nat.out.length) {
       let i = 0; while (i < eng.out.length && i < nat.out.length && eng.out[i] === nat.out[i]) i++;
