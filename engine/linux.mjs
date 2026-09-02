@@ -26,7 +26,7 @@ const PIPE_CAP = 65536;                       // Linux default pipe capacity
 // syscalls that sleep: a timer expiring on their entry interrupts them
 const SLEEPY = new Set([34, 35, 230, 130, 128, 7, 271, 23, 270, 232, 281, 61, 202]);
 const SYNTH_DIRS = new Set(['/proc', '/proc/self', '/proc/self/fd', '/proc/self/task', '/proc/sys', '/proc/sys/kernel',
-                            '/proc/sys/kernel/random', '/proc/sys/vm', '/proc/sys/fs', '/dev', '/dev/pts']);
+                            '/proc/sys/kernel/random', '/proc/sys/vm', '/proc/sys/fs', '/dev', '/dev/pts', '/dev/fd']);
 class DeoptUnwind { constructor(rip) { this.rip = rip; } }
 // A blocking syscall (poll/select/read with nothing ready, nanosleep) suspends
 // the guest the same way a deopt escapes compiled code: every register is
@@ -1049,6 +1049,11 @@ export class LinuxEngine {
   // open /proc/self/fd/N; scripts read cmdline/environ and sys/kernel/*.
   _synth(p) {
     if (!p.startsWith('/proc') && !p.startsWith('/dev')) return undefined;
+    {
+      const m = /^\/(?:proc\/(?:self|\d+)|dev)\/fd\/(\d+)$/.exec(p)
+             ?? (p === '/dev/stdin' ? [0, '0'] : p === '/dev/stdout' ? [0, '1'] : p === '/dev/stderr' ? [0, '2'] : null);
+      if (m) { const h = this.fds.get(Number(m[1])); return h ? (h.bytes ?? new Uint8Array(0)) : undefined; }
+    }
     const enc = (t) => new TextEncoder().encode(t);
     const argv = this._ctor?.argv ?? [this.argv0 ?? 'prog'];
     const comm = (this.argv0 ?? 'prog').split('/').pop().slice(0, 15);
@@ -1206,7 +1211,9 @@ export class LinuxEngine {
       '/proc/sys/kernel/random': [['boot_id', false], ['uuid', false]],
       '/proc/sys/vm': [['overcommit_memory', false], ['max_map_count', false]],
       '/proc/sys/fs': [['file-max', false], ['nr_open', false], ['pipe-max-size', false]],
-      '/dev': [['null', false], ['zero', false], ['urandom', false], ['random', false], ['tty', false], ['ptmx', false], ['pts', true]],
+      '/dev': [['null', false], ['zero', false], ['urandom', false], ['random', false], ['tty', false], ['ptmx', false], ['pts', true],
+               ['fd', true], ['stdin', false], ['stdout', false], ['stderr', false]],
+      '/dev/fd': [...this.fds.keys()].map(fd => [String(fd), false]),
     }[p.replace(/^\/proc\/\d+(\/|$)/, '/proc/self$1')];
     if (synth) for (const [n, d] of synth) names.set(n, d);
     // every real directory has these; without them find's recursive walk
@@ -1961,7 +1968,8 @@ export class LinuxEngine {
           }
           // /proc/self/fd/N reopens descriptor N (bash's <(...) and >(...)):
           // a regular file gets its own offset, a pipe end is shared
-          const m = /^\/proc\/(?:self|\d+)\/fd\/(\d+)$/.exec(np);
+          const m = /^\/proc\/(?:self|\d+)\/fd\/(\d+)$/.exec(np) ?? /^\/dev\/fd\/(\d+)$/.exec(np)
+                 ?? (np === '/dev/stdin' ? [0, '0'] : np === '/dev/stdout' ? [0, '1'] : np === '/dev/stderr' ? [0, '2'] : null);
           if (m) {
             const src = this.fds.get(Number(m[1]));
             if (!src) { ret(-2n); break; }
@@ -2068,7 +2076,29 @@ export class LinuxEngine {
       case 3: { const cfd = Number(a1), ch = this.fds.get(cfd);
         this.fds.delete(cfd); this.cloexec.delete(cfd);
         if (ch?.pipe && ch.mode === 'w') this._pipeEofSweep([ch]);
+        if (ch && this._fsMeta().flocks?.size) this._flockRelease(ch);
         ret(0n); break; }                                     // close
+      case 436: {                                             // close_range(first, last, flags)
+        const first = Number(a1), last = Math.min(Number(BigInt.asUintN(32, a2)), 1 << 20), fl = Number(a3);
+        for (const fd of [...this.fds.keys()]) if (fd >= first && fd <= last) {
+          if (fl & 4) { this.cloexec.add(fd); continue; }     // CLOSE_RANGE_CLOEXEC
+          const ch = this.fds.get(fd); this.fds.delete(fd); this.cloexec.delete(fd);
+          if (ch?.pipe && ch.mode === 'w') this._pipeEofSweep([ch]);
+          if (ch && this._fsMeta().flocks?.size) this._flockRelease(ch);
+        }
+        ret(0n); break; }
+      case 73: {                                              // flock(fd, op): advisory, per open file description
+        const h = this.fds.get(Number(a1)); if (!h) { ret(-9n); break; }
+        const op = Number(a2) & ~4, nb = !!(Number(a2) & 4);   // LOCK_NB
+        const key = h.path ?? h; const m = this._fsMeta(); m.flocks ??= new Map();
+        let L = m.flocks.get(key);
+        if (op === 8) { if (L) { L.sh.delete(h); if (L.ex === h) L.ex = null; if (!L.ex && !L.sh.size) m.flocks.delete(key); this.wakeAllBlk(); } ret(0n); break; }   // LOCK_UN
+        L ??= { ex: null, sh: new Set() };
+        const busy = op === 2 ? (L.ex && L.ex !== h) || [...L.sh].some(x => x !== h)    // LOCK_EX
+                   : op === 1 ? (L.ex && L.ex !== h) : true;                             // LOCK_SH
+        if (busy) { if (nb) { ret(-11n); break; } this.block(null); break; }             // EWOULDBLOCK / wait
+        if (op === 2) { L.sh.delete(h); L.ex = h; } else { if (L.ex === h) L.ex = null; L.sh.add(h); }
+        m.flocks.set(key, L); ret(0n); break; }
       case 8: {                                               // lseek
         const h = this.fds.get(Number(a1));
         if (!h) { ret(-9n); break; }
@@ -2536,6 +2566,9 @@ export class LinuxEngine {
         if (cmd === 4) { if (h?.sock) h.sock.nonblock = !!(Number(a3) & 0x800); if (h?.pipe) h.nonblock = !!(Number(a3) & 0x800); ret(0n); break; }  // F_SETFL
         if (cmd === 1) { ret(BigInt(this.cloexec.has(Number(a1)) ? 1 : 0)); break; }   // F_GETFD
         if (cmd === 2) { if (Number(a3) & 1) this.cloexec.add(Number(a1)); else this.cloexec.delete(Number(a1)); ret(0n); break; }  // F_SETFD
+        if (cmd === 5 || cmd === 36) {                        // F_GETLK / F_OFD_GETLK: nobody holds a record lock
+          if (a3) { this.jsnap(a3, 2); this.mem.write(a3, 2n, 2n); }   // l_type = F_UNLCK
+          ret(0n); break; }
         if (cmd === 0 || cmd === 1030) {                      // F_DUPFD / F_DUPFD_CLOEXEC
           if (!h) { ret(-9n); break; }
           let fd = Number(a3); while (this.fds.has(fd)) fd++;
@@ -2886,6 +2919,11 @@ export class LinuxEngine {
   }
   // stores through a shared writable mapping reach a descriptor read
   _mapsFlushPath(path) { for (const m of this.maps) if (m.shared && m.path === path) this._writeBackMap(m); }
+  _flockRelease(h) {
+    const m = this._fsMeta(); if (!m.flocks) return;
+    for (const [k, L] of m.flocks) { if (L.ex === h) L.ex = null; L.sh.delete(h); if (!L.ex && !L.sh.size) m.flocks.delete(k); }
+    this.wakeAllBlk();
+  }
   _fifoAt(p) { return this._fsMeta().fifos?.get(this.resolve(this.norm(p))); }
   _hardRefresh(path, nb) {
     const g = this._fsMeta().hard?.get(this.norm(path)); if (!g) return;

@@ -128,6 +128,16 @@ if (!existsSync(EPIPE)) {
                              new URL('./fixtures/epipe.c', import.meta.url).pathname]); } catch {}
 }
 
+// patch inputs, written once like IN
+const BP = '/tmp/bp';
+if (!existsSync(BP + '/change.diff')) {
+  mkdirSync(BP, { recursive: true });
+  writeFileSync(BP + '/orig.txt', 'alpha\nbeta\ngamma\n');
+  writeFileSync(BP + '/new.txt', 'alpha\nBETA\ngamma\ndelta\n');
+  try { execFileSync('diff', ['-u', BP + '/orig.txt', BP + '/new.txt'], { cwd: BP }); } catch (e) { writeFileSync(BP + '/change.diff', e.stdout); }
+}
+add(BP + '/orig.txt', BP + '/orig.txt'); add(BP + '/change.diff', BP + '/change.diff');
+
 // A C source for the compiler cases, written once like IN.
 const HELLO_C = '/tmp/breadth_hello.c';
 if (!existsSync(HELLO_C))
@@ -333,6 +343,25 @@ const CASES = [
   // (readdir order is filesystem-dependent natively, so the output is sorted)
   ['find-exec', '/bin/bash', ['-c', 'find /tmp/breadth_repo -maxdepth 1 -name "*.txt" -exec basename {} \\; | sort'],
                 { tree: '/tmp/breadth_repo', bins: ['/usr/bin/find', '/usr/bin/basename', '/usr/bin/sort'] }],
+  // patch: applies a unified diff to stdout
+  ['patch',     '/usr/bin/patch', ['-s', '-o', '-', '/tmp/bp/orig.txt', '/tmp/bp/change.diff']],
+  // flock: advisory lock on a file, then exec sh -c
+  ['flock',     '/usr/bin/flock', ['/tmp/bp/lock', '-c', 'echo locked'], { bins: ['/bin/sh'] }],
+  // tee: a pipeline that writes a file and passes bytes through
+  ['tee',       '/bin/bash', ['-c', 'printf "x\\ny\\n" | tee /tmp/bp/tee.out | wc -l; cat /tmp/bp/tee.out'],
+                { bins: ['/usr/bin/tee', '/usr/bin/wc', '/usr/bin/cat'] }],
+  // sort with a tiny buffer: external merge through temp files
+  ['sort-S',    '/bin/sort',       ['-S', '1K', IN]],
+  // python subprocess: posix_spawn + pipe capture + wait
+  ['python-sub','/usr/bin/python3', ['-S', new URL('./fixtures/sub.py', import.meta.url).pathname],
+                { tree: '/usr/lib/python3.11', bins: [new URL('./fixtures/sub.py', import.meta.url).pathname, '/usr/bin/echo', '/bin/sh'], memMB: 1024 }],
+  // perl fork + waitpid + exit status
+  ['perl-fork', '/usr/bin/perl', ['-e', 'if(my $p=fork){waitpid($p,0); print "parent ".($?>>8)."\\n"} else {print "child\\n"; exit 3}']],
+  // bash process substitution: /proc/self/fd/N handed to diff and cat
+  ['bash-psub', '/bin/bash', ['-c', 'diff <(printf "a\\nb\\n") <(printf "a\\nc\\n"); echo "rc=$?"; cat <(echo sub)'],
+                { bins: ['/usr/bin/diff', '/usr/bin/cat'] }],
+  // env -i: a scrubbed environment, then exec
+  ['env-i',     '/usr/bin/env',   ['-i', 'FOO=1', '/usr/bin/env']],
   // threaded xz: worker threads with big shared buffers
   ['xz-T2',     '/usr/bin/xz',     ['-T2', '-c', IN], { memMB: 1536 }],
   // ls -l: getdents + stat (nlink, 4K block counts, mtimes, owner names) on a

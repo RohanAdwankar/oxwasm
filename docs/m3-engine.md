@@ -2674,6 +2674,27 @@ so the case lists without `-a`.
 **Not a bug.** `find -exec` prints in readdir order, which is
 filesystem-dependent natively; the case sorts.
 
+### Second batch from the outside: eight programs, two gaps
+
+`patch` (a unified diff applied to stdout), `flock` (an advisory lock,
+then `sh -c`), a `tee` pipeline, `sort -S 1K` (external merge through temp
+files), Python `subprocess.run` (posix_spawn, pipe capture, wait), Perl
+`fork`+`waitpid`, bash process substitution (`diff <(…) <(…)`), and
+`env -i`. Six passed untouched; two found gaps:
+
+**flock.** ENOSYS. Advisory locks now live in the shared fs metadata,
+keyed by path, per open file description: LOCK_SH/LOCK_EX/LOCK_UN, LOCK_NB
+answering EWOULDBLOCK, otherwise the caller blocks and re-checks; a close
+(and `close_range`) releases what the description held. POSIX record locks
+through `fcntl` are still always granted, but F_GETLK now reports F_UNLCK
+instead of echoing the caller's own request type back (which reads as
+"locked by someone").
+
+**/dev/fd.** bash substitutes `/dev/fd/63`, not `/proc/self/fd/63`; the
+reopen path now serves both, plus `/dev/stdin`/`stdout`/`stderr`, and
+`/dev/fd` lists the open descriptors. `close_range` (Python's subprocess
+uses it) closes or marks close-on-exec a range of descriptors.
+
 
 **The one bug that stood between compile and link was in `read`, not the
 linker.** The full link completed and produced a structurally perfect ELF,
