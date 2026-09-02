@@ -78,6 +78,10 @@ const HELLO_C = '/tmp/breadth_hello.c';
 if (!existsSync(HELLO_C))
   writeFileSync(HELLO_C, 'int main(){__builtin_printf("hi from compiled C\\n");return 0;}\n');
 add(HELLO_C, HELLO_C);
+const HELLO_CPP = '/tmp/breadth_hello.cpp';
+if (!existsSync(HELLO_CPP))
+  writeFileSync(HELLO_CPP, '#include <cstdio>\nint main(){std::printf("hi from C++\\n");return 0;}\n');
+add(HELLO_CPP, HELLO_CPP);
 
 // wat2wasm for the AOT tier; cached by text hash so repeat cases are cheap
 const CACHE = new URL('../bench/kernels/watcache/', import.meta.url).pathname;
@@ -258,6 +262,18 @@ const CASES = [
               tree: ['/usr/include', '/usr/lib/gcc/x86_64-linux-gnu/13/include',
                      '/usr/lib/gcc/x86_64-linux-gnu/13'],
               outFile: '/tmp/breadth_hello_aout', memMB: 1024 }],
+  // the C++ frontend end to end: g++ -> cc1plus (a much larger front end than
+  // cc1) -> as -> collect2 -> ld, producing a PIE byte-compared to native.
+  // Exercises the same toolchain generality on a heavier translation load.
+  ['gpp-link', '/usr/bin/g++', ['-O1', '-o', '/tmp/breadth_hello_cpp_aout', HELLO_CPP],
+            { bins: ['/usr/libexec/gcc/x86_64-linux-gnu/13/cc1plus', '/usr/bin/as',
+                     '/usr/bin/x86_64-linux-gnu-as',
+                     '/usr/libexec/gcc/x86_64-linux-gnu/13/collect2',
+                     '/usr/bin/ld', '/usr/bin/x86_64-linux-gnu-ld',
+                     '/usr/bin/x86_64-linux-gnu-ld.bfd'],
+              tree: ['/usr/include', '/usr/lib/gcc/x86_64-linux-gnu/13/include',
+                     '/usr/lib/gcc/x86_64-linux-gnu/13'],
+              outFile: '/tmp/breadth_hello_cpp_aout', memMB: 2048 }],
 ];
 const STDIN = { tr: readFileSync(IN), bc: Buffer.from('scale=20\n7/3\n2^64\nsqrt(2)\nquit\n'),
                 jq: Buffer.from('{"a": 3, "b": 4}\n{"a": 10, "b": -2}\n'),

@@ -2341,7 +2341,12 @@ completes with exit 0 and produces a **15968-byte PIE byte-for-byte
 identical to native gcc's**, build-id included, and that binary **runs
 under the engine** and prints its output. `gcc-S` / `gcc-c` / `gcc-link`
 in breadth cover the three stages; the engine is now a C compiler that
-builds runnable native executables entirely inside wasm.
+builds runnable native executables entirely inside wasm. The **C++**
+frontend works untouched too: `g++ -O1 hello.cpp` drives `cc1plus` (a far
+larger front end than `cc1`), `as`, `collect2` and `ld` to a PIE
+byte-identical to native g++'s, which runs and prints (`gpp-link` in
+breadth, ~5 min under the engine for the heavier translation load). No
+new engine work was needed — the read-past-EOF clamp was the whole gap.
 
 **The one bug that stood between compile and link was in `read`, not the
 linker.** The full link completed and produced a structurally perfect ELF,
