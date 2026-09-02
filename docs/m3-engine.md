@@ -2249,3 +2249,24 @@ past its execve?** — the resurrection path (a `wake()` that switches to
 a not-actually-dead thread, or a `BlockUnwind` that unwinds into the
 wrong frame under a live wasm callout) is the next thing to trace, with
 a repro that runs in seconds.
+
+**Fourth pass — it is a corrupted function-pointer TABLE, and the fault
+thread is the parent, not the child.** A `_run1`-level (ti, rip) ring
+across the fault shows ti=0 (the parent) running the ELF init/fini
+function-pointer iterator (`call *0x10(%r15); add $0x18,%r15`), whose
+current entry sends it — through a couple of hops — into `__execve` and
+then off a corrupted return. So the earlier "child runs past its
+execve" reading was the surface: the real damage is a **code-pointer in
+the parent's `.data`/exit-handler array overwritten** with a value that
+resolves into `__execve`, planted by a compiled store during the vfork
+window; the parent iterates the table on the way to (or through) exit
+and calls into it. `park()`/`wake()` behave correctly (no dead thread
+steps, no bad wake-switch), which rules out the scheduler and points
+squarely at an unrolled-back or mis-journaled write to that table
+during the child's window. The write is a wasm store (invisible to
+`mem.write`), so the decisive next instrument is a value-watch: trap the
+moment a word in the fini/init array region acquires a code-pointer that
+is not its original, with AOT on. Four passes in, this is a genuine
+multi-layer bug; it is parked with a seconds-long repro and an exact
+corrupted-structure identification so a focused session can close it
+without re-deriving any of the above.
