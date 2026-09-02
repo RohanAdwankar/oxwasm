@@ -2166,13 +2166,43 @@ pre-fix emitter. Correctness was never at risk — wat2wasm's rejection is
 a hard stop, not silent corruption — but the tiering hole was real:
 these units ran interpreted.
 
-**Parked — the execve-child fault.** Through the gcc *driver*, cc1
-faults with `unsupported opcode 2f at 155f4c0`, an address whose real
-byte is 0x48 and which sits mid-instruction inside a valid `add
-rax,[rip+d]`. The engine is decoding memory that does not hold cc1's
-bytes, and it happens only when cc1 is an execve child, not when cc1 is
-the top-level guest — so it is a corruption in the execve child's
-mapping of a 30MB, four-PT_LOAD binary, not a decoder gap. Left as a
-documented lead with the exact fault address and the direct-vs-execve
-bisection; chasing it needs a segment-by-segment diff of the child's
-mapped image against the file.
+**Parked — the fork+AOT corruption (was mis-filed as an "execve-child
+mapping" bug; that guess was wrong).** Through the gcc *driver*, the
+run faults with `unsupported opcode 2f at 155f4c0`. A dump at the fault
+corrected the story: it is the **gcc driver** (a ~1MB binary) whose own
+`rip` is 0x155f4c0 — far past its highest mapped segment (~0x4fd000) —
+so the driver made a wild jump to what happens to be an address in
+cc1's range; cc1 itself (a separate child engine) is loaded correctly.
+The driver's strace ends `vfork()=1000` (pid to parent), the child does
+`close(3)` then `execve(cc1)`, and the parent then resumes with a
+corrupted `rip` (= the execve path-string pointer) and stale registers,
+executes a bogus "syscall 1000" (the vfork pid still in rax), and
+faults. So the parent's control flow was derailed after its vfork child
+exec'd.
+
+The bisection is decisive about the *conditions*, not yet the
+mechanism:
+
+- **No-AOT (`assembleWat: null`) → byte-identical, exit 0.** With
+  tiering off the whole gcc→cc1 compile produces the exact native
+  assembly. So this is an AOT-dependent corruption.
+- **gcc `-###` (driver + AOT, never forks) → clean.** The driver's own
+  translated code is correct.
+- **cc1 run directly (top-level, AOT) → clean** (it produces correct
+  `.s`, 878k interp insns + tiered units).
+- Only **fork + AOT together** corrupts. Ruled out along the way: the
+  vfork is executed interpreted, not from inside a wasm frame (a
+  deopt-on-fork-from-wasm fix changed nothing and was reverted); and no
+  AOT unit is dispatched while the vfork rollback journal is armed (so
+  the child is not bypassing the journal through compiled code).
+
+What is left is the interaction between the vfork window's
+save/restore of tiering state (`aotBudget`, the write journal, the
+shared regfile at wasm offsets 0–511) and the parent's resumption into
+or after a tiered unit. That is the next thing to instrument: trace the
+parent thread's control flow across the vfork window with AOT on, and
+find the store (or the stale spilled register) that plants the
+path-string pointer where the parent's next `ret`/indirect-call reads
+it. The whole compiler/toolchain breadth lane waits on it; GIMP's
+plug-in launcher (also fork+exec) does not hit it because its pre-exec
+child makes far fewer memory-touching syscalls than gcc's.
