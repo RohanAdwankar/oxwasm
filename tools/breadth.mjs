@@ -73,6 +73,12 @@ if (!existsSync(VFORK)) {
                              new URL('./fixtures/vforkexec.c', import.meta.url).pathname]); } catch {}
 }
 
+// A C source for the compiler cases, written once like IN.
+const HELLO_C = '/tmp/breadth_hello.c';
+if (!existsSync(HELLO_C))
+  writeFileSync(HELLO_C, 'int main(){__builtin_printf("hi from compiled C\\n");return 0;}\n');
+add(HELLO_C, HELLO_C);
+
 // wat2wasm for the AOT tier; cached by text hash so repeat cases are cheap
 const CACHE = new URL('../bench/kernels/watcache/', import.meta.url).pathname;
 mkdirSync(CACHE, { recursive: true });
@@ -223,6 +229,13 @@ const CASES = [
   // is not corrupted when its vfork child execs. busybox is the child's exec.
   ['vforkexec', '/tmp/breadth_vforkexec', [],
                 { bins: ['/usr/bin/busybox'] }],
+  // the compiler lane: gcc's driver vforks cc1 (the case that drove the
+  // interpUntil-depth fork fix); assembly comes back on stdout. Preprocessor,
+  // front end and back end of a 30MB binary, byte-compared to native.
+  ['gcc-S', '/usr/bin/gcc', ['-S', '-o', '-', '-O1', HELLO_C],
+            { bins: ['/usr/libexec/gcc/x86_64-linux-gnu/13/cc1'],
+              tree: ['/usr/include', '/usr/lib/gcc/x86_64-linux-gnu/13/include'],
+              memMB: 1024 }],
 ];
 const STDIN = { tr: readFileSync(IN), bc: Buffer.from('scale=20\n7/3\n2^64\nsqrt(2)\nquit\n'),
                 jq: Buffer.from('{"a": 3, "b": 4}\n{"a": 10, "b": -2}\n'),
@@ -279,7 +292,7 @@ for (const [name, bin, args, opts] of CASES) {
   if (!pick(name)) continue;
   if (!existsSync(bin)) { console.log(`  SKIP ${name.padEnd(9)} (${bin} not present)`); continue; }
   const stdin = STDIN[name] || null;
-  if (opts && opts.tree) walk(opts.tree);
+  if (opts && opts.tree) for (const t of [].concat(opts.tree)) walk(t);
   if (opts && opts.bins) for (const b of opts.bins) add(b, b);   // child-exec binaries
   const nat = native(bin, args, stdin);
   const eng = engine(bin, args, stdin, opts);
