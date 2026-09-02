@@ -72,6 +72,14 @@ export function decode(fetch, rip) {
     if (op === base + 4) return fin({ mnem, dst: reg8(0), src: { kind: 'imm', v: imm(1) }, size: 1 });
     if (op === base + 5) return fin({ mnem, dst: mkreg(0, osz), src: { kind: 'imm', v: imm(osz === 2 ? 2 : 4) }, size: osz });
   }
+  if (op >= 0xA0 && op <= 0xA3) {             // mov al/eax/rax <-> [moffs64] (V8 external refs)
+    const sz = op & 1 ? osz : 1;
+    const m = { kind: 'mem', base: -1, index: -1, scale: 1, disp: immU(8), ripRel: false,
+                size: sz, fs: fsSeg, a32: 0 };
+    const ax = sz === 1 ? reg8(0) : mkreg(0, sz);
+    return op < 0xA2 ? fin({ mnem: 'mov', dst: ax, src: m, size: sz })
+                     : fin({ mnem: 'mov', dst: m, src: ax, size: sz });
+  }
   if (op === 0xA8) return fin({ mnem: 'test', dst: reg8(0), src: { kind: 'imm', v: imm(1) }, size: 1 });
   if (op === 0xA9) return fin({ mnem: 'test', dst: mkreg(0, osz), src: { kind: 'imm', v: imm(osz === 2 ? 2 : 4) }, size: osz });
   if (op === 0x84) { const [r, rm] = modrm(1);   return fin({ mnem: 'test', dst: rm, src: r, size: 1 }); }

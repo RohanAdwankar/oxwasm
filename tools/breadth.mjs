@@ -170,6 +170,11 @@ const CASES = [
   // here took the epoll family, EBADF from fcntl on dead fds, a finite
   // RLIMIT_NOFILE, and pop r/m64 in the decoder.
   ['node',    '/opt/node22/bin/node', ['--jitless', '-e', 'console.log(6*7)'], { memMB: 2048 }],
+  // full JIT: V8 writes Sparkplug and irregexp machine code into rwx pages
+  // at runtime and the engine executes (and tiers) it - the JIT-in-JIT lane.
+  // The 3e6-iteration TurboFan stress lives in scratch tooling; this sized-
+  // down loop keeps the sweep's wall clock sane while still forcing codegen.
+  ['node-jit','/opt/node22/bin/node', ['-e', 'let s=0; for (let i=0;i<3e5;i++) s+=i%7; console.log(s, /a(b+)c/.exec("xabbbcy")[1])'], { memMB: 2048 }],
   // a real repo, read paths: object walk + index + worktree stat. The
   // fixture at /tmp/breadth_repo is committed with pinned dates so the
   // hash is stable; safe.directory silences ownership checks that would

@@ -2103,3 +2103,31 @@ gzip|md5sum and seq|sort|head pipelines through fork/execve/pipes/wait4),
 dd, cmp, and date. 67/67. The full-JIT node — V8 writing machine code
 into pages at runtime, the self-modifying-code frontier for
 address-keyed AOT units — is the next experiment.
+
+### JIT-in-JIT: V8 generates machine code and the engine runs it
+
+Full-JIT node is the self-modifying-code frontier: V8 writes Sparkplug,
+irregexp and TurboFan machine code into rwx pages at runtime, and the
+engine both interprets AND TIERS that generated code — address-keyed
+translation of instructions that did not exist at ELF load. Status:
+
+- `node -e 'console.log(6*7)'` (full JIT): byte-identical, exit 0.
+- The stress — a 3e6-iteration loop TurboFan optimizes plus 100k
+  matches of an irregexp-compiled regexp — prints the exact native
+  output. 9,973 units, ~4,300 of them translations of V8-generated
+  code. One new opcode fell out: `mov rax, [moffs64]` (A0–A3), which
+  V8 emits for external references and nothing in 68 static binaries
+  ever used.
+- A sized-down variant (3e5 iterations, Sparkplug + irregexp) is now
+  breadth case `node-jit`. 68/68.
+
+The correctness hole this exposed: `munmap` was a no-op and unit
+registration write-once, so a recycled code page (V8 GCs code
+constantly) would keep dispatching into stale translations of bytes
+that no longer exist. munmap now drops every compiled artifact whose
+entry lies in the range and rebuilds the dispatch hash without them —
+skipped entirely for data-buffer munmaps that intersect nothing.
+Remaining known gaps, queued: a targeted recycle regression (tier a
+page, munmap, map different code at the same address, prove the new
+code runs — the sweep cannot catch this), and in-place patching of
+still-mapped code (V8's IC updates), which no munmap ever announces.

@@ -1320,7 +1320,22 @@ export class LinuxEngine {
           this.execRanges.push([at, at + len]);   // library text: profiling must see it (prot untracked)
         }
         ret(at); break; }
-      case 11: ret(0n); break;                               // munmap
+      case 11: {                                             // munmap
+        // A JIT guest (V8 writes machine code into pages at runtime, then
+        // recycles them) invalidates address-keyed translations: a fresh
+        // mmap at this address after the munmap would otherwise dispatch
+        // into stale units. Drop every compiled artifact whose entry lies
+        // in the range and rebuild the dispatch hash without them; skip all
+        // of it for the common data-buffer munmap that intersects nothing.
+        const lo = a1, hi = a1 + a2;
+        const inR = (k) => k >= lo && k < hi;
+        let hit = false;
+        for (const k of this.aotFns.keys()) if (inR(k)) { this.aotFns.delete(k); hit = true; }
+        for (const k of this.aotFailed) if (inR(k)) this.aotFailed.delete(k);
+        if (this.compiled) for (const k of this.compiled.keys()) if (inR(k)) this.compiled.delete(k);
+        if (this.profile) for (const k of this.profile.keys()) if (inR(k)) this.profile.delete(k);
+        if (hit) this.rebuildFtmap();
+        ret(0n); break; }
       case 10: ret(0n); break;                               // mprotect (no page prot here)
       case 273: ret(0n); break;                              // set_robust_list
       case 334: ret(-38n); break;                            // rseq -> ENOSYS (glibc copes)
