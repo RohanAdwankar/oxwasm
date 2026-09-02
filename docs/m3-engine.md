@@ -2555,6 +2555,59 @@ same bytes as N, `/dev/zero` is zeros, `/dev/urandom` fills, and
 `pthread_getattr_np` reports a stack containing a local — byte-identical
 to native.
 
+### Timers and signal descriptors — and a blocked signal's default action
+
+`tools/fixtures/timers.c` (`timers`) closes the rest of the signal/timer
+ledger, byte-identical to native: a one-shot `timerfd` whose `read` blocks
+until expiry and returns 1; an interval `timerfd` that `poll` reports
+readable; `signalfd` reading a blocked, raised SIGUSR1 as a
+`signalfd_siginfo` with `ssi_code` SI_TKILL; `sigtimedwait` returning a
+pending signal, and −1/EAGAIN with a zero timeout when nothing is pending;
+a POSIX timer (`timer_create` with SIGEV_SIGNAL and a `sival`, `settime`)
+whose SA_SIGINFO handler sees `si_code` SI_TIMER and `si_value` 77; and
+`setitimer(ITIMER_VIRTUAL)` firing SIGVTALRM. The itimers are now three
+slots (REAL/VIRTUAL/PROF — CPU time is modelled as wall time, since a
+guest thread is always running while it is current), POSIX timers keep
+overrun counts, and every armed timer is folded into the host-facing
+deadline so a parked engine wakes for it.
+
+**The bug this found was in the day-old signal code, not the new one.** A
+`raise()` of a signal that is *blocked* and has no handler terminated the
+process on the spot: `raiseSignal` applied the default action without
+consulting the mask. The kernel leaves such a signal pending — for
+`sigprocmask` to unblock later, or for `sigtimedwait`/`signalfd` to
+consume — and applies the default action only when it becomes deliverable.
+`raiseSignal` now terminates immediately only when the target thread has
+the signal unblocked; otherwise it sets the pending bit, and the three
+delivery checkpoints apply the default action (terminate, or discard for
+the default-ignored set) when they find a pending, unblocked signal with
+no handler. `signalfd`/`sigtimedwait` dequeue from any live thread's
+pending set, carry the recorded `siginfo` across, and a blocked signal
+still wakes a thread parked in one of them.
+
+**Where a timer cannot fire.** Timers are checked at every syscall entry
+(regardless of whether anything is pending — a compiled loop that makes
+syscalls but never returns to the run loop would otherwise never see its
+timer), after every compiled dispatch, and at the run-loop quantum. A pure
+compute loop that never yields — no call, no syscall, compiled — cannot be
+interrupted at all; the fixture's spin makes an occasional `getppid()`, as
+a profiled program does. Asynchronous delivery into such a loop would need
+a back-edge check in the compiled code, which is a translated-code-cost
+decision, not a kernel-model one.
+
+**And where the wall clock and the guest disagree.** Widening the timer
+check to every syscall entry turned up one sweep failure: the `signal`
+fixture's 20 ms itimer had already expired by the time the guest reached
+`nanosleep(5 s)` — a tier-up compile between the two syscalls takes longer
+than that — so the entry checkpoint ran the handler first and then let the
+full sleep proceed (`ret=0`), where native, whose timer fires *during* the
+sleep, returns EINTR. Both orders are legal; for a timer armed moments
+earlier the second is the only one native ever shows. A timer that expires
+as a sleep-like syscall is entered (`pause`, `nanosleep`, `sigsuspend`,
+`sigtimedwait`, the poll family, `wait4`, `futex`) therefore counts as
+interrupting that call — EINTR, or re-execution under SA_RESTART — while
+for everything else the handler runs first and the syscall follows.
+
 
 **The one bug that stood between compile and link was in `read`, not the
 linker.** The full link completed and produced a structurally perfect ELF,

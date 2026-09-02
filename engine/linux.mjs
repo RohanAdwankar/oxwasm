@@ -23,6 +23,8 @@ const BRANCHY = new Set(['jmp','jcc','call','ret','retn','jmpind','callind','sys
 // stack. This is what keeps escape handling O(1) in stack depth (a hot loop
 // containing a jump table would otherwise grow the stack on every trip).
 const PIPE_CAP = 65536;                       // Linux default pipe capacity
+// syscalls that sleep: a timer expiring on their entry interrupts them
+const SLEEPY = new Set([34, 35, 230, 130, 128, 7, 271, 23, 270, 232, 281, 61, 202]);
 const SYNTH_DIRS = new Set(['/proc', '/proc/self', '/proc/self/fd', '/proc/self/task', '/proc/sys', '/proc/sys/kernel',
                             '/proc/sys/kernel/random', '/proc/sys/vm', '/proc/sys/fs', '/dev', '/dev/pts']);
 class DeoptUnwind { constructor(rip) { this.rip = rip; } }
@@ -1969,6 +1971,21 @@ export class LinuxEngine {
           }
           ret(BigInt(got)); break;
         }
+        if (h.tfd) {                                          // timerfd: 8-byte expiration count
+          this._tfdTick(h.tfd);
+          if (h.tfd.fired > 0) { this.mem.write(a2, 8n, BigInt(h.tfd.fired)); h.tfd.fired = 0; ret(8n); break; }
+          if (h.nonblock) { ret(-11n); break; }
+          this.block(h.tfd.at); break;
+        }
+        if (h.sfd) {                                          // signalfd: signalfd_siginfo records
+          const t = this._ts(this.threads[this.ti]);
+          let n = 0; const cap = Math.floor(Number(a3) / 128);
+          while (n < cap) { const sig = this._sigTake(t, h.sfd.mask); if (!sig) break;
+            this._writeSignalfdInfo(a2 + BigInt(n * 128), sig, t.siginfo?.get(sig) ?? {}); n++; }
+          if (n > 0) { ret(BigInt(n * 128)); break; }
+          if (h.nonblock) { ret(-11n); break; }
+          this.block(null); break;
+        }
         if (h.gen) {                                          // /dev/zero, /dev/urandom
           const n = Number(a3); this.jsnap(a2, n);
           const dst = this.ram.subarray(Number(a2 - this.base), Number(a2 - this.base) + n);
@@ -2024,6 +2041,7 @@ export class LinuxEngine {
           if (this.tty && (Number(a1) <= 2 || h?.istty)) {     // terminal: match stat("/dev/pts/0")
             this.writeStat(a2, '/dev/pts/0', 0, 0o020620, 0x8800n, 1001n); ret(0n); break; }
           if (h?.gen) { size = 0; mode = 0o020666; }                        // /dev/zero, /dev/urandom
+          else if (h?.tfd || h?.sfd) { size = 0; mode = 0o0100600; }       // anon inode
           else if (h?.bytes) { size = h.bytes.length; mode = this.fileMode(h.bytes); statPath = h.path ?? null; }  // regular file
           else if (h?.pipe) { size = 0; mode = 0o010600; }                 // FIFO
           else if (h?.sock) { size = 0; mode = 0o140777; }                 // socket
@@ -2203,6 +2221,8 @@ export class LinuxEngine {
           : t.sock ? !!(t.sock.conn && t.sock.conn.readable())
           : t.pipe ? (t.pipe.chunks.length > 0 || !!t.pipe.weof)
           : t.ev ? t.ev.count > 0n
+          : t.tfd ? this._tfdReady(t.tfd)
+          : t.sfd ? this._sfdReady(t.sfd)
           : !!t.bytes;
         this.jsnap(a2, maxev * 12);
         const v = new DataView(this.wmem.buffer), base = this.RAMOFF + Number(a2 - this.base);
@@ -2221,7 +2241,7 @@ export class LinuxEngine {
           this._deadline = null; ret(BigInt(n)); break;
         }
         this._deadline ??= (timeoutMs < 0 ? Infinity : now + timeoutMs);
-        this.block(this._deadline === Infinity ? null : this._deadline); break; }
+        this.block(this._capByTimerfd(this._deadline)); break; }
       case 13: {                                              // rt_sigaction(sig, act*, oldact*, sz)
         const sig = Number(a1);
         if (sig < 1 || sig > 64 || sig === 9 || sig === 19) { ret(-22n); break; }   // EINVAL
@@ -2255,25 +2275,91 @@ export class LinuxEngine {
       case 34: {                                              // pause(): until a handler has run
         this.block(null); break; }
       case 36: {                                              // getitimer(which, cur*)
-        const it = this.itimer ?? { at: null, interval: 0 };
+        const it = this._itimer(Number(a1)); if (!it) { ret(-22n); break; }
         const left = it.at == null ? 0 : Math.max(0, it.at - this.nowMs());
         this._writeItimerval(a2, it.interval, left); ret(0n); break; }
       case 37: {                                              // alarm(seconds)
-        const it = (this.itimer ??= { at: null, interval: 0 });
+        const it = this._itimer(0);
         const leftMs = it.at == null ? 0 : Math.max(0, it.at - this.nowMs());
         const secs = Number(a1);
         it.interval = 0; it.at = secs === 0 ? null : this.nowMs() + secs * 1000;
+        this._timerArmed();
         ret(BigInt(Math.ceil(leftMs / 1000))); break; }
       case 38: {                                              // setitimer(which, new*, old*)
-        const it = (this.itimer ??= { at: null, interval: 0 });
+        // ITIMER_VIRTUAL / ITIMER_PROF count CPU time; a guest thread here is
+        // always running when it is current, so wall time is the model
+        const it = this._itimer(Number(a1)); if (!it) { ret(-22n); break; }
         if (a3) { const left = it.at == null ? 0 : Math.max(0, it.at - this.nowMs());
                   this._writeItimerval(a3, it.interval, left); }
         if (a2) {
           const rd = (o) => Number(this.mem.read(a2 + BigInt(o), 8n)) * 1000 + Number(this.mem.read(a2 + BigInt(o) + 8n, 8n)) / 1000;
           const interval = rd(0), value = rd(16);             // it_interval, it_value (ms)
           it.interval = interval; it.at = value === 0 ? null : this.nowMs() + value;
+          this._timerArmed();
         }
         ret(0n); break; }
+      // ---- POSIX timers: timer_create / settime / gettime / getoverrun / delete
+      case 222: {                                             // timer_create(clockid, sigevent*, timerid*)
+        let sig = 14, notify = 0, sival = 0n;
+        if (a2) { sival = this.mem.read(a2, 8n); sig = Number(this.mem.read(a2 + 8n, 4n)); notify = Number(this.mem.read(a2 + 12n, 4n)); }
+        if (notify === 2) { ret(-22n); break; }                // SIGEV_THREAD: glibc's helper thread not modelled
+        const id = (this._ptimerNext = (this._ptimerNext ?? 0) + 1);
+        (this.ptimers ??= new Map()).set(id, { at: null, interval: 0, sig, notify, sival, overrun: 0 });
+        this.jsnap(a3, 4); this.mem.write(a3, 4n, BigInt(id)); ret(0n); break; }
+      case 223: {                                             // timer_settime(id, flags, new*, old*)
+        const t = this.ptimers?.get(Number(a1)); if (!t) { ret(-22n); break; }
+        const abs = Number(a2) & 1;
+        if (cpu.regs[10]) this._writeItimerspec(cpu.regs[10], t.interval, t.at == null ? 0 : Math.max(0, t.at - this.nowMs()));
+        const rd = (o) => Number(this.mem.read(a3 + BigInt(o), 8n)) * 1000 + Number(this.mem.read(a3 + BigInt(o) + 8n, 8n)) / 1e6;
+        const interval = rd(0), value = rd(16);
+        t.interval = interval;
+        t.at = value === 0 ? null : abs ? (value - Date.now() + this.nowMs()) : this.nowMs() + value;
+        this._timerArmed(); ret(0n); break; }
+      case 224: {                                             // timer_gettime(id, cur*)
+        const t = this.ptimers?.get(Number(a1)); if (!t) { ret(-22n); break; }
+        this._writeItimerspec(a2, t.interval, t.at == null ? 0 : Math.max(0, t.at - this.nowMs())); ret(0n); break; }
+      case 225: { const t = this.ptimers?.get(Number(a1)); ret(t ? BigInt(t.overrun) : -22n); break; }   // timer_getoverrun
+      case 226: { ret(this.ptimers?.delete(Number(a1)) ? 0n : -22n); break; }                       // timer_delete
+      // ---- timerfd -------------------------------------------------------------
+      case 283: {                                             // timerfd_create(clockid, flags)
+        const fd = this.allocFd();
+        this.fds.set(fd, { tfd: { at: null, interval: 0, fired: 0 }, nonblock: !!(Number(a2) & 0x800), path: 'anon_inode:[timerfd]' });
+        if (Number(a2) & 0x80000) this.cloexec.add(fd);
+        ret(BigInt(fd)); break; }
+      case 286: {                                             // timerfd_settime(fd, flags, new*, old*)
+        const h = this.fds.get(Number(a1)); if (!h?.tfd) { ret(-22n); break; }
+        const t = h.tfd, abs = Number(a2) & 1;
+        if (cpu.regs[10]) this._writeItimerspec(cpu.regs[10], t.interval, t.at == null ? 0 : Math.max(0, t.at - this.nowMs()));
+        const rd = (o) => Number(this.mem.read(a3 + BigInt(o), 8n)) * 1000 + Number(this.mem.read(a3 + BigInt(o) + 8n, 8n)) / 1e6;
+        const interval = rd(0), value = rd(16);
+        t.interval = interval; t.fired = 0;
+        t.at = value === 0 ? null : abs ? (value - Date.now() + this.nowMs()) : this.nowMs() + value;
+        ret(0n); break; }
+      case 287: {                                             // timerfd_gettime(fd, cur*)
+        const h = this.fds.get(Number(a1)); if (!h?.tfd) { ret(-22n); break; }
+        this._writeItimerspec(a2, h.tfd.interval, h.tfd.at == null ? 0 : Math.max(0, h.tfd.at - this.nowMs())); ret(0n); break; }
+      // ---- signalfd -------------------------------------------------------------
+      case 282: case 289: {                                   // signalfd / signalfd4(fd, mask*, sz, flags)
+        const mask = this.mem.read(a2, 8n) & ~((1n << 8n) | (1n << 18n));
+        const fdArg = Number(BigInt.asIntN(32, a1 & 0xFFFFFFFFn));
+        if (fdArg >= 0) { const h = this.fds.get(fdArg); if (!h?.sfd) { ret(-22n); break; } h.sfd.mask = mask; ret(BigInt(fdArg)); break; }
+        const flags = nr === 289 ? Number(cpu.regs[10]) : 0;
+        const fd = this.allocFd();
+        this.fds.set(fd, { sfd: { mask }, nonblock: !!(flags & 0x800), path: 'anon_inode:[signalfd]' });
+        if (flags & 0x80000) this.cloexec.add(fd);
+        ret(BigInt(fd)); break; }
+      case 128: {                                             // rt_sigtimedwait(set*, info*, timeout*, sz)
+        const set = this.mem.read(a1, 8n);
+        const t = this._ts(this.threads[this.ti]);
+        const sig = this._sigTake(t, set);
+        if (sig) { this._deadline = null; if (a2) this._writeSiginfo(a2, sig, t.siginfo?.get(sig) ?? {}); ret(BigInt(sig)); break; }
+        const now = this.nowMs();
+        if (a3 === 0n) { this._deadline ??= Infinity; }
+        else { const ms = Number(this.mem.read(a3, 8n)) * 1000 + Number(this.mem.read(a3 + 8n, 8n)) / 1e6;
+               if (ms === 0) { ret(-11n); break; }             // EAGAIN
+               this._deadline ??= now + ms; }
+        if (this._deadline !== Infinity && now >= this._deadline) { this._deadline = null; ret(-11n); break; }
+        this.block(this._deadline === Infinity ? null : this._deadline); break; }
       case 127: {                                             // rt_sigpending(set*, sz)
         const t = this._ts(this.threads[this.ti]);
         this.jsnap(a1, 8); this.mem.write(a1, 8n, t.pending); ret(0n); break; }
@@ -2595,6 +2681,8 @@ export class LinuxEngine {
           : h.sock ? !!(h.sock.conn && h.sock.conn.readable())
           : h.pipe ? (h.pipe.chunks.length > 0 || !!h.pipe.weof)
           : h.ev ? h.ev.count > 0n
+          : h.tfd ? this._tfdReady(h.tfd)
+          : h.sfd ? this._sfdReady(h.sfd)
           : !!h.bytes;                                        // regular file: always ready (EOF too)
         const base = this.RAMOFF + Number(a1 - this.base);
         this.jsnap(a1, nfds * 8);                             // revents go back into the caller's array
@@ -2629,7 +2717,7 @@ export class LinuxEngine {
           this._deadline = null; ret(BigInt(ready)); break;
         }
         this._deadline ??= (timeoutMs < 0 ? Infinity : now + timeoutMs);
-        this.block(this._deadline === Infinity ? null : this._deadline); break; }
+        this.block(this._capByTimerfd(this._deadline)); break; }
       case 23: case 270: {                                    // select / pselect6
         const nfds = Number(a1), v = new DataView(this.wmem.buffer);
         const rp = a2, wp = a3, ep = cpu.regs[10], tp = cpu.regs[8];
@@ -2643,6 +2731,8 @@ export class LinuxEngine {
           : h.sock ? !!(h.sock.conn && h.sock.conn.readable())
           : h.pipe ? (h.pipe.chunks.length > 0 || !!h.pipe.weof)
           : h.ev ? h.ev.count > 0n
+          : h.tfd ? this._tfdReady(h.tfd)
+          : h.sfd ? this._sfdReady(h.sfd)
           : !!h.bytes;
         const scan = (ptr) => { if (ptr === 0n) return [];
           const o = this.RAMOFF + Number(ptr - this.base); const out = [];
@@ -2661,7 +2751,7 @@ export class LinuxEngine {
           ret(BigInt(rd.length + wr.length)); break;
         }
         this._deadline ??= (timeoutMs < 0 ? Infinity : now + timeoutMs);
-        this.block(this._deadline === Infinity ? null : this._deadline); break; }
+        this.block(this._capByTimerfd(this._deadline)); break; }
       default:
         ret(-38n);                                           // ENOSYS
         (this.unknown ||= new Set()).add(nr);
@@ -2727,12 +2817,7 @@ export class LinuxEngine {
     if (this._execed) return;
     const bit = 1n << BigInt(sig - 1);
     const act = this.sigact?.get(sig);
-    if (!act) {
-      if (this.sigign?.has(sig)) return;                                        // SIG_IGN
-      if (sig === 17 || sig === 18 || sig === 23 || sig === 28) return;         // default: ignore (CHLD CONT URG WINCH)
-      if (sig === 19 || sig === 20 || sig === 21 || sig === 22) return;         // stop signals: not modelled
-      this._terminate(sig); return;                                             // default: terminate
-    }
+    if (!act && this._sigDefaultIgnored(sig)) return;                          // SIG_IGN / default-ignore: discarded
     let t = null;
     const live = (x) => x.state !== 'dead';
     if (tid != null) t = this.threads.find(x => x.id === tid && live(x)) ?? this.threads.find(live);
@@ -2744,13 +2829,18 @@ export class LinuxEngine {
     }
     if (!t) return;                                                             // nobody left to signal
     this._ts(t);
+    // no handler and deliverable now: the default action (terminate) applies
+    // at once. Blocked, it stays pending — for sigprocmask to unblock later,
+    // or for sigtimedwait / signalfd to consume.
+    if (!act && !(t.sigmask & bit)) { this._terminate(sig); return; }
     t.pending |= bit;
     (t.siginfo ??= new Map()).set(sig, info);
     this._sigAny = true;
     // a thread parked in a blocking syscall is woken: it re-executes the
     // syscall, whose entry checkpoint delivers the signal (EINTR / restart)
     if (t.state === 'blk' && !(t.sigmask & bit)) { t.state = 'run'; t.futex = null; t.dl = null; t.eintr = true; }
-    if (t === this.threads[this.ti] && this.blocked) { this.blocked = null; t.eintr = true; }
+    else if (t.sigmask & bit) this.wakeAllBlk();             // sigtimedwait / signalfd / poll on it re-check
+    if (t === this.threads[this.ti] && this.blocked) { this.blocked = null; if (!(t.sigmask & bit)) t.eintr = true; }
   }
   // default-action termination by `sig`. A fork child still inside its
   // vfork window is a thread of this engine: only IT dies (journal rolled
@@ -2773,12 +2863,100 @@ export class LinuxEngine {
     this.termSig = sig;
     this.exitCode = 128 + sig; this.cpu.halted = true;
   }
+  _itimer(which) {
+    if (which < 0 || which > 2) return null;
+    const a = (this.itimers ??= [null, null, null]);
+    return a[which] ??= { at: null, interval: 0, sig: [14, 26, 27][which] };   // SIGALRM SIGVTALRM SIGPROF
+  }
+  // any armed timer keeps the cheap per-quantum check alive
+  _timerArmed() { this.itimer = { at: this._earliestTimer() }; }
+  _earliestTimer() {
+    let e = null;
+    for (const it of this.itimers ?? []) if (it?.at != null) e = e == null ? it.at : Math.min(e, it.at);
+    for (const [, t] of this.ptimers ?? []) if (t.at != null) e = e == null ? t.at : Math.min(e, t.at);
+    return e;
+  }
+  _sigDefaultIgnored(sig) {
+    if (this.sigign?.has(sig)) return true;                                     // SIG_IGN
+    if (sig === 17 || sig === 18 || sig === 23 || sig === 28) return true;      // CHLD CONT URG WINCH
+    if (sig === 19 || sig === 20 || sig === 21 || sig === 22) return true;      // stop signals: not modelled
+    return false;
+  }
+  // a pending signal became deliverable with no handler installed
+  _sigDefault(t, sig) {
+    t.pending &= ~(1n << BigInt(sig - 1));
+    this._sigAny = this.threads.some(x => (x.pending ?? 0n) !== 0n);
+    if (!this._sigDefaultIgnored(sig)) this._terminate(sig);
+  }
   _checkAlarm() {
-    const it = this.itimer; if (!it || it.at == null) return;
     const now = this.nowMs();
-    if (now < it.at) return;
-    it.at = it.interval > 0 ? now + it.interval : null;
-    this.raiseSignal(14, null, { pid: 0, code: 0x80 });                         // SIGALRM, SI_KERNEL
+    for (const it of this.itimers ?? []) {
+      if (!it || it.at == null || now < it.at) continue;
+      it.at = it.interval > 0 ? now + it.interval : null;
+      this.raiseSignal(it.sig, null, { pid: 0, code: 0x80 });                  // SI_KERNEL
+    }
+    for (const [id, t] of this.ptimers ?? []) {
+      if (t.at == null || now < t.at) continue;
+      let over = 0;
+      if (t.interval > 0) { over = Math.max(0, Math.floor((now - t.at) / t.interval)); t.at = t.at + (over + 1) * t.interval; }
+      else t.at = null;
+      t.overrun = over;
+      if (t.notify !== 1) this.raiseSignal(t.sig, null, { pid: 0, code: -2, timer: id, overrun: over, sival: t.sival });   // SI_TIMER
+    }
+    this.itimer = { at: this._earliestTimer() };
+  }
+  _tfdTick(t) {
+    if (t.at == null) return;
+    const now = this.nowMs(); if (now < t.at) return;
+    if (t.interval > 0) { const k = 1 + Math.floor((now - t.at) / t.interval); t.fired += k; t.at += k * t.interval; }
+    else { t.fired += 1; t.at = null; }
+  }
+  _tfdReady(t) { this._tfdTick(t); return t.fired > 0; }
+  _sfdReady(sfd) { return this.threads.some(x => x.state !== 'dead' && ((x.pending ?? 0n) & sfd.mask) !== 0n); }
+  _capByTimerfd(dl) {
+    let e = dl === Infinity ? null : dl;
+    for (const [, h] of this.fds) if (h?.tfd?.at != null) e = e == null ? h.tfd.at : Math.min(e, h.tfd.at);
+    return e;
+  }
+  // dequeue the lowest pending signal in `set` from thread t (or any thread
+  // for a process-directed one), for sigtimedwait / signalfd
+  _sigTake(t, set) {
+    for (const x of [t, ...this.threads.filter(y => y !== t && y.state !== 'dead')]) {
+      const bits = (x.pending ?? 0n) & set;
+      if (bits === 0n) continue;
+      for (let s = 1; s <= 64; s++) if (bits & (1n << BigInt(s - 1))) {
+        x.pending &= ~(1n << BigInt(s - 1));
+        if (x !== t && x.siginfo?.has(s)) (t.siginfo ??= new Map()).set(s, x.siginfo.get(s));
+        this._sigAny = this.threads.some(y => (y.pending ?? 0n) !== 0n);
+        return s;
+      }
+    }
+    return 0;
+  }
+  _writeItimerspec(addr, intervalMs, valueMs) {
+    this.jsnap(addr, 32);
+    const put = (o, ms) => { this.mem.write(addr + BigInt(o), 8n, BigInt(Math.floor(ms / 1000)));
+                             this.mem.write(addr + BigInt(o) + 8n, 8n, BigInt(Math.floor((ms % 1000) * 1e6))); };
+    put(0, intervalMs); put(16, valueMs);
+  }
+  _writeSiginfo(addr, sig, info) {                            // 128-byte siginfo_t
+    this.jsnap(addr, 128);
+    for (let o = 0n; o < 128n; o += 8n) this.mem.write(addr + o, 8n, 0n);
+    this.mem.write(addr, 4n, BigInt(sig)); this.mem.write(addr + 8n, 4n, BigInt.asUintN(32, BigInt(info.code ?? 0)));
+    if (info.timer !== undefined) { this.mem.write(addr + 16n, 4n, BigInt(info.timer)); this.mem.write(addr + 20n, 4n, BigInt(info.overrun ?? 0));
+                                    this.mem.write(addr + 24n, 8n, info.sival ?? 0n); }
+    else { this.mem.write(addr + 16n, 4n, BigInt(info.pid ?? 0)); this.mem.write(addr + 20n, 4n, 0n);
+           if (sig === 17) this.mem.write(addr + 24n, 4n, BigInt(info.status ?? 0)); }
+  }
+  _writeSignalfdInfo(addr, sig, info) {                       // 128-byte signalfd_siginfo
+    this.jsnap(addr, 128);
+    for (let o = 0n; o < 128n; o += 8n) this.mem.write(addr + o, 8n, 0n);
+    this.mem.write(addr, 4n, BigInt(sig));                                      // ssi_signo
+    this.mem.write(addr + 8n, 4n, BigInt.asUintN(32, BigInt(info.code ?? 0)));  // ssi_code
+    this.mem.write(addr + 12n, 4n, BigInt(info.pid ?? 0));                      // ssi_pid
+    if (info.timer !== undefined) { this.mem.write(addr + 24n, 4n, BigInt(info.timer)); this.mem.write(addr + 32n, 4n, BigInt(info.overrun ?? 0));
+                                    this.mem.write(addr + 44n, 4n, (info.sival ?? 0n) & 0xFFFFFFFFn); this.mem.write(addr + 48n, 8n, info.sival ?? 0n); }
+    if (sig === 17) this.mem.write(addr + 40n, 4n, BigInt(info.status ?? 0)); // ssi_status
   }
   _writeItimerval(addr, intervalMs, valueMs) {
     if (!addr) return;
@@ -2790,14 +2968,27 @@ export class LinuxEngine {
   // syscall entry: a signal woke this thread out of a blocking call, or is
   // pending and unblocked. Returns true if the syscall must not run now.
   _sigEntry(cpu, nr) {
-    if (!this._sigAny || nr === 15) return false;
-    if (this.itimer?.at != null) this._checkAlarm();
+    // timers are checked at every syscall entry: a compiled loop that makes
+    // syscalls but never returns to the run loop would otherwise never see
+    // its ITIMER / POSIX timer expire (the run-loop quantum is the only other
+    // place; a pure compute loop that never yields cannot be interrupted)
     const t = this._ts(this.threads[this.ti]);
+    if (this.itimer?.at != null) {
+      const before = t.pending ?? 0n;
+      this._checkAlarm();
+      // A timer that expires as a sleep-like syscall is entered counts as
+      // interrupting that call (EINTR, or SA_RESTART re-execution): on the
+      // wall clock the expiry landed on the call, and running the handler
+      // first and then sleeping the full interval is the one order native
+      // never shows for a timer armed moments earlier.
+      if ((t.pending ?? 0n) !== before && SLEEPY.has(nr)) t.eintr = true;
+    }
+    if (!this._sigAny || nr === 15) return false;
     if (t.proc || t.state === 'dead') return false;                             // vfork child / retired image
     const sig = this._sigDeliverable(t);
     if (!sig) { t.eintr = false; return false; }
     const act = this.sigact.get(sig);
-    if (!act) { t.pending &= ~(1n << BigInt(sig - 1)); t.eintr = false; return false; }
+    if (!act) { t.eintr = false; this._sigDefault(t, sig); return this.exitCode !== null; }
     if (t.eintr) {
       t.eintr = false;
       // pause/sigsuspend always return EINTR; others restart under SA_RESTART
@@ -2820,7 +3011,7 @@ export class LinuxEngine {
     const sig = this._sigDeliverable(t);
     if (!sig) return;
     const act = this.sigact.get(sig);
-    if (!act) { t.pending &= ~(1n << BigInt(sig - 1)); return; }
+    if (!act) { this._sigDefault(t, sig); return; }
     this._sigDeliver(cpu, t, sig, cpu.rip);
   }
   _sigPoll() {                                                                  // run-loop quantum
@@ -2829,7 +3020,7 @@ export class LinuxEngine {
     const sig = this._sigDeliverable(t);
     if (!sig) return false;
     const act = this.sigact.get(sig);
-    if (!act) { t.pending &= ~(1n << BigInt(sig - 1)); return false; }
+    if (!act) { this._sigDefault(t, sig); return false; }
     this._sigDeliver(this.cpu, t, sig, this.cpu.rip);
     return true;
   }
@@ -2861,8 +3052,9 @@ export class LinuxEngine {
     const info = t.siginfo?.get(sig) ?? {};
     for (let o = 944; o < 1072; o += 8) w(o, 8, 0n);
     w(944, 4, BigInt(sig)); w(952, 4, BigInt.asUintN(32, BigInt(info.code ?? 0)));   // si_signo, si_code
-    w(960, 4, BigInt(info.pid ?? 0)); w(964, 4, 0n);                             // si_pid, si_uid
-    if (sig === 17) w(968, 4, BigInt(info.status ?? 0));                        // si_status
+    if (info.timer !== undefined) { w(960, 4, BigInt(info.timer)); w(964, 4, BigInt(info.overrun ?? 0)); w(968, 8, info.sival ?? 0n); }   // si_tid, si_overrun, si_value
+    else { w(960, 4, BigInt(info.pid ?? 0)); w(964, 4, 0n);                     // si_pid, si_uid
+           if (sig === 17) w(968, 4, BigInt(info.status ?? 0)); }               // si_status
     cpu.regs[7] = BigInt(sig); cpu.regs[6] = F + 944n; cpu.regs[2] = F + 8n;    // rdi rsi rdx
     cpu.regs[0] = 0n; cpu.regs[4] = F; cpu.rip = act.handler; cpu.f.df = 0;
     t.sigmask |= act.mask | ((act.flags & 0x40000000n) ? 0n : bit);            // SA_NODEFER
@@ -3088,6 +3280,7 @@ export class LinuxEngine {
                  if (this.ripTrace !== undefined) { this.ripTrace[this.ripTraceI++ & 1023] = -this.cpu.rip; }  // AOT exit
                  branched = true;
                  if (this.blocked) { if (this.park()) continue; break; }
+                 if (this.itimer?.at != null) this._checkAlarm();
                  if (this._sigAny) this._sigPoll();
                  if (this.sliceDeadline != null && performance.now() > this.sliceDeadline) break;
                  continue; }

@@ -112,6 +112,11 @@ if (!existsSync(PROCFS)) {
   try { execFileSync('gcc', ['-O1', '-pthread', '-o', PROCFS,
                              new URL('./fixtures/procfs.c', import.meta.url).pathname]); } catch {}
 }
+const TIMERS = '/tmp/breadth_timers';
+if (!existsSync(TIMERS)) {
+  try { execFileSync('gcc', ['-O1', '-o', TIMERS,
+                             new URL('./fixtures/timers.c', import.meta.url).pathname]); } catch {}
+}
 const EPIPE = '/tmp/breadth_epipe';
 if (!existsSync(EPIPE)) {
   try { execFileSync('gcc', ['-O1', '-o', EPIPE,
@@ -298,6 +303,10 @@ const CASES = [
   // synthetic /proc and /dev: cmdline/environ/maps/status/fd/N, /dev/zero,
   // /dev/urandom, cpuinfo/meminfo/sys; glibc's pthread_getattr_np walks maps
   ['procfs',    '/tmp/breadth_procfs', ['alpha']],
+  // timers and signal descriptors: timerfd (one-shot, interval via poll),
+  // signalfd, sigtimedwait (+EAGAIN), POSIX timers with SI_TIMER siginfo,
+  // ITIMER_VIRTUAL while spinning with occasional syscalls
+  ['timers',    '/tmp/breadth_timers', []],
   // the same through busybox: a NOEXEC applet's 170KB command substitution
   ['bb-subst',  '/usr/bin/busybox', ['sh', '-c', 'x=$(seq 1 30000); echo ${#x}'],
                 { bins: ['/usr/bin/busybox'] }],
