@@ -138,6 +138,7 @@ const CASES = [
   ['b2sum',   '/usr/bin/b2sum',   [IN]],
   ['sha1',    '/usr/bin/sha1sum', [IN]],
   ['sha224',  '/usr/bin/sha224sum', [IN]],
+  ['sha384',  '/usr/bin/sha384sum', [IN]],
   ['numfmt',  '/usr/bin/numfmt',  ['--to=iec', '1048576', '2000000', '999']],
   ['unexpand','/usr/bin/unexpand',['-t', '4', IN]],
   ['basename','/usr/bin/basename',['/usr/lib/gcc/x86_64/13/cc1', '.c']],
