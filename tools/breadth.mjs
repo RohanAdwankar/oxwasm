@@ -73,6 +73,17 @@ if (!existsSync(VFORK)) {
                              new URL('./fixtures/vforkexec.c', import.meta.url).pathname]); } catch {}
 }
 
+// The concurrency fixture (tools/fixtures/thread.c): 8 pthreads each do 200k
+// mutex-protected increments of a shared counter. Exercises clone(CLONE_THREAD),
+// the futex-backed mutex and the park/wake/switchTo scheduler under contention;
+// the total is 1600000 iff no update is lost and no thread is dropped. Built
+// with -pthread from the committed source when gcc is present.
+const THREAD = '/tmp/breadth_thread';
+if (!existsSync(THREAD)) {
+  try { execFileSync('gcc', ['-O1', '-pthread', '-o', THREAD,
+                             new URL('./fixtures/thread.c', import.meta.url).pathname]); } catch {}
+}
+
 // A C source for the compiler cases, written once like IN.
 const HELLO_C = '/tmp/breadth_hello.c';
 if (!existsSync(HELLO_C))
@@ -233,6 +244,9 @@ const CASES = [
   // is not corrupted when its vfork child execs. busybox is the child's exec.
   ['vforkexec', '/tmp/breadth_vforkexec', [],
                 { bins: ['/usr/bin/busybox'] }],
+  // the concurrency lane: 8 pthreads, 200k mutex-protected increments each.
+  // Prints 1600000 iff clone/futex/scheduler lose no update under contention.
+  ['thread',    '/tmp/breadth_thread', []],
   // binutils: libbfd + libopcodes, a whole codebase the coreutils cases never
   // touch. The input ELF (/bin/true) is provisioned as a read-only file; every
   // tool's output is a pure function of its bytes, so it byte-compares.
