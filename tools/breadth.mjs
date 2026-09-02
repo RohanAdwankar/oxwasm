@@ -233,6 +233,13 @@ const CASES = [
   // is not corrupted when its vfork child execs. busybox is the child's exec.
   ['vforkexec', '/tmp/breadth_vforkexec', [],
                 { bins: ['/usr/bin/busybox'] }],
+  // binutils: libbfd + libopcodes, a whole codebase the coreutils cases never
+  // touch. The input ELF (/bin/true) is provisioned as a read-only file; every
+  // tool's output is a pure function of its bytes, so it byte-compares.
+  ['readelf',   '/usr/bin/readelf', ['-a', '/bin/true'], { bins: ['/bin/true'] }],
+  ['objdump',   '/usr/bin/objdump', ['-d', '/bin/true'], { bins: ['/bin/true'] }],  // libopcodes disassembler
+  ['nm-d',      '/usr/bin/nm',      ['-D', '/bin/true'], { bins: ['/bin/true'] }],
+  ['size',      '/usr/bin/size',    ['/bin/true'],       { bins: ['/bin/true'] }],
   // the compiler lane: gcc's driver vforks cc1 (the case that drove the
   // interpUntil-depth fork fix); assembly comes back on stdout. Preprocessor,
   // front end and back end of a 30MB binary, byte-compared to native.
