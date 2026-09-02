@@ -2295,3 +2295,24 @@ seconds long, the corruption is now known to be register (r15/rbx), the
 table is proven intact, and the scheduler is ruled out. Continuing to
 probe it one hour at a time has low expected value; the breadth and
 perf lanes ship reliably and should take the bursts.
+
+**Sixth pass — corrected again, and the mechanism is finally coherent.**
+A full register diff of the parent across the window overturns the
+fifth pass: `%rbx` and `%r15` are *not* corrupted — they already held
+`1` at the vfork syscall. Between vfork and the fault ONLY `%rax`,
+`%rcx`, `%rsp` change, by exactly the amounts `__execve`'s error tail
+writes (`or $-1,%rax`; `mov $-0x40,%rcx`; one net pop). So the parent
+runs almost no instructions after the vfork — it lands in `__execve`'s
+error-return tail and rets through a garbage stack slot. Decisive clue:
+a probe on the first `ti==0` step after any `ti!=0` step in `_run1`
+**never fires** — the vfork child never runs in the top-level loop. It
+ran nested, inside an `interpUntil` under a live wasm callout. That is
+the AOT coupling five passes kept circling: the parent hit `vfork`
+inside a tiered unit's `x_callout` (not `x_syscall`, which is why the
+earlier fork-from-`x_syscall` deopt fix never triggered); the child ran
+nested on the shared stack; and its `execve` unwound that nested
+interpreter, leaving the parent's live wasm frame resuming into
+`__execve`'s tail. Fix: force an interpreter boundary for fork/vfork
+reached from ANY nested wasm context (callout or syscall) so the child
+is never spawned under a live parent frame — a single well-scoped
+change now, not a search.
