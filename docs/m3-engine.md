@@ -2725,9 +2725,32 @@ finishes: both runner and harness spend their iteration budgets sleeping
 on Ruby's timer thread's timed waits, and whether the child deadlocks
 (a lock whose owner is the parent's *other* thread, copied into the
 child's image) cannot be told without a syscall trace of the child
-engine — the runner traces only the root engine. The case is parked in
-the sweep with a note; adding child-engine tracing to the runner is the
-first step next time.
+engine — the runner traced only the root engine. It now arms every child
+engine's ring as it appears, and the trace changed the picture: the child
+*finishes* (prints, exits) — it is the **parent** that dies, at rip 0, in
+its timer thread.
+
+**fork() in a multithreaded parent freezes the siblings.** Ruby's child
+runs `atfork` cleanup that tears down the *other* threads' structures.
+In the vfork window that memory is shared with the parent, and the
+parent's other threads kept running on the torn-down state before the
+journal rolled it back — the timer thread resumed into garbage. The
+window now freezes every sibling thread of the forking parent (their real
+state is kept and restored on release: exec, exit, or materialisation),
+which is what fork's atomic-snapshot semantics require; a child that
+blocks still materialises and releases everyone.
+
+**Materialisation copies live ranges, not memMB.** With siblings frozen,
+`multiprocessing`'s workers block at once (nobody feeds their pipes during
+the window) and all materialise — and the copy touched every byte of a
+1GB image per worker, so the harness was OOM-killed copying zeros. The
+copy is now program+heap up to `brk`, the mmap arena, any MAP_FIXED spans
+outside it, file mappings, and the top 64MB of the stack; untouched pages
+are never committed. `python-mp` went from 105s to 72s.
+
+**Still open: the Ruby parent.** With the freeze in place the parent no
+longer faults, but it does not finish either — a slice-mode probe with the
+signal trace is the next step. The case stays parked.
 
 
 **The one bug that stood between compile and link was in `read`, not the

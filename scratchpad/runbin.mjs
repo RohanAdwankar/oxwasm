@@ -20,7 +20,7 @@ add('/etc/ld.so.cache'); add(bin);
 for (const b of (process.env.BINS||'').split(',').filter(Boolean)) add(b);
 const eng = new LinuxEngine(new Uint8Array(readFileSync(bin)),
   { argv: [bin, ...args], env: ['PATH=/usr/bin', 'HOME=/root', 'LANG=C'], files, mtimes, memMB: process.env.MEM ? +process.env.MEM : 512, assembleWat: process.env.AOT ? assembleWat : undefined });
-if (process.env.STRACE) eng.strace = []; if (process.env.DBG) { globalThis.__dbg = true; console.error('<constructed>'); }
+if (process.env.STRACE) eng.strace = []; if (process.env.SIGTRACE) globalThis.__sigtrace = true; if (process.env.DBG) { globalThis.__dbg = true; console.error('<constructed>'); }
 if (process.env.PROGRESS) { let k=0; eng.onProgress = (w) => { if ((k++ % 5) === 0) console.error(`<progress ${w} interp=${eng.stats.interpreted} aot=${eng.stats.aotRuns} rip=${eng.cpu.rip.toString(16)} blocked=${JSON.stringify(eng.blocked)} pend=${eng.threads[0].pending} mask=${eng.threads[0].sigmask}>`); }; }
 let err = null, guard = 0; const t0 = Date.now();
 const nap = new Int32Array(new SharedArrayBuffer(4));

@@ -374,9 +374,9 @@ const CASES = [
   // python threads + queue + lock: futex-backed producers/consumers
   ['python-thr','/usr/bin/python3', ['-S', new URL('./fixtures/thr.py', import.meta.url).pathname],
                 { tree: '/usr/lib/python3.11', bins: [new URL('./fixtures/thr.py', import.meta.url).pathname], memMB: 1024 }],
-  // ruby fork + Process.wait + exit status — OPEN: the forked child never
-  // finishes under the engine (docs: "Ruby fork"); parked until the child
-  // engine can be traced
+  // ruby fork + Process.wait + exit status: a fork in a multithreaded parent
+  // (Ruby's timer thread) — the siblings must stay frozen during the window
+  // OPEN (docs: "Ruby fork"): parked until the parent-side stall is understood
   // ['ruby-fork', '/opt/ruby-3.3.6/bin/ruby', ['--disable-gems', '-e', 'p = fork { puts "child"; exit 4 }; Process.wait(p); puts "parent #{$?.exitstatus}"'],
   //               { memMB: 1024 }],
   // git: init, add, commit, list the tree (blob ids are content-addressed)

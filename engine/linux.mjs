@@ -121,6 +121,7 @@ export class LinuxEngine {
     this.base = lo;
     this.brk = align(loadEnd, PAGE); this._brk0 = this.brk;
     this.mmapNext = align(this.brk + (64n << 20n), PAGE);      // anon mmaps above the heap
+    this._mmapBase = this.mmapNext;
     const total = BigInt(memMB) << 20n;
     this.stackTop = lo + total - 4096n;
 
@@ -1493,6 +1494,10 @@ export class LinuxEngine {
         const FIXED = 0x10n, ANON = 0x20n;
         const at = (flags & FIXED) ? a1 : this.mmapNext;
         if (!(flags & FIXED)) this.mmapNext += len;
+        else if (a1 < (this._mmapBase ?? 0n) || a1 >= this.mmapNext) {   // outside the arena: remember the span
+          this._fixedLo = this._fixedLo === undefined ? a1 : (a1 < this._fixedLo ? a1 : this._fixedLo);
+          const hi = a1 + len; this._fixedHi = this._fixedHi === undefined ? hi : (hi > this._fixedHi ? hi : this._fixedHi);
+        }
         const off0 = Number(at - this.base);
         if (off0 < 0 || off0 + Number(len) > this.ram.length) { ret(-12n); break; }   // ENOMEM
         this.ram.fill(0, off0, off0 + Number(len));          // fresh mapping is zeroed
@@ -1672,6 +1677,7 @@ export class LinuxEngine {
           if (nr === 56 && a2) c.regs[4] = a2;               // posix_spawn's child stack
           const parent = this.threads[this.ti];
           parent.state = 'vfork';                            // scheduler skips until released
+          this._vforkFreeze(parent);                         // ... and so do its sibling threads
           // The child shares this memory image, but real fork gives it a
           // COPY: everything it writes before execve — fork()'s return
           // value stored to a stack local, and heap mutation from child-
@@ -1775,7 +1781,7 @@ export class LinuxEngine {
         t.state = 'dead';
         this._pipeEofSweep(skipped);
         this._vforkRollback(t);
-        t.proc.parent.state = 'run';                         // vfork release
+        t.proc.parent.state = 'run'; this._vforkThaw(t.proc.parent);   // vfork release
         if (this.onSpawn) this.onSpawn(t.proc.pid, path, argv);
         this.block(null); ret(0n); break; }
       case 61: {                                             // wait4(pid, status*, options, rusage)
@@ -1808,7 +1814,7 @@ export class LinuxEngine {
           t.state = 'dead';
           this._pipeEofSweep([...t.proc.fds.values()]);
           this._vforkRollback(t);
-          t.proc.parent.state = 'run';
+          t.proc.parent.state = 'run'; this._vforkThaw(t.proc.parent);
           (this.children ??= []).push({ pid: t.proc.pid, eng: null, exited: Number(a1 & 0xffn) });
           // SIGCHLD to the PARENT thread (the current thread is the dying child)
           this.raiseSignal(17, t.proc.parent.id, { pid: t.proc.pid, code: 1, status: Number(a1 & 0xffn) });
@@ -2983,6 +2989,7 @@ export class LinuxEngine {
     }
     if (!t) return;                                                             // nobody left to signal
     this._ts(t);
+    if (globalThis.__sigtrace) console.error(`<raise sig=${sig} -> tid=${t.id} st=${t.state} cur=${this.threads[this.ti].id} mask=${t.sigmask.toString(16)}>`);
     // no handler and deliverable now: the default action (terminate) applies
     // at once. Blocked, it stays pending — for sigprocmask to unblock later,
     // or for sigtimedwait / signalfd to consume.
@@ -3007,7 +3014,7 @@ export class LinuxEngine {
       t.state = 'dead';
       this._pipeEofSweep([...t.proc.fds.values()]);
       this._vforkRollback(t);
-      t.proc.parent.state = 'run';
+      t.proc.parent.state = 'run'; this._vforkThaw(t.proc.parent);
       (this.children ??= []).push({ pid: t.proc.pid, eng: null, exited: 128 + sig, sig });
       this.raiseSignal(17, t.proc.parent.id, { pid: t.proc.pid, code: 2, status: sig });   // CLD_KILLED
       this.cpu.halted = true;                                // this thread's step ends here
@@ -3209,6 +3216,7 @@ export class LinuxEngine {
     if (info.timer !== undefined) { w(960, 4, BigInt(info.timer)); w(964, 4, BigInt(info.overrun ?? 0)); w(968, 8, info.sival ?? 0n); }   // si_tid, si_overrun, si_value
     else { w(960, 4, BigInt(info.pid ?? 0)); w(964, 4, 0n);                     // si_pid, si_uid
            if (sig === 17) w(968, 4, BigInt(info.status ?? 0)); }               // si_status
+    if (globalThis.__sigtrace) console.error(`<deliver sig=${sig} tid=${t.id} handler=${act.handler.toString(16)} savedRip=${savedRip.toString(16)} rsp0=${cpu.regs[4].toString(16)} frame=${F.toString(16)} alt=${onAlt} flags=${act.flags.toString(16)}>`);
     cpu.regs[7] = BigInt(sig); cpu.regs[6] = F + 944n; cpu.regs[2] = F + 8n;    // rdi rsi rdx
     cpu.regs[0] = 0n; cpu.regs[4] = F; cpu.rip = act.handler; cpu.f.df = 0;
     t.sigmask |= act.mask | ((act.flags & 0x40000000n) ? 0n : bit);            // SA_NODEFER
@@ -3228,6 +3236,7 @@ export class LinuxEngine {
     f.cf = Number(fl & 1n); f.pf = Number((fl >> 2n) & 1n); f.af = Number((fl >> 4n) & 1n);
     f.zf = Number((fl >> 6n) & 1n); f.sf = Number((fl >> 7n) & 1n); f.df = Number((fl >> 10n) & 1n); f.of = Number((fl >> 11n) & 1n);
     t.sigmask = r(296) & ~((1n << 8n) | (1n << 18n));
+    if (globalThis.__sigtrace) console.error(`<sigreturn tid=${t.id} uc=${uc.toString(16)} rip=${cpu.rip.toString(16)} rsp=${cpu.regs[4].toString(16)}>`);
     this._sigRedirected = true;
   }
 
@@ -3282,7 +3291,7 @@ export class LinuxEngine {
       argv: o.argv, env: o.env, memMB: o.memMB, threshold: o.threshold, files: this.files,
       assembleWat: o.assembleWat, aotCallThreshold: o.aotCallThreshold, aotLoopThreshold: o.aotLoopThreshold,
       xserver: o.xserver, mtimes: o.mtimes, tty: o.tty, ttyRows: o.ttyRows, ttyCols: o.ttyCols, stdin: o.stdin });
-    ceng.ram.set(this.ram);                                  // the child's view, before rollback
+    this._copyLiveRam(ceng);                                 // the child's view, before rollback (live ranges only)
     ceng.brk = this.brk; ceng.mmapNext = this.mmapNext;
     ceng.execRanges = this.execRanges.slice();
     if (this.execRangesStatic) ceng.execRangesStatic = this.execRangesStatic.slice();
@@ -3306,13 +3315,38 @@ export class LinuxEngine {
     t.state = 'dead';
     this._vforkRollback(t);
     const parent = t.proc.parent;
-    parent.state = 'run';
+    parent.state = 'run'; this._vforkThaw(parent);
     (this.children ??= []).push({ pid: t.proc.pid, eng: ceng, exited: null });
     ceng.pid = t.proc.pid; ceng.ppid = this.pid ?? 1;
     this.blocked = null;
     this._deadline = null;
     this.switchTo(this.threads.indexOf(parent));
     return true;
+  }
+  // fork() in a multithreaded parent: while the child runs in the shared
+  // image (its writes journaled), the parent's OTHER threads must not run —
+  // Ruby's child tears down the parent's thread structures in atfork, and
+  // a parent thread that ran on that state jumped to rip 0. Frozen threads
+  // keep their real state and resume on release (exec, exit, materialise).
+  _vforkFreeze(parent) {
+    for (const x of this.threads) if (x !== parent && !x.proc && x.state !== 'dead' && x._frz === undefined) { x._frz = x.state; x.state = 'vfork'; }
+  }
+  _vforkThaw(parent) {
+    if (this.threads.some(x => x !== parent && x.proc && x.state !== 'dead' && x.proc.parent === parent)) return;   // another window still open
+    for (const x of this.threads) if (x._frz !== undefined) { x.state = x._frz; delete x._frz; }
+  }
+  // Copy only the ranges a guest can have touched — program+heap up to brk,
+  // the mmap arena, MAP_FIXED spans, the top of the stack — so a materialised
+  // child commits the pages it needs, not the whole memMB (a Pool of four
+  // 1GB workers was OOM-killed copying 4GB of zeros).
+  _copyLiveRam(ceng) {
+    const B = this.base, L = this.ram.length;
+    const cp = (lo, hi) => { lo = Math.max(0, Number(lo - B)); hi = Math.min(L, Number(hi - B)); if (hi > lo) ceng.ram.set(this.ram.subarray(lo, hi), lo); };
+    cp(B, this.brk + 65536n);                                              // image + heap
+    cp(this._mmapBase ?? this.mmapNext, this.mmapNext + 65536n);           // the arena
+    if (this._fixedLo !== undefined) cp(this._fixedLo, this._fixedHi);    // MAP_FIXED spans
+    for (const m of this.maps ?? []) cp(m.at, m.at + m.len);
+    cp(this.stackTop - (64n << 20n), this.stackTop + 4096n);              // stack (64MB below the top)
   }
   _vforkRollback(t) {
     // the vfork child runs IN this engine, so its chdir (tar -C, cd in a
