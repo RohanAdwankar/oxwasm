@@ -22,6 +22,7 @@ const BRANCHY = new Set(['jmp','jcc','call','ret','retn','jmpind','callind','sys
 // vehicles — the interpreter can continue from `rip` with zero retained JS
 // stack. This is what keeps escape handling O(1) in stack depth (a hot loop
 // containing a jump table would otherwise grow the stack on every trip).
+const PIPE_CAP = 65536;                       // Linux default pipe capacity
 class DeoptUnwind { constructor(rip) { this.rip = rip; } }
 // A blocking syscall (poll/select/read with nothing ready, nanosleep) suspends
 // the guest the same way a deopt escapes compiled code: every register is
@@ -1245,7 +1246,20 @@ export class LinuxEngine {
         }
         this.wakeAllBlk(); return;
       }
-      if (h?.pipe) { h.pipe.chunks.push(bytes); this.wakeAllBlk(); return; }
+      if (h?.pipe) {
+        // no read end open anywhere in the process tree: SIGPIPE, and EPIPE
+        // if the writer survives it (handler installed or SIG_IGN) — this is
+        // what ends `yes | head -1` instead of letting yes fill a dead pipe
+        if (!this._pipeReaderAlive(h.pipe)) { this.raiseSignal(13, null, { pid: 0, code: 0 }); return -32; }
+        // A pipe holds 64KB: a writer that finds it full BLOCKS until a reader
+        // drains it (EAGAIN if non-blocking). Without a bound, a compiled
+        // `yes` pushed gigabytes of chunks before `head` ever ran.
+        if ((h.pipe.size ?? 0) >= PIPE_CAP) {
+          if (h.nonblock) return -11;
+          this.block(null); return -4096;                    // re-executed once woken
+        }
+        h.pipe.chunks.push(bytes); h.pipe.size = (h.pipe.size ?? 0) + bytes.length; this.wakeAllBlk(); return;
+      }
       if (h?.ev) {                                           // eventfd: add to the counter
         let v = 0n; for (let i = 7; i >= 0; i--) v = (v << 8n) | BigInt(bytes[i] ?? 0);
         h.ev.count += v; this.wakeAllBlk(); return;
@@ -1271,16 +1285,25 @@ export class LinuxEngine {
     };
     if (this._sigEntry(cpu, nr)) return;                  // signal delivery: interrupted / pending
     switch (nr) {
-      case 1:                                                // write(fd, buf, len)
-        writeChunk(Number(a1), a2, Number(a3)); ret(a3); break;
+      case 1: {                                              // write(fd, buf, len)
+        const r = writeChunk(Number(a1), a2, Number(a3));
+        if (r === -4096) break;                              // pipe full: blocked, re-executes
+        ret(r === undefined ? a3 : BigInt(r)); break; }
       case 20: {                                             // writev(fd, iov, cnt)
         const view = new DataView(this.wmem.buffer);
         let total = 0n;
         for (let i = 0; i < Number(a3); i++) {
           const io = this.RAMOFF + Number(a2 - this.base) + i * 16;
           const b = view.getBigUint64(io, true), l = view.getBigUint64(io + 8, true);
-          writeChunk(Number(a1), b, Number(l)); total += l;
+          const r = writeChunk(Number(a1), b, Number(l));
+          if (r === -4096) {                                 // pipe full mid-vector
+            if (total > 0n) this.blocked = null;             // short write: the guest retries the rest
+            break;
+          }
+          if (r !== undefined && r < 0) { if (total === 0n) total = BigInt(r); break; }
+          total += l;
         }
+        if (this.blocked) break;
         ret(total); break; }
       case 32: case 33: case 292: {                          // dup / dup2 / dup3
         const old = Number(a1), h = defSink(old);
@@ -1291,7 +1314,7 @@ export class LinuxEngine {
         if (nr === 292 && (Number(cpu.regs[2]) & 0x80000)) this.cloexec.add(nw); else this.cloexec.delete(nw);
         ret(BigInt(nw)); break; }
       case 22: case 293: {                                   // pipe / pipe2
-        const buf = { chunks: [], pos: 0, off: 0 };
+        const buf = { chunks: [], pos: 0, off: 0, size: 0 };
         const rfd = this.allocFd(); this.fds.set(rfd, null); const wfd = this.allocFd(); this.fds.delete(rfd);
         this.fds.set(rfd, { pipe: buf, mode: 'r' });
         this.fds.set(wfd, { pipe: buf, mode: 'w' });
@@ -1335,7 +1358,11 @@ export class LinuxEngine {
           const fo = Number(cpu.regs[9]);
           const n = Math.min(Number(a2), Math.max(0, h.bytes.length - fo));
           if (n > 0) this.ram.set(h.bytes.subarray(fo, fo + n), off0);
-          (this.maps ??= []).push({ at, len, path: h.path ?? '?', fileOff: fo });
+          // MAP_SHARED + PROT_WRITE on a regular file: stores through the
+          // mapping must reach the file. The kernel writes dirty pages back
+          // lazily; here they are copied out at msync, munmap and exit.
+          const shared = !!(flags & 0x1n) && !!(a3 & 0x2n) && h.bytes !== undefined && !!h.writable;
+          (this.maps ??= []).push({ at, len, path: h.path ?? '?', fileOff: fo, h, shared });
           this.execRanges.push([at, at + len]);   // library text: profiling must see it (prot untracked)
         }
         ret(at); break; }
@@ -1348,6 +1375,7 @@ export class LinuxEngine {
         // of it for the common data-buffer munmap that intersects nothing.
         const lo = a1, hi = a1 + a2;
         const inR = (k) => k >= lo && k < hi;
+        this._unmapRange(lo, hi);                            // shared-mapping write-back
         let hit = false;
         for (const k of this.aotFns.keys()) if (inR(k)) { this.aotFns.delete(k); hit = true; }
         for (const k of this.aotFailed) if (inR(k)) this.aotFailed.delete(k);
@@ -1594,7 +1622,8 @@ export class LinuxEngine {
         const done = mine.find(c => c.exited !== null || (c.eng && c.eng.exitCode !== null));
         if (!done) { if (opts & 1) ret(0n); else this.block(null); break; }   // WNOHANG / block
         const code = done.exited ?? done.eng.exitCode;
-        if (a2) this.mem.write(a2, 4n, BigInt((code & 0xff) << 8));           // WIFEXITED status
+        const tsig = done.sig ?? done.eng?.termSig;
+        if (a2) this.mem.write(a2, 4n, BigInt(tsig ? (tsig & 0x7f) : ((code & 0xff) << 8)));   // WIFSIGNALED / WIFEXITED
         this.children.splice(this.children.indexOf(done), 1);
         ret(BigInt(done.pid)); break; }
       case 24: ret(0n); break;                               // sched_yield (quantum rotation covers fairness)
@@ -1622,6 +1651,7 @@ export class LinuxEngine {
           this.block(null); ret(0n); break;
         }
         if (nr === 231 || this.threads.filter(x => x.state !== 'dead').length <= 1) {
+          this._flushSharedMaps();                            // dirty shared pages reach the file
           this.exitCode = Number(a1 & 0xffn); cpu.halted = true; ret(0n); break;
         }
         t.state = 'dead';
@@ -1783,6 +1813,7 @@ export class LinuxEngine {
             dst += take; got += take; h.pipe.off += take;
             if (h.pipe.off >= c.length) { h.pipe.chunks.shift(); h.pipe.off = 0; }
           }
+          if (got > 0) { h.pipe.size = Math.max(0, (h.pipe.size ?? 0) - got); this.wakeAllBlk(); }   // a blocked writer may fit now
           // empty: EOF only once the writing side is gone (weof — set when a
           // child process holding the write end exits); otherwise BLOCK like
           // a real pipe — the plug-in wire protocol reads before data arrives
@@ -1899,7 +1930,7 @@ export class LinuxEngine {
         // it to backfill sections (e.g. _start from Scrt1.o) after computing
         // final layout; falling through to ENOSYS zero-fills those bytes.
         if (h.bytes === undefined || !h.writable) {
-          writeChunk(Number(a1), a2, Number(a3)); ret(a3); break;   // pipe/sink: sequential
+          const r = writeChunk(Number(a1), a2, Number(a3)); if (r === -4096) break; ret(r === undefined ? a3 : BigInt(r)); break;   // pipe/sink: sequential
         }
         const len = Number(a3);
         if (len <= 0) { ret(0n); break; }
@@ -2260,7 +2291,28 @@ export class LinuxEngine {
         v.setBigUint64(o + 48, 1n << 15n, true);              // f_ffree
         v.setBigUint64(o + 64, 255n, true);                   // f_namelen
         ret(0n); break; }
-      case 25: ret(-38n); break;                              // mremap -> ENOSYS
+      case 25: {                                              // mremap(old, oldsz, newsz, flags, new)
+        const flags = Number(cpu.regs[10]);
+        const oldLen = align(a2, PAGE), newLen = align(a3, PAGE);
+        if (newLen <= oldLen) {                               // shrink (or same) in place
+          if (newLen < oldLen) this._unmapRange(a1 + newLen, a1 + oldLen);
+          ret(a1); break;
+        }
+        if (!(flags & 1)) { ret(-12n); break; }                // no MREMAP_MAYMOVE: cannot grow here (ENOMEM)
+        const at = this.mmapNext; this.mmapNext += newLen;
+        const o0 = Number(at - this.base);
+        if (o0 < 0 || o0 + Number(newLen) > this.ram.length) { ret(-12n); break; }
+        this.ram.fill(0, o0, o0 + Number(newLen));
+        this.ram.copyWithin(o0, Number(a1 - this.base), Number(a1 - this.base) + Number(oldLen));
+        for (const m of this.maps ?? []) if (m.at === a1) { m.at = at; m.len = newLen; }   // the record follows the pages
+        for (const t of this.threads) t.cpu.icache?.clear();
+        let hit = false;
+        for (const k of this.aotFns.keys()) if (k >= a1 && k < a1 + oldLen) { this.aotFns.delete(k); hit = true; }
+        if (hit) this.rebuildFtmap();
+        ret(at); break; }
+      case 26: {                                              // msync(addr, len, flags)
+        for (const m of this.maps ?? []) if (m.shared && m.at < a1 + a2 && m.at + m.len > a1) this._writeBackMap(m);
+        ret(0n); break; }
 
       // ---- sockets: the display connection (AF_UNIX -> in-process X server) ----
       case 41: {                                              // socket(domain, type, proto)
@@ -2286,7 +2338,7 @@ export class LinuxEngine {
           const b = this.ram.slice(Number(a2 - this.base), Number(a2 - this.base) + Number(a3));
           h.sock.conn.write(b); ret(a3); break;
         }
-        writeChunk(Number(a1), a2, Number(a3)); ret(a3); break; }
+        const r = writeChunk(Number(a1), a2, Number(a3)); if (r === -4096) break; ret(r === undefined ? a3 : BigInt(r)); break; }
       case 45: {                                              // recvfrom
         const h = this.fds.get(Number(a1));
         if (!h?.sock?.conn) { ret(-88n); break; }
@@ -2463,6 +2515,28 @@ export class LinuxEngine {
     if (this._sigAny) this._sigExit(cpu);                   // signal delivery on return to user
   }
 
+  // ---- shared file mappings ---------------------------------------------------
+  // Copy a MAP_SHARED|PROT_WRITE mapping's pages back into the file. Only the
+  // bytes inside the file's current length are written: a store past EOF in
+  // the last page does not grow the file (kernel semantics), and other
+  // handles on the same path see the new bytes through this.files.
+  _writeBackMap(m) {
+    const cur = this.files[m.path] ?? m.h.bytes;
+    if (!cur) return;
+    const n = Math.min(Number(m.len), Math.max(0, cur.length - m.fileOff));
+    if (n <= 0) return;
+    const o = Number(m.at - this.base);
+    cur.set(this.ram.subarray(o, o + n), m.fileOff);
+    if (m.h.bytes !== cur) m.h.bytes = cur;
+    (this.dirtyFiles ??= new Set()).add(m.path);
+  }
+  _unmapRange(lo, hi) {
+    if (!this.maps) return;
+    for (const m of this.maps) if (m.shared && m.at < hi && m.at + m.len > lo) this._writeBackMap(m);
+    this.maps = this.maps.filter(m => !(m.at >= lo && m.at + m.len <= hi));
+  }
+  _flushSharedMaps() { for (const m of this.maps ?? []) if (m.shared) this._writeBackMap(m); }
+
   // ---- signals -------------------------------------------------------------
   // Actions are per process (this.sigact: sig -> {handler, flags, restorer,
   // mask}); the blocked mask, pending set and alternate stack are per thread.
@@ -2495,7 +2569,7 @@ export class LinuxEngine {
       if (this.sigign?.has(sig)) return;                                        // SIG_IGN
       if (sig === 17 || sig === 18 || sig === 23 || sig === 28) return;         // default: ignore (CHLD CONT URG WINCH)
       if (sig === 19 || sig === 20 || sig === 21 || sig === 22) return;         // stop signals: not modelled
-      this.exitCode = 128 + sig; this.cpu.halted = true; return;              // default: terminate
+      this._terminate(sig); return;                                             // default: terminate
     }
     let t = null;
     const live = (x) => x.state !== 'dead';
@@ -2515,6 +2589,27 @@ export class LinuxEngine {
     // syscall, whose entry checkpoint delivers the signal (EINTR / restart)
     if (t.state === 'blk' && !(t.sigmask & bit)) { t.state = 'run'; t.futex = null; t.dl = null; t.eintr = true; }
     if (t === this.threads[this.ti] && this.blocked) { this.blocked = null; t.eintr = true; }
+  }
+  // default-action termination by `sig`. A fork child still inside its
+  // vfork window is a thread of this engine: only IT dies (journal rolled
+  // back, parent released, status recorded for wait4 as WIFSIGNALED);
+  // otherwise the whole process ends with the shell-convention 128+sig and
+  // remembers the signal so a parent's wait4 can report WTERMSIG.
+  _terminate(sig) {
+    const t = this.threads[this.ti];
+    if (t?.proc) {
+      t.state = 'dead';
+      this._pipeEofSweep([...t.proc.fds.values()]);
+      this._vforkRollback(t);
+      t.proc.parent.state = 'run';
+      (this.children ??= []).push({ pid: t.proc.pid, eng: null, exited: 128 + sig, sig });
+      this.raiseSignal(17, t.proc.parent.id, { pid: t.proc.pid, code: 2, status: sig });   // CLD_KILLED
+      this.cpu.halted = true;                                // this thread's step ends here
+      this.block(null);                                      // park: the scheduler moves on
+      return;
+    }
+    this.termSig = sig;
+    this.exitCode = 128 + sig; this.cpu.halted = true;
   }
   _checkAlarm() {
     const it = this.itimer; if (!it || it.at == null) return;
@@ -2689,6 +2784,20 @@ export class LinuxEngine {
       if (e._mainFds) tables.push(e._mainFds);
       for (const t of e.threads ?? []) if (t.state !== 'dead' && t.proc?.fds) tables.push(t.proc.fds);
       for (const tb of tables) for (const [, h] of tb) if (h?.pipe === buf && h.mode === 'w') return true;
+      for (const c of e.children ?? []) if (c.eng && c.exited === null && c.eng.exitCode === null && scan(c.eng)) return true;
+      return false;
+    };
+    return scan(root);
+  }
+  _pipeReaderAlive(buf) {                     // mirror of _pipeWriterAlive for the read end
+    let root = this; while (root.parentEng) root = root.parentEng;
+    const seen = new Set();
+    const scan = (e) => {
+      if (seen.has(e)) return false; seen.add(e);
+      const tables = [e.fds];
+      if (e._mainFds) tables.push(e._mainFds);
+      for (const t of e.threads ?? []) if (t.state !== 'dead' && t.proc?.fds) tables.push(t.proc.fds);
+      for (const tb of tables) for (const [, h] of tb) if (h?.pipe === buf && h.mode === 'r') return true;
       for (const c of e.children ?? []) if (c.eng && c.exited === null && c.eng.exitCode === null && scan(c.eng)) return true;
       return false;
     };

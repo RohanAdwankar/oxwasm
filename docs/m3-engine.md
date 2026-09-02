@@ -2435,6 +2435,56 @@ been replaced (`_execed`) is now dropped, and no checkpoint delivers to a
 dead thread. Gate: engine/test.sh (316/316 hardware differentials, the
 shell pipeline exact) and the full breadth sweep, both green.
 
+### Shared mappings, mremap, SIGPIPE — and pipes that hold 64KB
+
+Three more entries from the correctness ledger, each with a deterministic
+fixture that byte-compares to native (`mshared`, `epipe`, `sigpipe-sh` in
+breadth):
+
+**MAP_SHARED write-back.** `mmap` copied a file in and nothing ever copied
+it out, so stores through a shared writable mapping were silently lost.
+The mapping record now keeps its handle and a `shared` bit, and the pages
+are copied back into the file at `msync`, at `munmap` (only records fully
+covered are dropped; partial unmaps still flush), and at process exit for
+anything still mapped — the fixture leaves a dirty mapping at exit and the
+harness compares the file after the process is gone. Only bytes inside the
+file's current length are written: a store past EOF within the last page
+does not grow the file, as on Linux. Coherence in the other direction
+(`write` after `mmap` showing up in the mapping) is still not modelled.
+
+**mremap.** Shrinks in place; grows only with MREMAP_MAYMOVE, by taking a
+fresh region, copying the old pages, zeroing the tail, moving any file
+mapping record along and invalidating translations in the old range;
+ENOMEM otherwise.
+
+**SIGPIPE / EPIPE.** A write to a pipe whose read end is open nowhere in
+the process tree (a `_pipeReaderAlive` scan mirroring the writer-side one
+that sets EOF) raises SIGPIPE, and returns EPIPE if the writer survives it
+(SIG_IGN or a handler). The default action needed a real
+`_terminate(sig)`: a fork child still in its vfork window is a *thread* of
+the engine, so only it dies — journal rolled back, parent released, and its
+status recorded so `wait4` reports WIFSIGNALED/WTERMSIG (previously every
+child status was WIFEXITED); a whole-process death remembers `termSig` for
+the same reason. `yes | head -1` under bash prints `141 0` from PIPESTATUS,
+as native does.
+
+**The bound.** With the AOT tier on, `yes | head -1` hung: the engine's
+pipes had no capacity, and a compiled `yes` pushed gigabytes of chunks
+before `head` was ever scheduled. Pipes now hold 64KB — a writer that
+finds one full blocks until a reader drains it (EAGAIN when non-blocking;
+`writev` returns a short count if part of the vector went through), and
+every pipe read wakes blocked writers. This is the same "spurious wake,
+re-execute the syscall" model the rest of the scheduler uses.
+
+**A limitation the SIGPIPE fixture exposed.** The engine's `fork` is
+vfork-shaped: the child runs first and the parent stays frozen until the
+child execs or exits. A native race (parent closes its read end, child
+writes) therefore resolves the other way here, and a child that *blocks
+waiting on its parent* before exec deadlocks. The fixture was made
+order-independent (the read end is closed before the fork); the model gap
+itself — a real fork with copy-on-write pages and a runnable parent — is
+recorded as the next structural item.
+
 
 **The one bug that stood between compile and link was in `read`, not the
 linker.** The full link completed and produced a structurally perfect ELF,

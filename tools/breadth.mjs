@@ -95,6 +95,19 @@ if (!existsSync(SIGNAL)) {
                              new URL('./fixtures/signal.c', import.meta.url).pathname]); } catch {}
 }
 
+// Shared file mappings + mremap (tools/fixtures/mshared.c) and SIGPIPE/EPIPE
+// (tools/fixtures/epipe.c): see the fixture headers. Built when gcc is present.
+const MSHARED = '/tmp/breadth_mshared';
+if (!existsSync(MSHARED)) {
+  try { execFileSync('gcc', ['-O1', '-o', MSHARED,
+                             new URL('./fixtures/mshared.c', import.meta.url).pathname]); } catch {}
+}
+const EPIPE = '/tmp/breadth_epipe';
+if (!existsSync(EPIPE)) {
+  try { execFileSync('gcc', ['-O1', '-o', EPIPE,
+                             new URL('./fixtures/epipe.c', import.meta.url).pathname]); } catch {}
+}
+
 // A C source for the compiler cases, written once like IN.
 const HELLO_C = '/tmp/breadth_hello.c';
 if (!existsSync(HELLO_C))
@@ -261,6 +274,17 @@ const CASES = [
   // the signal lane: real handler delivery (rt_sigframe, rt_sigreturn),
   // EINTR/restart semantics, timers, SIGCHLD, masks. See fixtures/signal.c.
   ['signal',    '/tmp/breadth_signal', []],
+  // shared file mappings: stores through MAP_SHARED reach the file at msync,
+  // munmap and exit (the file is compared after the process is gone); a
+  // store past EOF does not grow it; mremap moves and grows a region.
+  ['mshared',   '/tmp/breadth_mshared', [], { outFile: '/tmp/breadth_mshared.dat' }],
+  // SIGPIPE/EPIPE: writes to a reader-less pipe under SIG_IGN, a handler,
+  // and the default action (a forked child killed, WIFSIGNALED reported)
+  ['epipe',     '/tmp/breadth_epipe', []],
+  // the classic: head exits, yes must die of SIGPIPE instead of filling a
+  // dead pipe forever; bash reports the killed stage's status (141)
+  ['sigpipe-sh','/bin/bash', ['-c', 'yes | head -1; echo "${PIPESTATUS[0]} ${PIPESTATUS[1]}"'],
+                { bins: ['/usr/bin/yes', '/usr/bin/head'] }],
   // binutils: libbfd + libopcodes, a whole codebase the coreutils cases never
   // touch. The input ELF (/bin/true) is provisioned as a read-only file; every
   // tool's output is a pure function of its bytes, so it byte-compares.

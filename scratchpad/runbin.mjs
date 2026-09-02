@@ -17,6 +17,7 @@ for (const d of ['/lib/x86_64-linux-gnu', '/usr/lib/x86_64-linux-gnu', '/lib64']
   for (const f of e) { try { const r = realpathSync(join(d, f)); if (lstatSync(r).isFile()) add(join(d, f), r); } catch {} }
 }
 add('/etc/ld.so.cache'); add(bin);
+for (const b of (process.env.BINS||'').split(',').filter(Boolean)) add(b);
 const eng = new LinuxEngine(new Uint8Array(readFileSync(bin)),
   { argv: [bin, ...args], env: ['PATH=/usr/bin', 'HOME=/root', 'LANG=C'], files, mtimes, memMB: 512, assembleWat: process.env.AOT ? assembleWat : undefined });
 if (process.env.STRACE) eng.strace = [];
@@ -26,7 +27,9 @@ try { while (eng.exitCode === null) { eng.run(5e7);
   if (eng.blocked) { const dl = eng.blocked.deadline; if (dl != null && isFinite(dl)) { const ms = dl - eng.nowMs(); if (ms > 0) { Atomics.wait(nap, 0, 0, Math.min(ms, 1000)); guard--; } } eng.wake(); }
   if (++guard > (process.env.GUARD ? +process.env.GUARD : 20000)) { err='no exit'; break; } } }
 catch (e) { err = e.stack || e.message; }
+console.log('children:', JSON.stringify((eng.children||[]).map(c=>({pid:c.pid,exited:c.exited,ceng:c.eng?c.eng.exitCode:null,termSig:c.eng?c.eng.termSig:null,interp:c.eng?c.eng.stats.interpreted:0}))));
 console.log('code:', eng.exitCode, 'err:', err, 'ms:', Date.now()-t0, 'rip:', eng.cpu.rip.toString(16), 'blocked:', JSON.stringify(eng.blocked), 'threads:', eng.threads.map(t=>`${t.id}:${t.state}:pend=${t.pending}:eintr=${t.eintr}`).join(' '), 'interp:', eng.stats.interpreted, 'aot:', eng.stats.aotRuns);
 process.stdout.write('--- stdout ---\n' + (eng.stdoutBytes&&eng.stdoutBytes.length?Buffer.concat(eng.stdoutBytes.map(b=>Buffer.from(b))):Buffer.from((eng.stdout||[]).join(''),'binary')).toString());
+if (process.env.FILE) { const f = eng.files[process.env.FILE]; console.log('--- file ' + process.env.FILE + ' ---\n' + (f ? Buffer.from(f).toString() : '(missing)')); }
 if (eng.stderr&&eng.stderr.length) console.log('--- stderr ---\n' + eng.stderr.join('').slice(0,500));
 if (process.env.STRACE) console.log('--- strace tail ---\n' + eng.strace.slice(-40).join('\n'));
