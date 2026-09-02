@@ -159,7 +159,7 @@ const assembleWat = (wat) => {
 // startup failure). Walked once per distinct tree.
 const walked = new Set();
 const walk = (d) => { if (walked.has(d)) return; walked.add(d);
-  let e; try { e = readdirSync(d); } catch { return; }
+  let e; try { e = readdirSync(d); mtimes[d] = Math.floor(statSync(d).mtimeMs / 1000); } catch { return; }   // dirs carry mtimes too (ls -l)
   for (const f of e) { const hp = join(d, f);
     let st; try { st = lstatSync(hp); } catch { continue; }
     if (st.isDirectory()) walk(hp); else { try { add(hp, realpathSync(hp)); } catch {} } } };
@@ -314,6 +314,30 @@ const CASES = [
   ['timers',    '/tmp/breadth_timers', []],
   // distinct pids across fork, mmap coherence in both directions, /proc listings
   ['procpid',   '/tmp/breadth_procpid', []],
+  // ---- programs that lean on the new kernel model from the outside ----
+  // coreutils timeout: SIGALRM, then SIGTERM to the child; exit 124
+  ['timeout',   '/usr/bin/timeout', ['0.2', 'sleep', '5'], { bins: ['/usr/bin/sleep'] }],
+  // bash: trap + kill -USR1 $$ (distinct pid, handler delivery), functions, arrays, arithmetic
+  ['bash-trap', '/bin/bash', ['-c', 'trap "echo got USR1" USR1; kill -USR1 $$; echo after; f(){ echo "f:$1"; }; f x; a=(1 2 3); echo ${#a[@]} $((7*6))']],
+  // python multiprocessing: fork children that never exec, blocking on pipes
+  ['python-mp', '/usr/bin/python3', ['-S', new URL('./fixtures/mp.py', import.meta.url).pathname],
+                { tree: '/usr/lib/python3.11', bins: [new URL('./fixtures/mp.py', import.meta.url).pathname], memMB: 1024 }],
+  // python: ITIMER_REAL interrupts time.sleep, PEP 475 retries it
+  ['python-sig','/usr/bin/python3', ['-S', new URL('./fixtures/sig.py', import.meta.url).pathname],
+                { tree: '/usr/lib/python3.11', bins: [new URL('./fixtures/sig.py', import.meta.url).pathname], memMB: 1024 }],
+  // a FIFO: mkfifo, a background writer, a reader that blocks on open
+  ['fifo',      '/bin/bash', ['-c', 'rm -f /tmp/breadth_fifo; mkfifo /tmp/breadth_fifo && (echo hello > /tmp/breadth_fifo &); cat /tmp/breadth_fifo; rm -f /tmp/breadth_fifo'],
+                { bins: ['/usr/bin/mkfifo', '/usr/bin/cat', '/usr/bin/rm'] }],
+  // xargs / find -exec: many short-lived fork+exec children
+  ['xargs',     '/bin/bash', ['-c', 'printf "a\\nb\\nc\\n" | xargs -n1 echo x'], { bins: ['/usr/bin/xargs', '/usr/bin/echo'] }],
+  // (readdir order is filesystem-dependent natively, so the output is sorted)
+  ['find-exec', '/bin/bash', ['-c', 'find /tmp/breadth_repo -maxdepth 1 -name "*.txt" -exec basename {} \\; | sort'],
+                { tree: '/tmp/breadth_repo', bins: ['/usr/bin/find', '/usr/bin/basename', '/usr/bin/sort'] }],
+  // threaded xz: worker threads with big shared buffers
+  ['xz-T2',     '/usr/bin/xz',     ['-T2', '-c', IN], { memMB: 1536 }],
+  // ls -l: getdents + stat (nlink, 4K block counts, mtimes, owner names) on a
+  // real tree (no -a: `..` would be the host's own /tmp)
+  ['ls-l',      '/usr/bin/ls',     ['-l', '/tmp/breadth_repo'], { tree: '/tmp/breadth_repo' }],
   // the same through busybox: a NOEXEC applet's 170KB command substitution
   ['bb-subst',  '/usr/bin/busybox', ['sh', '-c', 'x=$(seq 1 30000); echo ${#x}'],
                 { bins: ['/usr/bin/busybox'] }],

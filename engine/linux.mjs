@@ -1162,6 +1162,12 @@ export class LinuxEngine {
     return this._dirset.has(pre.slice(0, -1));
   }
   mtimeOf(p) { return this.mtimes?.[this.norm(p)] ?? 0; }
+  // a directory's link count is 2 + its subdirectories; a hard-linked file's
+  // is the size of its alias group
+  nlinkOf(p, mode) {
+    if ((mode & 0o170000) === 0o040000) { let n = 2; for (const [, d] of this.dirEntries(p).slice(2)) if (d) n++; return n; }
+    const g = this._fsMeta().hard?.get(this.norm(p)); return g ? g.size : 1;
+  }
   dirEntries(p) {
     p = this.norm(p); const pre = p.endsWith('/') ? p : p + '/';
     const names = new Map();                       // name -> isDir
@@ -1178,6 +1184,11 @@ export class LinuxEngine {
     for (const l of this._fsMeta().links.keys()) {
       if (!l.startsWith(pre)) continue;
       const rest = l.slice(pre.length);
+      if (rest && rest.indexOf('/') < 0) names.set(rest, false);
+    }
+    for (const f of this._fsMeta().fifos?.keys() ?? []) {
+      if (!f.startsWith(pre)) continue;
+      const rest = f.slice(pre.length);
       if (rest && rest.indexOf('/') < 0) names.set(rest, false);
     }
     // the synthetic /proc and /dev trees list what _synth answers
@@ -1245,11 +1256,11 @@ export class LinuxEngine {
     v.setBigUint64(off + 0, 8n, true);                        // st_dev
     v.setBigUint64(off + 8, ino ?? this.inoOf(path), true);   // st_ino
     v.setBigUint64(off + 40, rdev, true);                     // st_rdev
-    v.setBigUint64(off + 16, 1n, true);                       // st_nlink
+    v.setBigUint64(off + 16, BigInt(this.nlinkOf(path, mode)), true);   // st_nlink
     v.setUint32(off + 24, mode, true);                        // st_mode
     v.setBigUint64(off + 48, BigInt(size), true);             // st_size
     v.setBigUint64(off + 56, 4096n, true);                    // st_blksize
-    v.setBigUint64(off + 64, BigInt(Math.ceil(size / 512)), true);
+    v.setBigUint64(off + 64, BigInt(Math.ceil(size / 4096) * 8), true);   // st_blocks: 4K allocation units
     const mt = BigInt(this.mtimeOf(path));
     v.setBigUint64(off + 72, mt, true);                       // atime
     v.setBigUint64(off + 88, mt, true);                       // mtime
@@ -1395,6 +1406,7 @@ export class LinuxEngine {
           const nb = new Uint8Array(end);
           nb.set(h.bytes); h.bytes = nb;
           this.files[h.path] = nb;                           // growable buffer: refresh the map ref
+          this._hardRefresh(h.path, nb);                     // ... and every hard-link alias
         }
         h.bytes.set(bytes, h.pos);
         this._mapsAbsorb(h.path, h.pos, bytes);              // coherence: mapped pages see the write
@@ -1813,6 +1825,10 @@ export class LinuxEngine {
         v.setBigUint64(o + 8, BigInt(Math.floor((ms % 1000) * 1e6)), true);
         ret(0n); break; }
       case 201: ret(BigInt(Math.floor(Date.now() / 1000))); break;   // time
+      case 188: case 189: case 190: ret(-95n); break;           // setxattr family: ENOTSUP
+      case 191: case 192: case 193: ret(-61n); break;           // getxattr family: ENODATA
+      case 194: case 195: case 196: ret(0n); break;             // listxattr family: empty list
+      case 197: case 198: case 199: ret(-61n); break;           // removexattr family: ENODATA
       case 229: {                                             // clock_getres(clk, res*): 1ns
         if (a2) { this.jsnap(a2, 16); this.mem.write(a2, 8n, 0n); this.mem.write(a2 + 8n, 8n, 1n); }
         ret(0n); break; }
@@ -1918,6 +1934,29 @@ export class LinuxEngine {
           if (np === '/dev/zero' || np === '/dev/urandom' || np === '/dev/random') {
             const fd = this.allocFd();
             this.fds.set(fd, { gen: np === '/dev/zero' ? 'zero' : 'rand', pos: 0, path: np, writable: true, devnull: np === '/dev/zero' ? false : false });
+            ret(BigInt(fd)); break;
+          }
+          // a FIFO: a pipe buffer with a name. open blocks until the other
+          // end is open somewhere in the process tree (O_NONBLOCK: a reader
+          // proceeds, a writer gets ENXIO); a writer's open clears EOF.
+          const fifo = this._fifoAt(np);
+          if (fifo) {
+            const wr = (flags & 3) !== 0, nb = !!(flags & 0x800);
+            // the rendezvous: an open completes when the other end is open OR
+            // is itself waiting to open (both sides would otherwise wait for
+            // a handle that only a completed open creates)
+            fifo.waiters ??= new Map();
+            const key = `${this.pid ?? 1}:${this.threads[this.ti].id}`;
+            const otherWaiting = [...fifo.waiters.values()].some(v => v === (wr ? 'r' : 'w'));
+            const other = (wr ? this._pipeReaderAlive(fifo) : this._pipeWriterAlive(fifo)) || otherWaiting;
+            if (!other && !nb && (flags & 3) !== 2) { fifo.waiters.set(key, wr ? 'w' : 'r'); this.block(null); break; }   // O_RDWR never blocks
+            fifo.waiters.delete(key);
+            if (!other && nb && wr) { ret(-6n); break; }                          // ENXIO
+            const fd = this.allocFd();
+            if (wr) fifo.weof = false;
+            this.fds.set(fd, { pipe: fifo, mode: wr ? 'w' : 'r', fifo: true, nonblock: nb, path: np });
+            this.wakeAllBlk();                                                    // the waiting opener re-checks
+            let root = this; while (root.parentEng) root = root.parentEng; if (root !== this) root.wakeAllBlk();
             ret(BigInt(fd)); break;
           }
           // /proc/self/fd/N reopens descriptor N (bash's <(...) and >(...)):
@@ -2057,6 +2096,7 @@ export class LinuxEngine {
             const f = this.lookup(p);
             if (f !== undefined) { size = f.length; mode = this.fileMode(f); }
             else if (this.isDir(p)) { size = 4096; mode = 0o040755; }
+            else if (this._fifoAt(p)) { size = 0; mode = 0o010644; }
             else { ret(-2n); break; }                         // ENOENT
             statPath = p;
           }
@@ -2067,7 +2107,7 @@ export class LinuxEngine {
           if (h?.gen) { size = 0; mode = 0o020666; }                        // /dev/zero, /dev/urandom
           else if (h?.tfd || h?.sfd) { size = 0; mode = 0o0100600; }       // anon inode
           else if (h?.bytes) { size = h.bytes.length; mode = this.fileMode(h.bytes); statPath = h.path ?? null; }  // regular file
-          else if (h?.pipe) { size = 0; mode = 0o010600; }                 // FIFO
+          else if (h?.pipe) { size = 0; mode = h.fifo ? 0o010644 : 0o010600; statPath = h.fifo ? h.path : null; }   // FIFO / pipe
           else if (h?.sock) { size = 0; mode = 0o140777; }                 // socket
           else if (h?.isdir) { size = 4096; mode = 0o040755; statPath = h.path; }
           // sink/tty: leave mode as the char-device default
@@ -2086,11 +2126,11 @@ export class LinuxEngine {
                  else ino = 7n; }
           v.setBigUint64(off + 8, ino, true);                 // st_ino
         }
-        v.setBigUint64(off + 16, 1n, true);                   // st_nlink
+        v.setBigUint64(off + 16, BigInt(statPath ? this.nlinkOf(statPath, mode) : 1), true);   // st_nlink
         v.setUint32(off + 24, mode, true);                    // st_mode (u32 at 24)
         v.setBigUint64(off + 48, BigInt(size ?? 0), true);    // st_size
         v.setBigUint64(off + 56, 4096n, true);                // st_blksize
-        v.setBigUint64(off + 64, BigInt(Math.ceil((size ?? 0) / 512)), true);    // st_blocks
+        v.setBigUint64(off + 64, BigInt(Math.ceil((size ?? 0) / 4096) * 8), true);    // st_blocks: 4K units
         if (statPath) { const mt = BigInt(this.mtimeOf(statPath));
           v.setBigUint64(off + 72, mt, true); v.setBigUint64(off + 88, mt, true); v.setBigUint64(off + 104, mt, true); }
         ret(0n); break; }
@@ -2108,7 +2148,9 @@ export class LinuxEngine {
         if (this.isTtyPath(p)) {
           this.writeStat(a2, '/dev/pts/0', 0, 0o020620, 0x8800n, 1001n); ret(0n); break; }
         const f = this.lookup(p);
-        if (f === undefined && !this.isDir(p)) { ret(-2n); break; }   // ENOENT
+        if (f === undefined && !this.isDir(p)) {
+          if (this._fifoAt(p)) { this.writeStat(a2, p, 0, 0o010644); ret(0n); break; }
+          ret(-2n); break; }                                  // ENOENT
         this.writeStat(a2, p, f ? f.length : 4096, f ? this.fileMode(f) : 0o040755);
         ret(0n); break; }
       case 17: {                                              // pread64(fd, buf, count, off)
@@ -2139,13 +2181,26 @@ export class LinuxEngine {
           const nb = new Uint8Array(end);
           nb.set(h.bytes); h.bytes = nb;
           this.files[h.path] = nb;
+          this._hardRefresh(h.path, nb);
         }
         if (h.path) (this.dirtyFiles ??= new Set()).add(h.path);
         h.bytes.set(bytes, off);                              // position unchanged
         this._mapsAbsorb(h.path, off, bytes);
         ret(a3); break; }
-      case 21: { const p = this.readPath(a1); ret(this.lookup(p) !== undefined || this.isDir(p) ? 0n : -2n); break; }   // access
-      case 269: { const p = this.atPath(a1, a2); ret(this.lookup(p) !== undefined || this.isDir(p) ? 0n : -2n); break; }  // faccessat
+      case 86: case 265: {                                    // link(old, new) / linkat(olddirfd, old, newdirfd, new, flags)
+        const oldp = this.resolve(this.norm(nr === 86 ? this.readPath(a1) : this.atPath(a1, a2)));
+        const newp = this.norm(nr === 86 ? this.readPath(a2) : this.atPath(a3, cpu.regs[10]));
+        const f = this.files[oldp];
+        if (f === undefined) { ret(this.isDir(oldp) ? -1n : -2n); break; }    // EPERM on a dir, ENOENT
+        if (this.files[newp] !== undefined || this.isDir(newp)) { ret(-17n); break; }   // EEXIST
+        this.files[newp] = f;                                   // one inode, two names
+        const m = this._fsMeta(); m.hard ??= new Map();
+        const g = m.hard.get(oldp) ?? new Set([oldp]);
+        g.add(newp); for (const q of g) m.hard.set(q, g);
+        if (this.mtimes) this.mtimes[newp] = this.mtimes[oldp] ?? Math.floor(this.nowMs() / 1000);
+        this.fsBump(); ret(0n); break; }
+      case 21: { const p = this.readPath(a1); ret(this.lookup(p) !== undefined || this.isDir(p) || !!this._fifoAt(p) ? 0n : -2n); break; }   // access
+      case 269: { const p = this.atPath(a1, a2); ret(this.lookup(p) !== undefined || this.isDir(p) || !!this._fifoAt(p) ? 0n : -2n); break; }  // faccessat
       case 63: {                                              // uname
         const put = (o, s) => { const b = new TextEncoder().encode(s + '\0');
           this.ram.set(b, Number(a1 - this.base) + o); };
@@ -2176,6 +2231,15 @@ export class LinuxEngine {
           this.ram.set(b.subarray(0, n), Number(a2 - this.base));
           ret(BigInt(n)); break; }
         ret(-22n); break; }                                   // EINVAL: not a symlink
+      case 133: case 259: {                                   // mknod(path, mode, dev) / mknodat(dirfd, path, mode, dev)
+        const p = this.norm(nr === 133 ? this.readPath(a1) : this.atPath(a1, a2));
+        const mode = Number(nr === 133 ? a2 : a3);
+        if ((mode & 0o170000) !== 0o010000 && (mode & 0o170000) !== 0) { ret(-1n); break; }   // only FIFOs (and S_IFREG) here: EPERM
+        if (this.files[p] !== undefined || this.isDir(p) || this._fifoAt(p)) { ret(-17n); break; }   // EEXIST
+        if ((mode & 0o170000) === 0) { this.files[p] = new Uint8Array(0); this.fsBump(); ret(0n); break; }
+        const m = this._fsMeta(); (m.fifos ??= new Map()).set(p, { chunks: [], pos: 0, off: 0, size: 0, weof: false });
+        if (this.mtimes) this.mtimes[p] = Math.floor(this.nowMs() / 1000);
+        this.fsBump(); ret(0n); break; }
       case 79: {                                              // getcwd
         const b = new TextEncoder().encode((this.cwd ?? '/') + '\0');
         if (b.length > Number(a2)) { ret(-34n); break; }       // ERANGE
@@ -2529,7 +2593,9 @@ export class LinuxEngine {
           ret(BigInt(this.rmdirPath(p))); break; }
         const lm = this._fsMeta().links;
         if (lm.has(p)) { lm.delete(p); this.fsBump(); ret(0n); break; }   // the link, not its target
+        if (this._fsMeta().fifos?.delete(p)) { this.fsBump(); ret(0n); break; }
         if (this.files[p] === undefined) { ret(this.isDir(p) ? -21n : -2n); break; }  // EISDIR
+        const g = this._fsMeta().hard?.get(p); if (g) { g.delete(p); this._fsMeta().hard.delete(p); }
         delete this.files[p]; this.fsBump(); ret(0n); break; }
       case 77: {                                              // ftruncate(fd, len)
         const h = this.fds.get(Number(a1));
@@ -2820,6 +2886,11 @@ export class LinuxEngine {
   }
   // stores through a shared writable mapping reach a descriptor read
   _mapsFlushPath(path) { for (const m of this.maps) if (m.shared && m.path === path) this._writeBackMap(m); }
+  _fifoAt(p) { return this._fsMeta().fifos?.get(this.resolve(this.norm(p))); }
+  _hardRefresh(path, nb) {
+    const g = this._fsMeta().hard?.get(this.norm(path)); if (!g) return;
+    for (const q of g) if (this.files[q] !== undefined) this.files[q] = nb;
+  }
   _unmapRange(lo, hi) {
     if (!this.maps) return;
     for (const m of this.maps) if (m.shared && m.at < hi && m.at + m.len > lo) this._writeBackMap(m);

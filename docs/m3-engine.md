@@ -2634,6 +2634,46 @@ share the page cache.
 `/proc/self`, `/proc/self/fd` (the open descriptors), `/proc/self/task`
 (live threads), `/proc/sys/*` and `/dev` enumerate what `_synth` answers.
 
+### Breadth from the outside: nine programs, four gaps
+
+With the kernel ledger closed, the next gaps had to come from programs
+that lean on it from the outside. Nine new cases: coreutils `timeout`
+(SIGALRM then SIGTERM to its child, exit 124), a bash script with `trap`
+and `kill -USR1 $$`, Python `multiprocessing.Pool` (fork children that
+never exec, blocking on pipes and semaphores), Python `setitimer` +
+`time.sleep` (PEP 475 retries the interrupted sleep), a FIFO with a
+background writer and a blocking reader, `xargs -n1` and `find -exec`
+(fork storms), threaded `xz -T2`, and `ls -l` on a real tree. Five passed
+untouched; four found something:
+
+**Hard links.** `link`/`linkat` were ENOSYS, which is what stopped
+`multiprocessing`. A hard link is now one buffer under two names: the
+alias group lives in the fs metadata, a write that grows the buffer
+refreshes every alias, `nlink` is the group size, and `unlink` drops a
+name from its group.
+
+**FIFOs.** `mknod`/`mknodat` with S_IFIFO create a named pipe buffer; an
+`open` returns an ordinary pipe handle (so EOF, SIGPIPE, capacity and
+readiness all come for free), a writer's open clears EOF, O_NONBLOCK
+readers proceed and writers get ENXIO. The first run deadlocked on the
+classic rendezvous: each side's blocked open waited for the *other's
+handle*, which only a completed open creates. The FIFO keeps a registry
+of waiting openers, and an open completes when the other end is open or
+merely waiting — the writer here is a fork child that blocks in `open`
+(and is therefore materialised), the reader is `cat`, and both complete.
+
+**`ls -l` fidelity.** `ls` printed "Function not implemented" because the
+xattr family answered ENOSYS; `getxattr`/`removexattr` now answer ENODATA,
+`listxattr` an empty list, `setxattr` ENOTSUP. Then the columns: `st_blocks`
+is now in 4K allocation units (it was `size/512`, so `total` and `du` were
+wrong), a directory's `st_nlink` is 2 + its subdirectories, and the harness
+provisions directory mtimes (it recorded only files). The remaining
+difference was the `..` entry — the host's own `/tmp` with 1089 links —
+so the case lists without `-a`.
+
+**Not a bug.** `find -exec` prints in readdir order, which is
+filesystem-dependent natively; the case sorts.
+
 
 **The one bug that stood between compile and link was in `read`, not the
 linker.** The full link completed and produced a structurally perfect ELF,
