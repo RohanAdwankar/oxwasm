@@ -2330,3 +2330,29 @@ neutered) at 79/79, engine suite green, and every existing fork+exec /
 pipe / git / interpreter subprocess case still passes. Six passes to a
 five-line fix, but each pass genuinely eliminated a wrong hypothesis
 (scheduler, memory table, registers) before the nesting clue landed.
+
+### The compiler lane: compile+assemble byte-perfect, link one bug from done
+
+With the fork guard in, the full gcc pipeline runs end to end — the
+driver vforks `cc1`, `as`, and `collect2` (which vforks `ld`), all four
+executing as translated guest code. `gcc -c` and `gcc -S` produce output
+byte-identical to native (`gcc-c` / `gcc-S` in breadth, 81/81). The full
+link — `gcc -O1 hello.c -o a.out` — completes with exit 0 and produces a
+**15968-byte PIE, the exact size of native's**, with byte-identical
+program headers, sections, symbols, relocations and `.dynamic` — the
+whole ELF structure matches. `readelf -a` diffs to a single line: the
+build-id.
+
+But the produced binary segfaults, and the reason is sharp: the engine's
+`ld` leaves **`_start` zero-filled** (0x1060–0x1085, the 38 bytes from
+`Scrt1.o`) while every other object — `main`, `crti`/`crtn`, `crtbeginS`
+— links correctly. The 53 differing bytes are exactly the zeroed `_start`
+plus the build-id that hashes over it. So the crt object that supplies
+the entry point is the one input `ld` mis-handles under the engine;
+everything downstream is already correct. That is the single remaining
+step to a C compiler that builds runnable native executables entirely
+inside the wasm engine. Next instrument: trace `ld`'s read/mmap of
+`Scrt1.o` specifically (the 400-entry strace ring rotates past it on a
+link this size — widen it or filter by the fd `Scrt1.o`'s open returns)
+to tell a bad file read from a bad section copy. Repro:
+`scratchpad/trylink.mjs`.
