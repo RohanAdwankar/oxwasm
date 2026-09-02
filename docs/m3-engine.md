@@ -2206,3 +2206,20 @@ path-string pointer where the parent's next `ret`/indirect-call reads
 it. The whole compiler/toolchain breadth lane waits on it; GIMP's
 plug-in launcher (also fork+exec) does not hit it because its pre-exec
 child makes far fewer memory-touching syscalls than gcc's.
+
+A second instrumentation pass narrowed the *mechanism* further, mostly
+by elimination: the transfer to 0x155f4c0 is **not** an interpreted
+control transfer. A ring buffer over every interpreter step, and a
+guard on the interpreter's `ret`/`jmpind`/`callind` for any target
+past the driver's image (≥ 0x1000000), both stayed silent through the
+fault. So the driver reaches 0x155f4c0 either inside a live AOT wasm
+frame (a compiled `ret`/`jmpind` that reads a corrupted code-pointer
+slot and returns there, deopting into the interpreter at that rip) or
+during a `tierUpAot`→`analyze` that follows a corrupted jump-table
+edge. Either way a code-pointer-sized slot in the driver's guest
+memory has been overwritten with the execve path-string address, and
+the write is invisible to interpreter-level tracing — it is either a
+compiled store or an engine-side syscall write. The next pass has to
+watch the wasm side: instrument the deopt/`x_syscall`/`x_callout`
+boundary, or scan for the moment a guest word acquires the value
+0x155f4c0 outside the legitimate execve argv setup.
