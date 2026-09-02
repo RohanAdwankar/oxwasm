@@ -362,6 +362,26 @@ const CASES = [
                 { bins: ['/usr/bin/diff', '/usr/bin/cat'] }],
   // env -i: a scrubbed environment, then exec
   ['env-i',     '/usr/bin/env',   ['-i', 'FOO=1', '/usr/bin/env']],
+  // GNU make: dependency graph, recipes through /bin/sh, up-to-date check
+  ['make',      '/bin/bash', ['-c', 'cd /tmp/bm && rm -f a.txt b.txt out.txt && make -s && cat out.txt && make -q; echo rc=$?'],
+                { tree: '/tmp/bm', bins: ['/usr/bin/make', '/bin/sh', '/usr/bin/cat', '/usr/bin/rm', '/usr/bin/echo'] }],
+  // an awk program file: functions, arrays, printf
+  ['awk-prog',  '/usr/bin/awk', ['-f', new URL('./fixtures/prog.awk', import.meta.url).pathname, IN],
+                { bins: [new URL('./fixtures/prog.awk', import.meta.url).pathname] }],
+  // tar extract: directories, a symlink (symlinkat), then find/readlink over the result
+  ['tar-x',     '/bin/bash', ['-c', 'rm -rf /tmp/bt/out; mkdir -p /tmp/bt/out && tar -xf /tmp/bt/arc.tar -C /tmp/bt/out && cd /tmp/bt/out && find src | sort && cat src/link && readlink src/link'],
+                { bins: ['/tmp/bt/arc.tar', '/usr/bin/tar', '/usr/bin/find', '/usr/bin/sort', '/usr/bin/cat', '/usr/bin/readlink', '/usr/bin/mkdir', '/usr/bin/rm'] }],
+  // python threads + queue + lock: futex-backed producers/consumers
+  ['python-thr','/usr/bin/python3', ['-S', new URL('./fixtures/thr.py', import.meta.url).pathname],
+                { tree: '/usr/lib/python3.11', bins: [new URL('./fixtures/thr.py', import.meta.url).pathname], memMB: 1024 }],
+  // ruby fork + Process.wait + exit status — OPEN: the forked child never
+  // finishes under the engine (docs: "Ruby fork"); parked until the child
+  // engine can be traced
+  // ['ruby-fork', '/opt/ruby-3.3.6/bin/ruby', ['--disable-gems', '-e', 'p = fork { puts "child"; exit 4 }; Process.wait(p); puts "parent #{$?.exitstatus}"'],
+  //               { memMB: 1024 }],
+  // git: init, add, commit, list the tree (blob ids are content-addressed)
+  ['git-commit','/bin/bash', ['-c', 'rm -rf /tmp/gc; git init -q /tmp/gc && cd /tmp/gc && echo a > f && git add f && git -c user.name=x -c user.email=y commit -q -m m && git ls-tree HEAD && git log --format=%s'],
+                { bins: ['/usr/bin/git', '/usr/bin/rm'] }],
   // threaded xz: worker threads with big shared buffers
   ['xz-T2',     '/usr/bin/xz',     ['-T2', '-c', IN], { memMB: 1536 }],
   // ls -l: getdents + stat (nlink, 4K block counts, mtimes, owner names) on a

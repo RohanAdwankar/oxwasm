@@ -2695,6 +2695,40 @@ reopen path now serves both, plus `/dev/stdin`/`stdout`/`stderr`, and
 `/dev/fd` lists the open descriptors. `close_range` (Python's subprocess
 uses it) closes or marks close-on-exec a range of descriptors.
 
+### Third batch from the outside: six programs, three gaps, one open
+
+GNU `make` (a dependency graph with recipes through `/bin/sh` and an
+up-to-date check), an awk program file, `tar` extracting directories and a
+symlink then `find`/`readlink` over the result, Python threads with a
+`queue` and a lock, Ruby `fork` + `Process.wait`, and `git init`/`add`/
+`commit`/`ls-tree` in a fresh repository. Three passed untouched; three
+found gaps:
+
+**posix_spawn is `clone(CLONE_VM|CLONE_VFORK|SIGCHLD)`.** `make` runs
+every recipe through it, and the clone handler routed anything with
+CLONE_VM to the *thread* branch, so the recipe ran as a thread of make
+and make's `wait` found no children. CLONE_VFORK now decides: such a
+clone is a vfork-window child on the caller-supplied stack (posix_spawn
+allocates a small one), not a thread. Python's `subprocess` passed
+earlier only because CPython calls `vfork()` directly.
+
+**`symlinkat` ignored its directory fd.** The link name was resolved
+against the cwd, so tar (which extracts through an O_PATH fd on the
+parent directory) created the link one level up; every later attribute
+operation through the dirfd found nothing. Along the way: `fchmodat2`
+(452) answered ENOSYS, sending tar down an O_PATH+`/proc/self/fd` fallback
+for every entry — it is now answered like `fchmodat` (modes are not
+modelled) — and `utimensat` accepts symlink and FIFO paths.
+
+**Open: Ruby fork.** `fork { puts …; exit 4 }` under the engine never
+finishes: both runner and harness spend their iteration budgets sleeping
+on Ruby's timer thread's timed waits, and whether the child deadlocks
+(a lock whose owner is the parent's *other* thread, copied into the
+child's image) cannot be told without a syscall trace of the child
+engine — the runner traces only the root engine. The case is parked in
+the sweep with a note; adding child-engine tracing to the runner is the
+first step next time.
+
 
 **The one bug that stood between compile and link was in `read`, not the
 linker.** The full link completed and produced a structurally perfect ELF,

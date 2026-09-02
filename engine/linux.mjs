@@ -1642,7 +1642,9 @@ export class LinuxEngine {
       case 218: { const t = this.threads[this.ti]; t.ctid = a1; ret(BigInt(t.id)); break; }  // set_tid_address
       case 56: case 57: case 58: {                           // clone / fork / vfork
         const flags = nr === 56 ? Number(a1 & 0xffffffffn) : 0;
-        if (!(flags & 0x100)) {
+        // posix_spawn is clone(CLONE_VM|CLONE_VFORK|SIGCHLD): a vfork child
+        // on its own small stack, not a thread — CLONE_VFORK decides
+        if (!(flags & 0x100) || (flags & 0x4000)) {
           // Reached nested under a live wasm callout (a tiered caller reached
           // fork through interpUntil): spawning the child here runs it on the
           // shared stack beneath the parent's suspended wasm frame, and the
@@ -1667,6 +1669,7 @@ export class LinuxEngine {
           for (let r = 0; r < 16; r++) c.xmm[r] = cpu.xmm[r] ?? 0n;
           c.rip = cpu.rip; c.fsBase = cpu.fsBase;
           c.regs[0] = 0n;                                    // child sees 0
+          if (nr === 56 && a2) c.regs[4] = a2;               // posix_spawn's child stack
           const parent = this.threads[this.ti];
           parent.state = 'vfork';                            // scheduler skips until released
           // The child shares this memory image, but real fork gives it a
@@ -1893,6 +1896,10 @@ export class LinuxEngine {
       case 117: case 119:                                     // setresuid / setresgid
       case 92: case 93: case 260:                             // chown / fchown / fchownat
       case 90: case 91: case 268: ret(0n); break;             // chmod / fchmod / fchmodat
+      case 452: {                                             // fchmodat2(dirfd, path, mode, flags): modes are not modelled
+        const p = this.norm(this.atPath(a1, a2));
+        const exists = this.files[p] !== undefined || this.isDir(p) || this._fsMeta().links.has(p) || !!this._fifoAt(p);
+        ret(exists ? 0n : -2n); break; }
       case 157: ret(0n); break;                               // prctl
       case 96: {                                              // gettimeofday(tv*, tz)
         if (a1 !== 0n) {
@@ -2600,7 +2607,7 @@ export class LinuxEngine {
         const pa = nr === 280 ? a2 : a1;
         if (nr === 280 && pa === 0n) { ret(0n); break; }       // futimens on a fd
         const p = this.norm(nr === 280 ? this.atPath(a1, pa) : this.readPath(pa));
-        if (this.files[p] === undefined && !this.isDir(p)) { ret(-2n); break; }
+        if (this.files[p] === undefined && !this.isDir(p) && !this._fsMeta().links.has(p) && !this._fifoAt(p)) { ret(-2n); break; }
         if (this.mtimes) {
           let secs = Math.floor(Date.now() / 1000);
           const tp = nr === 280 ? a3 : a2;                     // timespec[2] / timeval[2]
@@ -2612,7 +2619,7 @@ export class LinuxEngine {
         ret(0n); break; }
       case 88: case 266: {                                    // symlink / symlinkat
         const target = this.readPath(a1);
-        const link = this.norm(this.readPath(nr === 88 ? a2 : a3));
+        const link = this.norm(nr === 88 ? this.readPath(a2) : this.atPath(a2, a3));   // symlinkat: relative to dirfd
         if (this.files[link] !== undefined || this.isDir(link) ||
             this._fsMeta().links.has(link)) { ret(-17n); break; }   // EEXIST
         this._fsMeta().links.set(link, target); this.fsBump();
