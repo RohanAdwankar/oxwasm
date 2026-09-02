@@ -2316,3 +2316,17 @@ interpreter, leaving the parent's live wasm frame resuming into
 reached from ANY nested wasm context (callout or syscall) so the child
 is never spawned under a live parent frame — a single well-scoped
 change now, not a search.
+
+**Resolved.** The change was exactly that. `interpUntil` now carries a
+nesting depth (`this._iuDepth`), and the thread-switching fork branch
+(clone-without-CLONE_VM / fork / vfork), when `_iuDepth > 0`, rewinds to
+the syscall and throws `DeoptUnwind` to re-execute at the top-level
+`_run1` loop — the same interpreter-boundary discipline that blocking
+syscalls already use to unwind cleanly out of a callout. With no wasm
+frame beneath it the fork spawns the child correctly. `gcc -S` compiles
+hello-world byte-identical to native under AOT; the minimal repro prints
+"survived"; breadth carries `vforkexec` (which faults with the guard
+neutered) at 79/79, engine suite green, and every existing fork+exec /
+pipe / git / interpreter subprocess case still passes. Six passes to a
+five-line fix, but each pass genuinely eliminated a wrong hypothesis
+(scheduler, memory table, registers) before the nesting clue landed.
