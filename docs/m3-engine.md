@@ -2223,3 +2223,29 @@ compiled store or an engine-side syscall write. The next pass has to
 watch the wasm side: instrument the deopt/`x_syscall`/`x_callout`
 boundary, or scan for the moment a guest word acquires the value
 0x155f4c0 outside the legitimate execve argv setup.
+
+**Third pass — localized to a 10-second minimal repro
+(`tools/fixtures/vforkexec.c`).** Two bisections collapsed the search:
+giving the execve *child* (cc1) no AOT while keeping the driver's still
+faults — so cc1 is irrelevant and it is the forking process's OWN
+tiering. And the whole thing reproduces without gcc at all: a static
+binary that tiers one hot function, `vfork`s, has the child `execl` a
+static `/bin/busybox true`, then runs the hot function again in the
+parent. Native and AOT-off print "survived"; AOT-on faults with
+`unsupported opcode e0 at <stack address>`.
+
+Instrumented, the fault is exact: an interpreter `ret` at guest
+`__execve+0x24` — the error-return tail of `__execve` — pops a garbage
+return address (a stack pointer) off a corrupted slot. So the **vfork
+child does not stop after its execve**: the engine creates the child
+engine, marks the thread dead and blocks it, yet under AOT the child's
+interpreter runs on down `__execve`'s failure path (`neg eax; or
+$-1,%rax; ret`) and returns through a stack slot whose value was
+planted by a compiled (wasm) store — invisible to a `mem.write` watch,
+which sees only the earlier legitimate writes. no-AOT stops the child
+cleanly. The open question is now sharply framed: **how does a tiered
+parent cause the dead, blocked vfork child thread to resume executing
+past its execve?** — the resurrection path (a `wake()` that switches to
+a not-actually-dead thread, or a `BlockUnwind` that unwinds into the
+wrong frame under a live wasm callout) is the next thing to trace, with
+a repro that runs in seconds.
