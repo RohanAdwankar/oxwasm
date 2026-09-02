@@ -2075,3 +2075,31 @@ IC tried and beaten by it, v128 fusion null, guard structural twice
 over, linking ≤11% ceiling. What remains of the call-dense band lives
 in the frames themselves (inlining, which ships) and in tier
 occupancy, not in how calls are reached.
+
+### Node.js runs — and what it took
+
+The sweep's biggest binary yet: Node 22 (`--jitless -e 'console.log(6*7)'`),
+124MB of V8, libuv, epoll and worker threads, byte-identical to native at
+exit 0. Four gaps stood between "spawns" and "prints 42", each surfaced by
+the failure printouts in order:
+
+1. **Infinite RLIMIT_NOFILE**: the engine reported rlimits as infinity;
+   node's close-on-exec sweep then walked 16M descriptors of interpreted
+   fcntl before reaching main. Rlimits now come from one table — STACK
+   finite (pthread sizing), NOFILE 4096/1M plausible.
+2. **fcntl on a dead fd answered 0**: F_SETFD tracked every one of those
+   16M fds in the cloexec set until the JS Set hit its 2^24 ceiling and
+   took the engine down ("Set maximum size exceeded" — the engine
+   crashing, not the guest). Any fcntl on a missing fd > 2 is now EBADF.
+3. **epoll** (from the ruby work) — node's event loop lives on it.
+4. **pop r/m64** (grp1a 8f /0): first binary in the sweep whose code uses
+   it — V8's codebase, fittingly. Decoder + emitters, with the rsp-based
+   memory destination refused to the interpreter (its address is computed
+   AFTER the increment, and the interpreter's set-after-pop order is the
+   exact semantics); a popm differential slice joins implicittest.
+
+Also new this pass: the subprocess lane in breadth (a real shell driving
+gzip|md5sum and seq|sort|head pipelines through fork/execve/pipes/wait4),
+dd, cmp, and date. 67/67. The full-JIT node — V8 writing machine code
+into pages at runtime, the self-modifying-code frontier for
+address-keyed AOT units — is the next experiment.

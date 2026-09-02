@@ -146,6 +146,15 @@ const CASES = [
   // the abort lane: a self-delivered fatal signal must terminate with the
   // default action (128+sig), the path php's fortify abort takes
   ['abort',   '/bin/dash',        ['-c', 'echo before; kill -ABRT $$; echo unreachable']],
+  // the subprocess lane: fork/execve/pipes/wait4 driven by a real shell -
+  // gzip -n so neither name nor mtime lands in the stream
+  ['pipe-gz', '/bin/dash',        ['-c', `/bin/gzip -n -1 -c ${IN} | /usr/bin/md5sum`],
+              { bins: ['/bin/gzip', '/usr/bin/md5sum'] }],
+  ['pipe-3',  '/bin/dash',        ['-c', '/usr/bin/seq 1 1000 | /bin/sort -rn | /usr/bin/head -5'],
+              { bins: ['/usr/bin/seq', '/bin/sort', '/usr/bin/head'] }],
+  ['dd',      '/usr/bin/dd',      [`if=${IN}`, 'bs=1024', 'count=20', 'status=none']],
+  ['cmp',     '/usr/bin/cmp',     [IN, IN]],
+  ['date',    '/usr/bin/date',    ['-u', '-d', '@1600000000', '+%Y-%m-%d %H:%M:%S']],
   ['busybox-md5', '/usr/bin/busybox', ['md5sum', IN]],
   // ruby's VM reserves ~500MB of address space at boot and exits 1 (silently)
   // when mmap says ENOMEM - it needs headroom above breadth's 512MB default
@@ -156,6 +165,11 @@ const CASES = [
   // detected") - provision the tree so engine and native walk the same world
   ['php',     '/usr/bin/php8.4', ['-n', '-r', 'echo 6*7, "\n", array_sum(range(1,100)), "\n", strrev("breadth"), "\n";'],
               { tree: '/usr/share/zoneinfo' }],
+  // Node 22 (V8, libuv, epoll, worker threads) end to end - jitless keeps
+  // V8 off its runtime-codegen path, which is a separate frontier. Getting
+  // here took the epoll family, EBADF from fcntl on dead fds, a finite
+  // RLIMIT_NOFILE, and pop r/m64 in the decoder.
+  ['node',    '/opt/node22/bin/node', ['--jitless', '-e', 'console.log(6*7)'], { memMB: 2048 }],
   // a real repo, read paths: object walk + index + worktree stat. The
   // fixture at /tmp/breadth_repo is committed with pinned dates so the
   // hash is stable; safe.directory silences ownership checks that would
@@ -223,6 +237,7 @@ for (const [name, bin, args, opts] of CASES) {
   if (!existsSync(bin)) { console.log(`  SKIP ${name.padEnd(9)} (${bin} not present)`); continue; }
   const stdin = STDIN[name] || null;
   if (opts && opts.tree) walk(opts.tree);
+  if (opts && opts.bins) for (const b of opts.bins) add(b, b);   // child-exec binaries
   const nat = native(bin, args, stdin);
   const eng = engine(bin, args, stdin, opts);
   // compare the bytes, not a summary: a truncated stdout that happens to

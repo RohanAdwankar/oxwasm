@@ -157,6 +157,11 @@ export function decode(fetch, rip) {
     if (sub === 1) return fin({ mnem: 'dec', dst: rm, size: 1 });
     throw new Error('grp4 ' + sub);
   }
+  if (op === 0x8F) {                                   // grp1a: pop r/m64 (V8-generated code uses it)
+    const [, rm, g] = modrm(osz);
+    if ((g & 7) !== 0) throw new Error('grp1a /' + (g & 7));
+    rm.size = 8; return fin({ mnem: 'pop', dst: rm, size: 8 });
+  }
   if (op === 0xFF) {
     const [, rm, g] = modrm(osz); const sub = g & 7;
     if (sub === 0) return fin({ mnem: 'inc', dst: rm, size: osz });

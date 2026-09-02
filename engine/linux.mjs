@@ -1329,17 +1329,19 @@ export class LinuxEngine {
         if (oldp) { const v = new DataView(this.wmem.buffer);
           const off = this.RAMOFF + Number(oldp - this.base);
           // RLIMIT_STACK must be finite: glibc sizes every pthread stack from
-          // it — garbage/huge values made 516MB stacks and EAGAIN thread spawns
-          const cur = Number(a2) === 3 ? 0x800000n : 0xFFFFFFFFFFFFFFFFn;
+          // it — garbage/huge values made 516MB stacks and EAGAIN thread spawns.
+          // RLIMIT_NOFILE too: infinity sent node's close-on-exec sweep over
+          // 16M descriptors of interpreted fcntl before main was reached
+          const [cur, max] = this.rlimits(Number(a2));
           v.setBigUint64(off, cur, true);
-          v.setBigUint64(off + 8, 0xFFFFFFFFFFFFFFFFn, true); }
+          v.setBigUint64(off + 8, max, true); }
         ret(0n); break; }
       case 97: {                                             // getrlimit(res, rlim*)
         const v = new DataView(this.wmem.buffer);
         const off = this.RAMOFF + Number(a2 - this.base);
-        const cur = Number(a1) === 3 ? 0x800000n : 0xFFFFFFFFFFFFFFFFn;
+        const [cur, max] = this.rlimits(Number(a1));
         v.setBigUint64(off, cur, true);
-        v.setBigUint64(off + 8, 0xFFFFFFFFFFFFFFFFn, true);
+        v.setBigUint64(off + 8, max, true);
         ret(0n); break; }
       case 267: {                                            // readlinkat: /proc/self/exe -> argv0
         const buf = cpu.regs[2], sz = cpu.regs[10] ?? cpu.regs[8];
@@ -2007,6 +2009,11 @@ export class LinuxEngine {
       case 221: ret(0n); break;                               // fadvise64: hints are free
       case 72: {                                              // fcntl
         const h = this.fds.get(Number(a1)), cmd = Number(a2);
+        // a missing fd is EBADF for EVERY cmd: answering 0 let node's
+        // close-on-exec sweep push millions of dead fds into the cloexec
+        // set (F_SETFD tracked them unconditionally) until the JS Set hit
+        // its 2^24 ceiling and took the engine down with it
+        if (!h && Number(a1) > 2) { ret(-9n); break; }
         if (cmd === 3) { ret(BigInt(2 | (h?.sock?.nonblock ? 0x800 : 0))); break; }   // F_GETFL: O_RDWR
         if (cmd === 4) { if (h?.sock) h.sock.nonblock = !!(Number(a3) & 0x800); if (h?.pipe) h.nonblock = !!(Number(a3) & 0x800); ret(0n); break; }  // F_SETFL
         if (cmd === 1) { ret(BigInt(this.cloexec.has(Number(a1)) ? 1 : 0)); break; }   // F_GETFD
@@ -2296,6 +2303,12 @@ export class LinuxEngine {
         ret(-38n);                                           // ENOSYS
         (this.unknown ||= new Set()).add(nr);
     }
+  }
+
+  rlimits(res) {                          // [cur, max] per resource
+    if (res === 3) return [0x800000n, 0xFFFFFFFFFFFFFFFFn];       // STACK: finite (pthread sizing)
+    if (res === 7) return [4096n, 1048576n];                       // NOFILE: a plausible table
+    return [0xFFFFFFFFFFFFFFFFn, 0xFFFFFFFFFFFFFFFFn];
   }
 
   inExec(rip) {

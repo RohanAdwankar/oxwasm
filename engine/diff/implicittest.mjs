@@ -27,6 +27,8 @@ const CASES = [
   ['cdq-entry', 'cdq\nmov rbx, rdx\nret\n', [0, 2, 3]],
   // rep movsb at entry: rsi/rdi/rcx all implicit
   ['movs-entry', 'rep movsb\nret\n', [1, 6, 7]],
+  // pop r/m64 (grp1a 8f /0, V8-generated code): value to memory, rsp bumped
+  ['popm-entry', 'pop qword [rdi]\nmov rax, [rdi]\nret\n', [0, 4, 7]],
 ];
 
 let pass = 0, fail = 0;
@@ -53,6 +55,7 @@ for (const [name, asm, cmpRegs] of CASES) {
     write(CODE + 0x900n, 0x5a5a5a5an);              // saved rbp
     write(CODE + 0x908n, SENT);                     // return address for ret
     write(CODE + 0x800n, SENT);                     // plain-ret path
+    write(CODE + 0x808n, SENT);                     // popm's ret (rsp moved 8)
     write(CODE + 0xa00n, 0x1122334455667788n);      // movs source bytes
   };
 
