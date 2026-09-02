@@ -1889,6 +1889,18 @@ a same-day standing check:
   a net win on call-direct workloads and a wash on indirect-dispatch
   interpreters — a future refinement could gate inlining on the
   direct-call share of the profile.
+
+  **Correction (next day, and it kills the gate idea): the "inlining
+  gives it back" attribution does not reproduce.** A direct paired A/B
+  of exactly that claim — perl runloop (pure compute driven to an
+  11.7s steady state, startup subtracted), inline-on vs inline-off,
+  fastdisp on in both arms — reads **1.004x ±8%**: inlining is a null
+  on perl, not a cost. The wash in the defaults-vs-all-off run was
+  real, but pinning its shape on inlining was an inference from
+  arithmetic across separate runs (0.985 ≈ 0.87 × cost), the exact
+  cross-run comparison this document keeps warning against. There is
+  no perl regression to gate away; the profile-gated-inlining
+  refinement is dropped as unfounded.
 3. Narrowing stays **opt-in**: perf-neutral steady state at current
    resolution, and its on-thread analysis costs ~+25% startup in
    realab (perl small runs: 14.7s vs 11.6s). If it is ever promoted,
