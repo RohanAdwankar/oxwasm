@@ -139,6 +139,7 @@ if (!existsSync(BP + '/change.diff')) {
 add(BP + '/orig.txt', BP + '/orig.txt'); add(BP + '/change.diff', BP + '/change.diff');
 
 // A C source for the compiler cases, written once like IN.
+const FX = (n) => new URL('./fixtures/' + n, import.meta.url).pathname;   // a fixture's host path (== guest path)
 const HELLO_C = '/tmp/breadth_hello.c';
 if (!existsSync(HELLO_C))
   writeFileSync(HELLO_C, 'int main(){__builtin_printf("hi from compiled C\\n");return 0;}\n');
@@ -376,9 +377,31 @@ const CASES = [
                 { tree: '/usr/lib/python3.11', bins: [new URL('./fixtures/thr.py', import.meta.url).pathname], memMB: 1024 }],
   // ruby fork + Process.wait + exit status: a fork in a multithreaded parent
   // (Ruby's timer thread) — the siblings must stay frozen during the window
-  // OPEN (docs: "Ruby fork"): parked until the parent-side stall is understood
-  // ['ruby-fork', '/opt/ruby-3.3.6/bin/ruby', ['--disable-gems', '-e', 'p = fork { puts "child"; exit 4 }; Process.wait(p); puts "parent #{$?.exitstatus}"'],
-  //               { memMB: 1024 }],
+  // ruby fork + Process.wait: a fork in a multithreaded parent whose child
+  // creates its own thread inside the window (Ruby's timer thread) — that
+  // thread belongs to the child and moves with it when it materialises
+  ['ruby-fork', '/opt/ruby-3.3.6/bin/ruby', ['--disable-gems', '-e', 'p = fork { puts "child"; exit 4 }; Process.wait(p); puts "parent #{$?.exitstatus}"'],
+                { memMB: 1024 }],
+  // ---- batch 4: text tools, build tools, an editor and a debugger in batch mode
+  // m4: macro expansion with recursion, eval, regexp, esyscmd (fork+exec of
+  // sh inside a filter), diversions
+  ['m4',        '/usr/bin/m4', [FX('prog.m4')], { bins: [FX('prog.m4'), '/bin/sh', '/usr/bin/printf'] }],
+  // bison: an LALR(1) parser generator writing its output file
+  ['bison',     '/usr/bin/bison', ['-o', '/tmp/breadth_calc.c', FX('calc.y')],
+                { bins: [FX('calc.y')], tree: '/usr/share/bison', outFile: '/tmp/breadth_calc.c' }],
+  // vim in ex (silent batch) mode: a substitution and a sort over IN, written out
+  ['vim-es',    '/usr/bin/vim', ['-es', '-u', 'NONE', '-i', 'NONE', '-c', '%s/e/E/g', '-c', '%!sort', '-c', 'w! /tmp/breadth_vim.txt', '-c', 'q!', IN],
+                { bins: ['/usr/bin/sort', '/usr/bin/sh'], outFile: '/tmp/breadth_vim.txt' }],   // vim's filter runs through /usr/bin/sh (its compiled-in 'shell'), an absolute path
+  // ninja: dry-run of a three-edge graph in dependency order
+  ['ninja',     '/usr/bin/ninja', ['-n', '-f', FX('build.ninja')], { bins: [FX('build.ninja')] }],
+  // cmake script mode: lists, math, regex, file write+read
+  ['cmake-P',   '/bin/bash', ['-c', 'mkdir -p /tmp/bcm && cmake -P ' + FX('script.cmake') + ' 2>&1'],
+                { bins: ['/usr/bin/cmake', '/usr/bin/mkdir', FX('script.cmake')], tree: '/usr/share/cmake-3.28' }],
+  // gdb in batch mode over a real binary: symbol lookup and disassembly of main
+  ['gdb-batch', '/usr/bin/gdb', ['-batch', '-nx', '-ex', 'info functions ^main$', '-ex', 'disassemble main', '/tmp/breadth_thread'],
+                { bins: ['/tmp/breadth_thread'], tree: '/usr/lib/python3.12', memMB: 1024 }],   // gdb embeds CPython and initialises it at startup: it needs the stdlib tree
+  // split into fixed-line pieces; the second piece is the file compared
+  ['split',     '/usr/bin/split', ['-l', '400', '-d', IN, '/tmp/breadth_split_'], { outFile: '/tmp/breadth_split_01' }],
   // git: init, add, commit, list the tree (blob ids are content-addressed)
   ['git-commit','/bin/bash', ['-c', 'rm -rf /tmp/gc; git init -q /tmp/gc && cd /tmp/gc && echo a > f && git add f && git -c user.name=x -c user.email=y commit -q -m m && git ls-tree HEAD && git log --format=%s'],
                 { bins: ['/usr/bin/git', '/usr/bin/rm'] }],
@@ -477,8 +500,23 @@ const engine = (bin, args, stdin, opts = {}) => {
     // itimer, a poll timeout): sleep until then like a real host would,
     // instead of spinning through the guard in a few ms of wall time.
     const nap = new Int32Array(new SharedArrayBuffer(4));
+    // The guard counts host iterations that did work; a parent and child
+    // that are both blocked with short deadlines make every iteration a nap
+    // and would spin forever - a wall-clock cap is the backstop.
+    let iter = 0; const T0 = performance.now(), wallMs = (opts.wallS ?? 900) * 1000;
     while (eng.exitCode === null) {
       eng.run(5e7);
+      if (performance.now() - T0 > wallMs) { err = `no exit within ${wallMs / 1000}s wall`; break; }
+      // BREADTH_PROGRESS=N: every N host iterations print each engine's
+      // threads and syscall tail (BREADTH_STRACE=1 arms the rings; children
+      // inherit them) - what read the ruby-fork mutual wait
+      if (process.env.BREADTH_PROGRESS) {
+        if ((++iter % +process.env.BREADTH_PROGRESS) === 0) {
+          console.error(`<it ${iter} interp=${eng.stats.interpreted} aot=${eng.stats.aotRuns} blocked=${eng.blocked ? (eng.blocked.deadline == null ? 'null' : (eng.blocked.deadline - eng.nowMs()).toFixed(0) + 'ms') : 'no'} thr=${eng.threads.map(t => t.id + ':' + t.state + (t.futex ? '@' + t.futex.toString(16) : '')).join(' ')} rip=${eng.cpu.rip.toString(16)} strace=[${(eng.strace || []).slice(-4).join(' | ')}]>`);
+          for (const c of eng.children ?? []) if (c.eng && c.exited === null)
+            console.error(`   child ${c.pid}: blocked=${JSON.stringify(c.eng.blocked)} thr=${c.eng.threads.map(t => t.id + ':' + t.state + (t.futex ? '@' + t.futex.toString(16) : '')).join(' ')} rip=${c.eng.cpu.rip.toString(16)} interp=${c.eng.stats.interpreted} strace=[${(c.eng.strace || []).slice(-6).join(' | ')}]`);
+        }
+      }
       if (eng.blocked) {
         const dl = eng.blocked.deadline;
         if (dl != null && isFinite(dl)) { const ms = dl - eng.nowMs(); if (ms > 0) { Atomics.wait(nap, 0, 0, Math.min(ms, 1000)); guard--; } }

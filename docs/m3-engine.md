@@ -2748,9 +2748,75 @@ copy is now program+heap up to `brk`, the mmap arena, any MAP_FIXED spans
 outside it, file mappings, and the top 64MB of the stack; untouched pages
 are never committed. `python-mp` went from 105s to 72s.
 
-**Still open: the Ruby parent.** With the freeze in place the parent no
-longer faults, but it does not finish either — a slice-mode probe with the
-signal trace is the next step. The case stays parked.
+**Resolved: a window child's threads are the child's.** A standalone
+isolation script (construct, then short `run` slices with counters and
+RSS) showed two things at once. The "hang" was slowness: the first slice
+alone took 111 s — Ruby's startup plus tiering 1,400 functions through an
+uncached `wat2wasm` — and the 5 GB of RSS was the runner's provisioned
+libraries, not the engine. And the thread table after the fork showed the
+real bug: thread 3 running, unfrozen. It was the *child's* new timer
+thread, created by `clone` inside the vfork window — and the thread branch
+attached it to the parent (no `proc`). When the child materialised, that
+thread stayed behind in the parent, running the child's code on
+rolled-back memory: rip 0.
+
+A thread cloned by a window child now inherits the child's `proc`, so it
+runs with the child's fd table and journal, is not frozen with the
+parent's siblings, migrates into the child engine at materialisation
+(its CPU state copied alongside the memory), and dies with the child on
+`exit_group` or `execve`; a plain `exit` of one such thread is a thread
+exit, not the process's. `ruby-fork` prints `child` / `parent 4`,
+byte-identical to native.
+
+**Then it hung under the sweep only.** In isolation the case passed; under
+`breadth.mjs`, with compiled units already cached, the parent sat in
+`wait4` and the child engine never exited, each host iteration advancing
+about 130 interpreted instructions. The child's syscall tail (a traced
+parent now arms its children's `strace` rings, and each line carries its
+thread id) named it: thread `[1]` did `epoll_wait`, `read`, `madvise`,
+`exit(60)` and died; thread `[1000]` wrote a byte to the wake-up pipe and
+blocked on a futex it never left. Thread 1000 was the child's *main*
+thread joining its timer thread; thread 1 was the timer thread. Cached
+units change the interleaving so that inside the window the timer thread
+blocked first — and materialisation had built the child engine's
+`threads[0]` from the constructor's blank record, copying only the
+blocking thread's CPU state and signal mask. Its `ctid` — the address
+`pthread_join` waits on, which `set_tid_address` had recorded — was lost,
+so the timer thread's exit cleared nothing and woke nobody. Whichever
+thread blocks first now carries its whole identity into `threads[0]`:
+tid (the one glibc cached, `gettid` must agree), `ctid`, pending signals,
+alternate stack. And pids come from one counter at the root of the engine
+tree, so a materialised child that forks cannot hand out its own pid
+again.
+
+### Fourth batch from the outside: seven programs, one gap
+
+`m4` (recursive macros, `eval`, `regexp`, `esyscmd` forking a shell inside
+a filter, diversions), `bison` generating an LALR(1) parser from a grammar
+(41 KB of output byte-compared to native's), `vim` in silent ex mode
+(a substitution, a filter through `sort`, a write), `ninja` dry-running a
+five-edge build graph, `cmake -P` (script mode: lists, math, regex, file
+write and read-back), `gdb -batch` looking up and disassembling `main` in
+a real binary, and `split` cutting the input into numbered pieces. m4,
+bison, ninja, split passed untouched. Two wanted more of the system
+provisioned — harness omissions, not engine gaps: cmake its module tree
+(`/usr/share/cmake-3.28`), and vim the shell its filter runs through.
+Vim's child execs `/usr/bin/sh` by absolute path (its compiled-in
+`shell`), so `/bin/sh` alone does not serve it; with ENOENT the filter
+produced nothing, the buffer emptied, and `w!` wrote an empty file with
+exit 0 — a silent wrong answer, which is why every case byte-compares its
+output rather than trusting the exit code. gdb embeds CPython and
+initialises it at startup, so it needs the stdlib tree like the python
+cases do; it also asked two things the surface lacked, `getrusage`
+(zeros now) and `faccessat2` (answered like `faccessat`). vim found the
+one real gap:
+
+**`fsync` was ENOSYS, and vim treats a failed fsync as a failed write.**
+Its write path is open, write, `fsync`, close; on the error it reports
+`E667`, exits 1, and — with `writebackup` on — deletes the file it had
+just written, leaving nothing to compare. `fsync`, `fdatasync`, `sync`,
+`syncfs` and `sync_file_range` now return 0: the file system lives in
+memory, so everything is already as durable as it will ever be.
 
 
 **The one bug that stood between compile and link was in `read`, not the

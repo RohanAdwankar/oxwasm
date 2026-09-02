@@ -1360,8 +1360,9 @@ export class LinuxEngine {
       ? (v) => { cpu.regs[0] = BigInt.asUintN(64, v);
                  let ps = '';   // decode the path argument of the fs family
                  try { if (nr === 257 || nr === 262) ps = ' "' + this.readPath(a2) + '"';
-                       else if (nr === 2 || nr === 21 || nr === 89 || nr === 4 || nr === 6) ps = ' "' + this.readPath(a1) + '"'; } catch {}
-                 this.strace.push(`${nr}(${a1.toString(16)},${a2.toString(16)},${a3.toString(16)})=${BigInt.asIntN(64, v)}${ps}`);
+                       else if (nr === 2 || nr === 21 || nr === 89 || nr === 4 || nr === 6 || nr === 87 || nr === 82 || nr === 83 || nr === 59) ps = ' "' + this.readPath(a1) + '"';
+                       else if (nr === 263 || nr === 264) ps = ' "' + this.readPath(a2) + '"'; } catch {}
+                 this.strace.push(`[${this.threads[this.ti]?.id ?? 1}]${nr}(${a1.toString(16)},${a2.toString(16)},${a3.toString(16)})=${BigInt.asIntN(64, v)}${ps}`);
                  if (this.strace.length > 400) this.strace.shift(); }
       : (v) => { cpu.regs[0] = BigInt.asUintN(64, v); };
     // resolve a write target: stdout / stderr sink, or a pipe buffer
@@ -1667,7 +1668,7 @@ export class LinuxEngine {
           // engine) or exits. Exact for the g_spawn / posix_spawn pattern
           // (dup2 + close + execve between fork and exec), which is what
           // GIMP's plug-in launcher does.
-          const pid = (this.nextPid = (this.nextPid ?? 999) + 1);
+          const pid = this._allocPid();
           const c = new CPU(this.mem);
           c.onSyscall = (cc) => this.syscall(cc);
           for (let r = 0; r < 16; r++) c.regs[r] = cpu.regs[r];
@@ -1705,7 +1706,8 @@ export class LinuxEngine {
         c.regs[4] = a2;                                      // child stack
         c.fsBase = (flags & 0x80000) ? cpu.regs[8] : cpu.fsBase;               // CLONE_SETTLS
         const t = { id: tid, cpu: c, state: 'run', dl: null, futex: null,
-                    ctid: (flags & 0x200000) ? cpu.regs[10] : 0n, _dl: null }; // CLONE_CHILD_CLEARTID
+                    ctid: (flags & 0x200000) ? cpu.regs[10] : 0n, _dl: null,   // CLONE_CHILD_CLEARTID
+                    proc: this.threads[this.ti].proc };          // a window child's thread is the CHILD's (Ruby's timer thread after fork)
         this.threads.push(t);
         if (flags & 0x100000) this.mem.write(a3, 4n, BigInt(tid));             // CLONE_PARENT_SETTID
         if (flags & 0x1000000) this.mem.write(cpu.regs[10], 4n, BigInt(tid));  // CLONE_CHILD_SETTID
@@ -1731,6 +1733,7 @@ export class LinuxEngine {
           memMB: this.childMemMB ?? 256, assembleWat: this.assembleWat,   // small: plug-ins are lean, and the tab already holds the parent's image
           aotCallThreshold: this.aotCallThreshold, aotLoopThreshold: this.aotLoopThreshold,
           xserver: this.xserver });
+        if (this.strace) ceng.strace = [];                   // a traced parent traces its children
         const skipped = [];
         const srcFds = t.proc ? t.proc.fds : this.fds;
         for (const [fd, h] of srcFds) {
@@ -1764,7 +1767,7 @@ export class LinuxEngine {
           // of a script in place): this engine can't replace its own image,
           // so it becomes a pump for the replacement child — run() forwards
           // slices to it and adopts its exit code.
-          const pid = (this.nextPid = (this.nextPid ?? 999) + 1);
+          const pid = this._allocPid();
           const rec = { pid, eng: ceng, exited: null };
           ceng.pid = this.pid ?? 1; ceng.ppid = this.ppid ?? 0;   // a tail-exec IS this process
           (this.children ??= []).push(rec);
@@ -1778,7 +1781,7 @@ export class LinuxEngine {
         }
         (this.children ??= []).push({ pid: t.proc.pid, eng: ceng, exited: null });
         ceng.pid = t.proc.pid; ceng.ppid = this.pid ?? 1;
-        t.state = 'dead';
+        t.state = 'dead'; this._killProcSiblings(t);
         this._pipeEofSweep(skipped);
         this._vforkRollback(t);
         t.proc.parent.state = 'run'; this._vforkThaw(t.proc.parent);   // vfork release
@@ -1796,6 +1799,11 @@ export class LinuxEngine {
         if (a2) this.mem.write(a2, 4n, BigInt(tsig ? (tsig & 0x7f) : ((code & 0xff) << 8)));   // WIFSIGNALED / WIFEXITED
         this.children.splice(this.children.indexOf(done), 1);
         ret(BigInt(done.pid)); break; }
+      case 98: {                                             // getrusage(who, rusage*): zeros (gdb asks at startup)
+        if (a2) { this.jsnap(a2, 144); new Uint8Array(this.wmem.buffer, this.RAMOFF + Number(a2 - this.base), 144).fill(0); }
+        ret(0n); break; }
+      case 74: case 75: case 162: case 306: case 277:        // fsync / fdatasync / sync / syncfs / sync_file_range
+        ret(0n); break;                                      // the FS is in memory: durable already. vim's write path fsyncs and, on ENOSYS, reports the write failed and unlinks it
       case 24: ret(0n); break;                               // sched_yield (quantum rotation covers fairness)
       case 273: ret(0n); break;                              // set_robust_list
       case 157: ret(0n); break;                              // prctl (PR_SET_NAME etc.)
@@ -1807,11 +1815,16 @@ export class LinuxEngine {
         ret(8n); break; }
       case 60: case 231: {                                   // exit / exit_group
         const t = this.threads[this.ti];
+        if (t.proc && nr === 60 && this.threads.some(x => x !== t && x.state !== 'dead' && x.proc === t.proc)) {
+          t.state = 'dead';                                  // one thread of a window child: the process lives on
+          if (t.ctid) { this.mem.write(t.ctid, 4n, 0n); this.futexWake(t.ctid, 1 << 30); }
+          this.block(null); ret(0n); break;
+        }
         if (t.proc) {
           // a vfork-window child died without execve (e.g. g_spawn's _exit
           // after a failed exec): release the parent, record the status for
           // wait4, retire this context
-          t.state = 'dead';
+          t.state = 'dead'; this._killProcSiblings(t);
           this._pipeEofSweep([...t.proc.fds.values()]);
           this._vforkRollback(t);
           t.proc.parent.state = 'run'; this._vforkThaw(t.proc.parent);
@@ -2243,7 +2256,7 @@ export class LinuxEngine {
         if (this.mtimes) this.mtimes[newp] = this.mtimes[oldp] ?? Math.floor(this.nowMs() / 1000);
         this.fsBump(); ret(0n); break; }
       case 21: { const p = this.readPath(a1); ret(this.lookup(p) !== undefined || this.isDir(p) || !!this._fifoAt(p) ? 0n : -2n); break; }   // access
-      case 269: { const p = this.atPath(a1, a2); ret(this.lookup(p) !== undefined || this.isDir(p) || !!this._fifoAt(p) ? 0n : -2n); break; }  // faccessat
+      case 269: case 439: { const p = this.atPath(a1, a2); ret(this.lookup(p) !== undefined || this.isDir(p) || !!this._fifoAt(p) ? 0n : -2n); break; }  // faccessat / faccessat2
       case 63: {                                              // uname
         const put = (o, s) => { const b = new TextEncoder().encode(s + '\0');
           this.ram.set(b, Number(a1 - this.base) + o); };
@@ -3011,7 +3024,7 @@ export class LinuxEngine {
   _terminate(sig) {
     const t = this.threads[this.ti];
     if (t?.proc) {
-      t.state = 'dead';
+      t.state = 'dead'; this._killProcSiblings(t);
       this._pipeEofSweep([...t.proc.fds.values()]);
       this._vforkRollback(t);
       t.proc.parent.state = 'run'; this._vforkThaw(t.proc.parent);
@@ -3291,6 +3304,7 @@ export class LinuxEngine {
       argv: o.argv, env: o.env, memMB: o.memMB, threshold: o.threshold, files: this.files,
       assembleWat: o.assembleWat, aotCallThreshold: o.aotCallThreshold, aotLoopThreshold: o.aotLoopThreshold,
       xserver: o.xserver, mtimes: o.mtimes, tty: o.tty, ttyRows: o.ttyRows, ttyCols: o.ttyCols, stdin: o.stdin });
+    if (this.strace) ceng.strace = [];                       // a traced parent traces its children
     this._copyLiveRam(ceng);                                 // the child's view, before rollback (live ranges only)
     ceng.brk = this.brk; ceng.mmapNext = this.mmapNext;
     ceng.execRanges = this.execRanges.slice();
@@ -3306,8 +3320,29 @@ export class LinuxEngine {
     for (let r = 0; r < 16; r++) c.xmm[r] = t.cpu.xmm[r] ?? 0n;
     c.rip = t.cpu.rip; c.fsBase = t.cpu.fsBase; Object.assign(c.f, t.cpu.f);
     ceng._deadline = this._deadline;                         // an interrupted nanosleep keeps its deadline
-    ceng.threads[0].sigmask = t.sigmask ?? 0n;
+    // threads[0] IS the blocking thread, whichever of the child's threads
+    // that was: Ruby's child restarts its timer thread inside the window and
+    // the TIMER thread is the first to block, so it lands here while the
+    // main thread migrates below. Its identity must come along whole — the
+    // tid glibc cached and the ctid pthread_join waits on. With ctid dropped
+    // the timer thread's exit woke nobody and the main thread joined forever.
+    const m0 = ceng.threads[0];
+    m0.id = t.id; m0.ctid = t.ctid ?? 0n; m0.sigmask = t.sigmask ?? 0n; m0.pending = t.pending ?? 0n;
+    m0.altstack = t.altstack ?? null; m0.eintr = false; m0.suspendOld = null;
+    ceng.nextTid = Math.max(ceng.nextTid ?? 2, t.id + 1);
     ceng.blocked = null;
+    // threads the child created inside the window move with it
+    for (const x of this.threads) {
+      if (x === t || x.proc !== t.proc || x.state === 'dead') continue;
+      const xc = new CPU(ceng.mem); xc.onSyscall = (cc) => ceng.syscall(cc);
+      for (let r = 0; r < 16; r++) xc.regs[r] = x.cpu.regs[r];
+      for (let r = 0; r < 16; r++) xc.xmm[r] = x.cpu.xmm[r] ?? 0n;
+      xc.rip = x.cpu.rip; xc.fsBase = x.cpu.fsBase; Object.assign(xc.f, x.cpu.f);
+      ceng.threads.push({ id: x.id, cpu: xc, state: x.state === 'vfork' ? 'run' : x.state, dl: x.dl, futex: x.futex,
+                          ctid: x.ctid, _dl: x._dl, sigmask: x.sigmask ?? 0n, pending: x.pending ?? 0n, eintr: false, suspendOld: null, altstack: x.altstack ?? null });
+      ceng.nextTid = Math.max(ceng.nextTid ?? 2, x.id + 1);
+      x.state = 'dead';
+    }
     if (this.asyncCompile) ceng.asyncCompile = this.asyncCompile;
     ceng.unitMaxFuncs = this.childUnitMaxFuncs ?? 24; ceng.unitMaxInsns = this.childUnitMaxInsns ?? 4000;
     ceng.parentEng = this;
@@ -3328,6 +3363,14 @@ export class LinuxEngine {
   // Ruby's child tears down the parent's thread structures in atfork, and
   // a parent thread that ran on that state jumped to rip 0. Frozen threads
   // keep their real state and resume on release (exec, exit, materialise).
+  // pids come from ONE counter at the root of the engine tree: a materialised
+  // child that forks must not hand out its own pid (or its sibling's) again
+  _allocPid() { let r = this; while (r.parentEng) r = r.parentEng; return (r.nextPid = (r.nextPid ?? 999) + 1); }
+  _killProcSiblings(t) {
+    for (const x of this.threads) if (x !== t && x.proc === t.proc && x.state !== 'dead') {
+      x.state = 'dead'; if (x.ctid) { try { this.mem.write(x.ctid, 4n, 0n); } catch {} }
+    }
+  }
   _vforkFreeze(parent) {
     for (const x of this.threads) if (x !== parent && !x.proc && x.state !== 'dead' && x._frz === undefined) { x._frz = x.state; x.state = 'vfork'; }
   }
@@ -3440,10 +3483,20 @@ export class LinuxEngine {
       out = this._run1(maxSteps);
       if (this.sliceDeadline != null && performance.now() > this.sliceDeadline) break;
     }
-    // while children live, never park indefinitely: the host must keep
-    // pumping so the children run (their progress is what unblocks us)
-    if (this.blocked && this.blocked.deadline == null && this.children?.some(c => c.exited === null))
-      this.blocked.deadline = this.nowMs() + 2;
+    // While children live, the deadline the host sleeps to is the EARLIEST
+    // across the tree: a child blocked on a shorter timer than the parent's
+    // (Ruby's forked child has its own timer thread), or a runnable child,
+    // must not wait out the parent's 100ms tick — that made a fork that
+    // finishes in seconds take a quarter of an hour, three quarters of it
+    // asleep. Never park indefinitely while a child lives.
+    if (this.blocked && this.children?.some(c => c.exited === null)) {
+      let dl = this.blocked.deadline;
+      for (const c of this.children) if (c.exited === null && c.eng && c.eng.exitCode === null) {
+        const cd = c.eng.blocked ? c.eng.blocked.deadline : this.nowMs();
+        if (cd != null && (dl == null || cd < dl)) dl = cd;
+      }
+      this.blocked.deadline = dl == null ? this.nowMs() + 2 : dl;
+    }
     return out;
   }
 
