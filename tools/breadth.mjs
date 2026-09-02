@@ -236,6 +236,13 @@ const CASES = [
             { bins: ['/usr/libexec/gcc/x86_64-linux-gnu/13/cc1'],
               tree: ['/usr/include', '/usr/lib/gcc/x86_64-linux-gnu/13/include'],
               memMB: 1024 }],
+  // the full compile+assemble chain: driver -> cc1 -> as, producing an ELF
+  // object byte-compared to native (via outFile, the engine's virtual FS).
+  ['gcc-c', '/usr/bin/gcc', ['-c', '-O1', '-o', '/tmp/breadth_hello.o', HELLO_C],
+            { bins: ['/usr/libexec/gcc/x86_64-linux-gnu/13/cc1', '/usr/bin/as',
+                     '/usr/bin/x86_64-linux-gnu-as'],
+              tree: ['/usr/include', '/usr/lib/gcc/x86_64-linux-gnu/13/include'],
+              outFile: '/tmp/breadth_hello.o', memMB: 1024 }],
 ];
 const STDIN = { tr: readFileSync(IN), bc: Buffer.from('scale=20\n7/3\n2^64\nsqrt(2)\nquit\n'),
                 jq: Buffer.from('{"a": 3, "b": 4}\n{"a": 10, "b": -2}\n'),
@@ -277,9 +284,13 @@ const engine = (bin, args, stdin, opts = {}) => {
   // comparing it reported gzip as differing from byte 1 when the bytes were
   // fine. A generality harness that corrupts its own evidence is worse than
   // none.
-  const raw = eng.stdoutBytes && eng.stdoutBytes.length
-    ? Buffer.concat(eng.stdoutBytes.map(b => Buffer.from(b)))
-    : Buffer.from(eng.stdout.join(''), 'binary');
+  // A case that produces a FILE (gcc -c writes an object) compares the file's
+  // bytes from the engine's virtual FS instead of stdout.
+  const raw = opts.outFile
+    ? (eng.files[opts.outFile] ? Buffer.from(eng.files[opts.outFile]) : Buffer.alloc(0))
+    : eng.stdoutBytes && eng.stdoutBytes.length
+      ? Buffer.concat(eng.stdoutBytes.map(b => Buffer.from(b)))
+      : Buffer.from(eng.stdout.join(''), 'binary');
   return { out: raw, code: eng.exitCode, stderr: (eng.stderr || []).join(''),
            unknown: [...(eng.unknown || [])], strace: eng.strace,
            ms: Number(process.hrtime.bigint() - t0) / 1e6,
@@ -295,6 +306,8 @@ for (const [name, bin, args, opts] of CASES) {
   if (opts && opts.tree) for (const t of [].concat(opts.tree)) walk(t);
   if (opts && opts.bins) for (const b of opts.bins) add(b, b);   // child-exec binaries
   const nat = native(bin, args, stdin);
+  // outFile case: native wrote the file to the real FS; read it as the oracle
+  if (opts && opts.outFile) { try { nat.out = readFileSync(opts.outFile); } catch { nat.out = Buffer.alloc(0); } }
   const eng = engine(bin, args, stdin, opts);
   // compare the bytes, not a summary: a truncated stdout that happens to
   // share a prefix is exactly the failure a length check alone would miss
