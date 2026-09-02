@@ -117,6 +117,11 @@ if (!existsSync(TIMERS)) {
   try { execFileSync('gcc', ['-O1', '-o', TIMERS,
                              new URL('./fixtures/timers.c', import.meta.url).pathname]); } catch {}
 }
+const PROCPID = '/tmp/breadth_procpid';
+if (!existsSync(PROCPID)) {
+  try { execFileSync('gcc', ['-O1', '-o', PROCPID,
+                             new URL('./fixtures/procpid.c', import.meta.url).pathname]); } catch {}
+}
 const EPIPE = '/tmp/breadth_epipe';
 if (!existsSync(EPIPE)) {
   try { execFileSync('gcc', ['-O1', '-o', EPIPE,
@@ -307,6 +312,8 @@ const CASES = [
   // signalfd, sigtimedwait (+EAGAIN), POSIX timers with SI_TIMER siginfo,
   // ITIMER_VIRTUAL while spinning with occasional syscalls
   ['timers',    '/tmp/breadth_timers', []],
+  // distinct pids across fork, mmap coherence in both directions, /proc listings
+  ['procpid',   '/tmp/breadth_procpid', []],
   // the same through busybox: a NOEXEC applet's 170KB command substitution
   ['bb-subst',  '/usr/bin/busybox', ['sh', '-c', 'x=$(seq 1 30000); echo ${#x}'],
                 { bins: ['/usr/bin/busybox'] }],

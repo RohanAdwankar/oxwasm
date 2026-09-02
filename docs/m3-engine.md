@@ -2608,6 +2608,32 @@ as a sleep-like syscall is entered (`pause`, `nanosleep`, `sigsuspend`,
 interrupting that call — EINTR, or re-execution under SA_RESTART — while
 for everything else the handler runs first and the syscall follows.
 
+### Pids, mmap coherence, /proc listings
+
+Three small entries from the ledger, one fixture (`tools/fixtures/procpid.c`,
+`procpid`), byte-identical to native:
+
+**Distinct pids.** `getpid` answered 1 in every engine. Each child engine
+now carries the pid its parent's fork assigned and the parent's pid as
+`ppid` (a tail-exec keeps its own identity), and a fork child still inside
+its vfork window answers with its own pid while it is the current thread;
+`kill`, `/proc/self/status` and `/proc/self/stat` use the same numbers. So
+the child's `getpid()` equals what `fork()` returned in the parent and its
+`getppid()` equals the parent's pid.
+
+**mmap coherence.** A file written through a descriptor after being mapped
+did not change the mapping, and a store through a shared writable mapping
+was invisible to `read()` until `msync`/`munmap`. Now a descriptor write
+(`write`, `pwrite`) lands in every live mapping of the path that overlaps
+the written range, and a descriptor read (`read`, `pread`) of a path with
+shared writable mappings first copies those mappings back — both
+directions are coherent without an explicit sync, as on Linux where they
+share the page cache.
+
+**/proc listings.** `dirEntries` adds the synthetic tree, so `ls /proc`,
+`/proc/self`, `/proc/self/fd` (the open descriptors), `/proc/self/task`
+(live threads), `/proc/sys/*` and `/dev` enumerate what `_synth` answers.
+
 
 **The one bug that stood between compile and link was in `read`, not the
 linker.** The full link completed and produced a structurally perfect ELF,

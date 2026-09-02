@@ -1075,7 +1075,7 @@ export class LinuxEngine {
       case '/proc/self/status': {
         const threads = this.threads.filter(t => t.state !== 'dead').length;
         const rss = Math.min(memKB, Number(this.brk - this.base) / 1024 | 0);
-        return enc(`Name:\t${comm}\nUmask:\t0022\nState:\tR (running)\nTgid:\t1\nNgid:\t0\nPid:\t1\nPPid:\t0\n` +
+        return enc(`Name:\t${comm}\nUmask:\t0022\nState:\tR (running)\nTgid:\t${this.pid ?? 1}\nNgid:\t0\nPid:\t${this.pid ?? 1}\nPPid:\t${this.ppid ?? 0}\n` +
           `TracerPid:\t0\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nFDSize:\t64\nGroups:\t0\nNStgid:\t1\nNSpid:\t1\nNSpgid:\t1\nNSsid:\t1\n` +
           `VmPeak:\t${memKB} kB\nVmSize:\t${memKB} kB\nVmLck:\t0 kB\nVmPin:\t0 kB\nVmHWM:\t${rss} kB\nVmRSS:\t${rss} kB\n` +
           `RssAnon:\t${rss} kB\nRssFile:\t0 kB\nRssShmem:\t0 kB\nVmData:\t${rss} kB\nVmStk:\t132 kB\nVmExe:\t4 kB\nVmLib:\t0 kB\nVmPTE:\t4 kB\nVmSwap:\t0 kB\n` +
@@ -1086,7 +1086,7 @@ export class LinuxEngine {
       }
       case '/proc/self/stat': {
         const rssPages = Math.max(1, Number(this.brk - this.base) / 4096 | 0);
-        return enc(`1 (${comm}) R 0 1 1 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 ${this.threads.filter(t => t.state !== 'dead').length} 0 0 ${memKB * 1024} ${rssPages} 18446744073709551615 ` +
+        return enc(`${this.pid ?? 1} (${comm}) R ${this.ppid ?? 0} ${this.pid ?? 1} ${this.pid ?? 1} 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 ${this.threads.filter(t => t.state !== 'dead').length} 0 0 ${memKB * 1024} ${rssPages} 18446744073709551615 ` +
           `${this.base} ${this.brk} ${this.stackTop} 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n`);
       }
       case '/proc/self/statm': return enc(`${memKB / 4 | 0} ${Number(this.brk - this.base) / 4096 | 0} 0 1 0 ${Number(this.brk - this.base) / 4096 | 0} 0\n`);
@@ -1180,6 +1180,24 @@ export class LinuxEngine {
       const rest = l.slice(pre.length);
       if (rest && rest.indexOf('/') < 0) names.set(rest, false);
     }
+    // the synthetic /proc and /dev trees list what _synth answers
+    const synth = {
+      '/proc': [['self', true], ['sys', true], ['cpuinfo', false], ['meminfo', false], ['mounts', false], ['filesystems', false],
+                ['version', false], ['uptime', false], ['loadavg', false], ['stat', false], [String(this.pid ?? 1), true]],
+      '/proc/self': [['cmdline', false], ['environ', false], ['exe', false], ['comm', false], ['maps', false], ['smaps', false],
+                     ['status', false], ['stat', false], ['statm', false], ['mounts', false], ['mountinfo', false], ['limits', false],
+                     ['fd', true], ['task', true]],
+      '/proc/self/fd': [...this.fds.keys()].map(fd => [String(fd), false]),
+      '/proc/self/task': [...this.threads.filter(t => t.state !== 'dead').map(t => [String(t.id), true])],
+      '/proc/sys': [['kernel', true], ['vm', true], ['fs', true]],
+      '/proc/sys/kernel': [['osrelease', false], ['ostype', false], ['version', false], ['hostname', false], ['pid_max', false],
+                           ['threads-max', false], ['ngroups_max', false], ['cap_last_cap', false], ['random', true]],
+      '/proc/sys/kernel/random': [['boot_id', false], ['uuid', false]],
+      '/proc/sys/vm': [['overcommit_memory', false], ['max_map_count', false]],
+      '/proc/sys/fs': [['file-max', false], ['nr_open', false], ['pipe-max-size', false]],
+      '/dev': [['null', false], ['zero', false], ['urandom', false], ['random', false], ['tty', false], ['ptmx', false], ['pts', true]],
+    }[p.replace(/^\/proc\/\d+(\/|$)/, '/proc/self$1')];
+    if (synth) for (const [n, d] of synth) names.set(n, d);
     // every real directory has these; without them find's recursive walk
     // never terminates (it re-opens the parent forever) and rm -r/du misread
     // the tree
@@ -1378,7 +1396,9 @@ export class LinuxEngine {
           nb.set(h.bytes); h.bytes = nb;
           this.files[h.path] = nb;                           // growable buffer: refresh the map ref
         }
-        h.bytes.set(bytes, h.pos); h.pos = end;
+        h.bytes.set(bytes, h.pos);
+        this._mapsAbsorb(h.path, h.pos, bytes);              // coherence: mapped pages see the write
+        h.pos = end;
         return;
       }
       const str = new TextDecoder().decode(bytes);
@@ -1718,6 +1738,7 @@ export class LinuxEngine {
           // slices to it and adopts its exit code.
           const pid = (this.nextPid = (this.nextPid ?? 999) + 1);
           const rec = { pid, eng: ceng, exited: null };
+          ceng.pid = this.pid ?? 1; ceng.ppid = this.ppid ?? 0;   // a tail-exec IS this process
           (this.children ??= []).push(rec);
           this._execed = rec;
           this._pipeEofSweep(skipped);
@@ -1728,6 +1749,7 @@ export class LinuxEngine {
           this.block(null); break;
         }
         (this.children ??= []).push({ pid: t.proc.pid, eng: ceng, exited: null });
+        ceng.pid = t.proc.pid; ceng.ppid = this.pid ?? 1;
         t.state = 'dead';
         this._pipeEofSweep(skipped);
         this._vforkRollback(t);
@@ -1813,7 +1835,7 @@ export class LinuxEngine {
           (abs ? (Number(a1) === 0 ? tms - Date.now() + now : tms) : now + tms);
         if (now >= deadline) { this._deadline = null; ret(0n); break; }
         this._deadline = deadline; this.block(deadline); break; }
-      case 39: ret(1n); break;                               // getpid
+      case 39: ret(BigInt(this.threads[this.ti].proc?.pid ?? this.pid ?? 1)); break;   // getpid: a vfork-window child has its own
       case 62: case 200: case 234: {                         // kill / tkill / tgkill
         // signal delivery to SELF with a fatal signal takes the default
         // action: terminate with the shell-convention 128+sig status. No
@@ -1828,7 +1850,8 @@ export class LinuxEngine {
           const pid = Number(BigInt.asIntN(32, a1));
           const kid = (this.children ?? []).find(c => c.pid === pid && c.exited === null);
           if (kid) { kid.eng.raiseSignal(sig, null, { pid: 1, code: 0 }); ret(0n); break; }
-          if (pid > 1 && pid !== this.pid) { ret(-3n); break; }   // ESRCH: no such process here
+          const self = this.threads[this.ti].proc?.pid ?? this.pid ?? 1;
+          if (pid > 1 && pid !== self) { ret(-3n); break; }         // ESRCH: no such process here
           this.raiseSignal(sig, null, { pid: 1, code: 0 });         // SI_USER, process-directed
         } else {
           const tid = Number(nr === 200 ? a1 : a2);
@@ -1992,6 +2015,7 @@ export class LinuxEngine {
           if (h.gen === 'zero') dst.fill(0); else for (let i = 0; i < n; i += 65536) crypto.getRandomValues(dst.subarray(i, Math.min(n, i + 65536)));
           h.pos += n; ret(BigInt(n)); break;
         }
+        if (h.path && this.maps?.length) this._mapsFlushPath(h.path);   // coherence: mapped stores reach the read
         // A read at or past EOF returns 0 and must NOT move the position.
         // Without the max(0,...), a read whose offset is beyond the current
         // file length (h.pos > h.bytes.length — routine while a linker writes
@@ -2091,6 +2115,7 @@ export class LinuxEngine {
         const h = this.fds.get(Number(a1));
         if (!h) { ret(-9n); break; }
         const fo = Number(cpu.regs[10]);
+        if (h.path && this.maps?.length) this._mapsFlushPath(h.path);
         const n = Math.min(Number(a3), Math.max(0, h.bytes.length - fo));
         if (n > 0) { this.jsnap(a2, n); this.ram.set(h.bytes.subarray(fo, fo + n), Number(a2 - this.base)); }
         ret(BigInt(n)); break; }
@@ -2117,6 +2142,7 @@ export class LinuxEngine {
         }
         if (h.path) (this.dirtyFiles ??= new Set()).add(h.path);
         h.bytes.set(bytes, off);                              // position unchanged
+        this._mapsAbsorb(h.path, off, bytes);
         ret(a3); break; }
       case 21: { const p = this.readPath(a1); ret(this.lookup(p) !== undefined || this.isDir(p) ? 0n : -2n); break; }   // access
       case 269: { const p = this.atPath(a1, a2); ret(this.lookup(p) !== undefined || this.isDir(p) ? 0n : -2n); break; }  // faccessat
@@ -2455,7 +2481,7 @@ export class LinuxEngine {
         }
         ret(0n); break; }                                     // F_GETFD/F_SETFD/...
       case 28: ret(0n); break;                                // madvise
-      case 110: ret(0n); break;                               // getppid
+      case 110: ret(BigInt(this.threads[this.ti].proc ? (this.pid ?? 1) : (this.ppid ?? 0))); break;   // getppid
       // Job control: a shell loops on getpgrp() != tcgetpgrp(fd) until they
       // agree, so these must match what TIOCGPGRP reports. Leaving getpgrp
       // unimplemented made dash spin forever — 1.28M ioctls in one run.
@@ -2782,6 +2808,18 @@ export class LinuxEngine {
     if (m.h.bytes !== cur) m.h.bytes = cur;
     (this.dirtyFiles ??= new Set()).add(m.path);
   }
+  // a write through a descriptor lands in every live mapping of the path
+  _mapsAbsorb(path, fileOff, bytes) {
+    if (!path || !this.maps) return;
+    for (const m of this.maps) {
+      if (m.path !== path) continue;
+      const lo = Math.max(fileOff, m.fileOff), hi = Math.min(fileOff + bytes.length, m.fileOff + Number(m.len));
+      if (hi <= lo) continue;
+      this.ram.set(bytes.subarray(lo - fileOff, hi - fileOff), Number(m.at - this.base) + (lo - m.fileOff));
+    }
+  }
+  // stores through a shared writable mapping reach a descriptor read
+  _mapsFlushPath(path) { for (const m of this.maps) if (m.shared && m.path === path) this._writeBackMap(m); }
   _unmapRange(lo, hi) {
     if (!this.maps) return;
     for (const m of this.maps) if (m.shared && m.at < hi && m.at + m.len > lo) this._writeBackMap(m);
@@ -3154,6 +3192,7 @@ export class LinuxEngine {
     const parent = t.proc.parent;
     parent.state = 'run';
     (this.children ??= []).push({ pid: t.proc.pid, eng: ceng, exited: null });
+    ceng.pid = t.proc.pid; ceng.ppid = this.pid ?? 1;
     this.blocked = null;
     this._deadline = null;
     this.switchTo(this.threads.indexOf(parent));
