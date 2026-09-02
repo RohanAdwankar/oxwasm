@@ -2485,6 +2485,40 @@ order-independent (the read end is closed before the fork); the model gap
 itself — a real fork with copy-on-write pages and a runnable parent — is
 recorded as the next structural item.
 
+### Fork materialisation: the vfork window pays for its copy only when it must
+
+The 64KB pipe bound made the structural gap urgent: busybox runs many
+applets (`seq`, `yes`, `echo` …) in the forked child *without* an exec, so
+`x=$(seq 1 30000)` — 170KB into a substitution pipe the frozen parent is
+supposed to be reading — would now block the child with nobody to drain it.
+
+The fix keeps the vfork window (fork+exec still costs no memory copy) and
+adds one rule in `park()`: **a fork child that blocks inside its window is
+materialised into a real child process.** `_materializeFork` builds a new
+engine from the same image and options (the constructor's arguments are
+kept for this), copies the RAM *as the child sees it* (its own writes
+included), hands it the copied fd table, cwd and signal dispositions, seeds
+its CPU from the thread (rip at the syscall it blocked in, so it simply
+re-executes there; an interrupted `nanosleep` keeps its deadline), then
+rolls the parent's journal back and releases the parent. From there the
+child is driven by the child pump exactly like an execve'd child — SIGCHLD,
+pipe EOF and `wait4` all already work that way. The child starts cold in
+the tiers, since compiled units are bound to the parent's memory. A child
+that has live in-engine children of its own stays in the window (they are
+threads of this engine).
+
+`tools/fixtures/forkblock.c` (`forkblock`) checks both blocking shapes and
+copy-on-write in both directions: the child writes 200KB into a pipe and
+the parent reads it all and reaps exit 3; then the child sets a global to 7
+*before* blocking on a read the parent has yet to satisfy, and after the
+exchange the parent still prints 1 while the child reports 7. `bb-subst`
+is the busybox case that motivated it. Both byte-compare to native.
+
+The remaining fork divergence is the ordering inside the window: the child
+runs first, so a race the parent would normally win natively (closing its
+end of a pipe before the child writes) resolves the other way. Semantics
+are POSIX-legal either way; fixtures are written order-independent.
+
 
 **The one bug that stood between compile and link was in `read`, not the
 linker.** The full link completed and produced a structurally perfect ELF,

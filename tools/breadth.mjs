@@ -102,6 +102,11 @@ if (!existsSync(MSHARED)) {
   try { execFileSync('gcc', ['-O1', '-o', MSHARED,
                              new URL('./fixtures/mshared.c', import.meta.url).pathname]); } catch {}
 }
+const FORKBLOCK = '/tmp/breadth_forkblock';
+if (!existsSync(FORKBLOCK)) {
+  try { execFileSync('gcc', ['-O1', '-o', FORKBLOCK,
+                             new URL('./fixtures/forkblock.c', import.meta.url).pathname]); } catch {}
+}
 const EPIPE = '/tmp/breadth_epipe';
 if (!existsSync(EPIPE)) {
   try { execFileSync('gcc', ['-O1', '-o', EPIPE,
@@ -281,6 +286,13 @@ const CASES = [
   // SIGPIPE/EPIPE: writes to a reader-less pipe under SIG_IGN, a handler,
   // and the default action (a forked child killed, WIFSIGNALED reported)
   ['epipe',     '/tmp/breadth_epipe', []],
+  // fork materialisation: a child that blocks before exec/exit (fills a pipe
+  // past 64KB; reads before the parent writes) becomes a real child engine
+  // instead of freezing its parent; memory is private both ways.
+  ['forkblock', '/tmp/breadth_forkblock', []],
+  // the same through busybox: a NOEXEC applet's 170KB command substitution
+  ['bb-subst',  '/usr/bin/busybox', ['sh', '-c', 'x=$(seq 1 30000); echo ${#x}'],
+                { bins: ['/usr/bin/busybox'] }],
   // the classic: head exits, yes must die of SIGPIPE instead of filling a
   // dead pipe forever; bash reports the killed stage's status (141)
   ['sigpipe-sh','/bin/bash', ['-c', 'yes | head -1; echo "${PIPESTATUS[0]} ${PIPESTATUS[1]}"'],

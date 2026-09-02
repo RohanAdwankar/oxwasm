@@ -42,6 +42,10 @@ export class LinuxEngine {
                           xserver = null, mtimes = {}, tty = false, ttyRows = 24, ttyCols = 80,
                           stdin = null } = {}) {
     this.files = files;                       // path -> Uint8Array (read-only)
+    // kept for fork materialisation: a blocked vfork-window child becomes a
+    // real child engine built from the same image and options
+    this._ctor = { elfBytes, argv, env, memMB, threshold, assembleWat, aotCallThreshold, aotLoopThreshold,
+                   xserver, mtimes, tty, ttyRows, ttyCols, stdin };
     // Terminal mode: with it off, ioctl answers ENOTTY for everything, so
     // isatty() is false, `tty` prints "not a tty", stty fails outright and a
     // shell disables job control. With it on the standard fds and /dev/tty
@@ -1182,6 +1186,14 @@ export class LinuxEngine {
   // run() should surface this.blocked (earliest deadline) to the host.
   park() {
     const t = this.threads[this.ti];
+    // A fork child that BLOCKS inside its vfork window (reads a pipe the
+    // parent has yet to write, fills a 64KB pipe the parent has yet to
+    // drain, sleeps) would otherwise freeze its parent forever: the window
+    // exists so that fork+exec costs no memory copy, and it is only when the
+    // child needs the parent to run that the copy is paid.
+    if (t.proc && this.blocked && t.state !== 'dead' && t.state !== 'vfork' &&
+        !this.threads.some(x => x !== t && x.state !== 'dead' && x.proc?.parent === t))
+      return this._materializeFork(t);
     if (t.state !== 'dead' && t.state !== 'vfork') {   // vfork: parent stays
       t.state = 'blk'; t.dl = this.blocked?.deadline ?? null;   // suspended (child
       t.futex = this._futexAddr; t._dl = this._deadline;        // owns the stack)
@@ -2761,6 +2773,50 @@ export class LinuxEngine {
     try { jr.push([addr, 0, 0n, this.mem.view(addr, BigInt(len)).slice()]); } catch {}
   }
 
+  // Turn the vfork-window child thread `t` into a real child process: a new
+  // engine over a COPY of the memory as the child sees it (its own writes
+  // included), its copied fd table, cwd and signal dispositions, resuming at
+  // the syscall it blocked in. Then the journal is rolled back so the parent
+  // sees memory as it was at the fork, and the parent runs again. The child
+  // starts cold in the tiers (compiled units are bound to the parent's
+  // memory) and is driven by the child pump like an execve'd child.
+  _materializeFork(t) {
+    const o = this._ctor;
+    const ceng = new LinuxEngine(o.elfBytes, {
+      argv: o.argv, env: o.env, memMB: o.memMB, threshold: o.threshold, files: this.files,
+      assembleWat: o.assembleWat, aotCallThreshold: o.aotCallThreshold, aotLoopThreshold: o.aotLoopThreshold,
+      xserver: o.xserver, mtimes: o.mtimes, tty: o.tty, ttyRows: o.ttyRows, ttyCols: o.ttyCols, stdin: o.stdin });
+    ceng.ram.set(this.ram);                                  // the child's view, before rollback
+    ceng.brk = this.brk; ceng.mmapNext = this.mmapNext;
+    ceng.execRanges = this.execRanges.slice();
+    if (this.execRangesStatic) ceng.execRangesStatic = this.execRangesStatic.slice();
+    ceng.maps = (this.maps ?? []).map(m => ({ ...m }));
+    ceng.cwd = this.cwd;                                     // the child's cwd (its chdir stays with it)
+    ceng.fds = t.proc.fds; ceng.cloexec = new Set(this.cloexec);
+    ceng.sigact = new Map(this.sigact ?? []); ceng.sigign = new Set(this.sigign ?? []);
+    ceng.termios = this.termios; ceng.ptys = this.ptys; ceng.ttyWin = this.ttyWin;
+    ceng.env = this.env; ceng.argv0 = this.argv0;
+    const c = ceng.cpu;
+    for (let r = 0; r < 16; r++) c.regs[r] = t.cpu.regs[r];
+    for (let r = 0; r < 16; r++) c.xmm[r] = t.cpu.xmm[r] ?? 0n;
+    c.rip = t.cpu.rip; c.fsBase = t.cpu.fsBase; Object.assign(c.f, t.cpu.f);
+    ceng._deadline = this._deadline;                         // an interrupted nanosleep keeps its deadline
+    ceng.threads[0].sigmask = t.sigmask ?? 0n;
+    ceng.blocked = null;
+    if (this.asyncCompile) ceng.asyncCompile = this.asyncCompile;
+    ceng.unitMaxFuncs = this.childUnitMaxFuncs ?? 24; ceng.unitMaxInsns = this.childUnitMaxInsns ?? 4000;
+    ceng.parentEng = this;
+    // retire the thread, restore the parent's memory and release it
+    t.state = 'dead';
+    this._vforkRollback(t);
+    const parent = t.proc.parent;
+    parent.state = 'run';
+    (this.children ??= []).push({ pid: t.proc.pid, eng: ceng, exited: null });
+    this.blocked = null;
+    this._deadline = null;
+    this.switchTo(this.threads.indexOf(parent));
+    return true;
+  }
   _vforkRollback(t) {
     // the vfork child runs IN this engine, so its chdir (tar -C, cd in a
     // subshell) must not follow the parent out of the window
