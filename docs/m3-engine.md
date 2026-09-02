@@ -2348,6 +2348,94 @@ byte-identical to native g++'s, which runs and prints (`gpp-link` in
 breadth, ~5 min under the engine for the heavier translation load). No
 new engine work was needed — the read-past-EOF clamp was the whole gap.
 
+### Signals: real delivery, at the kernel's checkpoints
+
+Until now `rt_sigaction` was a stored no-op: handlers were recorded
+nowhere, and the only "delivery" was the default action (a self-directed
+fatal signal terminated with 128+sig). Anything that relies on SIGALRM,
+SIGCHLD, SIGINT, `pause`, `sigsuspend` or timers simply hung or died. The
+subsystem is now modelled the way the kernel does it, and it is exercised
+by `tools/fixtures/signal.c` (`signal` in breadth), whose seven scenarios
+byte-compare to native: an SA_SIGINFO handler entered by `raise()` with
+`si_signo`/`si_code` checked and a live computation intact across it, a
+signal blocked with `sigprocmask` held pending until unblocked
+(`sigpending` sees it), `setitimer` + `pause` returning EINTR after
+SIGALRM, an interrupted `nanosleep` (no SA_RESTART → EINTR), SIGCHLD from a
+`fork`ed child's `_exit` reaped with `waitpid` inside the handler,
+`sigsuspend`, and SA_RESETHAND.
+
+**State.** Actions are per process (`sigact`: sig → handler, flags,
+restorer, mask; SIG_IGN kept in `sigign`); the blocked mask, pending set,
+alternate stack and the "a signal woke me" bit are per thread.
+
+**Checkpoints.** Delivery happens only where the kernel delivers — on the
+way back to user code — at three places: `_sigExit`, at the end of every
+syscall (a self-`raise` lands here); `_sigEntry`, at the start of a
+syscall a thread is re-executing after a signal woke it out of a blocking
+call (`raiseSignal` flips a parked thread to runnable and marks it
+`eintr`), which is where EINTR versus SA_RESTART is decided — the syscall
+does not run, rax is −EINTR with the saved rip past the instruction, or
+the saved rip is the instruction itself so it re-executes after the
+handler; `pause`/`sigsuspend` never restart, and a pending signal at their
+entry returns EINTR at once; and `_sigPoll`, once per run-loop iteration
+(a single boolean when nothing is pending), so a signal raised into a
+computing thread lands at the next instruction boundary.
+
+**The frame.** A real x86-64 `rt_sigframe` is pushed below the red zone
+(or on the `sigaltstack` under SA_ONSTACK), 16-aligned minus 8 as at a
+call: pretcode = the SA_RESTORER, then a full `ucontext` with
+`uc_mcontext.gregs` in the kernel's order, eflags, cs/ss, the saved
+`uc_sigmask` (the *pre-`sigsuspend`* mask when that is what is being
+restored), and a 128-byte `siginfo` with `si_signo`, `si_code`
+(SI_USER/SI_TKILL/SI_KERNEL/CLD_EXITED) and `si_pid`/`si_status`. The
+handler gets rdi/rsi/rdx = sig, &info, &uc with DF clear; the mask is
+widened by `sa_mask` plus the signal itself unless SA_NODEFER.
+`rt_sigreturn` restores every general register, rip, the arithmetic flags
+and the mask from that frame — nothing is kept on the host side, so a
+handler that longjmps out is fine.
+
+**Compiled code.** From a wasm unit the syscall import runs the same
+`syscall()`; if delivery or `rt_sigreturn` moved rip, the import publishes
+the registers and throws `DeoptUnwind` so the unit's frame unwinds and
+`_run1` resumes at the new rip — the unit would otherwise have carried on
+at its own next instruction. The first AOT run of the fixture found the
+one real gap in the design: a fork child that exits *without* exec takes
+the in-engine exit path, not the child pump, and raised no SIGCHLD; the
+parent then re-entered `pause` forever. The exit path now raises SIGCHLD
+to the parent thread explicitly.
+
+**Timers and sources.** `alarm`/`setitimer`/`getitimer` keep one
+ITIMER_REAL (one-shot or interval) checked by `reapTimers` (so a parked
+thread wakes for it) and folded into the host-facing deadline; SIGCHLD
+comes from both child paths; `kill` to a child pid reaches that child's
+engine; `tkill`/`tgkill` target a thread. Default actions: terminate,
+except CHLD/CONT/URG/WINCH (ignored) and the stop signals (not
+modelled). Not yet modelled: SIGPIPE on a write to a reader-less pipe,
+`rt_sigtimedwait`/`signalfd`, per-thread ITIMER_VIRTUAL/PROF, and
+delivery into a vfork-window child.
+
+**A harness lesson that looked like an engine bug.** With the AOT tier on,
+`breadth` reported the fixture never exiting while the same binary passed
+under a bare runner — not a compiled-code fault at all: the harness wakes
+a blocked engine *immediately* and counts iterations, so its guard of
+4000 burned out in ~40 ms of wall time, before the 20 ms timers were due.
+The harness now sleeps until the engine's reported deadline (as the
+browser pump does) and does not count a deadline wait as a no-progress
+iteration.
+
+**The one real regression, caught by the suite's shell test.** busybox
+`sh -c` tail-execs its last command without a fork; the engine keeps the
+old shell image parked so that its re-stepped `execve` blocks forever
+while the replacement runs. When the replacement (`cat`) exited, the child
+pump raised SIGCHLD *on the old engine*, delivery marked its retired thread
+interrupted, and the re-stepped `execve` came back EINTR instead of
+re-blocking — the dead shell printed "cat: Interrupted system call" and
+exited 126 with byte-perfect stdout. A signal to a process whose image has
+been replaced (`_execed`) is now dropped, and no checkpoint delivers to a
+dead thread. Gate: engine/test.sh (316/316 hardware differentials, the
+shell pipeline exact) and the full breadth sweep, both green.
+
+
 **The one bug that stood between compile and link was in `read`, not the
 linker.** The full link completed and produced a structurally perfect ELF,
 but `ld` left **`_start` zero-filled** (0x1060–0x1085, the 38 bytes from

@@ -84,6 +84,17 @@ if (!existsSync(THREAD)) {
                              new URL('./fixtures/thread.c', import.meta.url).pathname]); } catch {}
 }
 
+// The signal fixture (tools/fixtures/signal.c): sigaction+raise with
+// SA_SIGINFO, a blocked signal held pending, setitimer+pause -> EINTR, an
+// interrupted nanosleep, SIGCHLD reaped in the handler, sigsuspend and
+// SA_RESETHAND. Every printed value is program-determined, not timing-
+// determined, so it byte-compares to native.
+const SIGNAL = '/tmp/breadth_signal';
+if (!existsSync(SIGNAL)) {
+  try { execFileSync('gcc', ['-O1', '-o', SIGNAL,
+                             new URL('./fixtures/signal.c', import.meta.url).pathname]); } catch {}
+}
+
 // A C source for the compiler cases, written once like IN.
 const HELLO_C = '/tmp/breadth_hello.c';
 if (!existsSync(HELLO_C))
@@ -247,6 +258,9 @@ const CASES = [
   // the concurrency lane: 8 pthreads, 200k mutex-protected increments each.
   // Prints 1600000 iff clone/futex/scheduler lose no update under contention.
   ['thread',    '/tmp/breadth_thread', []],
+  // the signal lane: real handler delivery (rt_sigframe, rt_sigreturn),
+  // EINTR/restart semantics, timers, SIGCHLD, masks. See fixtures/signal.c.
+  ['signal',    '/tmp/breadth_signal', []],
   // binutils: libbfd + libopcodes, a whole codebase the coreutils cases never
   // touch. The input ELF (/bin/true) is provisioned as a read-only file; every
   // tool's output is a pure function of its bytes, so it byte-compares.
@@ -326,9 +340,17 @@ const engine = (bin, args, stdin, opts = {}) => {
   let err = null;
   try {
     let guard = 0;
+    // A blocked engine with a future deadline is WAITING (nanosleep, an
+    // itimer, a poll timeout): sleep until then like a real host would,
+    // instead of spinning through the guard in a few ms of wall time.
+    const nap = new Int32Array(new SharedArrayBuffer(4));
     while (eng.exitCode === null) {
       eng.run(5e7);
-      if (eng.blocked) eng.wake();
+      if (eng.blocked) {
+        const dl = eng.blocked.deadline;
+        if (dl != null && isFinite(dl)) { const ms = dl - eng.nowMs(); if (ms > 0) { Atomics.wait(nap, 0, 0, Math.min(ms, 1000)); guard--; } }
+        eng.wake();
+      }
       if (++guard > 4000) { err = 'no exit after 200e9 steps'; break; }
     }
   } catch (e) { err = e.message; }

@@ -727,6 +727,7 @@ export class LinuxEngine {
         // the child thread from cpu.rip (a stale value sent a pthread into
         // the weeds); the blocked path below rewinds it for re-execution
         this.cpu.rip = BigInt.asUintN(64, (rip ?? 0n) + 2n);
+        this._sigRedirected = false;
         this.syscall(this.cpu);
         if (this.exitCode !== null) throw EXIT;
         if (this.blocked) {
@@ -735,6 +736,11 @@ export class LinuxEngine {
           throw new BlockUnwind(this.cpu.rip);
         }
         this.syncOut();
+        // A signal handler (or rt_sigreturn) redirected rip: the compiled
+        // unit would otherwise carry on at its own next instruction. Unwind
+        // to the top loop, which resumes at the new rip with the state just
+        // published.
+        if (this._sigRedirected) { this._sigRedirected = false; throw new DeoptUnwind(this.cpu.rip); }
       },
       callout: (target) => {
         target = BigInt.asUintN(64, target);
@@ -1161,6 +1167,7 @@ export class LinuxEngine {
         this.aotBudget = this._vforkBudget; this._vforkBudget = undefined; } }
   }
   reapTimers() { const now = this.nowMs();
+    if (this.itimer?.at != null) this._checkAlarm();
     for (const t of this.threads)
       if (t.state === 'blk' && t.dl != null && now >= t.dl) { t.state = 'run'; t.futex = null; } }
   futexWake(addr, max) { let n = 0;
@@ -1186,6 +1193,7 @@ export class LinuxEngine {
     }
     let dl = null;
     for (const x of this.threads) if (x.state === 'blk' && x.dl != null) dl = dl == null ? x.dl : Math.min(dl, x.dl);
+    if (this.itimer?.at != null) dl = dl == null ? this.itimer.at : Math.min(dl, this.itimer.at);   // SIGALRM due
     this.blocked = { deadline: dl };
     return false;
   }
@@ -1261,6 +1269,7 @@ export class LinuxEngine {
       if (h?.sink === 'err') { (root.stderr ||= []).push(str); (root.stderrBytes ||= []).push(bytes); }
       else { root.stdout.push(str); root.stdoutBytes.push(bytes); }
     };
+    if (this._sigEntry(cpu, nr)) return;                  // signal delivery: interrupted / pending
     switch (nr) {
       case 1:                                                // write(fd, buf, len)
         writeChunk(Number(a1), a2, Number(a3)); ret(a3); break;
@@ -1608,6 +1617,8 @@ export class LinuxEngine {
           this._vforkRollback(t);
           t.proc.parent.state = 'run';
           (this.children ??= []).push({ pid: t.proc.pid, eng: null, exited: Number(a1 & 0xffn) });
+          // SIGCHLD to the PARENT thread (the current thread is the dying child)
+          this.raiseSignal(17, t.proc.parent.id, { pid: t.proc.pid, code: 1, status: Number(a1 & 0xffn) });
           this.block(null); ret(0n); break;
         }
         if (nr === 231 || this.threads.filter(x => x.state !== 'dead').length <= 1) {
@@ -1652,7 +1663,18 @@ export class LinuxEngine {
         // where native dies 134. sig 0 stays a liveness probe.
         const sig = Number(nr === 62 ? a2 : a3);
         if (sig === 0) { ret(0n); break; }
-        if (Number(a1) <= 1) { this.exitCode = 128 + sig; cpu.halted = true; }
+        if (sig < 1 || sig > 64) { ret(-22n); break; }
+        if (nr === 62) {
+          const pid = Number(BigInt.asIntN(32, a1));
+          const kid = (this.children ?? []).find(c => c.pid === pid && c.exited === null);
+          if (kid) { kid.eng.raiseSignal(sig, null, { pid: 1, code: 0 }); ret(0n); break; }
+          if (pid > 1 && pid !== this.pid) { ret(-3n); break; }   // ESRCH: no such process here
+          this.raiseSignal(sig, null, { pid: 1, code: 0 });         // SI_USER, process-directed
+        } else {
+          const tid = Number(nr === 200 ? a1 : a2);
+          if (!this.threads.some(t => t.id === tid) && tid > 1) { ret(-3n); break; }
+          this.raiseSignal(sig, tid <= 1 ? this.threads[0].id : tid, { pid: 1, code: -6 });   // SI_TKILL
+        }
         ret(0n); break; }
       case 102: case 104: case 107: case 108: ret(0n); break; // getuid/getgid/geteuid/getegid
       // Credentials and ownership are single-user here: everything runs as
@@ -2015,8 +2037,77 @@ export class LinuxEngine {
         }
         this._deadline ??= (timeoutMs < 0 ? Infinity : now + timeoutMs);
         this.block(this._deadline === Infinity ? null : this._deadline); break; }
-      case 13: case 14: ret(0n); break;                       // rt_sigaction / rt_sigprocmask
-      case 131: ret(0n); break;                               // sigaltstack
+      case 13: {                                              // rt_sigaction(sig, act*, oldact*, sz)
+        const sig = Number(a1);
+        if (sig < 1 || sig > 64 || sig === 9 || sig === 19) { ret(-22n); break; }   // EINVAL
+        const acts = (this.sigact ??= new Map());
+        if (a3) {                                             // report the old action
+          const o = acts.get(sig) ?? { handler: 0n, flags: 0n, restorer: 0n, mask: 0n };
+          this.jsnap(a3, 32);
+          this.mem.write(a3, 8n, o.handler); this.mem.write(a3 + 8n, 8n, o.flags);
+          this.mem.write(a3 + 16n, 8n, o.restorer); this.mem.write(a3 + 24n, 8n, o.mask);
+        }
+        if (a2) {
+          const act = { handler: this.mem.read(a2, 8n), flags: this.mem.read(a2 + 8n, 8n),
+                        restorer: this.mem.read(a2 + 16n, 8n), mask: this.mem.read(a2 + 24n, 8n) };
+          if (act.handler === 0n || act.handler === 1n) acts.delete(sig); else acts.set(sig, act);
+          if (act.handler === 1n) (this.sigign ??= new Set()).add(sig); else this.sigign?.delete(sig);
+        }
+        ret(0n); break; }
+      case 14: {                                              // rt_sigprocmask(how, set*, oldset*, sz)
+        const t = this._ts(this.threads[this.ti]);
+        if (a3) { this.jsnap(a3, 8); this.mem.write(a3, 8n, t.sigmask); }
+        if (a2) {
+          const m = this.mem.read(a2, 8n), how = Number(a1);
+          const CANT = (1n << 8n) | (1n << 18n);              // SIGKILL / SIGSTOP never block
+          if (how === 0) t.sigmask |= (m & ~CANT);            // SIG_BLOCK
+          else if (how === 1) t.sigmask &= ~m;                // SIG_UNBLOCK
+          else if (how === 2) t.sigmask = m & ~CANT;          // SIG_SETMASK
+          else { ret(-22n); break; }
+        }
+        ret(0n); break; }
+      case 15: this._sigreturn(cpu); break;                   // rt_sigreturn
+      case 34: {                                              // pause(): until a handler has run
+        this.block(null); break; }
+      case 36: {                                              // getitimer(which, cur*)
+        const it = this.itimer ?? { at: null, interval: 0 };
+        const left = it.at == null ? 0 : Math.max(0, it.at - this.nowMs());
+        this._writeItimerval(a2, it.interval, left); ret(0n); break; }
+      case 37: {                                              // alarm(seconds)
+        const it = (this.itimer ??= { at: null, interval: 0 });
+        const leftMs = it.at == null ? 0 : Math.max(0, it.at - this.nowMs());
+        const secs = Number(a1);
+        it.interval = 0; it.at = secs === 0 ? null : this.nowMs() + secs * 1000;
+        ret(BigInt(Math.ceil(leftMs / 1000))); break; }
+      case 38: {                                              // setitimer(which, new*, old*)
+        const it = (this.itimer ??= { at: null, interval: 0 });
+        if (a3) { const left = it.at == null ? 0 : Math.max(0, it.at - this.nowMs());
+                  this._writeItimerval(a3, it.interval, left); }
+        if (a2) {
+          const rd = (o) => Number(this.mem.read(a2 + BigInt(o), 8n)) * 1000 + Number(this.mem.read(a2 + BigInt(o) + 8n, 8n)) / 1000;
+          const interval = rd(0), value = rd(16);             // it_interval, it_value (ms)
+          it.interval = interval; it.at = value === 0 ? null : this.nowMs() + value;
+        }
+        ret(0n); break; }
+      case 127: {                                             // rt_sigpending(set*, sz)
+        const t = this._ts(this.threads[this.ti]);
+        this.jsnap(a1, 8); this.mem.write(a1, 8n, t.pending); ret(0n); break; }
+      case 130: {                                             // rt_sigsuspend(mask*, sz)
+        const t = this._ts(this.threads[this.ti]);
+        t.suspendOld = t.sigmask;
+        t.sigmask = this.mem.read(a1, 8n) & ~((1n << 8n) | (1n << 18n));
+        const sig = this._sigDeliverable(t);
+        if (sig) { ret(-4n); this._sigDeliver(cpu, t, sig, cpu.rip); break; }   // EINTR after the handler
+        this.block(null); break; }
+      case 131: {                                             // sigaltstack(new*, old*)
+        const t = this._ts(this.threads[this.ti]);
+        if (a2) { this.jsnap(a2, 24);
+          const st = t.altstack;
+          this.mem.write(a2, 8n, st ? st.sp : 0n); this.mem.write(a2 + 8n, 4n, st ? 0n : 2n);   // SS_DISABLE
+          this.mem.write(a2 + 16n, 8n, st ? st.size : 0n); }
+        if (a1) { const flags = Number(this.mem.read(a1 + 8n, 4n));
+          t.altstack = (flags & 2) ? null : { sp: this.mem.read(a1, 8n), size: this.mem.read(a1 + 16n, 8n) }; }
+        ret(0n); break; }
       case 99: {                                              // sysinfo: modest plausible box
         const o = this.RAMOFF + Number(a1 - this.base);
         new Uint8Array(this.wmem.buffer, o, 112).fill(0);
@@ -2369,6 +2460,172 @@ export class LinuxEngine {
         ret(-38n);                                           // ENOSYS
         (this.unknown ||= new Set()).add(nr);
     }
+    if (this._sigAny) this._sigExit(cpu);                   // signal delivery on return to user
+  }
+
+  // ---- signals -------------------------------------------------------------
+  // Actions are per process (this.sigact: sig -> {handler, flags, restorer,
+  // mask}); the blocked mask, pending set and alternate stack are per thread.
+  // Delivery happens where the kernel does it — on the way back to user code:
+  // at syscall exit (_sigExit), at syscall ENTRY for a thread a signal woke
+  // out of a blocking call (_sigEntry: EINTR, or SA_RESTART re-execution),
+  // and at the run-loop quantum for a thread that is computing (_sigPoll). A
+  // real x86-64 rt_sigframe (ucontext + siginfo at the kernel's offsets) is
+  // pushed so SA_SIGINFO handlers read what they expect and rt_sigreturn
+  // restores exactly what was saved. From compiled code the redirect unwinds
+  // the wasm frame (aotEnv.syscall) so the top loop resumes at the handler.
+  _ts(t) { if (t.sigmask === undefined) { t.sigmask = 0n; t.pending = 0n; t.eintr = false; t.suspendOld = null; t.altstack = null; } return t; }
+  _sigDeliverable(t) {
+    const bits = t.pending & ~t.sigmask;
+    if (bits === 0n) return 0;
+    for (let s = 1; s <= 64; s++) if (bits & (1n << BigInt(s - 1))) return s;
+    return 0;
+  }
+  // raise `sig` on this process (tid null: process-directed) or on thread tid
+  raiseSignal(sig, tid = null, info = {}) {
+    // A main process that tail-exec'd is gone: its old image is only parked
+    // so its re-stepped execve keeps blocking. A signal to it (the child
+    // pump raising SIGCHLD when the replacement exits) must vanish — waking
+    // that image made the re-stepped execve return EINTR and the dead shell
+    // ran on to exit 126.
+    if (this._execed) return;
+    const bit = 1n << BigInt(sig - 1);
+    const act = this.sigact?.get(sig);
+    if (!act) {
+      if (this.sigign?.has(sig)) return;                                        // SIG_IGN
+      if (sig === 17 || sig === 18 || sig === 23 || sig === 28) return;         // default: ignore (CHLD CONT URG WINCH)
+      if (sig === 19 || sig === 20 || sig === 21 || sig === 22) return;         // stop signals: not modelled
+      this.exitCode = 128 + sig; this.cpu.halted = true; return;              // default: terminate
+    }
+    let t = null;
+    const live = (x) => x.state !== 'dead';
+    if (tid != null) t = this.threads.find(x => x.id === tid && live(x)) ?? this.threads.find(live);
+    else {
+      const cur = this.threads[this.ti];
+      t = this.threads.find(x => x === cur && live(x) && !((this._ts(x).sigmask) & bit))
+       ?? this.threads.find(x => live(x) && !((this._ts(x).sigmask) & bit))
+       ?? this.threads.find(live);
+    }
+    if (!t) return;                                                             // nobody left to signal
+    this._ts(t);
+    t.pending |= bit;
+    (t.siginfo ??= new Map()).set(sig, info);
+    this._sigAny = true;
+    // a thread parked in a blocking syscall is woken: it re-executes the
+    // syscall, whose entry checkpoint delivers the signal (EINTR / restart)
+    if (t.state === 'blk' && !(t.sigmask & bit)) { t.state = 'run'; t.futex = null; t.dl = null; t.eintr = true; }
+    if (t === this.threads[this.ti] && this.blocked) { this.blocked = null; t.eintr = true; }
+  }
+  _checkAlarm() {
+    const it = this.itimer; if (!it || it.at == null) return;
+    const now = this.nowMs();
+    if (now < it.at) return;
+    it.at = it.interval > 0 ? now + it.interval : null;
+    this.raiseSignal(14, null, { pid: 0, code: 0x80 });                         // SIGALRM, SI_KERNEL
+  }
+  _writeItimerval(addr, intervalMs, valueMs) {
+    if (!addr) return;
+    this.jsnap(addr, 32);
+    const put = (o, ms) => { this.mem.write(addr + BigInt(o), 8n, BigInt(Math.floor(ms / 1000)));
+                             this.mem.write(addr + BigInt(o) + 8n, 8n, BigInt(Math.floor((ms % 1000) * 1000))); };
+    put(0, intervalMs); put(16, valueMs);
+  }
+  // syscall entry: a signal woke this thread out of a blocking call, or is
+  // pending and unblocked. Returns true if the syscall must not run now.
+  _sigEntry(cpu, nr) {
+    if (!this._sigAny || nr === 15) return false;
+    if (this.itimer?.at != null) this._checkAlarm();
+    const t = this._ts(this.threads[this.ti]);
+    if (t.proc || t.state === 'dead') return false;                             // vfork child / retired image
+    const sig = this._sigDeliverable(t);
+    if (!sig) { t.eintr = false; return false; }
+    const act = this.sigact.get(sig);
+    if (!act) { t.pending &= ~(1n << BigInt(sig - 1)); t.eintr = false; return false; }
+    if (t.eintr) {
+      t.eintr = false;
+      // pause/sigsuspend always return EINTR; others restart under SA_RESTART
+      const restart = (act.flags & 0x10000000n) && nr !== 34 && nr !== 130;
+      if (restart) this._sigDeliver(cpu, t, sig, BigInt.asUintN(64, cpu.rip - 2n));
+      else { if (nr === 35 || nr === 230) this._deadline = null;
+             cpu.regs[0] = BigInt.asUintN(64, -4n); this._sigDeliver(cpu, t, sig, cpu.rip); }
+      return true;
+    }
+    // pending before the call: pause/sigsuspend see it at once and return
+    // EINTR; anything else runs the handler first, then the syscall
+    if (nr === 34 || nr === 130) { cpu.regs[0] = BigInt.asUintN(64, -4n); this._sigDeliver(cpu, t, sig, cpu.rip); }
+    else this._sigDeliver(cpu, t, sig, BigInt.asUintN(64, cpu.rip - 2n));
+    return true;
+  }
+  _sigExit(cpu) {
+    if (this.blocked || this.exitCode !== null) return;
+    const t = this._ts(this.threads[this.ti]);
+    if (t.proc || t.state === 'dead') return;
+    const sig = this._sigDeliverable(t);
+    if (!sig) return;
+    const act = this.sigact.get(sig);
+    if (!act) { t.pending &= ~(1n << BigInt(sig - 1)); return; }
+    this._sigDeliver(cpu, t, sig, cpu.rip);
+  }
+  _sigPoll() {                                                                  // run-loop quantum
+    const t = this._ts(this.threads[this.ti]);
+    if (t.eintr || t.proc || t.state === 'dead') return false;
+    const sig = this._sigDeliverable(t);
+    if (!sig) return false;
+    const act = this.sigact.get(sig);
+    if (!act) { t.pending &= ~(1n << BigInt(sig - 1)); return false; }
+    this._sigDeliver(this.cpu, t, sig, this.cpu.rip);
+    return true;
+  }
+  // push the rt_sigframe and enter the handler
+  _sigDeliver(cpu, t, sig, savedRip) {
+    const act = this.sigact.get(sig);
+    const bit = 1n << BigInt(sig - 1);
+    t.pending &= ~bit;
+    if (!act.restorer) {                                                        // no SA_RESTORER: cannot return
+      this.exitCode = 128 + sig; cpu.halted = true; return;
+    }
+    const FRAME = 1072n;                                                        // pretcode + ucontext(936) + siginfo(128)
+    const onAlt = (act.flags & 0x08000000n) && t.altstack && !(cpu.regs[4] >= t.altstack.sp && cpu.regs[4] < t.altstack.sp + t.altstack.size);
+    const base = onAlt ? t.altstack.sp + t.altstack.size : BigInt.asUintN(64, cpu.regs[4] - 128n);   // red zone
+    const F = BigInt.asUintN(64, ((base - FRAME) & ~15n) - 8n);
+    this.jsnap(F, Number(FRAME));
+    const w = (o, n, v) => this.mem.write(F + BigInt(o), BigInt(n), BigInt.asUintN(n * 8, v));
+    w(0, 8, act.restorer);                                                      // pretcode
+    w(8, 8, 0n); w(16, 8, 0n);                                                  // uc_flags, uc_link
+    w(24, 8, t.altstack ? t.altstack.sp : 0n); w(32, 4, t.altstack ? 0n : 2n); w(40, 8, t.altstack ? t.altstack.size : 0n);
+    const G = [8, 9, 10, 11, 12, 13, 14, 15, 7, 6, 5, 3, 2, 0, 1, 4];         // r8..r15 rdi rsi rbp rbx rdx rax rcx rsp
+    for (let i = 0; i < 16; i++) w(48 + i * 8, 8, cpu.regs[G[i]]);
+    w(48 + 16 * 8, 8, savedRip);                                                // rip
+    w(48 + 17 * 8, 8, cpu.flagsValue() | (BigInt(cpu.f.df) << 10n));           // eflags
+    w(192, 8, 0x33n | (0x2bn << 48n));                                          // cs / gs / fs / ss
+    for (let o = 200; o < 304; o += 8) w(o, 8, 0n);                             // err trapno oldmask cr2 fpstate reserved
+    const savedMask = t.suspendOld ?? t.sigmask; t.suspendOld = null;
+    for (let o = 304; o < 432; o += 8) w(o, 8, o === 304 ? savedMask : 0n);     // uc_sigmask
+    const info = t.siginfo?.get(sig) ?? {};
+    for (let o = 944; o < 1072; o += 8) w(o, 8, 0n);
+    w(944, 4, BigInt(sig)); w(952, 4, BigInt.asUintN(32, BigInt(info.code ?? 0)));   // si_signo, si_code
+    w(960, 4, BigInt(info.pid ?? 0)); w(964, 4, 0n);                             // si_pid, si_uid
+    if (sig === 17) w(968, 4, BigInt(info.status ?? 0));                        // si_status
+    cpu.regs[7] = BigInt(sig); cpu.regs[6] = F + 944n; cpu.regs[2] = F + 8n;    // rdi rsi rdx
+    cpu.regs[0] = 0n; cpu.regs[4] = F; cpu.rip = act.handler; cpu.f.df = 0;
+    t.sigmask |= act.mask | ((act.flags & 0x40000000n) ? 0n : bit);            // SA_NODEFER
+    if (act.flags & 0x80000000n) this.sigact.delete(sig);                       // SA_RESETHAND
+    this._sigRedirected = true;
+    this._sigAny = this.threads.some(x => (x.pending ?? 0n) !== 0n);
+  }
+  _sigreturn(cpu) {
+    const t = this._ts(this.threads[this.ti]);
+    const uc = cpu.regs[4];                                                     // handler's ret popped pretcode
+    const r = (o) => this.mem.read(uc + BigInt(o), 8n);
+    const G = [8, 9, 10, 11, 12, 13, 14, 15, 7, 6, 5, 3, 2, 0, 1, 4];
+    for (let i = 0; i < 16; i++) cpu.regs[G[i]] = r(40 + i * 8);
+    cpu.rip = r(40 + 16 * 8);
+    const fl = r(40 + 17 * 8);
+    const f = cpu.f;
+    f.cf = Number(fl & 1n); f.pf = Number((fl >> 2n) & 1n); f.af = Number((fl >> 4n) & 1n);
+    f.zf = Number((fl >> 6n) & 1n); f.sf = Number((fl >> 7n) & 1n); f.df = Number((fl >> 10n) & 1n); f.of = Number((fl >> 11n) & 1n);
+    t.sigmask = r(296) & ~((1n << 8n) | (1n << 18n));
+    this._sigRedirected = true;
   }
 
   rlimits(res) {                          // [cur, max] per resource
@@ -2455,6 +2712,7 @@ export class LinuxEngine {
       if (c.exited === null && e.exitCode !== null) {
         c.exited = e.exitCode;
         this._pipeEofSweep([...e.fds.values()]);
+        this.raiseSignal(17, null, { pid: c.pid, code: 1, status: c.exited });   // SIGCHLD, CLD_EXITED
         if (this.onChildExit) this.onChildExit(c);
       }
     }
@@ -2502,7 +2760,11 @@ export class LinuxEngine {
     try {
       let branched = true;    // compiled entries are branch targets: only look up after a branch
       while (steps++ < maxSteps && this.exitCode === null) {
-        if ((steps & 0x3FFFF) === 0 && this.threads.length > 1) { this.rotate(); branched = true; }   // preemption quantum
+        if ((steps & 0x3FFFF) === 0) {
+          if (this.threads.length > 1) { this.rotate(); branched = true; }   // preemption quantum
+          if (this.itimer?.at != null) this._checkAlarm();
+        }
+        if (this._sigAny && this._sigPoll()) branched = true;     // asynchronous delivery at an insn boundary
         const key = this.cpu.rip;
         let f = branched ? this.aotFns.get(key) : undefined;
         if (f && this.aotBudget !== undefined && --this.aotBudget < 0) f = null;
@@ -2511,6 +2773,7 @@ export class LinuxEngine {
                  if (this.ripTrace !== undefined) { this.ripTrace[this.ripTraceI++ & 1023] = -this.cpu.rip; }  // AOT exit
                  branched = true;
                  if (this.blocked) { if (this.park()) continue; break; }
+                 if (this._sigAny) this._sigPoll();
                  if (this.sliceDeadline != null && performance.now() > this.sliceDeadline) break;
                  continue; }
         const c = branched ? this.compiled.get(key) : undefined;
