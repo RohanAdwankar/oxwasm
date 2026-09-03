@@ -2951,9 +2951,18 @@ What is left is what TurboFan makes of the emitter's patterns for
 branchy byte-scanning code — a compare and a conditional branch per
 character, byte loads through wrapped 64-bit addresses, lazy flags in
 three locals. The ideal-kernel method (`bench/kernels/`) priced calls
-and memory at 1.4–2x on straight-line loops; a tokenizer-shaped kernel
-is the next measurement, and the answer decides whether the emitter's
-flag and address patterns or the CFG shape carry the remaining 4–6x.
+and memory at 1.4–2x on straight-line loops. A tokenizer-shaped kernel
+(`scan`: one byte per iteration, a chain of four class compares with
+sub-width `cmp $imm,%cl`, three counters, a masked index — gcc's own
+code for it, run through the real emitter) measures **3.80x**, against
+`alu` 3.03x and `branch` 1.94x on the same run. So the shape alone is
+nearly half of m4's 8.4x; the rest is what the real function adds —
+calls (priced null one layer at a time, but the kernel has none), and
+6,000-line bodies whose register allocation TurboFan does over 40
+locals. The next probe is `idealmem`'s method on this shape: the
+emitter's exact WAT against a hand-written ideal for the same loop,
+which splits the 3.8x into what the emitter could still win and the
+platform's floor.
 
 The same dump named the two refusals left: `shufps`/`shufpd` (0f c6) had
 no AOT emitter — it does now (`i8x16.shuffle`, covered by packedtest) —
