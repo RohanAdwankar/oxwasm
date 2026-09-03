@@ -55,7 +55,7 @@ const nativeOnce = (kernel, n) => {
 
 const REPS = Number(process.env.REPS || 7);
 const N = Number(process.env.N || 60000000);      // big enough that startup is a correction
-const kernels = (process.env.KERNELS || 'alu mem call branch subw muldiv').split(/\s+/);
+const kernels = (process.env.KERNELS || 'alu mem call branch subw muldiv scan').split(/\s+/);
 
 const stat = (f, reps) => {
   const xs = []; let out = null;

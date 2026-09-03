@@ -2929,8 +2929,31 @@ call site spills 16 GPRs and 8 xmm registers to the regfile and reloads
 them after (`v128.store`/`v128.load` ×8 each way), and every callee
 reloads at entry and spills at exit — a fixed ~64 memory operations per
 call, which for a per-character helper is the whole function. Reload
-narrowing measured as a null on perl; the xmm half was not part of that
-measurement and is the next thing to price.
+narrowing measured as a null on perl, and the xmm half is now priced the
+same way: `OXWASM_NOXMMCALL=1`, a probe that drops the eight `v128`
+stores and loads from every spill and reload site (unsound for calls
+passing floats; the A/B checks the output hash), reads **0.956x, inside
+±9%** on m4. The whole regfile protocol — GPR and xmm, spill and reload —
+is not where the 8x lives.
+
+That leaves the translated instructions themselves, or V8's treatment of
+them. The unit's hot functions are 4,000–6,000 lines with 40-plus
+locals, so whether V8 ever tiers them from Liftoff to TurboFan was the
+next probe. It does: `--liftoff-only` is 1.7x slower end to end
+(44.7 s vs 26.3 s), and `--no-liftoff` (TurboFan for everything, up
+front) has the same steady state as the default by two-size subtraction
+(20.8 s vs 19.1 s, the difference inside noise) while paying 4.5 s more
+compile time. The default's steady state is TurboFan code already.
+
+So every layer above the instructions is priced: calls and inlining,
+the regfile protocol in both halves, dispatch, stack checks, tiering.
+What is left is what TurboFan makes of the emitter's patterns for
+branchy byte-scanning code — a compare and a conditional branch per
+character, byte loads through wrapped 64-bit addresses, lazy flags in
+three locals. The ideal-kernel method (`bench/kernels/`) priced calls
+and memory at 1.4–2x on straight-line loops; a tokenizer-shaped kernel
+is the next measurement, and the answer decides whether the emitter's
+flag and address patterns or the CFG shape carry the remaining 4–6x.
 
 The same dump named the two refusals left: `shufps`/`shufpd` (0f c6) had
 no AOT emitter — it does now (`i8x16.shuffle`, covered by packedtest) —

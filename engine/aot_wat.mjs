@@ -2311,11 +2311,18 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       (typeof process !== 'undefined' && process.env?.OXWASM_NARROW === '1')) &&
       (!onlyN || onlyN.split(',').includes(fnAddr.toString(16)));
     const regs16 = Array.from({length: 16}, (_, r) => r);
+    // OXWASM_NOXMMCALL=1 is a PRICING PROBE, not a mode: it drops the xmm
+    // half of every spill/reload site (8 v128 stores and loads each way per
+    // call). Unsound for any call passing or returning floats in xmm - the
+    // A/B checks the output hash - but it bounds what narrowing that half
+    // could ever be worth.
+    const noXmm = typeof process !== 'undefined' && process.env?.OXWASM_NOXMMCALL === '1';
+    const xS = noXmm ? [] : [...xUsed];
     const expandFull = (sx) => [
       ...regs16.filter(r => touched(r) && !(sx && savedI32(r))).map(spillR),
-      ...[...xUsed].map(xSpill),
+      ...xS.map(xSpill),
     ].join('\n      ');
-    const rlFull = [...regs16.filter(touched).map(reloadR), ...[...xUsed].map(xReload)].join('\n      ');
+    const rlFull = [...regs16.filter(touched).map(reloadR), ...xS.map(xReload)].join('\n      ');
     if (!narrowOn) {
       // off: every marker becomes the full list; no scan, no dataflow
       const sa = expandFull(false), sX = expandFull(true);

@@ -76,6 +76,21 @@ static uint64_t k_branch(uint64_t n) {
   return s;
 }
 
+// 8. tokenizer-shaped scan: a byte load, a chain of class compares and
+//    branches, a counter update, a pointer step - m4's next_token/peek_input
+//    loop without the calls. The buffer is L1-resident text-like data.
+static uint64_t k_scan(uint64_t n, const unsigned char *text, uint64_t mask) {
+  uint64_t s = 0, digits = 0, words = 0, spaces = 0;
+  for (uint64_t i = 0; i < n; i++) {
+    unsigned char c = text[i & mask];              // one character per iteration, like a tokenizer
+    if (c >= '0' && c <= '9') digits++;
+    else if ((c | 0x20) >= 'a' && (c | 0x20) <= 'z') words++;
+    else if (c == ' ' || c == '\n') spaces++;
+    else s += c;
+  }
+  return s * 31 + digits + words * 3 + spaces * 7;
+}
+
 // 5. sub-width ops: the width masks x86 semantics force on every write
 static uint64_t k_subw(uint64_t n) {
   uint32_t a = 1; uint16_t b = 2; uint8_t c = 3; uint64_t s = 0;
@@ -103,6 +118,10 @@ int main(int argc, char **argv) {
   else if (!strcmp(w, "branch")) r = k_branch(n);
   else if (!strcmp(w, "subw"))   r = k_subw(n);
   else if (!strcmp(w, "muldiv")) r = k_muldiv(n);
+  else if (!strcmp(w, "scan")) {
+    static unsigned char text[4096]; const char *pat = "define(`x', eval(12 * 3))dnl\nfoo bar 4711 baz  "; size_t pl = strlen(pat);
+    for (int i = 0; i < 4096; i++) text[i] = pat[i % pl];
+    r = k_scan(n, text, 4095); }
   else { printf("unknown kernel\n"); return 2; }
   printf("%s %llu\n", w, (unsigned long long)r);
   return 0;
