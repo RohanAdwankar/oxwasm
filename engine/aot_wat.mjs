@@ -332,7 +332,7 @@ export function compileFunctionWatDispatch(mem, entry, { guestBase, ramBase, max
 // One FUNCTION at a time: `call` is a mid-block instruction (fall-through
 // successor) whose target is recorded in `calls` for the unit driver;
 // `leave` is a plain epilogue instruction; ret/retn/jmpind end a block.
-export function analyze(mem, entry, { maxInsns = 20000, noJtab = false } = {}) {
+export function analyze(mem, entry, { maxInsns = 20000, noJtab = false, entries = null } = {}) {
   const M = 0xFFFFFFFFFFFFFFFFn;
   const insnAt = new Map(); const work = [entry]; const seen = new Set(); let count = 0;
   const calls = new Set();
@@ -386,7 +386,21 @@ export function analyze(mem, entry, { maxInsns = 20000, noJtab = false } = {}) {
     }
     if (insn.mnem === 'jmp') { work.push((insn.next + insn.rel) & M); continue; }
     if (insn.mnem === 'jcc') { work.push((insn.next + insn.rel) & M); work.push(insn.next); continue; }
-    if (insn.mnem === 'call') calls.add(((insn.next + insn.rel) & M).toString());
+    if (insn.mnem === 'call') {
+      calls.add(((insn.next + insn.rel) & M).toString());
+      // A call to a noreturn function (abort, exit, __stack_chk_fail, error)
+      // is followed by the NEXT function, and following the fall-through
+      // swallowed it whole - m4's 40-instruction peek_input compiled to 4,700
+      // lines and its unit to 27MB. The fall-through is cut when the next
+      // address is a known function entry - one the tiering profile has seen
+      // called or one already compiled (a static marker such as endbr64 is
+      // not used: CET also marks jump-table case labels, and a switch case
+      // falling through a call into the next case would be cut). Cut, the
+      // block ends in the call and its (never taken) continuation is a deopt
+      // to the real address, so a wrong guess costs a frame's interpretation,
+      // never correctness.
+      if (insn.next !== entry && entries && entries.has(insn.next.toString())) { insn.noretCut = true; continue; }
+    }
     work.push(insn.next);
   } };
   drain();
@@ -2475,10 +2489,15 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     const tab = Array.from({length:N}, (_,k)=>'$b'+k).join(' ');
     wat += `      (br_table ${tab} $exit_disp (local.get $pc)))\n`;   // closes $b0
     for (let i=0;i<N;i++) {
-      // every body gets a free loop label so a self-edge (tight single-block
-      // loop — the hottest backward-edge kind) branches directly instead of
-      // paying the $pc + br_table dispatcher round-trip
-      wat += `      (loop $l${i}\n      ` + bodies[i] + ')\n';
+      // a block with a SELF-EDGE (tight single-block loop - the hottest
+      // backward-edge kind) gets a loop label so it branches directly instead
+      // of paying the $pc + br_table dispatcher round-trip. Only those: V8
+      // places a stack check at every wasm loop header, and wrapping every
+      // body in a loop (12,000 of them in one m4 unit, 112 ever branched to)
+      // cost a quarter of m4's steady state (--no-wasm-stack-checks: -28%).
+      // OXWASM_BLOCKLOOPS=1 restores the old shape for A/B.
+      const selfLoop = BLOCKLOOPS || succs[i].includes(i);
+      wat += (selfLoop ? `      (loop $l${i}\n      ` : '      ') + bodies[i] + (selfLoop ? ')\n' : '\n');
       if (i < N-1) wat += `      )\n`;                                 // close $b${i+1}
     }
     wat += '    ))\n';                                                 // close loop + exit block
@@ -2509,6 +2528,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
 // On by default: suite + breadth (31/31 byte-identical, incl. two-tier
 // CPython) pass with it, steady-state on call-dense code is 6-11% faster,
 // and the tier-up cost objection is halved by the assembler worker.
+const BLOCKLOOPS = typeof process !== 'undefined' && process.env?.OXWASM_BLOCKLOOPS === '1';
 // Opt out with OXWASM_INLINE=0 or globalThis.__inline = false.
 // OXWASM_INLINE_BUDGET caps the callee size in instructions - the default is
 // in the low hundreds because gzip's three hot callees are 66, 88 and 114,
@@ -2555,12 +2575,12 @@ export function compileUnitWat(mem, entry, opts = {}) {
     if (skip && k !== entry.toString() && skip(k)) continue;
     try {
       let an;
-      try { an = analyze(mem, a, { maxInsns, noJtab: !!globalThis.__noJtab }); }
+      try { an = analyze(mem, a, { maxInsns, noJtab: !!globalThis.__noJtab, entries: opts.entries ?? null }); }
       catch (e) {
         // jump-table discovery can push a function over the size budget;
         // it compiled before the feature, so retry without it
         if (!/function too large/.test(e.message) || globalThis.__noJtab) throw e;
-        an = analyze(mem, a, { maxInsns, noJtab: true });
+        an = analyze(mem, a, { maxInsns, noJtab: true, entries: opts.entries ?? null });
       }
       // a body that starts undecodable compiles to a pure deopt — worse than
       // useless: dispatching it can ping-pong with the engine. Poison instead

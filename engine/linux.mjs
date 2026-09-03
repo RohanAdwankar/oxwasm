@@ -440,6 +440,9 @@ export class LinuxEngine {
         // the tiering call profile, so the inliner can pick targets by how
         // often they are actually called rather than by what fits a budget
         hot: this.aotCalls,
+        // every function entry the engine knows of: the analyzer cuts a
+        // call's fall-through at one (a noreturn callee's neighbour)
+        entries: this._knownEntries(),
         // hosts whose assembler is wabt.js (itself wasm) choke on multi-MB
         // closure texts — child engines cap the unit size and chain instead
         ...(this.unitMaxFuncs ? { maxFuncs: this.unitMaxFuncs } : {}),
@@ -3375,6 +3378,13 @@ export class LinuxEngine {
     h.bytes = nb;
     this.files[h.path] = nb;                                 // growable buffer: refresh the map ref
     this._hardRefresh(h.path, nb);                           // ... and every hard-link alias
+  }
+  _knownEntries() {
+    const e = new Set();
+    for (const k of this.aotCalls.keys()) e.add(k.toString());
+    for (const k of this.aotFns.keys()) e.add(k.toString());
+    for (const k of this._ftSeen) e.add(k.toString());
+    return e;
   }
   _killProcSiblings(t) {
     for (const x of this.threads) if (x !== t && x.proc === t.proc && x.state !== 'dead') {

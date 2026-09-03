@@ -2877,6 +2877,61 @@ bison, split, bigheap) are the regression net. vim's steady state halved,
 run); on a 1.2 M-line input, where the work is 43% of the run, **5.7x**
 (7.6 s vs 1.34 s), in the call-dense band with m4 and perl.
 
+### Inside the call-dense band: what m4's 8.4x is made of
+
+With everything compiled, the remaining question is what the compiled
+code spends its time on. `bench/realab-run.mjs` now assembles with
+`--debug-names`, so a V8 CPU profile of the cached steady state names
+guest functions: on 200 k macro lines, m4's tokenizer `next_token`
+(0x40fe70) takes 4.9 s, its per-character helper `peek_input` (0x409e80)
+2.3 s, four small m4 helpers 1–1.6 s each, `memcpy` 0.8 s — and the
+engine's own JS under 1 s: the JS boundary is not where the time is.
+Three probes, each a null or near-null, narrow what is:
+
+- **More inlining.** `next_token` has 44 call sites to `peek_input`,
+  `next_char` and an obstack helper; the inliner's 640-instruction
+  per-function cap covers a fraction of them. A 4x cap
+  (`OXWASM_INLINE_TOTAL=2560 OXWASM_INLINE_BUDGET=256`): **1.036x, inside
+  ±5%**. The calls it makes are not the cost.
+- **V8's loop stack checks.** 40 of the unit's 95 functions use the
+  dispatch (br_table) layout, which wrapped every block body in a `loop`
+  so that self-edges could branch directly — 11,772 loop headers for 112
+  self-edges, each header a stack check. `--no-wasm-stack-checks`:
+  one pair read −28%, the next −2%; the first was a warm-up artifact. The
+  emitter now wraps only blocks that actually branch to themselves
+  (`OXWASM_BLOCKLOOPS=1` keeps the old shape for A/B). The dispatch
+  differential is 400/400 bit-exact with the new shape; the steady-state
+  A/B was interrupted by container restarts three times and not
+  completed — its ceiling is the −2% the stack-check probe bounds it by.
+- **Function bloat from noreturn calls.** `peek_input` is 40
+  instructions; its translation is 4,500 lines. The analyzer follows a
+  call's fall-through, and after `call abort@plt` that is the next
+  function — which it swallows, along with everything that function tail-
+  jumps to: the analysis spans 608 instructions from 0x407b30 to
+  0x4306a8. The unit is 27 MB of WAT for 95 functions. The analyzer now
+  cuts the fall-through when the next address is a known function entry
+  (one the profile has seen called, or one already compiled; the block
+  ends in the call and a never-taken deopt). A static marker such as
+  `endbr64` was considered and rejected: CET also marks jump-table case
+  labels, and a switch case falling through a call into the next case
+  would be cut on a hot path. Honest limit: the neighbour `peek_input`
+  swallows is an error-path function nothing ever calls, so the dynamic
+  cut does not fire there and that unit's size is unchanged; the cut
+  helps where the neighbour is live code (the common `__stack_chk_fail`
+  epilogue before a hot function). A translator-level answer for the
+  rest — treating a tail `jmp` into another function's entry as a call
+  rather than following it, and a symbol-based noreturn list — stays
+  open. Dead code costs compile time and register allocation rather than
+  steady-state cycles, so this is a size fix first.
+
+What none of the probes touched is the per-call protocol itself: every
+call site spills 16 GPRs and 8 xmm registers to the regfile and reloads
+them after (`v128.store`/`v128.load` ×8 each way), and every callee
+reloads at entry and spills at exit — a fixed ~64 memory operations per
+call, which for a per-character helper is the whole function. Reload
+narrowing measured as a null on perl; the xmm half was not part of that
+measurement and is the next thing to price.
+
 The same dump named the two refusals left: `shufps`/`shufpd` (0f c6) had
 no AOT emitter — it does now (`i8x16.shuffle`, covered by packedtest) —
 and two libc entries whose first instruction the decoder does not know —
