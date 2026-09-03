@@ -2959,10 +2959,25 @@ code for it, run through the real emitter) measures **3.80x**, against
 nearly half of m4's 8.4x; the rest is what the real function adds —
 calls (priced null one layer at a time, but the kernel has none), and
 6,000-line bodies whose register allocation TurboFan does over 40
-locals. The next probe is `idealmem`'s method on this shape: the
-emitter's exact WAT against a hand-written ideal for the same loop,
-which splits the 3.8x into what the emitter could still win and the
-platform's floor.
+locals. `idealmem`'s method on this shape splits the 3.8x: the
+emitter's exact WAT for the loop, lifted verbatim from the unit dump into
+a standalone module, runs at **0.86x native** (faster than gcc's -O1
+code), and a hand-written ideal at 0.88x — faithful/ideal 0.99x. The
+emitter's patterns are not the cost: lazy flags in three locals,
+width masks, wrapped addresses all compile to native-speed code when
+the function is small. The same loop inside the engine's unit is 3.8x.
+The difference is the CONTEXT the loop is compiled in — a 1,000-line
+function with 60 locals and 67 blocks, the engine's memory — and the
+experiments vary it one factor at a time. Eight more guest registers
+live across the loop (`LIVE=1`): 0.87x — not register pressure. The
+engine's memory is not shared and 4,096 pages is inside V8's guard-page
+regime, so not that either. The remaining difference is dynamic: in the
+kernel binary `main` enters the loop once and never returns until the
+run ends. V8 compiles a function with Liftoff first and tiers it up in
+the background, but a frame already running baseline code keeps
+running it unless the loop is replaced on the stack — and whether V8's
+wasm OSR fires for this loop is exactly what `--no-liftoff` (TurboFan
+from the start) against `--liftoff-only` on the scan kernel decides.
 
 The same dump named the two refusals left: `shufps`/`shufpd` (0f c6) had
 no AOT emitter — it does now (`i8x16.shuffle`, covered by packedtest) —
