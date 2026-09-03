@@ -1369,6 +1369,11 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       case 0x70: {                                                            // pshufd (66) / pshuflw (F2) / pshufhw (F3)
         const idx = insn.pF2 ? pshufwIdx(insn.imm8, 0) : insn.pF3 ? pshufwIdx(insn.imm8, 8) : pshufdIdx(insn.imm8);
         put(`(i8x16.shuffle ${idx.join(' ')} ${xv(rm, next)} ${xv(rm, next)})`); break; }
+      case 0xC6: {                                                            // shufps (ps) / shufpd (66): low half from dst, high half from src
+        const im = insn.imm8, idx = [];
+        if (insn.p66) { for (let i = 0; i < 8; i++) idx.push((im & 1) * 8 + i); for (let i = 0; i < 8; i++) idx.push(16 + ((im >> 1) & 1) * 8 + i); }
+        else { for (const [sel, from] of [[im & 3, 0], [(im >> 2) & 3, 0], [(im >> 4) & 3, 16], [(im >> 6) & 3, 16]]) for (let i = 0; i < 4; i++) idx.push(from + sel * 4 + i); }
+        put(`(i8x16.shuffle ${idx.join(' ')} ${dst} ${xv(rm, next)})`); break; }
       case 0x60: case 0x61: case 0x62: case 0x68: case 0x69: case 0x6A: {     // punpck l/h bw/wd/dq
         const EB = { 0x60:1,0x61:2,0x62:4,0x68:1,0x69:2,0x6A:4 }[op], high = op >= 0x68;
         put(`(i8x16.shuffle ${unpckIdx(EB, high).join(' ')} ${dst} ${xv(rm, next)})`); break; }
@@ -2560,7 +2565,14 @@ export function compileUnitWat(mem, entry, opts = {}) {
       // a body that starts undecodable compiles to a pure deopt — worse than
       // useless: dispatching it can ping-pong with the engine. Poison instead
       // so control reaches the interpreter, which faults faithfully.
-      if (an.blocks[0].insns[0].mnem === 'udec') throw new Error('entry undecodable');
+      // blocks[] is sorted by address; the ENTRY block is the one at `a`.
+      // A function whose CFG reaches a lower-address block - a tail jump into
+      // a PLT stub below it - had blocks[0] be that stub, and the two checks
+      // below refused every such function as "a trampoline": m4's input
+      // reader and 30 of its neighbours stayed interpreted forever, 250x
+      // native on a macro-heavy input.
+      const eb = an.blocks[an.bidx.get(a.toString())] ?? an.blocks[0];
+      if (eb.insns[0].mnem === 'udec') throw new Error('entry undecodable');
       // A PLT/IFUNC trampoline (endbr64/nops then `jmp *GOT`) must stay a
       // callout, not a direct wasm call: a direct call would run its indirect
       // jump in wasm, deopt, and unwind the CALLER's live frame every time.
@@ -2573,7 +2585,7 @@ export function compileUnitWat(mem, entry, opts = {}) {
       // that to stub 0x7dbbec0 and the page's stroke path died on the stale
       // binding. Register/indexed jmpind (a computed goto) keeps the
       // single-block rule, since a jtab-resolved entry is a real function.
-      { const b0 = an.blocks[0].insns; let t0 = null;
+      { const b0 = eb.insns; let t0 = null;
         for (const insn of b0) { if (insn.mnem === 'nop') continue; t0 = insn; break; }
         if (t0?.mnem === 'jmpind' &&
             ((t0.src?.kind === 'mem' && t0.src.ripRel) || an.blocks.length === 1))

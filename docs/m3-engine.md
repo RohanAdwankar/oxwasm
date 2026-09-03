@@ -2818,6 +2818,62 @@ just written, leaving nothing to compare. `fsync`, `fdatasync`, `sync`,
 `syncfs` and `sync_file_range` now return 0: the file system lives in
 memory, so everything is already as durable as it will ever be.
 
+### m4 at 250x native: the translator refused every function above a PLT stub
+
+The first steady-state measurement of the new batch never finished: m4 on
+a 13 MB macro input took over twelve minutes per run against 2.9 s
+native. The profile said why in two numbers — 253 M interpreted
+instructions and 15 M compiled-unit entries on a 50 k-line input, seventeen
+interpreted instructions per entry: the hot path was bouncing between
+compiled callers and one interpreted callee. The hot rip was the prologue
+of m4's input reader (`peek_input`, `push rbp; mov rbp, rsp; ...`), and
+the runner's new tiering dump (`DUMP=rip`) said it was in `aotFailed` with
+the reason `trampoline -> callout` — a check meant for PLT stubs, refusing
+a plain function.
+
+The check read `an.blocks[0]` as the entry block. `analyze()` sorts blocks
+by address, and this function's CFG reaches a block *below* its entry — a
+tail jump into a PLT stub at 0x404b90 — so `blocks[0]` was that stub
+(`nop; jmp *GOT`), and the function was classified as a trampoline. The
+"entry undecodable" check had the same bug. Every function whose control
+flow touches a lower-address stub was refused, permanently: thirty-two of
+m4's own functions, its whole input path. Both checks now use the block at
+the entry address (`bidx`). On 10 k lines m4 went from 139 s to 28.5 s,
+interpreted instructions from 126 M to 28 k. Steady state by two-size
+subtraction (`bench/vsnative.mjs`, 20 k vs 200 k lines): **8.4x native**
+(20.7 s vs 2.46 s of work) — m4 is now in the call-dense band with perl,
+a `getc`/`ungetc` per character through the PLT, no longer off the chart.
+
+The same dump named the two refusals left: `shufps`/`shufpd` (0f c6) had
+no AOT emitter — it does now (`i8x16.shuffle`, covered by packedtest) —
+and two libc entries whose first instruction the decoder does not know.
+
+### The heap walked into the mmap arena: vim on a 14 MB file
+
+The vim measurement never produced a number either: on a 400 k-line input
+the engine faulted reading address 0x59 — and only at `q!`, after the
+file had been written correctly. The runner's crash report (the ELF image
+holding rip, walked down page by page to its header and matched against
+the provisioned files; the last interpreted rips) put it in `ld.so` at
+`_dl_fini`, walking the link-map chain: `cmp %rax,0x28(%rax)` with an
+`l_next` of 0x31 — an ASCII `1`, the input file's own text.
+
+The heap had overwritten ld.so's first mmapped pages. The break started
+above the loaded images and the anonymous-mmap arena 64 MB above *that*,
+and `brk` enforced only the end of guest RAM: a heap past 64 MB grew
+straight through the arena, where ld.so's minimal malloc had put the
+link maps (and where libc, TLS and everything else mmapped early live).
+A 2 k-line file never got there; 14 MB of text plus vim's memline and
+undo did. On Linux the break stops at the first mapping in its way and
+glibc's malloc carries on from mmap; the engine now does the same — the
+break refuses to cross the arena base (answering with the break
+unchanged, which glibc reads as ENOMEM and turns into `mmap`), and the
+gap is a quarter of guest RAM, at least 64 MB. A `bigheap` sweep case
+(160 MB in 64 KB pieces on a 512 MB guest, every byte verified) crosses
+the 128 MB gap and takes the fallback: 361 `brk` calls, the tail of them
+refused, exit 0 byte-identical to native.
+
+
 
 **The one bug that stood between compile and link was in `read`, not the
 linker.** The full link completed and produced a structurally perfect ELF,

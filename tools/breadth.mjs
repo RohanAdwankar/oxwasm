@@ -122,6 +122,11 @@ if (!existsSync(PROCPID)) {
   try { execFileSync('gcc', ['-O1', '-o', PROCPID,
                              new URL('./fixtures/procpid.c', import.meta.url).pathname]); } catch {}
 }
+const BIGHEAP = '/tmp/breadth_bigheap';
+if (!existsSync(BIGHEAP)) {
+  try { execFileSync('gcc', ['-O1', '-o', BIGHEAP,
+                             new URL('./fixtures/bigheap.c', import.meta.url).pathname]); } catch {}
+}
 const EPIPE = '/tmp/breadth_epipe';
 if (!existsSync(EPIPE)) {
   try { execFileSync('gcc', ['-O1', '-o', EPIPE,
@@ -382,6 +387,9 @@ const CASES = [
   // thread belongs to the child and moves with it when it materialises
   ['ruby-fork', '/opt/ruby-3.3.6/bin/ruby', ['--disable-gems', '-e', 'p = fork { puts "child"; exit 4 }; Process.wait(p); puts "parent #{$?.exitstatus}"'],
                 { memMB: 1024 }],
+  // a 160MB heap in 64KB pieces: brk must stop at the mmap arena and glibc
+  // must carry on from mmap - the heap that overran ld.so's link maps in vim
+  ['bigheap',   BIGHEAP, []],                                  // 512MB guest: the 128MB gap is crossed, the fallback is exercised
   // ---- batch 4: text tools, build tools, an editor and a debugger in batch mode
   // m4: macro expansion with recursion, eval, regexp, esyscmd (fork+exec of
   // sh inside a filter), diversions

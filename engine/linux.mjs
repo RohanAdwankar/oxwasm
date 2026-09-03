@@ -120,9 +120,15 @@ export class LinuxEngine {
     }
     this.base = lo;
     this.brk = align(loadEnd, PAGE); this._brk0 = this.brk;
-    this.mmapNext = align(this.brk + (64n << 20n), PAGE);      // anon mmaps above the heap
-    this._mmapBase = this.mmapNext;
     const total = BigInt(memMB) << 20n;
+    // The anonymous-mmap arena starts a quarter of guest RAM (at least 64MB)
+    // above the initial break, and brk may NOT grow into it: past that line
+    // it answers with the break unchanged and glibc's malloc falls back to
+    // mmap, exactly as on Linux when the heap meets a mapping. vim on a 14MB
+    // file grew a 64MB+ heap straight through ld.so's first mmapped pages -
+    // the link_map chain - and _dl_fini walked an l_next of 0x31 at exit.
+    this.mmapNext = align(this.brk + (total / 4n > (64n << 20n) ? total / 4n : (64n << 20n)), PAGE);
+    this._mmapBase = this.mmapNext;
     this.stackTop = lo + total - 4096n;
 
     // one contiguous guest region backed by wasm memory -> interpreter and
@@ -1480,13 +1486,11 @@ export class LinuxEngine {
         // found; mmap already bounds-checked and returned -ENOMEM, brk did
         // not.
         //
-        // Only the end of guest RAM is enforced. The heap can still in
-        // principle grow into the mmap region that starts 64MB above it -
-        // that is a separate, pre-existing overlap, and narrowing brk to
-        // mmapBase here would cap every guest's heap at 64MB.
+        // Both ends are enforced: the end of guest RAM and the mmap arena
+        // above the heap (glibc's malloc switches to mmap when brk stops).
         const lim = this.base + BigInt(this.ram.length);
         const want = align(a1, PAGE);
-        if (a1 > this.brk && want <= lim) this.brk = want;
+        if (a1 > this.brk && want <= lim && want <= this._mmapBase) this.brk = want;
         ret(this.brk); break; }
       case 9: {                                              // mmap(addr,len,prot,flags,fd,off)
         for (const t of this.threads) t.cpu.icache?.clear();  // new code may appear
