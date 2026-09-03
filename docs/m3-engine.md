@@ -3346,3 +3346,58 @@ remaining static answer - a symbol-based noreturn list - stays open;
 with both dynamic cuts in place, what a unit still swallows is the
 neighbour after a noreturn call that nothing ever calls, and that is
 dead text, not a fault.
+
+### The batch re-measured with the yield on
+
+Kernels, `bench/kernels/run.mjs`, 7 reps, the two arms one after the
+other on an otherwise idle box (self-check: alu measured twice within
+1-3%). Yield off is `OXWASM_LOOPYIELD=0`; on is the default now, with
+the tail cut in.
+
+| kernel | yield off | yield on |
+|---|---:|---:|
+| alu | 2.92x | 2.99x |
+| mem | 2.47x | 2.45x |
+| call | 11.47x | 11.81x |
+| branch | 1.96x | 1.39x |
+| subw | 5.48x | 3.43x |
+| muldiv | 1.59x | 1.59x |
+| scan | 3.94x | 1.57x |
+
+The loop-shaped kernels whose hot loop sat in baseline code are the
+ones that move (branch, subw, scan: 1.4-2.5x better); alu, mem and
+muldiv were already in tiered code by their shape and read the same.
+The call kernel reads 3% worse: that is the FTNEST store pair around
+every in-unit call site, the price of the nesting rule, on the one
+kernel that is nothing but calls. The call kernel itself - 11.5x, the
+dispatch protocol, unchanged by anything in this round - remains the
+band's ceiling and the open item.
+
+Steady state of real binaries, the two-size subtraction of
+`bench/vsnative.mjs` (3 reps; the macro file is the three-macro one
+above, 200 k against 20 k lines; the text file 400 k lines of random
+words, 22 MB, against a tenth of it):
+
+| binary | work | engine | native | ratio | before |
+|---|---|---:|---:|---:|---:|
+| m4 | 200 k macro lines | 19.4 s | 2.61 s | **7.42x** (28%) | 8.4x |
+| vim -es | `%s` + write over 400 k lines | 2.69 s | 0.57 s | **4.70x** (85%) | 5.7x |
+
+The 22 MB text was too small for the byte-streaming tools: sha256sum
+finished it in 68 ms native and the engine's two runs differed by
+-7 ms (all startup), and gzip's run was 56% startup. Both re-measured
+on 267 MB (the text repeated twelve times) against a tenth of it:
+
+| binary | work | engine | native | ratio |
+|---|---|---:|---:|---:|
+| sha256sum | 267 MB | 0.95 s | 0.73 s | **1.29x** (78%, ±15%) |
+| gzip -c | 267 MB | 20.7 s | 8.33 s | **2.48x** (18%, ±7%) |
+
+sha256sum's hot loop is one compiled function of straight-line SSE
+and rotates: 1.3x is where the alu/mem kernels say the codegen sits,
+at a resolution too poor to call it closer. gzip's 2.5x is a
+Huffman/LZ77 inner loop with a call per literal and a table lookup per
+match: between the mem kernel and the call kernel, as its shape
+predicts. vim's 4.7x and m4's 7.4x remain the call-dense band, and
+their gap to gzip is the dispatch protocol priced earlier: 11.5x on
+pure calls.
