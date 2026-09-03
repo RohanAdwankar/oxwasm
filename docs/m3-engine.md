@@ -2859,7 +2859,9 @@ functions, little call tax. vim is the outlier and the next profile.
 
 The same dump named the two refusals left: `shufps`/`shufpd` (0f c6) had
 no AOT emitter — it does now (`i8x16.shuffle`, covered by packedtest) —
-and two libc entries whose first instruction the decoder does not know.
+and two libc entries whose first instruction the decoder does not know —
+both `cpuid` (0f a2) in ld.so's feature probing, called four times at
+startup; they run interpreted and cost nothing.
 
 ### The heap walked into the mmap arena: vim on a 14 MB file
 
