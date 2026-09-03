@@ -2686,9 +2686,10 @@ files), Python `subprocess.run` (posix_spawn, pipe capture, wait), Perl
 keyed by path, per open file description: LOCK_SH/LOCK_EX/LOCK_UN, LOCK_NB
 answering EWOULDBLOCK, otherwise the caller blocks and re-checks; a close
 (and `close_range`) releases what the description held. POSIX record locks
-through `fcntl` are still always granted, but F_GETLK now reports F_UNLCK
-instead of echoing the caller's own request type back (which reads as
-"locked by someone").
+through `fcntl` were still always granted at this point, with F_GETLK
+reporting F_UNLCK instead of echoing the caller's own request type back
+(which reads as "locked by someone"); they became real later (see
+"Record locks, SIGEV_THREAD, and the mask a thread is born with").
 
 **/dev/fd.** bash substitutes `/dev/fd/63`, not `/proc/self/fd/63`; the
 reopen path now serves both, plus `/dev/stdin`/`stdout`/`stderr`, and
@@ -3003,7 +3004,7 @@ from then on runs whatever tier V8 has compiled by then. A yield every
 of loop, well under 1%. Correctness rests on the same ground as a
 deopt to a loop head: the frame's stack stays in place, the registers
 are in the regfile, and execution resumes at a guest address.
-`OXWASM_LOOPYIELD=1` enables the emission (it is off by default; see below). One detail that
+`OXWASM_LOOPYIELD=0` (or `globalThis.__loopYield = false`) turns the emission off for A/B; it is on by default (it shipped off for one commit while its cost was bisected; see below). One detail that
 mattered: the edge burns first and tests for exactly zero, so a budget
 nobody armed (a unit function called outside `dispatchAot`, as the
 differential tests do) wraps and never yields — the test-then-burn
@@ -3166,9 +3167,24 @@ cache, on and off alike (on was in fact the faster of the two). The
 90-minute cap assumes a warm cache; a build that touches every unit's
 text pays one cold sweep before it can be gated. (The cache had also
 grown to 9.8 GB of entries no current text can hit; pruned to the
-live 2 GB.) The gate stays for A/B, and the FTLOOP/FTNEST words,
+live 2 GB.) (And the next on-sweep was killed at case 90 by the memory cgroup, not
+the cap: the sweep process runs at up to 9.6 GB, every extra engine
+instance is another ~4 GB of RSS, and the container has ~15 GB - a
+two-case harness run alongside it was enough. Nothing runs beside a
+sweep, not even a "light" case.) The gate stays for A/B, and the FTLOOP/FTNEST words,
 `env.loophot`, the counters and the differential stubs are emitted
 regardless, so on/off is one environment variable.
+
+**Back on by default.** The on-sweep, run alone, is 130/130
+byte-identical (the two new fixtures included), and its counters say
+what the sweep can and cannot show: not one case reaches a yield -
+none runs a single loop for 4M back edges - so the sweep is a
+correctness gate for the emission and no measure of it. Its timings
+against the off-sweep are noise dominated by which units happened to
+be cached (php 8 s against 62 s one way, m4 49 s against 28 s the
+other). The measure stays the kernels and the long runs: scan
+3.86x -> 1.56x, branch 1.94x -> 1.35x, subw 5.29x -> 2.80x. The
+default is `OXWASM_LOOPYIELD=0` to turn it off.
 
 ### The heap walked into the mmap arena: vim on a 14 MB file
 
@@ -3218,3 +3234,54 @@ block-buffered stdio. `pwrite64` (nr 18) was ENOSYS and is now implemented
 too (honouring its explicit offset without moving `h.pos`), though this
 `ld` reached `_start` through `lseek`+`write`, not `pwrite`. Repro:
 `scratchpad/trylink.mjs`.
+
+### Record locks, SIGEV_THREAD, and the mask a thread is born with
+
+Two of the listed correctness gaps closed while the yield sweeps ran,
+each pinned by a fixture whose native output the breadth harness
+compares against (`tools/fixtures/rlock.c`, `sigevthread.c`).
+
+**POSIX record locks.** `fcntl` F_SETLK/F_SETLKW/F_GETLK and the OFD
+trio were granted unconditionally: two processes contending for a lock
+file both won, and F_GETLK always answered F_UNLCK. They are now byte
+ranges in the shared fs metadata (`_fsMeta().rlocks`, keyed by path),
+so a fork child - its own engine over the same file store - sees the
+parent's locks. A POSIX lock is owned by the process and dropped when
+*any* fd on the file closes (the classic trap, reproduced by the
+fixture: the parent unlocks by opening and closing a second fd); an OFD
+lock is owned by the open file description - the handle object dup and
+fork share - and dropped with its last fd. Conflicts are by range and
+type (two readers coexist, a writer excludes), F_SETLK answers EAGAIN,
+F_SETLKW parks the thread with a 20 ms deadline and re-checks (every
+blocking syscall re-executes on wake), F_GETLK describes the first
+blocker with `l_pid` (-1 for an OFD lock, as Linux reports). The one
+subtlety was identity: a child that takes a lock *inside its vfork
+window* is still a thread of the parent engine, owned by its proc
+record; when its F_SETLKW blocks, the scheduler materialises it into
+its own engine, and its identity became that engine - it then
+conflicted with its own earlier lock and spun forever after the parent
+unlocked. Materialisation now re-owns the proc's locks to the new
+engine. Locks die with the process (`exit_group` and the window-exit
+path both release the owner's).
+
+**SIGEV_THREAD timers** were refused with EINVAL. glibc never sends
+SIGEV_THREAD to the kernel: it starts a helper thread with every
+signal blocked around the `pthread_create`, asks for SIGEV_THREAD_ID
+delivery of SIGTIMER (signal 32) to that thread, and the helper
+`sigwaitinfo`s and starts a thread per expiry for the callback. So the
+engine needed thread-directed timer delivery (`notify === 4`, the tid
+at sigevent offset 16, validated against the live threads), and it
+needed the thing that actually broke: **clone never copied the
+creator's signal mask** into the new thread. The helper started with
+an empty mask, SIGTIMER was "deliverable, no handler", and the first
+5 ms tick applied the default action - the whole process died with
+exit 160 (128 + 32). Both clone sites now inherit the mask as Linux
+does (pending cleared; the alternate stack copied across fork but not
+into a thread). The fixture's callback fires three times in 15 ms and
+the process exits 0 with 29 dead callback threads behind it.
+
+Still open from that list: `mprotect` is a no-op (a guard page never
+faults, so a runtime that probes its stack limit by touching it will
+not see the SIGSEGV it expects), and mremap grows only by moving: a
+grow without MREMAP_MAYMOVE answers ENOMEM even when the pages after
+the mapping are free.

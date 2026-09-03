@@ -2607,18 +2607,19 @@ function emitUnitFunction(a0, fnAddr, ctx) {
 // CPython) pass with it, steady-state on call-dense code is 6-11% faster,
 // and the tier-up cost objection is halved by the assembler worker.
 const BLOCKLOOPS = typeof process !== 'undefined' && process.env?.OXWASM_BLOCKLOOPS === '1';
-// Gated (OXWASM_LOOPYIELD=1 or globalThis.__loopYield) so the mechanism can
-// be A/B'd in one environment variable: off, no back edge burns the budget,
-// no call site touches FTNEST and no $yield exit is emitted. The words, the
-// env.loophot import and the counters stay so the unit text is the same
-// shape either way. Two full sweeps with it on died at the harness's
-// 90-minute cap with zero yields taken, and so did the sweep with it OFF
-// (gdb-batch 1081s, python-mp 600s): every unit's text had changed (the new
-// import line), the wat cache was cold for all 20,983 of them, and a cold
-// sweep is 2-7x a warm one (m4's case 39.8s vs 6.7s). Warm and off it is
-// back in the pre-yield band (python-mp 273s, gdb-batch 398s); the warm
-// on-sweep is what flips this default.
-const LOOPYIELD = (typeof process !== 'undefined' && process.env?.OXWASM_LOOPYIELD === '1') || !!globalThis.__loopYield;
+// On by default; OXWASM_LOOPYIELD=0 or globalThis.__loopYield = false turns
+// the whole mechanism off for A/B: no back edge burns the budget, no call
+// site touches FTNEST, no $yield exit is emitted. The words, the env.loophot
+// import and the counters stay either way. It was shipped off for one
+// commit while its cost was bisected: two full sweeps with it on had died
+// at the harness's 90-minute cap with zero yields taken - and so did the
+// sweep with it OFF (gdb-batch 1081s, python-mp 600s). Every unit's text had
+// changed (the new import line), the wat cache was cold for all 20,983 of
+// them, and a cold sweep is 2-7x a warm one (m4's case 39.8s vs 6.7s). With
+// it on the sweep is 130/130 byte-identical and no sweep case ever reaches
+// a yield (none runs one loop 4M back edges); the effect is on long loops:
+// the scan kernel 3.86x -> 1.56x native, branch 1.94x -> 1.35x.
+const LOOPYIELD = !((typeof process !== 'undefined' && process.env?.OXWASM_LOOPYIELD === '0') || globalThis.__loopYield === false);
 export const LOOPYIELD_N = 4000000;   // backward edges per yield; dispatchAot's fill and the in-wasm refill agree
 // Opt out with OXWASM_INLINE=0 or globalThis.__inline = false.
 // OXWASM_INLINE_BUDGET caps the callee size in instructions - the default is

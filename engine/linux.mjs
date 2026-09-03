@@ -1709,6 +1709,7 @@ export class LinuxEngine {
           // threads' writes are untouched); exec/exit rolls it back.
           const t = { id: pid, cpu: c, state: 'run', dl: null, futex: null, ctid: 0n, _dl: null,
                       proc: { pid, fds: new Map(this.fds), parent, jrnl: [], cwd0: this.cwd ?? '/' } };
+          this._sigInherit(t, parent, true);
           this.threads.push(t);
           // Complete the parent's syscall (rax = pid, rip already past the
           // insn) and switch STRAIGHT to the child — blocking here would
@@ -1728,6 +1729,7 @@ export class LinuxEngine {
         const t = { id: tid, cpu: c, state: 'run', dl: null, futex: null,
                     ctid: (flags & 0x200000) ? cpu.regs[10] : 0n, _dl: null,   // CLONE_CHILD_CLEARTID
                     proc: this.threads[this.ti].proc };          // a window child's thread is the CHILD's (Ruby's timer thread after fork)
+        this._sigInherit(t, this.threads[this.ti], false);
         this.threads.push(t);
         if (flags & 0x100000) this.mem.write(a3, 4n, BigInt(tid));             // CLONE_PARENT_SETTID
         if (flags & 0x1000000) this.mem.write(cpu.regs[10], 4n, BigInt(tid));  // CLONE_CHILD_SETTID
@@ -1846,6 +1848,7 @@ export class LinuxEngine {
           // wait4, retire this context
           t.state = 'dead'; this._killProcSiblings(t);
           this._pipeEofSweep([...t.proc.fds.values()]);
+          this._rlockExit(t.proc);
           this._vforkRollback(t);
           t.proc.parent.state = 'run'; this._vforkThaw(t.proc.parent);
           (this.children ??= []).push({ pid: t.proc.pid, eng: null, exited: Number(a1 & 0xffn) });
@@ -1855,6 +1858,7 @@ export class LinuxEngine {
         }
         if (nr === 231 || this.threads.filter(x => x.state !== 'dead').length <= 1) {
           this._flushSharedMaps();                            // dirty shared pages reach the file
+          this._rlockExit(this);                              // POSIX record locks die with the process
           this.exitCode = Number(a1 & 0xffn); cpu.halted = true; ret(0n); break;
         }
         t.state = 'dead';
@@ -2123,6 +2127,7 @@ export class LinuxEngine {
         this.fds.delete(cfd); this.cloexec.delete(cfd);
         if (ch?.pipe && ch.mode === 'w') this._pipeEofSweep([ch]);
         if (ch && this._fsMeta().flocks?.size) this._flockRelease(ch);
+        if (ch && this._fsMeta().rlocks?.size) this._rlockClose(ch);
         ret(0n); break; }                                     // close
       case 436: {                                             // close_range(first, last, flags)
         const first = Number(a1), last = Math.min(Number(BigInt.asUintN(32, a2)), 1 << 20), fl = Number(a3);
@@ -2131,6 +2136,7 @@ export class LinuxEngine {
           const ch = this.fds.get(fd); this.fds.delete(fd); this.cloexec.delete(fd);
           if (ch?.pipe && ch.mode === 'w') this._pipeEofSweep([ch]);
           if (ch && this._fsMeta().flocks?.size) this._flockRelease(ch);
+          if (ch && this._fsMeta().rlocks?.size) this._rlockClose(ch);
         }
         ret(0n); break; }
       case 73: {                                              // flock(fd, op): advisory, per open file description
@@ -2462,11 +2468,19 @@ export class LinuxEngine {
         ret(0n); break; }
       // ---- POSIX timers: timer_create / settime / gettime / getoverrun / delete
       case 222: {                                             // timer_create(clockid, sigevent*, timerid*)
-        let sig = 14, notify = 0, sival = 0n;
+        let sig = 14, notify = 0, sival = 0n, tid = null;
         if (a2) { sival = this.mem.read(a2, 8n); sig = Number(this.mem.read(a2 + 8n, 4n)); notify = Number(this.mem.read(a2 + 12n, 4n)); }
-        if (notify === 2) { ret(-22n); break; }                // SIGEV_THREAD: glibc's helper thread not modelled
+        // glibc's SIGEV_THREAD is a helper thread it starts itself, then
+        // SIGEV_THREAD_ID (4) to the kernel with that thread's tid and
+        // SIGTIMER; the helper sigwaits and runs the callback. So the kernel
+        // never sees notify=2 from glibc (and treats it as SIGEV_SIGNAL when
+        // it does); what it needs is the thread-directed delivery.
+        if (notify === 4) { tid = Number(this.mem.read(a2 + 16n, 4n));
+          if (!this.threads.some(x => x.id === tid && x.state !== 'dead')) { ret(-22n); break; } }
+        else if (notify !== 0 && notify !== 1 && notify !== 2) { ret(-22n); break; }
+        if (notify !== 1 && (sig < 1 || sig > 64)) { ret(-22n); break; }
         const id = (this._ptimerNext = (this._ptimerNext ?? 0) + 1);
-        (this.ptimers ??= new Map()).set(id, { at: null, interval: 0, sig, notify, sival, overrun: 0 });
+        (this.ptimers ??= new Map()).set(id, { at: null, interval: 0, sig, notify, sival, tid, overrun: 0 });
         this.jsnap(a3, 4); this.mem.write(a3, 4n, BigInt(id)); ret(0n); break; }
       case 223: {                                             // timer_settime(id, flags, new*, old*)
         const t = this.ptimers?.get(Number(a1)); if (!t) { ret(-22n); break; }
@@ -2608,9 +2622,38 @@ export class LinuxEngine {
         if (cmd === 4) { if (h?.sock) h.sock.nonblock = !!(Number(a3) & 0x800); if (h?.pipe) h.nonblock = !!(Number(a3) & 0x800); ret(0n); break; }  // F_SETFL
         if (cmd === 1) { ret(BigInt(this.cloexec.has(Number(a1)) ? 1 : 0)); break; }   // F_GETFD
         if (cmd === 2) { if (Number(a3) & 1) this.cloexec.add(Number(a1)); else this.cloexec.delete(Number(a1)); ret(0n); break; }  // F_SETFD
-        if (cmd === 5 || cmd === 36) {                        // F_GETLK / F_OFD_GETLK: nobody holds a record lock
-          if (a3) { this.jsnap(a3, 2); this.mem.write(a3, 2n, 2n); }   // l_type = F_UNLCK
-          ret(0n); break; }
+        if (cmd === 5 || cmd === 6 || cmd === 7 || cmd === 36 || cmd === 37 || cmd === 38) {
+          // POSIX record locks (F_GETLK/F_SETLK/F_SETLKW) and the OFD trio.
+          // Advisory byte ranges in the shared fs meta, so a fork child (its
+          // own engine over the same files) sees the parent's locks. A POSIX
+          // lock is owned by the process and dropped when ANY fd on the file
+          // closes; an OFD lock by the open file description (the fd handle
+          // shared by dup/fork) and dropped with its last fd. Before this,
+          // every F_SETLK was granted and F_GETLK always said unlocked:
+          // two processes contending for a lock file both won.
+          if (!h) { ret(-9n); break; }
+          const r = this._rlockRange(h, a3); if (!r) { ret(-22n); break; }
+          const ofd = cmd >= 36, tcur = this.threads[this.ti];
+          const owner = ofd ? h : (tcur.proc ?? this), pid = tcur.proc?.pid ?? this.pid ?? 1;
+          const key = h.path ?? h, m = this._fsMeta(); m.rlocks ??= new Map();
+          const L = m.rlocks.get(key) ?? [];
+          if (globalThis.__dbg) console.error(`<rlock cmd=${cmd} key=${String(key)} owner=${owner === this ? 'eng' + (this.pid ?? '?') : 'proc'} r=${JSON.stringify(r)} table=${JSON.stringify(L.map(x => ({ o: x.owner === this ? 'me' : 'other', t: x.type, s: x.start, e: x.end })))}>`);
+          const conflict = (x) => x.owner !== owner && x.start <= r.end && r.start <= x.end && (x.type === 1 || r.type === 1);
+          if (cmd === 5 || cmd === 36) {                      // F_GETLK: describe the first blocker, or F_UNLCK
+            const c = r.type === 2 ? null : L.find(conflict);
+            this.jsnap(a3, 32);
+            if (!c) this.mem.write(a3, 2n, 2n);
+            else { this.mem.write(a3, 2n, BigInt(c.type)); this.mem.write(a3 + 2n, 2n, 0n);
+                   this.mem.write(a3 + 8n, 8n, BigInt(c.start));
+                   this.mem.write(a3 + 16n, 8n, c.end === Infinity ? 0n : BigInt(c.end - c.start + 1));
+                   this.mem.write(a3 + 24n, 4n, BigInt.asUintN(32, BigInt(c.ofd ? -1 : c.pid))); }
+            ret(0n); break; }
+          if (r.type !== 2 && L.some(conflict)) {
+            if (cmd === 6 || cmd === 37) { ret(-11n); break; } // F_SETLK: EAGAIN
+            this.block(this.nowMs() + 20); break; }           // F_SETLKW: re-checked on every wake
+          this._rlockApply(L, owner, r, ofd, pid);
+          if (L.length) m.rlocks.set(key, L); else m.rlocks.delete(key);
+          this.wakeAllBlk(); ret(0n); break; }
         if (cmd === 0 || cmd === 1030) {                      // F_DUPFD / F_DUPFD_CLOEXEC
           if (!h) { ret(-9n); break; }
           let fd = Number(a3); while (this.fds.has(fd)) fd++;
@@ -2961,6 +3004,44 @@ export class LinuxEngine {
   }
   // stores through a shared writable mapping reach a descriptor read
   _mapsFlushPath(path) { for (const m of this.maps) if (m.shared && m.path === path) this._writeBackMap(m); }
+  // ---- POSIX / OFD record locks (fcntl F_SETLK family) ----
+  // struct flock: l_type i16 @0, l_whence i16 @2, l_start i64 @8, l_len i64 @16, l_pid i32 @24
+  _rlockRange(h, p) {
+    const type = Number(this.mem.read(p, 2n)), whence = Number(this.mem.read(p + 2n, 2n));
+    const off = Number(BigInt.asIntN(64, this.mem.read(p + 8n, 8n))), len = Number(BigInt.asIntN(64, this.mem.read(p + 16n, 8n)));
+    if (type < 0 || type > 2 || whence > 2) return null;
+    const base = whence === 0 ? 0 : whence === 1 ? (h.pos ?? 0) : (h.bytes?.length ?? 0);
+    let start = base + off, end;
+    if (len === 0) end = Infinity; else if (len > 0) end = start + len - 1; else { end = start - 1; start += len; }
+    if (start < 0) return null;
+    return { type, start, end };
+  }
+  _rlockApply(L, owner, r, ofd, pid) {
+    // the owner's existing locks over the range are cut out (split at the
+    // ends), then the new lock is added - F_UNLCK adds nothing
+    for (let i = L.length - 1; i >= 0; i--) {
+      const x = L[i]; if (x.owner !== owner || x.start > r.end || r.start > x.end) continue;
+      L.splice(i, 1);
+      if (x.start < r.start) L.push({ ...x, end: r.start - 1 });
+      if (x.end > r.end) L.push({ ...x, start: r.end + 1 });
+    }
+    if (r.type !== 2) L.push({ owner, ofd, pid, type: r.type, start: r.start, end: r.end });
+  }
+  _rlockDrop(pred) {
+    const m = this._fsMeta(); if (!m.rlocks) return; let any = false;
+    for (const [k, L] of m.rlocks) {
+      const keep = L.filter(x => !pred(k, x)); if (keep.length === L.length) continue;
+      any = true; if (keep.length) m.rlocks.set(k, keep); else m.rlocks.delete(k);
+    }
+    if (any) this.wakeAllBlk();
+  }
+  _rlockClose(h) {
+    const key = h.path ?? h, owner = this.threads[this.ti]?.proc ?? this;
+    if (globalThis.__dbg) console.error(`<rlockClose key=${String(key)} owner=${owner === this ? 'eng' + (this.pid ?? '?') : 'proc'} table=${JSON.stringify([...(this._fsMeta().rlocks ?? [])].map(([k, L]) => [k, L.map(x => x.owner === this ? 'me' : 'other')]))}>`);
+    const last = ![...this.fds.values()].includes(h);          // the description's last fd is gone
+    this._rlockDrop((k, x) => k === key && (x.ofd ? (last && x.owner === h) : x.owner === owner));
+  }
+  _rlockExit(owner) { this._rlockDrop((k, x) => x.owner === owner); }
   _flockRelease(h) {
     const m = this._fsMeta(); if (!m.flocks) return;
     for (const [k, L] of m.flocks) { if (L.ex === h) L.ex = null; L.sh.delete(h); if (!L.ex && !L.sh.size) m.flocks.delete(k); }
@@ -2989,6 +3070,16 @@ export class LinuxEngine {
   // pushed so SA_SIGINFO handlers read what they expect and rt_sigreturn
   // restores exactly what was saved. From compiled code the redirect unwinds
   // the wasm frame (aotEnv.syscall) so the top loop resumes at the handler.
+  // clone: the new thread / window child starts with its creator's signal
+  // mask (glibc blocks every signal around pthread_create of its timer
+  // helper, which then sigwaits for SIGTIMER - started with an empty mask,
+  // the first tick's default action killed the process, exit 160), no
+  // pending set, and the alternate stack only across fork, not per thread
+  _sigInherit(t, from, isFork) {
+    this._ts(from);
+    t.sigmask = from.sigmask; t.pending = 0n; t.eintr = false; t.suspendOld = null;
+    t.altstack = isFork ? from.altstack : null;
+  }
   _ts(t) { if (t.sigmask === undefined) { t.sigmask = 0n; t.pending = 0n; t.eintr = false; t.suspendOld = null; t.altstack = null; } return t; }
   _sigDeliverable(t) {
     const bits = t.pending & ~t.sigmask;
@@ -3091,7 +3182,7 @@ export class LinuxEngine {
       if (t.interval > 0) { over = Math.max(0, Math.floor((now - t.at) / t.interval)); t.at = t.at + (over + 1) * t.interval; }
       else t.at = null;
       t.overrun = over;
-      if (t.notify !== 1) this.raiseSignal(t.sig, null, { pid: 0, code: -2, timer: id, overrun: over, sival: t.sival });   // SI_TIMER
+      if (t.notify !== 1) this.raiseSignal(t.sig, t.notify === 4 ? t.tid : null, { pid: 0, code: -2, timer: id, overrun: over, sival: t.sival });   // SI_TIMER; SIGEV_THREAD_ID is thread-directed
     }
     this.itimer = { at: this._earliestTimer() };
   }
@@ -3321,6 +3412,11 @@ export class LinuxEngine {
       assembleWat: o.assembleWat, aotCallThreshold: o.aotCallThreshold, aotLoopThreshold: o.aotLoopThreshold,
       xserver: o.xserver, mtimes: o.mtimes, tty: o.tty, ttyRows: o.ttyRows, ttyCols: o.ttyCols, stdin: o.stdin });
     if (this.strace) ceng.strace = [];                       // a traced parent traces its children
+    // record locks the child took inside its window are owned by its proc
+    // record; from here on its identity is the new engine (it conflicted
+    // with its own lock otherwise - F_SETLKW spun forever after the parent
+    // unlocked)
+    for (const L of this._fsMeta().rlocks?.values() ?? []) for (const x of L) if (x.owner === t.proc) x.owner = ceng;
     this._copyLiveRam(ceng);                                 // the child's view, before rollback (live ranges only)
     ceng.brk = this.brk; ceng.mmapNext = this.mmapNext;
     ceng.execRanges = this.execRanges.slice();
