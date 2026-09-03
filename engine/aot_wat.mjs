@@ -61,6 +61,21 @@ export const FTDEPTH = FTMAP + 8, FTDLIMIT = 1200;
 // more than a tankful away. dispatchAot fills the tank per dispatch from
 // eng.chainFuel (hosts without deadlines leave it effectively unlimited).
 export const FTFUEL = FTMAP + 12;
+// Loop yield budget (u32 at FTMAP+16, dead space since the hash replaced the
+// sorted map). V8 compiles a unit function with Liftoff first and tiers it
+// up in the background, but a FRAME already running baseline code keeps it
+// until it returns: a long-running loop entered once (a kernel's main loop,
+// a program's read-process-write loop) ran at Liftoff speed for the whole
+// run - the scan kernel measured 3.80x native in the engine against 0.86x
+// for the same loop as a small standalone function, and --liftoff-only
+// read the same 3.65x. Every backward edge burns one unit of this budget;
+// at zero the frame spills its registers and RETURNS the loop head's
+// address as its exit rip, exactly the contract a guest ret uses. The
+// engine re-dispatches at that rip: the loop head becomes a profiled entry
+// (its own unit after a few interpreted iterations), and every re-entry
+// picks up whatever tier V8 has by then. dispatchAot fills the budget per
+// dispatch from eng.loopYield; OXWASM_LOOPYIELD=0 disables the emission.
+export const FTLOOP = FTMAP + 16;
 
 // The in-wasm resolver over the sorted (addr, table-slot) map at FTMAP —
 // shared by every unit module and by generated PLT stubs.
@@ -2200,8 +2215,19 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       // before body j, so `br $b{j}` lands at its start); only backward
       // edges pay the $pc + br_table dispatcher round-trip. Measured before:
       // 3044 of 3248 edges in a hot unit went through the dispatcher.
-      if (DISP) return j > i ? `(br $b${j})` : j === i ? `(br $l${i})` : `(local.set $pc (i32.const ${j})) (br $L_disp)`;
-      return `(br ${labelFor(j)})`; };
+      // backward edge: burn one loop-yield unit; at zero, hand the loop head
+      // back to the engine as this frame's exit rip (see FTLOOP)
+      // Burn first, then test for exactly zero: a budget nobody armed (the
+      // word is 0 when a unit function is called outside dispatchAot - the
+      // differential tests do that) wraps to 2^32-1 and never yields, and
+      // an armed budget yields once, at its last edge. disptest read 10/400
+      // with test-then-burn: every first back edge "exited" the function.
+      const yieldAt = (LOOPYIELD && j <= i)
+        ? `(i32.store (i32.const ${FTLOOP}) (i32.sub (i32.load (i32.const ${FTLOOP})) (i32.const 1))) ` +
+          `(if (i32.eqz (i32.load (i32.const ${FTLOOP}))) (then (local.set $rex (i64.const ${hexs(blocks[j].start)})) ${SA_MARK} (return (local.get $rex)))) `
+        : '';
+      if (DISP) return yieldAt + (j > i ? `(br $b${j})` : j === i ? `(br $l${i})` : `(local.set $pc (i32.const ${j})) (br $L_disp)`);
+      return yieldAt + `(br ${labelFor(j)})`; };
     const brTo = (j) => j === i+1 ? '' : goto(j);
     // A branch TARGET the analyzer couldn't decode (an address past a decode
     // failure, a cut-off jump-table row) becomes a cold deopt edge instead of
@@ -2536,6 +2562,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
 // CPython) pass with it, steady-state on call-dense code is 6-11% faster,
 // and the tier-up cost objection is halved by the assembler worker.
 const BLOCKLOOPS = typeof process !== 'undefined' && process.env?.OXWASM_BLOCKLOOPS === '1';
+const LOOPYIELD = !(typeof process !== 'undefined' && process.env?.OXWASM_LOOPYIELD === '0') && !globalThis.__noLoopYield;
 // Opt out with OXWASM_INLINE=0 or globalThis.__inline = false.
 // OXWASM_INLINE_BUDGET caps the callee size in instructions - the default is
 // in the low hundreds because gzip's three hot callees are 66, 88 and 114,

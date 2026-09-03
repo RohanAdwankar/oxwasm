@@ -7,7 +7,7 @@
 import { CPU, Memory } from './interp.mjs';
 import { compileLoop } from './jit2.mjs';
 import { compileVectorLoop } from './jitsimd.mjs';
-import { compileUnitWat, pltStubWat, FTMAP, FTMAP_MAX, FTDLIMIT, FTFUEL,
+import { compileUnitWat, pltStubWat, FTMAP, FTMAP_MAX, FTDLIMIT, FTFUEL, FTLOOP,
          FTHASH, FTHBITS, FTHMASK, FTHBYTES } from './aot_wat.mjs';
 import { decode } from './decode.mjs';
 
@@ -523,6 +523,7 @@ export class LinuxEngine {
     // fill the chain-fuel tank for this dispatch (see FTFUEL in aot_wat.mjs);
     // hosts that set no sliceDeadline get an effectively bottomless tank
     fdv.setUint32(FTFUEL, this.chainFuel ?? 0x0FFFFFFF, true);
+    fdv.setUint32(FTLOOP, this.loopYield ?? 4000000, true);      // backward edges before a frame yields its loop head (see FTLOOP)
     this.syncOut();
     const entry = this.cpu.rip;
     try { let exit = f();

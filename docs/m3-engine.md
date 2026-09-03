@@ -2975,9 +2975,53 @@ regime, so not that either. The remaining difference is dynamic: in the
 kernel binary `main` enters the loop once and never returns until the
 run ends. V8 compiles a function with Liftoff first and tiers it up in
 the background, but a frame already running baseline code keeps
-running it unless the loop is replaced on the stack — and whether V8's
-wasm OSR fires for this loop is exactly what `--no-liftoff` (TurboFan
-from the start) against `--liftoff-only` on the scan kernel decides.
+running it unless the loop is replaced on the stack. `--liftoff-only`
+on the scan kernel reads **3.65x** — the default's 3.80x within noise.
+The default run IS the baseline tier for this loop: V8 tiered `main` up
+in the background long ago, but the frame that entered the loop first
+never returned to pick the new code up. (This Node's V8 exposes no wasm
+OSR flag; its tiering is budget-driven and replaces code for the *next*
+entry only.) The decisive pair, by two-size subtraction on the runner
+(400 M minus 100 M iterations): default tiering **2.2 s**, TurboFan from
+the start (`--no-liftoff`) **0.33 s** — 7.4 ns against 1.1 ns per
+iteration, native 1.5 ns. The compiled loop is not slow; the frame that
+runs it never gets the compiled code.
+
+### The loop yield: a frame hands its loop head back
+
+The fix is the engine's, not V8's: give a long-running compiled frame a
+way to return. Every backward edge in both emitter layouts now burns one
+unit of a loop budget (`FTLOOP`, a word in the FTMAP header's dead
+space, refilled per dispatch from `eng.loopYield`, default 4 M edges);
+at zero the frame spills its registers and *returns the loop head's
+address as its exit rip* — the contract a guest `ret` already uses, so
+nothing new is needed on the engine side: `dispatchAot` treats the rip
+as the resume point, the interpreter profiles the back edge, the loop
+head becomes its own unit after twelve iterations, and every re-entry
+from then on runs whatever tier V8 has compiled by then. A yield every
+4 M edges costs one JS round-trip (a regfile sync each way) per ~10 ms
+of loop, well under 1%. Correctness rests on the same ground as a
+deopt to a loop head: the frame's stack stays in place, the registers
+are in the regfile, and execution resumes at a guest address.
+`OXWASM_LOOPYIELD=0` disables the emission for A/B. One detail that
+mattered: the edge burns first and tests for exactly zero, so a budget
+nobody armed (a unit function called outside `dispatchAot`, as the
+differential tests do) wraps and never yields — the test-then-burn
+draft made every first back edge an exit and read 10/400 on disptest.
+
+By the same two-size subtraction, yield on: 300 M iterations in
+**0.95 s** (168 dispatches, 75 of them yields), against 2.2 s without
+and 0.33 s for TurboFan-from-the-start — the frame now reaches tiered
+code partway through, and what remains is the Liftoff time before each
+loop head's own unit is tiered. On the kernel harness — the number that
+started this — `scan` goes from **3.86x to 1.15x native** (yield off vs
+on, same run, ±1%; the harness recalibrated N to 4.1 G iterations as the
+engine sped up). `alu` and `branch`, whose loops the harness also enters
+once, are the next re-measurement, and every program whose hot loop is
+entered once and never returns — a compressor's main loop, a checksum,
+a sort — is the population this applies to. m4's tokenizer, called per
+token, was reaching tiered code already; its 8.4x is still the
+per-call-frame story, now with the loop-yield effect separated from it.
 
 The same dump named the two refusals left: `shufps`/`shufpd` (0f c6) had
 no AOT emitter — it does now (`i8x16.shuffle`, covered by packedtest) —
