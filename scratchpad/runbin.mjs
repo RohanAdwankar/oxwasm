@@ -6,9 +6,9 @@ import { execFileSync } from 'node:child_process';
 import { writeFileSync, unlinkSync } from 'node:fs';
 let an = 0;
 let watBytes = 0, watUnits = 0;
-const assembleWat = (wat) => { watBytes += wat.length; watUnits++;                       // AOT=1: tier live, like breadth
+const assembleWat = (wat) => { watBytes += wat.length; watUnits++; if (process.env.WATDUMP && wat.includes('$f_' + process.env.WATDUMP)) writeFileSync(process.env.WATDUMP_TO || ('/tmp/claude-0/-home-user-0/39bd4f7f-c25c-5004-92d0-ce544ed5705a/scratchpad/unit_' + process.env.WATDUMP + '.wat'), wat);                       // AOT=1: tier live, like breadth
   const w = `/tmp/rb_${process.pid}_${an++}`; writeFileSync(w + '.wat', wat);
-  execFileSync('wat2wasm', ['--enable-tail-call', w + '.wat', '-o', w + '.wasm']);
+  execFileSync('wat2wasm', ['--enable-tail-call', '--debug-names', w + '.wat', '-o', w + '.wasm']);
   const b = new Uint8Array(readFileSync(w + '.wasm')); try { unlinkSync(w+'.wat'); unlinkSync(w+'.wasm'); } catch {} return b; };
 const bin = process.argv[2], args = process.argv.slice(3);
 const files = {}, mtimes = {};
@@ -53,6 +53,8 @@ if (err) {   // where did it die: the mapping holding rip (library + file offset
   if (eng.ripTrace) { const out = []; for (let i = 1; i <= 48; i++) { const v = eng.ripTrace[(eng.ripTraceI - i) & 1023]; if (v === 0n || v === undefined) break; out.push((v < 0n ? 'A' : '') + (v < 0n ? -v : v).toString(16)); }
     console.log('--- last rips (newest first; A=AOT entry/exit): ' + out.join(' ')); }
 }
+const __fdv = new DataView(eng.wmem.buffer), __yt = __fdv.getUint32(0x10000 + 24, true), __yn = __fdv.getUint32(0x10000 + 28, true);
+console.log(`--- yields: top=${__yt} nested=${__yn}`);
 console.log(`--- wat: units=${watUnits} bytes=${(watBytes/1e6).toFixed(2)}MB loopHot=${eng.stats.loopHot|0} yieldTop=${eng.stats.loopYieldTop|0} yieldNested=${eng.stats.loopYieldNested|0} aotFns=${eng.aotFns.size}`);
 if (process.env.DUMP) {   // DUMP=hexrip,...: tiering state of given entries + the hottest uncompiled call targets
   console.log(`--- tiering: loopHot=${eng.stats.loopHot|0} yieldTop=${eng.stats.loopYieldTop|0} yieldNested=${eng.stats.loopYieldNested|0} aotFns=${eng.aotFns.size} aotFailed=${eng.aotFailed?.size} ftCount=${eng._ftCount} ftFull=${eng._ftFull} tiers=${JSON.stringify(eng.stats.tiers)}`);

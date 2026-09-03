@@ -84,6 +84,8 @@ export const FTLOOP = FTMAP + 16;
 // returned rip is honoured (dispatchAot's f(), the in-wasm drive loop, a
 // nested dispatch from a callout - each zeroes the word for its dispatch).
 export const FTNEST = FTMAP + 20;
+// yield counters, bumped in the $yield tail: top-level returns at +24, nested deopts at +28
+export const FTYTOP = FTMAP + 24, FTYNEST = FTMAP + 28;
 
 // The in-wasm resolver over the sorted (addr, table-slot) map at FTMAP —
 // shared by every unit module and by generated PLT stubs.
@@ -2298,10 +2300,16 @@ function emitUnitFunction(a0, fnAddr, ctx) {
         else L.push(`(if ${c} (then ${goto(T)}) (else ${goto(F)}))`);
       } else {
         const lbl = (j) => labelFor(j);
+        // a BACKWARD conditional edge goes through goto() so it burns the
+        // loop-yield budget like an unconditional one: the br_if form
+        // skipped the burn, and since gcc closes nearly every loop with
+        // cmp/jcc, only jmp-closed loops (scan) ever yielded - alu ran
+        // 600M iterations in Liftoff at 5.6ns/iter with TurboFan at 1.15
+        const bj = (j, cc) => (LOOPYIELD && j <= i) ? `(if ${cc} (then ${goto(j)}))` : `(br_if ${lbl(j)} ${cc})`;
         if (T === i+1 && F === i+1) { /* both fall through */ }
-        else if (T !== i+1 && F === i+1) L.push(`(br_if ${lbl(T)} ${c})`);
-        else if (T === i+1 && F !== i+1) L.push(`(br_if ${lbl(F)} (i32.eqz ${c}))`);
-        else { L.push(`(br_if ${lbl(T)} ${c})`); L.push(`(br ${lbl(F)})`); }
+        else if (T !== i+1 && F === i+1) L.push(bj(T, c));
+        else if (T === i+1 && F !== i+1) L.push(bj(F, `(i32.eqz ${c})`));
+        else { L.push(bj(T, c)); L.push(goto(F)); }
       }
     } else if (t.kind === 'jmp' || t.kind === 'inlinecall') {
       if (t.t < 0 && t.tail) {                            // tail call to a known entry: chain in wasm, else deopt
@@ -2573,7 +2581,8 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   const yieldSpill = () => [...regs16y.filter(touched).map(spillR), ...(noXmmY ? [] : [...xUsed]).map(xSpill)].join('\n    ');   // the full spill, as expandFull(false) builds it
   const yieldTail = () => !usesYield ? '' :
     `    ${yieldSpill()}\n    (i32.store (i32.const ${FTLOOP}) (i32.const ${LOOPYIELD_N}))\n` +
-    `    (if (i32.eqz (i32.load (i32.const ${FTNEST}))) (then (return (local.get $rex))))\n` +
+    `    (if (i32.eqz (i32.load (i32.const ${FTNEST}))) (then (i32.store (i32.const ${FTYTOP}) (i32.add (i32.load (i32.const ${FTYTOP})) (i32.const 1))) (return (local.get $rex))))\n` +
+    `    (i32.store (i32.const ${FTYNEST}) (i32.add (i32.load (i32.const ${FTYNEST})) (i32.const 1)))\n` +
     `    (return (call $x_deopt (local.get $rex) (local.get $rsp0)))\n`;
   if (usesYield) wat += '    (block $yield\n';
   if (DISP) {
@@ -2641,7 +2650,7 @@ const BLOCKLOOPS = typeof process !== 'undefined' && process.env?.OXWASM_BLOCKLO
 // OXWASM_TAILCUT=0 follows tail jumps into other functions again (A/B)
 const TAILCUT = !(typeof process !== 'undefined' && process.env?.OXWASM_TAILCUT === '0');
 const LOOPYIELD = !((typeof process !== 'undefined' && process.env?.OXWASM_LOOPYIELD === '0') || globalThis.__loopYield === false);
-export const LOOPYIELD_N = 4000000;   // backward edges per yield; dispatchAot's fill and the in-wasm refill agree
+export const LOOPYIELD_N = (typeof process !== 'undefined' && +process.env?.OXWASM_LOOPYIELD_N) || 4000000;   // backward edges per yield; dispatchAot's fill and the in-wasm refill agree
 // Opt out with OXWASM_INLINE=0 or globalThis.__inline = false.
 // OXWASM_INLINE_BUDGET caps the callee size in instructions - the default is
 // in the low hundreds because gzip's three hot callees are 66, 88 and 114,

@@ -3401,3 +3401,67 @@ match: between the mem kernel and the call kernel, as its shape
 predicts. vim's 4.7x and m4's 7.4x remain the call-dense band, and
 their gap to gzip is the dispatch protocol priced earlier: 11.5x on
 pure calls.
+
+### The yield never fired on a conditional back edge
+
+The kernels table above said the yield moved scan, branch and subw
+and left alu and mem where they were - and alu was the kernel whose
+TurboFan-forced ideal is 0.87x. A two-size subtraction under
+`runbin.mjs` (60M against 600M iterations, one run each) put numbers
+on it: alu 5.6 ns per iteration by default, 5.1 under
+`--liftoff-only`, 1.15 under `--no-liftoff`, native 1.56. The default
+run never left Liftoff, yield or no yield (`OXWASM_LOOPYIELD=0` read
+the same 5.5).
+
+The cause was in the emitter, not the mechanism. The burn-and-probe
+sequence lives in `goto()`; the structured layout's `jcc` path emitted
+`br_if` through the label helper directly, so a *conditional* backward
+edge never burned the budget. gcc closes nearly every counted loop
+with `cmp; jne head`; the loops that yielded were the ones closed by
+an unconditional `jmp` - scan's `jmp .cond` shape, and the dispatch
+layout, whose jcc already routed through `goto()`. Backward
+conditional edges now go through `goto()` (an `if` around the burn and
+branch instead of `br_if`; forward edges keep `br_if`).
+
+Two smaller findings from the same session:
+
+- **The counters could not see a top-level yield.** `dispatchAot`
+  tested FTLOOP for zero after the frame returned, but the yield tail
+  refills the word before returning, and the nested counter only
+  counted heads that had missed the probe. Both were blind to the
+  common case. The `$yield` tail now bumps two words itself (FTMAP+24
+  top-level returns, FTMAP+28 nested deopts) and `runbin.mjs` prints
+  them: mem at 60M iterations reads 14 top-level yields at the 4M
+  budget and 599 at 100k, as designed.
+- **Single-run two-size timings are not trustworthy for tiering
+  questions.** The same mem configuration read 3.9 ns/iter in one run
+  and 1.2 in another; V8 compiles the loop function's TurboFan code on
+  a background thread whose job lands at a variable time (behind the
+  engine's own stream of new-unit compiles), and everything before it
+  lands runs in Liftoff. The 7-rep harness with ~1.5G iterations per
+  rep is the instrument; `--wasm-tiering-budget=1000` and
+  `--no-liftoff` bound what the code *can* do. Browsers take no V8
+  flags, so the engine's own knob is the yield period
+  (`OXWASM_LOOPYIELD_N` overrides the 4M default for A/B; 20k-iteration
+  yields cost nothing measurable on alu).
+
+Kernels harness, 7 reps, N auto-calibrated (alu at 6.5G iterations):
+
+| kernel | before | after |
+|---|---:|---:|
+| alu | 2.99x | **1.40x** |
+| mem | 2.45x | **1.31x** |
+| call | 11.81x | 9.27x |
+| branch | 1.39x | 1.37x |
+| subw | 3.43x | 3.50x |
+| muldiv | 1.59x | **1.00x** |
+| scan | 1.57x | 1.60x |
+
+alu and mem are within 1.4x of native and muldiv at parity - the
+straight-line kernels whose top-tier ideal is parity; what is left of
+their gap is the Liftoff phase before the background TurboFan job
+lands, amortised over the rep, plus the burn on every back edge. subw
+did not move: its loop is `jmp`-closed and was yielding all along, so
+its 3.5x is codegen (the sub-word merges), not tier occupancy - the
+next straight-line item. The call kernel's 9.3x is the same protocol
+as before at a different auto-calibrated N.
