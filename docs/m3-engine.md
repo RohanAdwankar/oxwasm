@@ -2844,6 +2844,19 @@ subtraction (`bench/vsnative.mjs`, 20 k vs 200 k lines): **8.4x native**
 (20.7 s vs 2.46 s of work) — m4 is now in the call-dense band with perl,
 a `getc`/`ungetc` per character through the PLT, no longer off the chart.
 
+Steady state of the batch so far, engine work over native work by the same
+subtraction (startup share in the engine's big run in parentheses — above
+50% the resolution is poor and the number is an upper bound):
+
+| binary | work | engine | native | ratio |
+|---|---|---|---|---|
+| m4 | 200k macro lines | 20.7 s | 2.46 s | **8.4x** (27%) |
+| cmake -P | 60k-iteration script loop | 11.5 s | 8.7 s | **1.3x** (51%) |
+| vim -es | `%s` + write over 400k lines | 6.2 s | 0.42 s | **14.8x** (63%) |
+
+cmake is near native — its work is C++ string and list code, large
+functions, little call tax. vim is the outlier and the next profile.
+
 The same dump named the two refusals left: `shufps`/`shufpd` (0f c6) had
 no AOT emitter — it does now (`i8x16.shuffle`, covered by packedtest) —
 and two libc entries whose first instruction the decoder does not know.
