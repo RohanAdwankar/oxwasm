@@ -1417,12 +1417,7 @@ export class LinuxEngine {
       if (h && h.bytes !== undefined && h.writable) {        // regular file opened for writing
         if (h.path) (this.dirtyFiles ??= new Set()).add(h.path);
         const end = h.pos + bytes.length;
-        if (end > h.bytes.length) {
-          const nb = new Uint8Array(end);
-          nb.set(h.bytes); h.bytes = nb;
-          this.files[h.path] = nb;                           // growable buffer: refresh the map ref
-          this._hardRefresh(h.path, nb);                     // ... and every hard-link alias
-        }
+        if (end > h.bytes.length) this._growFile(h, end);
         h.bytes.set(bytes, h.pos);
         this._mapsAbsorb(h.path, h.pos, bytes);              // coherence: mapped pages see the write
         h.pos = end;
@@ -2237,12 +2232,8 @@ export class LinuxEngine {
         const bytes = this.ram.slice(Number(a2 - this.base), Number(a2 - this.base) + len);
         const off = Number(cpu.regs[10]);
         const end = off + len;
-        if (end > h.bytes.length) {
-          const nb = new Uint8Array(end);
-          nb.set(h.bytes); h.bytes = nb;
-          this.files[h.path] = nb;
-          this._hardRefresh(h.path, nb);
-        }
+        if (end > h.bytes.length) this._growFile(h, end);
+
         if (h.path) (this.dirtyFiles ??= new Set()).add(h.path);
         h.bytes.set(bytes, off);                              // position unchanged
         this._mapsAbsorb(h.path, off, bytes);
@@ -3370,6 +3361,21 @@ export class LinuxEngine {
   // pids come from ONE counter at the root of the engine tree: a materialised
   // child that forks must not hand out its own pid (or its sibling's) again
   _allocPid() { let r = this; while (r.parentEng) r = r.parentEng; return (r.nextPid = (r.nextPid ?? 999) + 1); }
+  // Grow a written file to `end` bytes. The file array is an exact-length
+  // VIEW over a backing buffer with spare capacity, so appending 8KB at a
+  // time copies the file once per doubling, not once per write: exact
+  // reallocation was O(n^2) - vim writing 14MB in 8KB chunks spent 3.4s of
+  // a 6s run copying 12GB. Every consumer takes the view's length and
+  // byteOffset (parseElf, DataView, Buffer.from), so the capacity is invisible.
+  _growFile(h, end) {
+    const old = h.bytes;
+    const nb = (old.byteOffset + end <= old.buffer.byteLength)
+      ? new Uint8Array(old.buffer, old.byteOffset, end)
+      : (() => { const b = new Uint8Array(Math.max(end, old.length * 2, 4096)); b.set(old); return b.subarray(0, end); })();
+    h.bytes = nb;
+    this.files[h.path] = nb;                                 // growable buffer: refresh the map ref
+    this._hardRefresh(h.path, nb);                           // ... and every hard-link alias
+  }
   _killProcSiblings(t) {
     for (const x of this.threads) if (x !== t && x.proc === t.proc && x.state !== 'dead') {
       x.state = 'dead'; if (x.ctid) { try { this.mem.write(x.ctid, 4n, 0n); } catch {} }

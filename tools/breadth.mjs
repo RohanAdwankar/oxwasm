@@ -396,7 +396,7 @@ const CASES = [
   ['m4',        '/usr/bin/m4', [FX('prog.m4')], { bins: [FX('prog.m4'), '/bin/sh', '/usr/bin/printf'] }],
   // bison: an LALR(1) parser generator writing its output file
   ['bison',     '/usr/bin/bison', ['-o', '/tmp/breadth_calc.c', FX('calc.y')],
-                { bins: [FX('calc.y')], tree: '/usr/share/bison', outFile: '/tmp/breadth_calc.c' }],
+                { bins: [FX('calc.y'), '/usr/bin/m4'], tree: '/usr/share/bison', outFile: '/tmp/breadth_calc.c' }],   // bison runs its skeletons through m4 (execve'd)
   // vim in ex (silent batch) mode: a substitution and a sort over IN, written out
   ['vim-es',    '/usr/bin/vim', ['-es', '-u', 'NONE', '-i', 'NONE', '-c', '%s/e/E/g', '-c', '%!sort', '-c', 'w! /tmp/breadth_vim.txt', '-c', 'q!', IN],
                 { bins: ['/usr/bin/sort', '/usr/bin/sh'], outFile: '/tmp/breadth_vim.txt' }],   // vim's filter runs through /usr/bin/sh (its compiled-in 'shell'), an absolute path

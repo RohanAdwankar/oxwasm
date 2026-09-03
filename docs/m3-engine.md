@@ -2793,7 +2793,9 @@ again.
 
 `m4` (recursive macros, `eval`, `regexp`, `esyscmd` forking a shell inside
 a filter, diversions), `bison` generating an LALR(1) parser from a grammar
-(41 KB of output byte-compared to native's), `vim` in silent ex mode
+(41 KB of output byte-compared to native's; it runs its skeletons through
+an execve'd `m4`, which the case must provision itself — run alone it
+failed with SIGPIPE on m4's ENOENT until it did), `vim` in silent ex mode
 (a substitution, a filter through `sort`, a write), `ninja` dry-running a
 five-edge build graph, `cmake -P` (script mode: lists, math, regex, file
 write and read-back), `gdb -batch` looking up and disassembling `main` in
@@ -2852,10 +2854,28 @@ subtraction (startup share in the engine's big run in parentheses — above
 |---|---|---|---|---|
 | m4 | 200k macro lines | 20.7 s | 2.46 s | **8.4x** (27%) |
 | cmake -P | 60k-iteration script loop | 11.5 s | 8.7 s | **1.3x** (51%) |
-| vim -es | `%s` + write over 400k lines | 6.2 s | 0.42 s | **14.8x** (63%) |
+| vim -es | `%s` + write over 1.2M lines | 7.6 s | 1.34 s | **5.7x** (43%), after the write fix below; 14.8x before it |
 
 cmake is near native — its work is C++ string and list code, large
 functions, little call tax. vim is the outlier and the next profile.
+
+### vim's 14.8x was the file write, quadratic
+
+The vim profile said nothing was interpreted (85 k instructions in a run
+of billions, 2,800 unit entries) and syscalls were few (under 300). The
+V8 profile of the run said where the time was: `writeChunk` — the engine's
+own `write(2)` — at 3.4 s of a 6 s steady state. Its regular-file path
+grew the file by allocating an exact-length array and copying the whole
+file on every append past the end: 8 KB writes of a 14 MB file copy
+12 GB. Native vim's write is 30 ms. The file array is now an exact-length
+*view* over a backing buffer that doubles (`_growFile`, shared by `write`
+and `pwrite64`); every consumer already takes the view's length and
+byteOffset, so the spare capacity is invisible to readers, `mmap`, and
+the ELF parser. The sweep's file-writing cases (compilers, tar, tee,
+bison, split, bigheap) are the regression net. vim's steady state halved,
+6.2 s to 3.1 s — 7.5x native at poor resolution (startup 77% of the big
+run); on a 1.2 M-line input, where the work is 43% of the run, **5.7x**
+(7.6 s vs 1.34 s), in the call-dense band with m4 and perl.
 
 The same dump named the two refusals left: `shufps`/`shufpd` (0f c6) had
 no AOT emitter — it does now (`i8x16.shuffle`, covered by packedtest) —

@@ -18,6 +18,8 @@ for (const d of ['/lib/x86_64-linux-gnu', '/usr/lib/x86_64-linux-gnu', '/lib64']
 }
 add('/etc/ld.so.cache'); add(bin);
 for (const b of (process.env.BINS||'').split(',').filter(Boolean)) add(b);
+const walk = (d) => { let e; try { e = readdirSync(d); } catch { return; } for (const f of e) { const hp = join(d, f); let st; try { st = lstatSync(hp); } catch { continue; } if (st.isDirectory()) walk(hp); else { try { add(hp, realpathSync(hp)); } catch {} } } };
+for (const d of (process.env.TREE || '').split(':').filter(Boolean)) walk(d);   // TREE=dir:dir - provision whole directories
 const eng = new LinuxEngine(new Uint8Array(readFileSync(bin)),
   { argv: [bin, ...args], env: ['PATH=/usr/bin', 'HOME=/root', 'LANG=C'], files, mtimes, memMB: process.env.MEM ? +process.env.MEM : 512, assembleWat: process.env.AOT ? assembleWat : undefined });
 if (process.env.RIPTRACE) { eng.ripTrace = new Array(1024).fill(0n); eng.ripTraceI = 0; } if (process.env.AOTFAIL) eng.onAotFail = (a, m) => console.error(`<aotfail ${a.toString(16)}: ${String(m).slice(0, 300)}>`); if (process.env.STRACE) eng.strace = []; if (process.env.SIGTRACE) globalThis.__sigtrace = true; if (process.env.DBG) { globalThis.__dbg = true; console.error('<constructed>'); }
