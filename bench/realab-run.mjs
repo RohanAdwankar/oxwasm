@@ -16,7 +16,7 @@ const assembleWat = (wat) => {
   if (existsSync(cp)) return new Uint8Array(readFileSync(cp));
   const w = `/tmp/ra_${process.pid}_${an++}`;
   writeFileSync(w + '.wat', wat);
-  execFileSync('wat2wasm', ['--enable-tail-call', w + '.wat', '-o', w + '.wasm']);
+  execFileSync('wat2wasm', ['--enable-tail-call', '--debug-names', w + '.wat', '-o', w + '.wasm']);   // names survive into V8 profiles
   const b = new Uint8Array(readFileSync(w + '.wasm'));
   try { unlinkSync(w + '.wat'); unlinkSync(w + '.wasm'); } catch {}
   try { writeFileSync(cp, b); } catch {}
