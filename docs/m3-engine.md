@@ -3285,3 +3285,64 @@ faults, so a runtime that probes its stack limit by touching it will
 not see the SIGSEGV it expects), and mremap grows only by moving: a
 grow without MREMAP_MAYMOVE answers ENOMEM even when the pages after
 the mapping are free.
+
+### Bounding a function at its tail calls
+
+The other half of the function-bloat item: gcc's sibling-call
+optimisation ends a function with `jmp callee`, and the analyzer
+followed that jump as if it were a branch, decoding the callee and
+everything *it* tail-jumps to into the caller's unit. The noreturn
+cut (above) stops the fall-through after `call abort`; this stops the
+walk at a direct `jmp` whose target is a known function entry - one
+the tiering profile has seen called or one already compiled - and not
+already part of this function's own decoded range (a jump back to the
+function's entry, or into a block already reached, is a loop and
+still followed). `OXWASM_TAILCUT=0` restores the old walk.
+
+The cut block ends in the jump and the emitter treats it as the tail
+call it is: `$rex` is the callee's address, the frame retires
+(FTDEPTH), and the funcref table is probed - a compiled callee is
+entered by `return_call_indirect`, wasm to wasm, no JS - with the
+deopt to the real address as the fallback for one that is not. A
+wrong guess (an "entry" that was really a case label) therefore costs
+a frame of interpretation, never correctness.
+
+On the 200 k-line m4 run (three macros: a recursive factorial via
+`eval`, a string reverse via `substr`, a greeting - 3.04 s native)
+under `scratchpad/runbin.mjs` with live tiering, byte-identical
+output on both arms:
+
+| | units | unit text | wall |
+|---|---|---|---|
+| tail cut off | 131 | 76.2 MB | 64.7 s |
+| tail cut on | 133 | 65.8 MB | 63.2 s |
+
+14% less text to assemble and compile, the same run time: the dead
+code was compile-time weight, not run-time weight, as the noreturn
+section predicted.
+
+The first sweep with the cut was 120/130: perl aborted in
+`malloc_consolidate`, bash, ruby, node and the python multiprocess
+cases died on wild memory accesses. Bisecting bash's 109 cuts (an
+allow-window over the cut sequence, `TAILCUT_LO/HI` in
+`scratchpad/runbin.mjs`) landed on cut 58, `jmp free@plt` at the end
+of a 70-instruction helper - a perfectly ordinary sibling call. The
+helper was one the inliner had spliced into its caller, and there the
+cut's terminator (spill, chain or deopt, `return`) unwinds *the
+caller's* wasm frame from the middle of an inlined body. That is the
+same hazard the inliner already refuses for `udec` and `jmpind`
+callees ("a deopt that unwinds THIS frame; spliced in, it would unwind
+the caller's"); a tail-cut jmp joined that list. With inlining off the
+case passed, with the rule in place all nine pass. Two things the
+bisect also settled on the way: restricting cut targets to addresses
+the profile has seen *called* (the wider known-entries set holds
+compiled loop heads and resolver-probed labels, and a forward jmp to a
+loop's condition block must not be cut) was right but not sufficient,
+and the chain-versus-deopt choice at the cut was not the fault (the
+deopt-only variant crashed the same way). (`runbin.mjs` now prints the unit count and text
+bytes it assembled, plus the yield counters: on this run 7 heads were
+compiled on request and 21 nested yields fired, 0 top-level.) The
+remaining static answer - a symbol-based noreturn list - stays open;
+with both dynamic cuts in place, what a unit still swallows is the
+neighbour after a noreturn call that nothing ever calls, and that is
+dead text, not a fault.

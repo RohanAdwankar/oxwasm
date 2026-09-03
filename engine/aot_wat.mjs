@@ -355,7 +355,7 @@ export function compileFunctionWatDispatch(mem, entry, { guestBase, ramBase, max
 // One FUNCTION at a time: `call` is a mid-block instruction (fall-through
 // successor) whose target is recorded in `calls` for the unit driver;
 // `leave` is a plain epilogue instruction; ret/retn/jmpind end a block.
-export function analyze(mem, entry, { maxInsns = 20000, noJtab = false, entries = null } = {}) {
+export function analyze(mem, entry, { maxInsns = 20000, noJtab = false, entries = null, callTargets = null } = {}) {
   const M = 0xFFFFFFFFFFFFFFFFn;
   const insnAt = new Map(); const work = [entry]; const seen = new Set(); let count = 0;
   const calls = new Set();
@@ -407,7 +407,20 @@ export function analyze(mem, entry, { maxInsns = 20000, noJtab = false, entries 
               && insn.src.scale === 8 && !insn.src.ripRel && !insn.src.fs))) jmpinds.push(insn);
       continue;
     }
-    if (insn.mnem === 'jmp') { work.push((insn.next + insn.rel) & M); continue; }
+    if (insn.mnem === 'jmp') {
+      // A direct jmp to another KNOWN function entry is a tail call (gcc's
+      // sibling-call optimisation): walking into it swallowed the callee and
+      // everything it reaches. Cut like the noreturn call: the target is not
+      // decoded, and the emitter chains to it through the funcref table (a
+      // compiled callee runs in wasm) or deopts to the real address.
+      const tgt = (insn.next + insn.rel) & M;
+      // only an address the profile has seen CALLED counts as a function
+      // entry here: the wider `entries` set also holds compiled loop heads
+      // and resolver-probed labels, and a forward jmp to a loop's condition
+      // block (gcc's loop layout) was cut as a tail call - ten sweep cases
+      // died on wild addresses
+      if (TAILCUT && tgt !== entry && callTargets && callTargets.has(tgt.toString()) && !insnAt.has(tgt.toString()) && (!globalThis.__tailCutAllow || globalThis.__tailCutAllow(globalThis.__tailCutN = (globalThis.__tailCutN | 0) + 1))) { insn.tailCut = true; if (globalThis.__tailTrace) console.error(`<tailcut fn=${entry.toString(16)} at=${rip.toString(16)} -> ${tgt.toString(16)}>`); continue; }
+      work.push(tgt); continue; }
     if (insn.mnem === 'jcc') { work.push((insn.next + insn.rel) & M); work.push(insn.next); continue; }
     if (insn.mnem === 'call') {
       calls.add(((insn.next + insn.rel) & M).toString());
@@ -625,8 +638,11 @@ export function inlineCallees(a0, fnAddr, resolve, opts = {}) {
     for (const b of c.blocks) for (const i of b.insns) {
       size++;
       // an undecodable byte or an indirect jump compiles to a deopt that
-      // unwinds THIS frame; spliced in, it would unwind the caller's
-      if (i.mnem === 'udec' || i.mnem === 'jmpind') bad = true;
+      // unwinds THIS frame; spliced in, it would unwind the caller's. A
+      // tail-cut jmp (a sibling call to another known entry) is the same
+      // kind of terminator - inlined, bash died on a wild rsp at the next
+      // function entry (bisected to `jmp free@plt` at the end of a callee)
+      if (i.mnem === 'udec' || i.mnem === 'jmpind' || i.tailCut) bad = true;
     }
     if (bad || size === 0 || size > budget) { no(t, bad ? 'deopt-insn' : 'size=' + size); continue; }
     cand.set(t, { an: c, size });
@@ -891,7 +907,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     else if (last.edgeT !== undefined) {
       const ta = (next+last.rel)&MM, t = idxOfEdge(last.edgeT);
       if (t < 0) hasDeopt = true;
-      term.push({kind:'jmp', t, ta}); succs.push([t]); }
+      term.push({kind:'jmp', t, ta, tail: !!last.tailCut}); succs.push([t]); }
     else if (last.edgeN !== undefined) {
       const t = idxOfEdge(last.edgeN);
       if (t < 0) hasDeopt = true;
@@ -901,7 +917,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       term.push({kind:'jcc', t, f, ta, fa}); succs.push([t, f]); }
     else if (last.mnem === 'jmp') { const ta = (next+last.rel)&MM, t = idxOf(ta);
       if (t < 0) hasDeopt = true;
-      term.push({kind:'jmp', t, ta}); succs.push([t]); }
+      term.push({kind:'jmp', t, ta, tail: !!last.tailCut}); succs.push([t]); }
     else if (last.mnem === 'ret' || last.mnem === 'retn') { term.push({kind:'ret', pad: last.mnem==='retn' ? Number(last.n) : 0}); succs.push([]); }
     else if (last.mnem === 'jmpind') { hasDeopt = true;
       if (hasJtab && a0.jtabs.has(last.rip.toString())) { term.push({kind:'jtab', src:last.src}); succs.push([...jtabUnion]); }
@@ -2288,7 +2304,10 @@ function emitUnitFunction(a0, fnAddr, ctx) {
         else { L.push(`(br_if ${lbl(T)} ${c})`); L.push(`(br ${lbl(F)})`); }
       }
     } else if (t.kind === 'jmp' || t.kind === 'inlinecall') {
-      if (t.t < 0) L.push(...deoptTo(t.ta));
+      if (t.t < 0 && t.tail) {                            // tail call to a known entry: chain in wasm, else deopt
+        L.push(`(local.set $rex (i64.const ${hexs(t.ta)}))`, SA_MARK, ...tailJmp(),
+               `(return (call $x_deopt (local.get $rex) (local.get $rsp0)))`); }
+      else if (t.t < 0) L.push(...deoptTo(t.ta));
       else { const b = brTo(t.t); if (b) L.push(b); }
     } else if (t.kind === 'inlineret') {
       // pop what the inlined call pushed. The continuation is known
@@ -2619,6 +2638,8 @@ const BLOCKLOOPS = typeof process !== 'undefined' && process.env?.OXWASM_BLOCKLO
 // it on the sweep is 130/130 byte-identical and no sweep case ever reaches
 // a yield (none runs one loop 4M back edges); the effect is on long loops:
 // the scan kernel 3.86x -> 1.56x native, branch 1.94x -> 1.35x.
+// OXWASM_TAILCUT=0 follows tail jumps into other functions again (A/B)
+const TAILCUT = !(typeof process !== 'undefined' && process.env?.OXWASM_TAILCUT === '0');
 const LOOPYIELD = !((typeof process !== 'undefined' && process.env?.OXWASM_LOOPYIELD === '0') || globalThis.__loopYield === false);
 export const LOOPYIELD_N = 4000000;   // backward edges per yield; dispatchAot's fill and the in-wasm refill agree
 // Opt out with OXWASM_INLINE=0 or globalThis.__inline = false.
@@ -2667,12 +2688,12 @@ export function compileUnitWat(mem, entry, opts = {}) {
     if (skip && k !== entry.toString() && skip(k)) continue;
     try {
       let an;
-      try { an = analyze(mem, a, { maxInsns, noJtab: !!globalThis.__noJtab, entries: opts.entries ?? null }); }
+      try { an = analyze(mem, a, { maxInsns, noJtab: !!globalThis.__noJtab, entries: opts.entries ?? null, callTargets: opts.callTargets ?? null }); }
       catch (e) {
         // jump-table discovery can push a function over the size budget;
         // it compiled before the feature, so retry without it
         if (!/function too large/.test(e.message) || globalThis.__noJtab) throw e;
-        an = analyze(mem, a, { maxInsns, noJtab: true, entries: opts.entries ?? null });
+        an = analyze(mem, a, { maxInsns, noJtab: true, entries: opts.entries ?? null, callTargets: opts.callTargets ?? null });
       }
       // a body that starts undecodable compiles to a pure deopt — worse than
       // useless: dispatching it can ping-pong with the engine. Poison instead

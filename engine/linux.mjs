@@ -443,6 +443,8 @@ export class LinuxEngine {
         // every function entry the engine knows of: the analyzer cuts a
         // call's fall-through at one (a noreturn callee's neighbour)
         entries: this._knownEntries(),
+        // ... and the addresses actually seen called: what a tail jmp may target
+        callTargets: new Set([...this.aotCalls.keys()].map(k => k.toString())),
         // hosts whose assembler is wabt.js (itself wasm) choke on multi-MB
         // closure texts — child engines cap the unit size and chain instead
         ...(this.unitMaxFuncs ? { maxFuncs: this.unitMaxFuncs } : {}),
