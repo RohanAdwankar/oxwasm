@@ -22,7 +22,7 @@ const walk = (d) => { let e; try { e = readdirSync(d); } catch { return; } for (
 for (const d of (process.env.TREE || '').split(':').filter(Boolean)) walk(d);   // TREE=dir:dir - provision whole directories
 const eng = new LinuxEngine(new Uint8Array(readFileSync(bin)),
   { argv: [bin, ...args], env: ['PATH=/usr/bin', 'HOME=/root', 'LANG=C'], files, mtimes, memMB: process.env.MEM ? +process.env.MEM : 512, assembleWat: process.env.AOT ? assembleWat : undefined });
-if (process.env.RIPTRACE) { eng.ripTrace = new Array(1024).fill(0n); eng.ripTraceI = 0; } if (process.env.AOTFAIL) eng.onAotFail = (a, m) => console.error(`<aotfail ${a.toString(16)}: ${String(m).slice(0, 300)}>`); if (process.env.STRACE) eng.strace = []; if (process.env.SIGTRACE) globalThis.__sigtrace = true; if (process.env.DBG) { globalThis.__dbg = true; console.error('<constructed>'); }
+if (process.env.RIPTRACE) { eng.ripTrace = new Array(1024).fill(0n); eng.ripTraceI = 0; } if (process.env.LOOPTRACE) globalThis.__loopTrace = true; if (process.env.AOTFAIL) eng.onAotFail = (a, m) => console.error(`<aotfail ${a.toString(16)}: ${String(m).slice(0, 300)}>`); if (process.env.STRACE) eng.strace = []; if (process.env.SIGTRACE) globalThis.__sigtrace = true; if (process.env.DBG) { globalThis.__dbg = true; console.error('<constructed>'); }
 if (process.env.PROGRESS) { let k=0; eng.onProgress = (w) => { if ((k++ % 5) === 0) console.error(`<progress ${w} interp=${eng.stats.interpreted} aot=${eng.stats.aotRuns} rip=${eng.cpu.rip.toString(16)} thr=${eng.threads.map(t=>t.id+':'+t.state).join(' ')} kids=${(eng.children||[]).map(c=>c.pid+':'+(c.exited??'live')).join(' ')} rss=${(process.memoryUsage().rss/1e6)|0}MB>`); }; }
 let err = null, guard = 0; const t0 = Date.now();
 const nap = new Int32Array(new SharedArrayBuffer(4));
@@ -53,7 +53,7 @@ if (err) {   // where did it die: the mapping holding rip (library + file offset
     console.log('--- last rips (newest first; A=AOT entry/exit): ' + out.join(' ')); }
 }
 if (process.env.DUMP) {   // DUMP=hexrip,...: tiering state of given entries + the hottest uncompiled call targets
-  console.log(`--- tiering: aotFns=${eng.aotFns.size} aotFailed=${eng.aotFailed?.size} ftCount=${eng._ftCount} ftFull=${eng._ftFull} tiers=${JSON.stringify(eng.stats.tiers)}`);
+  console.log(`--- tiering: loopHot=${eng.stats.loopHot|0} yieldTop=${eng.stats.loopYieldTop|0} yieldNested=${eng.stats.loopYieldNested|0} aotFns=${eng.aotFns.size} aotFailed=${eng.aotFailed?.size} ftCount=${eng._ftCount} ftFull=${eng._ftFull} tiers=${JSON.stringify(eng.stats.tiers)}`);
   for (const h of process.env.DUMP.split(',').filter(Boolean)) { const a = BigInt('0x' + h);
     console.log(`  ${h}: aotFns=${eng.aotFns.has(a)} failed=${eng.aotFailed?.has(a)} calls=${eng.aotCalls?.get(a)} trampoline=${eng.isTrampoline(a)}`); }
   console.log('  syscalls: ' + Object.entries(eng.stats.syscalls).sort((x, y) => y[1] - x[1]).slice(0, 10).map(([n, c]) => n + 'x' + c).join(' '));

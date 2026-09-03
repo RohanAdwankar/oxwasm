@@ -42,7 +42,7 @@ for (const mnem of ['mul', 'imul']) {
     // AOT: run the pre-built function in wasm over a fresh memory image
     const mem = new WebAssembly.Memory({ initial: 4096 });
     const stub = () => { throw new Error('escape'); };
-    const inst = new WebAssembly.Instance(mod, { js: { mem }, env: { syscall: stub, callout: stub, deopt: stub } });
+    const inst = new WebAssembly.Instance(mod, { js: { mem, ftab: new WebAssembly.Table({ initial: 0, element: 'anyfunc' }) }, env: { syscall: stub, callout: stub, deopt: stub, loophot: stub } });
     const rv = new BigInt64Array(mem.buffer, 0, 16);
     for (let r = 0; r < 16; r++) rv[r] = 0n;
     rv[0] = BigInt.asIntN(64, a); rv[1] = BigInt.asIntN(64, b); rv[4] = BigInt.asIntN(64, CODE + 0x800n);

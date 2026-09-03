@@ -29,7 +29,7 @@ for (const op of ['rol', 'ror']) for (const w of [1,2,4,8]) for (const cnt of [0
     const want = BigInt.asUintN(64, cpu.regs[2]);
     const wmem = new WebAssembly.Memory({ initial: 4096 });
     const stub = () => { throw new Error('escape'); };
-    const inst = new WebAssembly.Instance(mod, { js: { mem: wmem }, env: { syscall: stub, callout: stub, deopt: stub } });
+    const inst = new WebAssembly.Instance(mod, { js: { mem: wmem, ftab: new WebAssembly.Table({ initial: 0, element: 'anyfunc' }) }, env: { syscall: stub, callout: stub, deopt: stub, loophot: stub } });
     const rv = new BigInt64Array(wmem.buffer, 0, 16);
     for (let i = 0; i < 16; i++) rv[i] = 0n;
     rv[2] = BigInt.asIntN(64, v); rv[4] = BigInt.asIntN(64, CODE + 0x800n);
@@ -69,7 +69,7 @@ console.log(`\n${pass}/${pass+fail} rol/ror results bit-exact (AOT vs interprete
 
     const wmem = new WebAssembly.Memory({ initial: 4096 });
     const stub = () => { throw new Error('escape'); };
-    const inst = new WebAssembly.Instance(mod, { js: { mem: wmem }, env: { syscall: stub, callout: stub, deopt: stub } });
+    const inst = new WebAssembly.Instance(mod, { js: { mem: wmem, ftab: new WebAssembly.Table({ initial: 0, element: 'anyfunc' }) }, env: { syscall: stub, callout: stub, deopt: stub, loophot: stub } });
     const rv = new BigInt64Array(wmem.buffer, 0, 16);
     for (let i = 0; i < 16; i++) rv[i] = 0n;
     const dv = new DataView(wmem.buffer);

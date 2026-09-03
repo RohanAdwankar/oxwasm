@@ -3003,7 +3003,7 @@ from then on runs whatever tier V8 has compiled by then. A yield every
 of loop, well under 1%. Correctness rests on the same ground as a
 deopt to a loop head: the frame's stack stays in place, the registers
 are in the regfile, and execution resumes at a guest address.
-`OXWASM_LOOPYIELD=0` disables the emission for A/B. One detail that
+`OXWASM_LOOPYIELD=1` enables the emission (it is off by default; see below). One detail that
 mattered: the edge burns first and tests for exactly zero, so a budget
 nobody armed (a unit function called outside `dispatchAot`, as the
 differential tests do) wraps and never yields — the test-then-burn
@@ -3023,11 +3023,152 @@ a sort — is the population this applies to. m4's tokenizer, called per
 token, was reaching tiered code already; its 8.4x is still the
 per-call-frame story, now with the loop-yield effect separated from it.
 
-The same dump named the two refusals left: `shufps`/`shufpd` (0f c6) had
-no AOT emitter — it does now (`i8x16.shuffle`, covered by packedtest) —
-and two libc entries whose first instruction the decoder does not know —
-both `cpuid` (0f a2) in ld.so's feature probing, called four times at
-startup; they run interpreted and cost nothing.
+The other kernels, yield off → on, same run: `branch` 1.94x → **1.35x**,
+`subw` 5.29x → **2.80x**, `alu` 2.95x → 3.02x, `mem` 2.43x → 2.46x,
+`muldiv` 1.60x → 1.57x. Two of five were baseline-tier loops too; the
+three that did not move were already reaching tiered code (their loops
+call out or exit often enough), and the yield costs them nothing.
+
+**And m4 diverged.** The realab A/B of m4 on 200 k lines with the yield
+on exited 2 with different output. The sweep's m4 case is 86 bytes and
+never reaches a yield; the big input does, and the yield was unsound
+for one frame kind: an in-unit call site `(drop (call $f_x))` drops
+its callee's returned rip and continues after the call — the frame
+protocol for a *nested* wasm call, where the callee's rip is only
+meaningful as "my frame exited normally". A callee that yielded
+mid-loop returned early, its caller carried on past the call with the
+callee's frame still on the guest stack, and m4 walked off. The yield
+now fires only in a frame whose returned rip is honoured: every in-unit
+call site bumps a nesting word (`FTNEST`) around the call, each
+dispatch (`dispatchAot`, the drive loop, a nested dispatch from a
+callout) zeroes it for its own frame and restores it after, and the
+back-edge check tests it before returning. Nested frames simply keep
+running — they are short-lived by construction, being callees.
+With the nesting rule m4 on 200 k lines is exit 0 with the output hash
+identical to native, and the dispatch differential stays 400/400.
+
+**And the sweep ran past its 90-minute cap.** 116 cases passed, none
+failed, but `gdb-batch` took 1,068 s where it had taken 271 s and
+`python-mp` 619 s where it had taken 72 s. A yield hands a loop head to
+the engine; when no unit is rooted there, the interpreter runs the
+loop, its back-edge profile tiers a *new* unit at that head after
+twelve iterations — a whole closure translation and an assembler run —
+and a big program has hundreds of hot loops entered once. The rule is
+now: yield only to a head that already resolves in the funcref table.
+The back edge probes `$ftr` once the budget is spent; on a hit the frame
+returns the address and `$drive` chains into the loop-head unit in
+wasm, no interpreter and no compile; on a miss it refills the budget
+and keeps running. Hot loops the interpreter ever ran already have
+their loop-head unit (that is how the scan kernel's `main` was
+compiled in the first place), so the case that matters still yields,
+and the rest costs one hash probe per 4 M edges. Except that the
+assumption was wrong where it mattered most: the scan kernel's loop
+head never had a unit — the frame running it was compiled from a
+different root — and with the probe alone the kernel read 4.28x again,
+the whole win gone. So a miss now does one more thing: it calls
+`env.loophot(head)`, and the engine roots a unit at that head, once
+(`_loopHot`, a set of heads already asked for). No interpretation, one
+bounded compile per loop that has run 4 M edges without a unit of its
+own; the next expiry's probe hits and the frame chains into it in wasm.
+The storm case is bounded the same way: gdb's hundreds of loops each
+cost one compile only after 4 M back edges, not after twelve interpreted
+iterations.
+
+**The nesting rule then lost the kernel a second time.** With the unit
+rooted and the probe hitting, the scan kernel still read 4.8x: its
+`main` is called by libc's `__libc_start_call_main` from *compiled*
+code, so it is a nested frame — as is any hot function called from
+main — and nested frames never yielded. The rule was right about what
+a nested frame may not do (return early past a caller that drops its
+rip) and wrong about the remedy. A nested frame now takes the other
+exit the emitter already has: it deopts to the resolved loop head. The
+engine's `interpUntil` dispatches the loop-head unit *under* the
+frame, runs it to the frame's own exit (rsp above `rsp0`), and returns
+that rip to the wasm caller, which continues past its call site exactly
+as if the callee had returned. One JS round trip per 4 M edges, and no
+growth in nesting: the loop-head unit's own yields are top-level within
+that dispatch. Top-level frames keep the cheaper return-the-head path.
+
+Measurement discipline for this stretch: the numbers taken while the
+three slow sweep cases were re-running on the same CPU came out about
+2x slower in every configuration, including TurboFan-only, and were
+discarded; the engine now counts the yields it takes (`loopYieldTop`
+for the return path, `loopYieldNested` for deopts to a loop head,
+`loopHot` for units rooted on request), so a clean two-size run reports
+whether the mechanism fired and how, not just how long it took.
+The first counted run said: on 100 M iterations of the scan kernel,
+`loopHot` 1, `loopYieldTop` 1, `loopYieldNested` 0 — one unit rooted at
+the head on request, one yield through the engine, and from then on the
+loop-head unit hands its head to `$drive`, which chains back into it
+without leaving wasm; the JS-side counters see nothing more, which is
+the design working. (A comment that swallowed the deopt handler's first
+statement made every deopt a ReferenceError for one measurement round;
+those numbers were voided too.)
+
+The clean run then read the one thing the counters could not: yield on,
+300 M iterations in **3.0 s**; yield off, **1.2 s**; TurboFan-only,
+1.2 s. Worse with the mechanism than without. The cause is in the
+hand-off itself: after the first yield the loop-head unit hands its head
+to `$drive`, which chains straight back into it in wasm — and nothing
+on that path refills the loop budget, which `dispatchAot` alone had been
+filling. The second entry started with the word at zero, burned it to
+2^32−1, and ran baseline code for the rest of the run: the original
+problem, moved one frame over. The yielding frame now refills its own
+budget before it returns, so every re-entry — through `$drive` or
+through the engine — gets a full budget and yields again in turn.
+With that, the scan kernel on the harness reads **1.53x native**
+(±2%; 3.86x without the yield). The unsound first version read 1.15x;
+the difference is what soundness costs here — a nested frame's yield
+is a deopt round trip through the engine rather than a return, and the
+head's unit is compiled on request rather than found — both bounded,
+once per long-running loop and once per 4 M edges.
+
+**And the sweep ran past its cap a third time — with zero yields.** The
+per-case counters said `yields=0/0/0` on every slow case (gdb-batch at
+the 900 s wall, python-mp 495 s, bison 209 s, m4's 86-byte case 60 s
+where it takes 9), so the mechanism never fired; the cost was the code
+it added. Each backward edge carried its whole exit inline — the full
+register spill, thirty-odd lines, inside a branch never taken — and a
+big function has thousands of back edges: the units grew enough that
+V8's compile of them, and the code it produced, took the sweep down
+4–7x with nothing yielding. The exit is now emitted once per function,
+a `$yield` block wrapping the body: a back edge whose budget is spent
+and whose head resolves sets `$rex` and `br`s there, and the spill,
+refill, and return-or-deopt live in one place. A back edge costs a
+burn, a test and (once per 4 M edges) a probe.
+m4's sweep case under the shared exit: 39.8 s on the one-time
+recompile, **6.7 s** cached — where it was before the yield existed.
+The scan kernel under it: **1.56x** (1.53x with the per-edge exit —
+the same within noise; the shared exit changed the code size, not the
+hot path).
+m4 on 200 k lines under this rule: exit 0, output hash identical to
+native, 29.9 s wall against 45.7 s with the unconditional yield (both
+uncached). One consequence for the test rig: any function with a loop
+now imports the funcref table for the probe, so the twenty
+differentials that instantiate hand-made snippets with stub imports
+supply an empty table (every probe misses, the snippet's own loop runs).
+
+**A fourth cap, still with zero yields — and the same cap with the
+yield off.** The full sweep with the shared exit was killed at 90
+minutes once more, every case at `yields=0/0/0`: gdb-batch 898 s
+against 271 s, gcc-link 428 s, python-mp 444 s against 72 s, bison
+156 s against 50 s. To bisect, the whole mechanism went behind a gate
+(`OXWASM_LOOPYIELD=1`, or `globalThis.__loopYield`): off, the back
+edges, the call-site nesting stores and the `$yield` exit are not
+emitted. The sweep with it off was killed at the cap too — gdb-batch
+1081 s, python-mp 600 s, bison 178 s, m4 48 s — so the emitted yield
+code was never the cost. The harness caches assembled units by the
+SHA-1 of their text, and the one line every unit now carries, the
+`env.loophot` import, had changed every text: 20,983 fresh entries
+were written during the off sweep, and m4's case alone is 39.8 s on a
+recompile against 6.7 s cached. Every "slowdown" above was a cold
+cache, on and off alike (on was in fact the faster of the two). The
+90-minute cap assumes a warm cache; a build that touches every unit's
+text pays one cold sweep before it can be gated. (The cache had also
+grown to 9.8 GB of entries no current text can hit; pruned to the
+live 2 GB.) The gate stays for A/B, and the FTLOOP/FTNEST words,
+`env.loophot`, the counters and the differential stubs are emitted
+regardless, so on/off is one environment variable.
 
 ### The heap walked into the mmap arena: vim on a 14 MB file
 

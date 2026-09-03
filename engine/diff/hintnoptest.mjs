@@ -54,7 +54,7 @@ for (const [name, body] of CASES) {
     if (oracle !== want) { console.log(`FAIL interp ${name} a=${a} b=${b}: ${oracle} != ${want}`); fail++; continue; }
     const mem = new WebAssembly.Memory({ initial: 4096 });
     const stub = () => { throw new Error('escape'); };
-    const inst = new WebAssembly.Instance(mod, { js: { mem }, env: { syscall: stub, callout: stub, deopt: stub } });
+    const inst = new WebAssembly.Instance(mod, { js: { mem, ftab: new WebAssembly.Table({ initial: 0, element: 'anyfunc' }) }, env: { syscall: stub, callout: stub, deopt: stub, loophot: stub } });
     const rv = new BigInt64Array(mem.buffer, 0, 16);
     for (let q = 0; q < 16; q++) rv[q] = 0n;
     rv[7] = BigInt.asIntN(64, a); rv[6] = BigInt.asIntN(64, b);

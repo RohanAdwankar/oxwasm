@@ -76,6 +76,14 @@ export const FTFUEL = FTMAP + 12;
 // picks up whatever tier V8 has by then. dispatchAot fills the budget per
 // dispatch from eng.loopYield; OXWASM_LOOPYIELD=0 disables the emission.
 export const FTLOOP = FTMAP + 16;
+// Nesting depth of in-unit calls (u32 at FTMAP+20). An in-unit call site
+// DROPS its callee's returned rip and continues after the call, so a callee
+// that yielded mid-frame would leave its frame abandoned on the guest stack
+// - m4 on 200k lines diverged exactly so. Every such site bumps this word
+// around the call; the yield fires only at zero, i.e. in a frame whose
+// returned rip is honoured (dispatchAot's f(), the in-wasm drive loop, a
+// nested dispatch from a callout - each zeroes the word for its dispatch).
+export const FTNEST = FTMAP + 20;
 
 // The in-wasm resolver over the sorted (addr, table-slot) map at FTMAP —
 // shared by every unit module and by generated PLT stubs.
@@ -1594,7 +1602,11 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   // the target is a registered compiled function, run it wasm-to-wasm — the
   // callee's ret pops OUR caller's return address, so its frame-exit rip is
   // exactly this frame's exit value.
-  let usesFtr = false, usesFts = false;
+  let usesFtr = false, usesFts = false, usesYield = false;
+  // in-unit call sites bump the nesting word only when the yield is on (it is
+  // what the yield's nested-frame rule reads); off, the call site is as before
+  const nestUp = LOOPYIELD ? `(i32.store (i32.const ${FTNEST}) (i32.add (i32.load (i32.const ${FTNEST})) (i32.const 1))) ` : '';
+  const nestDn = LOOPYIELD ? ` (i32.store (i32.const ${FTNEST}) (i32.sub (i32.load (i32.const ${FTNEST})) (i32.const 1)))` : '';
   // Stack accounting is entry-tax-only: a function bumps FTDEPTH by its
   // weight (frame size grows with function size — V8 spill slots) and never
   // decrements on ret; instead every call site snapshots the word and
@@ -2080,7 +2092,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
             // interprets the callee instead of nesting another wasm frame
             L.push(ftSave(),
                    `(if ${ftOk}`,
-                   `  (then ${ftBurn} (drop (call $f_${target.toString(16)})) ${ftRestore})`,
+                   `  (then ${ftBurn} ${nestUp}(drop (call $f_${target.toString(16)}))${nestDn} ${ftRestore})`,
                    `  (else (drop (call $x_callout (i64.const ${hexs(target)})))))`);
           else {
             // out-of-unit target: it may be compiled in ANOTHER unit — chain
@@ -2089,7 +2101,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
             L.push(icResolve(`(i64.const ${hexs(target)})`),
                    ftSave(),
                    `(if ${ftHit}`,
-                   `  (then ${ftBurn} (drop (call_indirect $ft (type $uft) (local.get $fti))) ${ftRestore})`,
+                   `  (then ${ftBurn} ${nestUp}(drop (call_indirect $ft (type $uft) (local.get $fti)))${nestDn} ${ftRestore})`,
                    `  (else (drop (call $x_callout (i64.const ${hexs(target)})))))`);
           }
           L.push(RL_MARK);
@@ -2103,7 +2115,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           L.push(icResolve(`(local.get ${t})`),
                  ftSave(),
                  `(if ${ftHit}`,
-                 `  (then ${ftBurn} (drop (call_indirect $ft (type $uft) (local.get $fti))) ${ftRestore})`,
+                 `  (then ${ftBurn} ${nestUp}(drop (call_indirect $ft (type $uft) (local.get $fti)))${nestDn} ${ftRestore})`,
                  `  (else (drop (call $x_callout (local.get ${t})))))`);
           L.push(RL_MARK);
           break; }
@@ -2222,10 +2234,30 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       // differential tests do that) wraps to 2^32-1 and never yields, and
       // an armed budget yields once, at its last edge. disptest read 10/400
       // with test-then-burn: every first back edge "exited" the function.
+      // ... and only to a loop head that already RESOLVES in the funcref
+      // table, so the hand-off is a wasm-to-wasm chain through $drive. A
+      // yield to an uncompiled head sent the interpreter there, which then
+      // tiered a whole new unit per hot loop, rooted at the head, and the
+      // sweep ran past its 90-minute cap (that cap has since also been
+      // traced to a cold wat cache, see LOOPYIELD; the extra units per
+      // head were real and are gone with the probe). Hot loops
+      // the interpreter ever ran already have their loop-head unit (the
+      // back-edge profile tiers one at 12 iterations); a head without one
+      // just refills the budget and keeps running.
+      if (LOOPYIELD && j <= i) usesFtr = true;
       const yieldAt = (LOOPYIELD && j <= i)
         ? `(i32.store (i32.const ${FTLOOP}) (i32.sub (i32.load (i32.const ${FTLOOP})) (i32.const 1))) ` +
-          `(if (i32.eqz (i32.load (i32.const ${FTLOOP}))) (then (local.set $rex (i64.const ${hexs(blocks[j].start)})) ${SA_MARK} (return (local.get $rex)))) `
+          `(if (i32.eqz (i32.load (i32.const ${FTLOOP}))) (then ` +
+          `(if (i32.ge_s (call $ftr (i64.const ${hexs(blocks[j].start)})) (i32.const 0)) ` +
+          // hit: record the head and leave through the ONE yield exit this
+          // function has (spill, refill, return or deopt) - the exit was
+          // inlined at every back edge at first, a full register spill per
+          // edge, and the emitted units grew enough that every big sweep case
+          // ran 4-7x slower with zero yields taken (compile time and code)
+          `(then (local.set $rex (i64.const ${hexs(blocks[j].start)})) (br $yield)) ` +
+          `(else (call $x_loophot (i64.const ${hexs(blocks[j].start)})) (i32.store (i32.const ${FTLOOP}) (i32.const ${LOOPYIELD_N})))))) `
         : '';
+      if (yieldAt) usesYield = true;
       if (DISP) return yieldAt + (j > i ? `(br $b${j})` : j === i ? `(br $l${i})` : `(local.set $pc (i32.const ${j})) (br $L_disp)`);
       return yieldAt + `(br ${labelFor(j)})`; };
     const brTo = (j) => j === i+1 ? '' : goto(j);
@@ -2514,6 +2546,17 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   for (const r of xUsed) if (entryKeep === null || (entryKeep & ((0x10000<<r)|0))) wat += '    ' + xReload(r) + '\n';
   wat += '    (local.set $rsp0 (local.get $r4))\n';
   wat += '    ' + ftInc + '\n';       // entry tax: this frame\'s stack weight
+  // one yield exit per function (see FTLOOP): a back edge whose budget is
+  // spent and whose head resolves sets $rex and br's here; the spill and the
+  // return-or-deopt are emitted once, not per edge
+  const regs16y = Array.from({length: 16}, (_, r) => r);
+  const noXmmY = typeof process !== 'undefined' && process.env?.OXWASM_NOXMMCALL === '1';
+  const yieldSpill = () => [...regs16y.filter(touched).map(spillR), ...(noXmmY ? [] : [...xUsed]).map(xSpill)].join('\n    ');   // the full spill, as expandFull(false) builds it
+  const yieldTail = () => !usesYield ? '' :
+    `    ${yieldSpill()}\n    (i32.store (i32.const ${FTLOOP}) (i32.const ${LOOPYIELD_N}))\n` +
+    `    (if (i32.eqz (i32.load (i32.const ${FTNEST}))) (then (return (local.get $rex))))\n` +
+    `    (return (call $x_deopt (local.get $rex) (local.get $rsp0)))\n`;
+  if (usesYield) wat += '    (block $yield\n';
   if (DISP) {
     // flat br_table dispatch: $pc holds the current block's RPO index. Block
     // bodies run in order; a non-fallthrough edge sets $pc and br's $L_disp.
@@ -2534,6 +2577,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       if (i < N-1) wat += `      )\n`;                                 // close $b${i+1}
     }
     wat += '    ))\n';                                                 // close loop + exit block
+    if (usesYield) wat += '    (unreachable))\n' + yieldTail();          // close $yield; its tail follows
     wat += '    (unreachable)\n  )\n';
     if (hasJtab) {
       // address -> RPO index for every jump-table target, as a balanced
@@ -2553,6 +2597,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     wat += '      ' + bodies[i] + '\n';
     for (const _ of closeAfter[i]) wat += '      )\n';
   }
+  if (usesYield) wat += '    (unreachable))\n' + yieldTail();            // close $yield; its tail follows
   wat += '    (unreachable)\n  )\n';        // every path leaves via ret/deopt
   return wat;
 }
@@ -2562,7 +2607,19 @@ function emitUnitFunction(a0, fnAddr, ctx) {
 // CPython) pass with it, steady-state on call-dense code is 6-11% faster,
 // and the tier-up cost objection is halved by the assembler worker.
 const BLOCKLOOPS = typeof process !== 'undefined' && process.env?.OXWASM_BLOCKLOOPS === '1';
-const LOOPYIELD = !(typeof process !== 'undefined' && process.env?.OXWASM_LOOPYIELD === '0') && !globalThis.__noLoopYield;
+// Gated (OXWASM_LOOPYIELD=1 or globalThis.__loopYield) so the mechanism can
+// be A/B'd in one environment variable: off, no back edge burns the budget,
+// no call site touches FTNEST and no $yield exit is emitted. The words, the
+// env.loophot import and the counters stay so the unit text is the same
+// shape either way. Two full sweeps with it on died at the harness's
+// 90-minute cap with zero yields taken, and so did the sweep with it OFF
+// (gdb-batch 1081s, python-mp 600s): every unit's text had changed (the new
+// import line), the wat cache was cold for all 20,983 of them, and a cold
+// sweep is 2-7x a warm one (m4's case 39.8s vs 6.7s). Warm and off it is
+// back in the pre-yield band (python-mp 273s, gdb-batch 398s); the warm
+// on-sweep is what flips this default.
+const LOOPYIELD = (typeof process !== 'undefined' && process.env?.OXWASM_LOOPYIELD === '1') || !!globalThis.__loopYield;
+export const LOOPYIELD_N = 4000000;   // backward edges per yield; dispatchAot's fill and the in-wasm refill agree
 // Opt out with OXWASM_INLINE=0 or globalThis.__inline = false.
 // OXWASM_INLINE_BUDGET caps the callee size in instructions - the default is
 // in the low hundreds because gzip's three hot callees are 66, 88 and 114,
@@ -2702,6 +2759,7 @@ export function compileUnitWat(mem, entry, opts = {}) {
   wat += '  (import "env" "syscall" (func $x_syscall (param i64)))\n';
   wat += '  (import "env" "callout" (func $x_callout (param i64) (result i64)))\n';
   wat += '  (import "env" "deopt" (func $x_deopt (param i64 i64) (result i64)))\n';
+  wat += '  (import "env" "loophot" (func $x_loophot (param i64)))\n';   // a loop head that ran long without a unit of its own (see FTLOOP)
   // the global dispatch table + its in-wasm resolver, iff some site chains
   // through it (indirect call, out-of-unit static call, indirect tail jump)
   const tf0 = PHASE ? performance.now() : 0;

@@ -550,7 +550,8 @@ const engine = (bin, args, stdin, opts = {}) => {
                             for (const c of e.children ?? []) if (c.eng) walk(c.eng); };
                             walk(eng); return [...m].map(([k, n]) => `${k}x${n}`); })(),
            ms: Number(process.hrtime.bigint() - t0) / 1e6,
-           units: eng.aotFns.size, insns: eng.stats.interpreted, err };
+           units: eng.aotFns.size, insns: eng.stats.interpreted, err,
+           yields: `${eng.stats.loopYieldTop | 0}/${eng.stats.loopYieldNested | 0}/${eng.stats.loopHot | 0}` };   // top-level yields / nested (deopt) yields / units rooted on request
 };
 
 let pass = 0, fail = 0;
@@ -570,7 +571,7 @@ for (const [name, bin, args, opts] of CASES) {
   const same = eng.code === nat.code && Buffer.compare(eng.out, nat.out) === 0;
   if (same) { pass++;
     console.log(`  ok   ${name.padEnd(9)} ${String(nat.out.length).padStart(8)}B out, ` +
-                `${eng.units} fns, ${(eng.ms).toFixed(0)}ms`);
+                `${eng.units} fns, ${(eng.ms).toFixed(0)}ms yields=${eng.yields}`);
     if (eng.unknown.length) console.log(`         ENOSYS syscalls: ${eng.unknown.join(' ')}`);
     if (eng.ioctls.length) console.log(`         ENOTTY ioctls: ${eng.ioctls.join(' ')}`); }
   else { fail++;

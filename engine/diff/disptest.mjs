@@ -57,7 +57,7 @@ for (let n = 1n; n <= 40n; n++) for (const seed of seeds) {
 
   // AOT
   const e2 = mk();
-  const inst = new WebAssembly.Instance(mod, { js: { mem: e2.wmem }, env: e2.aotEnv() });
+  const inst = new WebAssembly.Instance(mod, e2.aotImports());
   for (let r = 0; r < 16; r++) e2.regview[r] = 0n;
   e2.regview[4] = BigInt.asIntN(64, rsp); e2.regview[7] = BigInt.asIntN(64, n); e2.regview[6] = BigInt.asIntN(64, seed);
   new DataView(e2.wmem.buffer).setBigUint64(e2.RAMOFF + Number(rsp - e2.base), SENT, true);

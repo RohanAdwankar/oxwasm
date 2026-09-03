@@ -7,7 +7,7 @@
 import { CPU, Memory } from './interp.mjs';
 import { compileLoop } from './jit2.mjs';
 import { compileVectorLoop } from './jitsimd.mjs';
-import { compileUnitWat, pltStubWat, FTMAP, FTMAP_MAX, FTDLIMIT, FTFUEL, FTLOOP,
+import { compileUnitWat, pltStubWat, FTMAP, FTMAP_MAX, FTDLIMIT, FTFUEL, FTLOOP, FTNEST, LOOPYIELD_N,
          FTHASH, FTHBITS, FTHMASK, FTHBYTES } from './aot_wat.mjs';
 import { decode } from './decode.mjs';
 
@@ -523,10 +523,12 @@ export class LinuxEngine {
     // fill the chain-fuel tank for this dispatch (see FTFUEL in aot_wat.mjs);
     // hosts that set no sliceDeadline get an effectively bottomless tank
     fdv.setUint32(FTFUEL, this.chainFuel ?? 0x0FFFFFFF, true);
-    fdv.setUint32(FTLOOP, this.loopYield ?? 4000000, true);      // backward edges before a frame yields its loop head (see FTLOOP)
+    fdv.setUint32(FTLOOP, this.loopYield ?? LOOPYIELD_N, true);      // backward edges before a frame yields its loop head (see FTLOOP)
+    const fn0 = fdv.getUint32(FTNEST, true); fdv.setUint32(FTNEST, 0, true);   // this dispatch's frame is top-level: its exit rip is honoured
     this.syncOut();
     const entry = this.cpu.rip;
     try { let exit = f();
+      if (fdv.getUint32(FTLOOP, true) === 0) this.stats.loopYieldTop = (this.stats.loopYieldTop || 0) + 1;   // the frame returned on a spent loop budget: a top-level yield
       // In-wasm driver: a top frame's guest ret exits its wasm function, but
       // the next rip is usually another compiled function — chain to it in
       // wasm ($drive resolves via the shared map and call_indirects, burning
@@ -554,7 +556,7 @@ export class LinuxEngine {
         return BigInt.asUintN(64, e.rip); }
       if (e instanceof BlockUnwind) { this.syncIn(); return BigInt.asUintN(64, e.rip); }
       throw e; }
-    finally { fdv.setUint32(FTMAP + 8, fd0, true); }
+    finally { fdv.setUint32(FTMAP + 8, fd0, true); fdv.setUint32(FTNEST, fn0, true); }
   }
 
   // Differential shadow: run one compiled-function dispatch BOTH ways — first
@@ -732,8 +734,21 @@ export class LinuxEngine {
     } finally { this._iuDepth--; }
   }
 
+  // A compiled frame's back edge found its loop head unresolvable after a
+  // full yield budget (see FTLOOP): root a unit there, once, so the next
+  // expiry's probe hits and the frame hands its loop over in wasm.
+  _loopHot(a) {
+    if (!this.assembleWat && !this.unitBytes) return;
+    (this._loopHotSeen ??= new Set());
+    if (this._loopHotSeen.has(a)) return;
+    this._loopHotSeen.add(a);
+    this.stats.loopHot = (this.stats.loopHot || 0) + 1;
+    if (!this.aotFns.has(a) && !this.aotFailed.has(a)) this.tierUpAot(a);
+    if (globalThis.__loopTrace) console.error(`<loophot ${a.toString(16)} -> aotFns=${this.aotFns.has(a)} failed=${this.aotFailed.has(a)}>`);
+  }
   aotEnv() {
     return {
+      loophot: (a) => this._loopHot(BigInt.asUintN(64, a)),
       // rip = guest address of the syscall instruction (an emit-time constant)
       // so a blocking syscall can suspend: state is spilled, frames unwind,
       // and resume re-executes the syscall at exactly this rip.
@@ -848,7 +863,9 @@ export class LinuxEngine {
       // stack — tail-jumps spend no guest stack, so only this bounds it.
       // Profile the landing so an indirect jump that only runs inside AOT code
       // (a compiled trampoline, a jump table) still tiers up its target.
-      deopt: (rip, _rsp0) => { const t = BigInt.asUintN(64, rip);
+      deopt: (rip, _rsp0) => {
+        if (this._loopHotSeen?.has(BigInt.asUintN(64, rip))) this.stats.loopYieldNested = (this.stats.loopYieldNested || 0) + 1;   // a nested frame's yield arrives as a deopt to a loop head
+        const t = BigInt.asUintN(64, rip);
         this.stats.deopts = (this.stats.deopts || 0) + 1;
         if (this.deoptLog) this.deoptLog.set(t, (this.deoptLog.get(t) || 0) + 1);
         if (this.inExec(t)) this.profileTarget(t);
