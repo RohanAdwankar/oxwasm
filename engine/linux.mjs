@@ -326,6 +326,25 @@ export class LinuxEngine {
     }
     const at = this.mmapNext; this.mmapNext += len; return at;
   }
+  _mmapFree(lo, len) {                              // is [lo, lo+len) unmapped as far as the arena knows?
+    const hi = lo + len, base = this._mmapBase ?? 0n;
+    if (lo < base) return false;                    // below the arena: ELF, brk - not ours to say
+    if (lo >= this.mmapNext) return hi - this.base <= BigInt(this.ram.length);
+    for (const h of (this._mmapHoles ??= [])) if (lo >= h[0] && hi <= h[1]) return true;
+    return false;
+  }
+  _mmapCarve(lo, len) {                             // a fixed mapping lands here: remove it from holes, advance the bump past it
+    const hi = lo + len, holes = (this._mmapHoles ??= []);
+    for (let i = 0; i < holes.length; i++) {
+      const h = holes[i];
+      if (hi <= h[0] || lo >= h[1]) continue;
+      const parts = [];
+      if (h[0] < lo) parts.push([h[0], lo]);
+      if (hi < h[1]) parts.push([hi, h[1]]);
+      holes.splice(i, 1, ...parts); i += parts.length - 1;
+    }
+    if (lo >= (this._mmapBase ?? 0n) && hi > this.mmapNext && lo <= this.mmapNext) this.mmapNext = hi;
+  }
   _mmapGive(lo, len) {
     const base = this._mmapBase ?? 0n, hi = lo + len;
     if (lo < base || hi > this.mmapNext || len <= 0n) return;   // not the arena's (fixed spans, brk): leave it
@@ -1562,8 +1581,19 @@ export class LinuxEngine {
         // Go's runtime probes a dozen 64 MB arena hints (each returned
         // elsewhere, unmapped, retried) and then a 512 MB summary, and
         // exhausted a 3 GB slab in reservations it had already released.
-        const at = (flags & FIXED) ? a1 : this._mmapTake(len);
-        if (flags & FIXED) if (a1 < (this._mmapBase ?? 0n) || a1 >= this.mmapNext) {   // outside the arena: remember the span
+        // MAP_FIXED_NOREPLACE (0x100000): the caller's address or EEXIST, never
+        // a different one. "Free" here is what the arena knows: inside a hole
+        // munmap left, or at/above the bump pointer within RAM. HotSpot
+        // reserves its heap and code cache this way (falling back to hints).
+        const NOREPLACE = 0x100000n;
+        let fixedAt = (flags & FIXED) ? a1 : null;
+        if (fixedAt === null && (flags & NOREPLACE)) {
+          if (this._mmapFree(a1, len)) fixedAt = a1; else { ret(-17n); break; }
+        }
+        // a fixed mapping over arena space takes it out of the holes / bump
+        if (fixedAt !== null) this._mmapCarve(fixedAt, len);
+        const at = fixedAt !== null ? fixedAt : this._mmapTake(len);
+        if (fixedAt !== null) if (a1 < (this._mmapBase ?? 0n) || a1 >= this.mmapNext) {   // outside the arena: remember the span
           this._fixedLo = this._fixedLo === undefined ? a1 : (a1 < this._fixedLo ? a1 : this._fixedLo);
           const hi = a1 + len; this._fixedHi = this._fixedHi === undefined ? hi : (hi > this._fixedHi ? hi : this._fixedHi);
         }
