@@ -107,6 +107,24 @@ if (!existsSync(FORKBLOCK)) {
   try { execFileSync('gcc', ['-O1', '-o', FORKBLOCK,
                              new URL('./fixtures/forkblock.c', import.meta.url).pathname]); } catch {}
 }
+const GOSTR = '/tmp/breadth_gostrings';
+if (!existsSync(GOSTR)) {
+  // Go: the runtime's page allocator (huge PROT_NONE reservations, rcr),
+  // three threads at start, and strings.Index over a constant table - the
+  // shape that found the clobbered-block flag bug (memequal via shl %cl)
+  try {
+    writeFileSync('/tmp/breadth_gostrings.go', [
+      'package main',
+      'import ("fmt"; "strings"; "bytes")',
+      'const t = "\\n\\tAR\\n\\tCC\\n\\tGOARCH\\n\\tGOFLAGS\\n\\tGOOS\\n\\tGOROOT\\n\\tPKG_CONFIG\\n"',
+      'func main() {',
+      '  for _, k := range []string{"GOOS", "AR", "GOARCH", "NOPE", "GO", "PKG_CONFIG"} { fmt.Println(k, strings.Contains(t, "\\t"+k+"\\n"), strings.Index(t, "\\t"+k+"\\n")) }',
+      '  b := []byte(t); fmt.Println(bytes.IndexByte(b, \'P\'), bytes.Count(b, []byte("GO")), strings.LastIndex(t, "GO"), strings.EqualFold("goos", "GOOS"))',
+      '}', ''].join('\n'));
+    execFileSync('go', ['build', '-o', GOSTR, '/tmp/breadth_gostrings.go'],
+      { cwd: '/tmp', env: { ...process.env, CGO_ENABLED: '0', GO111MODULE: 'off', GOCACHE: '/tmp/breadth_gocache', GOFLAGS: '-trimpath' } });
+  } catch (e) { console.log('  (go build unavailable: ' + String(e.stderr || e.message).split('\n')[0] + ')'); }
+}
 const PROCFS = '/tmp/breadth_procfs';
 if (!existsSync(PROCFS)) {
   try { execFileSync('gcc', ['-O1', '-pthread', '-o', PROCFS,
@@ -216,6 +234,8 @@ const CASES = [
   // xz -9 reserves a 512MB+ dictionary, more than the default guest. Give it
   // room so this case tests compression; the out-of-memory path is covered by
   // the brk fix, where it now exits 1 like native instead of faulting.
+  ['gostrings', '/tmp/breadth_gostrings', [], { memMB: 2048 }],
+  ['go-version', '/usr/local/go/bin/go', ['version'], { memMB: 2048, env: ['GOROOT=/usr/local/go', 'GOTELEMETRY=off'] }],
   ['xz',      '/usr/bin/xz',      ['-9', '-c', IN], { memMB: 1536 }],
   ['xz-1',    '/usr/bin/xz',      ['-1', '-c', IN]],
   ['gzip',    '/bin/gzip',        ['-9', '-c', IN]],
@@ -514,7 +534,7 @@ const native = (bin, args, stdin) => {
 const engine = (bin, args, stdin, opts = {}) => {
   add(bin, bin);
   const eng = new LinuxEngine(new Uint8Array(readFileSync(bin)),
-    { argv: [bin, ...args], env: ['PATH=/usr/bin:/bin', 'HOME=/root', 'LANG=C'],
+    { argv: [bin, ...args], env: ['PATH=/usr/bin:/bin', 'HOME=/root', 'LANG=C', ...(opts.env || [])],
       files, mtimes, memMB: opts.memMB || 512, assembleWat, stdin });
 
   if (process.env.BREADTH_STRACE) eng.strace = [];
