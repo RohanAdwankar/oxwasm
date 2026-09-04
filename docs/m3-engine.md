@@ -3590,3 +3590,52 @@ unrolled block, the try/catch around tier-up swallowed it, and the
 run was the interpreter alone. The unit emitter throwing is
 indistinguishable from a hang from outside; the debug prints that
 found it are gone again.
+
+### Unrolling at the CFG level
+
+The emit-time unroll knew two shapes. The general one is simpler to
+state at the CFG: after the analyzer's blocks are laid out in RPO and
+their terminators resolved to indices, a natural loop [h, e) that is
+short and plain (≤8 blocks, ≤64 instructions, no call, syscall,
+indirect jump, undecodable byte or inlined splice; no nested loop, no
+other loop overlapping it) is duplicated k-1 times right after
+itself. Copy c's internal edges stay inside copy c; its back edge to h
+goes *forward* to copy c+1's head; only the last copy's back edge
+returns to h. That leaves one backward edge, so `structure()` sees one
+loop and `goto()` emits one burn per k iterations, and every exit
+keeps its (shifted) target and stays a forward edge. The copies are
+the same block objects - same instructions, same guest address - so
+deopt targets, the probe's head address and jump tables need nothing;
+the flag and liveness analyses run afterwards on the widened CFG and
+see ordinary blocks. Jump-table functions are excluded (the dispatch
+layout keeps address-indexed rows), and higher loops are processed
+first so an insertion never shifts a lower range.
+
+The first form of the pass excluded nested and overlapping loops and
+missed scan: its tokenizer loop has two back-edge targets one block
+apart (`add %rsi` / `add %rax`, the continue paths of different
+cases), which `structure()` sees as two nested loops sharing most of
+their blocks. Loops that share blocks now form one cluster [H, E)
+and unroll as a whole: inside a copy every back edge - to any header
+of the cluster - goes forward to the next copy's image of that
+header, so a copy has no backward edge at all; the last copy's back
+edges return to the originals.
+
+Kernels harness, 5 reps, default tiers:
+
+| kernel | emit-time unroll | CFG-level |
+|---|---:|---:|
+| alu | 1.36x | 1.38x |
+| mem | 0.62x | 0.61x |
+| subw | 1.36x | 1.40x |
+| scan | 1.62x | **1.18x** |
+| branch | 1.37x | 1.41x |
+| muldiv | 1.05x | 1.04x |
+| call | 9.0x | 9.3x |
+
+scan drops to 1.18x (its yield-off ideal under TurboFan was 1.23x - the
+unroll is at the ideal); branch reads 1.41x against its 1.07x ideal,
+so its remaining cost is not the burn (an `imul`-fed unpredictable
+branch pair; the lazy-flag materialisation per `test` is the suspect).
+Every straight-line kernel is now within 1.4x of native and two are
+at or past parity.

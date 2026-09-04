@@ -866,7 +866,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   // each copy carries its own id and its cloned branches carry copy-local
   // edge ids. Everything downstream works on indices and is unaffected.
   const bId = (b) => b.id ?? b.start.toString();
-  const N = blocks.length;
+  let N = blocks.length;
   const bidx = new Map(blocks.map((b,i)=>[bId(b), i]));
   const MASKl = { 1: 0xFFn, 2: 0xFFFFn, 4: 0xFFFFFFFFn, 8: 0xFFFFFFFFFFFFFFFFn };
   const SIGNl = { 1: 0x80n, 2: 0x8000n, 4: 0x80000000n, 8: 0x8000000000000000n };
@@ -927,6 +927,90 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     else if (last.mnem === 'udec')   { hasDeopt = true; term.push({kind:'deopt', src:null, at:last.rip}); succs.push([]); }
     else { const t = idxOf(next); if (t < 0) hasDeopt = true;
       term.push({kind:'fall', t, ta: next}); succs.push([t]); }
+  }
+  // ---- loop unrolling, at the CFG level -------------------------------------
+  // The loop yield's burn (a read-modify-write of the budget word at every
+  // back edge) was 40% of alu, 80% of subw and 28% of scan under forced
+  // TurboFan (yield off: 1.01x, 1.93x, 1.23x native); it cannot be made
+  // cheaper per iteration, so it is made rarer. A natural loop [h, e) whose
+  // blocks are short and plain (no call, syscall, indirect jump, undecodable
+  // byte or inlined splice; no nested loop; no other loop overlapping) is
+  // duplicated UNROLL-1 times right after itself: copy c's internal edges
+  // stay inside copy c, its back edge to h goes FORWARD to copy c+1's head,
+  // and only the last copy's back edge returns to h - the one backward edge
+  // left, so structure() sees one loop and goto() emits one burn per UNROLL
+  // iterations. Exits keep their targets (shifted with the insertion), so a
+  // copy's exit is still a forward edge. Copies are the same block objects
+  // (same instructions, same address), so every address-keyed fact (deopt
+  // targets, the probe's head address, jump tables) is unchanged; the flag
+  // and liveness analyses run afterwards on the widened CFG. OXWASM_UNROLL
+  // sets k (1 disables), default 8. Not applied to a jump-table function
+  // (the dispatch layout keeps address-indexed rows).
+  const UNROLL = (typeof process !== 'undefined' && +process.env?.OXWASM_UNROLL) || 8;
+  if (LOOPYIELD && UNROLL > 1 && !hasJtab) {
+    const BAD = new Set(['call','callind','syscall','udec','jmpind','int','hlt','ud2','int3','x87']);
+    const plain = (b) => { const last = b.insns[b.insns.length-1];
+      if (last.edgeT !== undefined || last.edgeN !== undefined || last.tailCut) return false;
+      for (const x of b.insns) if (BAD.has(x.mnem) || x.inlineTo) return false;
+      return true; };
+    const loopEnd = new Map();
+    for (let i = 0; i < N; i++) for (const j of succs[i]) if (j >= 0 && j <= i) loopEnd.set(j, Math.max(loopEnd.get(j) || 0, i + 1));
+    // loops that share blocks (a tokenizer loop whose continue paths land on
+    // two adjacent headers; a while loop nested in a for) form one cluster
+    // [H, E), unrolled as a whole: inside a copy every back edge - to any
+    // header of the cluster - goes forward to the next copy's image of that
+    // header, so a copy has no backward edge at all
+    const hs = [...loopEnd].sort((a, b) => a[0] - b[0]);
+    const clusters = [];
+    for (const [h, e] of hs) { const c = clusters[clusters.length - 1];
+      if (c && h < c[1]) c[1] = Math.max(c[1], e); else clusters.push([h, e]); }
+    const cands = [];
+    for (const [h, e] of clusters) {
+      if (e - h > 12) continue;
+      let ok = true, insns = 0;
+      for (let q = h; q < e && ok; q++) {
+        if (!plain(blocks[q])) { ok = false; break; }
+        insns += blocks[q].insns.length;
+        for (const j of succs[q]) if (j >= 0 && j < h) ok = false;         // a back edge below the cluster: not a loop of its own
+      }
+      if (ok && insns <= 80) cands.push([h, e]);
+    }
+    cands.sort((a, b) => b[0] - a[0]);                 // highest first: an insertion never shifts a lower range
+    for (const [h, e] of cands) {
+      const len = e - h, k = UNROLL, add = (k - 1) * len;
+      const sh = (j) => j >= e ? j + add : j;           // an index at or past the range moves past the copies
+      const inCopy = (c, q) => e + (c - 1) * len + (q - h);   // copy c (1..k-1) of block q; copy 0 is the original
+      // target j of block q's edge, in copy c: a back edge (j <= q, inside)
+      // goes to the next copy's image of j, the last copy's back home; an
+      // internal forward edge stays in the copy; anything else is shifted
+      const mapEdge = (q, j, c) => { if (j < 0) return j;
+        if (j >= h && j < e) {
+          if (j <= q) return c === k - 1 ? j : inCopy(c + 1, j);
+          return c === 0 ? j : inCopy(c, j); }
+        return sh(j); };
+      const remapTerm = (q, t, c) => { const u = { ...t };
+        if ('t' in u && typeof u.t === 'number') u.t = mapEdge(q, u.t, c);
+        if ('f' in u && typeof u.f === 'number') u.f = mapEdge(q, u.f, c);
+        return u; };
+      const shiftTerm = (t) => { const u = { ...t };
+        if ('t' in u && typeof u.t === 'number') u.t = sh(u.t);
+        if ('f' in u && typeof u.f === 'number') u.f = sh(u.f);
+        return u; };
+      const nb = [], nt = [], ns = [];
+      for (let q = 0; q < N; q++) {
+        if (q === e) for (let c = 1; c < k; c++) for (let r = h; r < e; r++) {
+          nb.push(blocks[r]); nt.push(remapTerm(r, term[r], c)); ns.push(succs[r].map(j => mapEdge(r, j, c)));
+        }
+        const inRange = q >= h && q < e;
+        nb.push(blocks[q]);
+        nt.push(inRange ? remapTerm(q, term[q], 0) : shiftTerm(term[q]));
+        ns.push(succs[q].map(j => inRange ? mapEdge(q, j, 0) : (j < 0 ? j : sh(j))));
+      }
+      blocks.length = 0; blocks.push(...nb); term.length = 0; term.push(...nt); succs.length = 0; succs.push(...ns);
+      for (const [id, ix] of bidx) bidx.set(id, sh(ix));
+      N = blocks.length;
+      (globalThis.__unrollStats ??= { loops: 0, blocks: 0 }).loops++; globalThis.__unrollStats.blocks += add;
+    }
   }
   // Try the structured (scope-nesting) layout first — it yields tight wasm
   // loops. If the CFG is irreducible / has improper block-loop overlap, fall
@@ -1651,60 +1735,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     `  (then ${ftBurn} ${ftDec} (return_call_indirect $ft (type $uft) (local.get $fti))))`,
   ]; };
 
-  // A single-block self-loop with a plain conditional terminator is emitted
-  // UNROLL times inside its loop: copies 0..k-2 leave through $sx_i on the
-  // loop's exit condition and fall through into the next copy on the loop
-  // back, the last copy keeps the real terminator - and with it the ONE burn
-  // of the loop-yield budget per k iterations. Under forced TurboFan the
-  // per-iteration read-modify-write of that budget word was 40% of alu, 80%
-  // of subw and 28% of scan (yield off: 1.01x, 1.93x, 1.23x native); a
-  // loop-carried local was worse still (register pressure). Restricted to
-  // short blocks without calls, syscalls or undecodable bytes; a copy is
-  // byte-for-byte the block's own code, so the flag state entering copy
-  // c+1 is the state the analyzer already meets at the head from the back
-  // edge. OXWASM_UNROLL=1 disables (k), default 8.
-  // The two-block shape gcc emits for a while loop - head `cmp; jcc exit`,
-  // body `...; jmp head` - unrolls the same way: k copies of (head, body),
-  // every head copy exits through $sx_i, body copies 0..k-2 fall into the
-  // next head copy, the last body copy keeps its terminator (and the burn).
-  // The body block is then emitted empty in its own slot.
-  const UNROLL = (typeof process !== 'undefined' && +process.env?.OXWASM_UNROLL) || 8;
-  const plainBlock = (j) => {
-    const blk = blocks[j], last = blk.insns[blk.insns.length-1];
-    if (last.edgeT !== undefined || last.edgeN !== undefined || last.tailCut) return false;
-    if (blk.insns.length > 24) return false;
-    for (const x of blk.insns) if (['call','callind','syscall','udec','jmpind','int','hlt','ud2','int3','x87'].includes(x.mnem) || x.inlineTo) return false;
-    return true;
-  };
-  const consumed = new Set();                       // body blocks emitted inside their head's unroll
-  const unrollPlan = (i) => {                       // -> { k, body: i (self) | i+1 (two-block) } or null
-    if (!LOOPYIELD || UNROLL <= 1 || consumed.has(i)) return null;
-    const t = term[i];
-    if (!t || t.kind !== 'jcc' || t.t === t.f || !plainBlock(i)) return null;
-    if (t.t === i || t.f === i) return { k: UNROLL, body: i };
-    if (t.t === i + 1 || t.f === i + 1) {
-      const u = term[i + 1];
-      if (!u || u.kind !== 'jmp' || u.t !== i || !plainBlock(i + 1)) return null;
-      for (let q = 0; q < N; q++) if (q !== i && succs[q].includes(i + 1)) return null;   // the body has one way in
-      return { k: UNROLL, body: i + 1 };
-    }
-    return null;
-  };
   function emitBlock(i) {
-    if (consumed.has(i)) return '';
-    const plan = unrollPlan(i);
-    if (!plan) return emitBlockOnce(i, 0, 1, 'self');
-    const { k, body } = plan;
-    (globalThis.__unrollStats ??= { blocks: 0 }).blocks++;
-    const parts = [];
-    if (body === i) { for (let c = 0; c < k; c++) parts.push(emitBlockOnce(i, c, k, 'self')); }
-    else {
-      consumed.add(body);
-      for (let c = 0; c < k; c++) { parts.push(emitBlockOnce(i, c, k, 'head')); parts.push(emitBlockOnce(body, c, k, 'body')); }
-    }
-    return `(block $sx_${i}\n      ` + parts.join('\n      ') + ')';
-  }
-  function emitBlockOnce(i, copy, k, role) {
     const blk = blocks[i]; const L = [];
     const producers = new Set();
     for (let idx = 0; idx < blk.insns.length; idx++) if (matProducers.has(i+':'+idx)) producers.add(idx);
@@ -2339,20 +2370,6 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     // native would if the bytes are truly garbage.
     const deoptTo = (addr) => [`(local.set $rex (i64.const ${hexs(addr)}))`,
       SA_MARK, `(return (call $x_deopt (local.get $rex) (local.get $rsp0)))`];
-    if (k > 1 && role === 'body' && copy < k - 1) return L.join('\n      ');   // fall into the next head copy
-    if (t.kind === 'jcc' && k > 1 && (role === 'head' || copy < k - 1)) {
-      // an unrolled copy: exit on the loop's exit condition, otherwise fall
-      // through into what follows (the next copy, or this copy's body)
-      const c = cond(last.cond);
-      const contJ = role === 'head' ? i + 1 : i;
-      const backOnTaken = t.t === contJ, exitJ = backOnTaken ? t.f : t.t;
-      const exitCond = backOnTaken ? `(i32.eqz ${c})` : c;
-      const after = role === 'head' ? i + 2 : i + 1;            // the block that follows the loop
-      const exitEdge = exitJ < 0 ? deoptTo(backOnTaken ? t.fa : t.ta).join(' ')
-                     : exitJ === after ? `(br $sx_${i})` : goto(exitJ);
-      L.push(`(if ${exitCond} (then ${exitEdge}))`);
-      return L.join('\n      ');
-    }
     if (t.kind === 'jcc') {
       const c = cond(last.cond);
       const T = t.t, F = t.f;
