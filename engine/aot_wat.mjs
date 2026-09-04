@@ -39,8 +39,14 @@ export const FTHBYTES = FTSLOTS * 16;
 // registered entries, capped to keep the load factor (here 61%) low enough
 // that linear probing stays short
 export const FTMAP_MAX = 20000;
-export const FNPROF_BASE = 0x20000, FNPROF_SLOTS = 1 << 15;   // OXWASM_FNPROF counters: 32768 x i64, in the dead space below FTHASH
-export const fnprofSlot = (a) => FNPROF_BASE + ((Number((BigInt(a) >> 4n) & 0x7fffn)) * 8);
+export const FNPROF_BASE = 0x20000, FNPROF_SLOTS = 1 << 14;   // OXWASM_FNPROF counters: 16384 x i64, in the dead space below FTHASH
+export const fnprofSlot = (a) => FNPROF_BASE + ((Number((BigInt(a) >> 4n) & 0x3fffn)) * 8);
+// OXWASM_BLKPROF=hexfn[,hexfn]: a per-BLOCK entry counter for the named
+// functions (which blocks of a hot function are hot; V8's profile stops at
+// the function). Same scheme, the upper half of the dead space.
+export const BLKPROF_BASE = 0x40000, BLKPROF_SLOTS = 1 << 14;
+export const blkprofSlot = (a) => BLKPROF_BASE + ((Number((BigInt(a) >> 2n) & 0x3fffn)) * 8);
+export const BLKPROF = new Set(((typeof process !== 'undefined' && process.env?.OXWASM_BLKPROF) || '').split(',').filter(Boolean).map(h => BigInt('0x' + h).toString()));
 // Wasm calls nest real host-stack frames, so unlike native calls they can
 // blow the ~1MB stack under deep guest recursion — and a frame's size grows
 // with the FUNCTION's size (V8 spill slots), so post-jump-table units (one
@@ -1793,6 +1799,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
 
   function emitBlock(i) {
     const blk = blocks[i]; const L = [];
+    if (BLKPROF.size && BLKPROF.has(fnAddr.toString())) { const sl = blkprofSlot(blk.start); L.push(`(i64.store (i32.const ${sl}) (i64.add (i64.load (i32.const ${sl})) (i64.const 1)))`); }
     const producers = new Set();
     for (let idx = 0; idx < blk.insns.length; idx++) if (matProducers.has(i+':'+idx)) producers.add(idx);
     let flagState = blkFlagIn[i] || null, ii = 0;

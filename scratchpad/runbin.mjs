@@ -71,6 +71,15 @@ if (process.env.OXWASM_FNPROF === '1') {   // per-function entry counts (see FNP
   const tot = rows.reduce((s, r) => s + r[0], 0n);
   console.log(`--- fnprof: ${rows.length} entered fns, ${tot} entries\n` + rows.slice(0, 40).map(([n, as]) => `  ${as.map(a => a.toString(16)).join('|')} x${n} (${(Number(n * 1000n / tot) / 10).toFixed(1)}%)`).join('\n'));
 }
+if (process.env.OXWASM_BLKPROF) {   // per-block entry counts of the named functions: top 40 by guest block address
+  const { blkprofSlot, BLKPROF_BASE, BLKPROF_SLOTS } = await import('../engine/aot_wat.mjs');
+  const dv = new DataView(eng.wmem.buffer), rows = [];
+  for (let i = 0; i < BLKPROF_SLOTS; i++) { const n = dv.getBigUint64(BLKPROF_BASE + i * 8, true); if (n) rows.push([n, i]); }
+  rows.sort((x, y) => (y[0] > x[0]) - (y[0] < x[0]));
+  const tot = rows.reduce((s, r) => s + r[0], 0n);
+  console.log(`--- blkprof ${process.env.OXWASM_BLKPROF}: ${rows.length} blocks, ${tot} entries (slot = (addr>>2)&0x3fff; resolve against the function's block list)\n` +
+    rows.slice(0, 40).map(([n, i]) => `  slot ${i} x${n} (${(Number(n * 1000n / tot) / 10).toFixed(1)}%)`).join('\n'));
+}
 if (process.env.DUMP) {   // DUMP=hexrip,...: tiering state of given entries + the hottest uncompiled call targets
   console.log(`--- tiering: loopHot=${eng.stats.loopHot|0} yieldTop=${eng.stats.loopYieldTop|0} yieldNested=${eng.stats.loopYieldNested|0} aotFns=${eng.aotFns.size} aotFailed=${eng.aotFailed?.size} ftCount=${eng._ftCount} ftFull=${eng._ftFull} tiers=${JSON.stringify(eng.stats.tiers)}`);
   for (const h of process.env.DUMP.split(',').filter(Boolean)) { const a = BigInt('0x' + h);
