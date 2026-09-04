@@ -4013,3 +4013,31 @@ before the call), the return-address push and pop, the depth
 save/check/restore, and the callee's two entry loads and three exit
 stores. Narrowing and the ABI reload are the only pieces priced above
 5% each; there is no single item left in it.
+
+**perl's ten hot pp_ functions, as compiled** (from a unit dump of the
+3M-iteration loop; each is 8-17% of the run's 36M entries):
+
+| fn | unit lines | entry reloads | yield | layout | call sites |
+|---|---:|---:|---|---|---:|
+| 532550 | 92 | 4 | no | structured | 1 |
+| 532fc0 | 179 | 7 | no | structured | 3 |
+| 532640 | 146 | 4 | no | structured | 2 |
+| 533390 | 188 | 10 | no | structured | 3 |
+| 53ef10 | 2267 | 16 | yes | dispatch | 29 |
+| 53ef59 | 2176 | 16 | yes | dispatch | 27 |
+| 53f0a0 | 9280 | all | yes | dispatch | 152 |
+| 567df0 | 1289 | 18 | no | structured | 15 |
+| 569780 | 1085 | 20 | no | structured | 13 |
+| 534360 | 1100 | 15 | no | structured | 11 |
+
+Four are small leaves with 4-10 entry reloads; six are 1-9k-line
+bodies entered once per iteration, three of them in the dispatch
+layout with the full 16-register entry reload because they can yield.
+That is perl's 7x against the kernel's 3.1x: the same indirect-call
+protocol per entry (the kernel's 14 ns), plus a big function's own
+per-entry cost - its prologue reload, its dispatch loop, and a body
+that runs a few dozen instructions of a large CFG and returns. The
+precise entry-reload set for yielding functions is worth 1-2% here,
+same as on m4. There is no single lever left in the call-dense band;
+what remains is the sum of a protocol at 2x V8's own floor and the
+per-entry cost of large interpreter functions.
