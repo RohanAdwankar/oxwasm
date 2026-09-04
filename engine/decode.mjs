@@ -130,6 +130,8 @@ export function decode(fetch, rip) {
     return fin({ mnem: 'xchg', dst: mkreg(0, osz), src: mkreg((op - 0x90) | (B << 3), osz), size: osz });
   if (op === 0x98) return fin({ mnem: 'cwde', size: osz });   // cbw/cwde/cdqe
   if (op === 0x99) return fin({ mnem: 'cdq', size: osz });    // cwd/cdq/cqo
+  if (op === 0x9C) return fin({ mnem: 'pushf' });          // HotSpot's CPUID-presence probe toggles the ID bit through pushf/popf
+  if (op === 0x9D) return fin({ mnem: 'popf' });
   if (op === 0xF4) return fin({ mnem: 'hlt' });
   if (op === 0xFC) return fin({ mnem: 'cld' });
   if (op === 0xFD) return fin({ mnem: 'std' });

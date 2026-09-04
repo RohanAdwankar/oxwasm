@@ -1073,6 +1073,15 @@ export class CPU {
           // OF (count 1): rcl = MSB(result) ^ CF(after); rcr = MSB(original) ^ CF(before) = MSB(original) ^ MSB(result)
           if (c === 1n) this.f.of = Number(insn.mnem === 'rcl' ? ((a >> (w - 1n)) & 1n) ^ cf : ((a0 >> (w - 1n)) & 1n) ^ ((a >> (w - 1n)) & 1n)); }
         this.set(insn.dst, a); break; }
+      case 'pushf': {                                // RFLAGS: bit 1 set, IF set, arithmetic flags, DF, and the sticky ID/AC bits popf stored
+        const f = this.f;
+        this.push(BigInt(0x202 | f.cf | (f.pf << 2) | (f.af << 4) | (f.zf << 6) | (f.sf << 7) | (f.df << 10) | (f.of << 11)) | BigInt(this.eflagsSticky || 0));
+        break; }
+      case 'popf': {
+        const v = this.pop(), f = this.f, n = Number(v & 0xFFFFFFFFn);
+        f.cf = n & 1; f.pf = (n >> 2) & 1; f.af = (n >> 4) & 1; f.zf = (n >> 6) & 1; f.sf = (n >> 7) & 1; f.df = (n >> 10) & 1; f.of = (n >> 11) & 1;
+        this.eflagsSticky = n & 0x240000;             // AC (18) and ID (21) are writable and read back by pushf
+        break; }
       case 'push': this.push(this.get(insn.src)); break;
       case 'pop': this.set(insn.dst, this.pop()); break;
       case 'jmp': this.rip = (next + insn.rel) & MASK[8]; break;
