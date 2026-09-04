@@ -2397,17 +2397,27 @@ export class LinuxEngine {
         const op = Number(a2) & 0x7f;
         if (op === 0 || op === 9) {                           // WAIT / WAIT_BITSET
           const cur = Number(this.mem.read(a1, 4n));
-          if (cur !== Number(a3 & 0xFFFFFFFFn)) { ret(-11n); break; }   // EAGAIN
+          if (cur !== Number(a3 & 0xFFFFFFFFn)) { this._deadline = null; ret(-11n); break; }   // EAGAIN (a wake changed the word)
           let dl = null;
           const tp = cpu.regs[10];                            // struct timespec*
           if (tp) {
-            const o = this.RAMOFF + Number(tp - this.base);
-            const v = new DataView(this.wmem.buffer);
-            let ms = Number(v.getBigUint64(o, true)) * 1000 + Number(v.getBigUint64(o + 8, true)) / 1e6;
-            if (op === 9) {                                   // WAIT_BITSET: absolute time
-              if (ms > 1e11) ms = ms - Date.now() + this.nowMs();   // realtime epoch -> engine clock
-              dl = ms;
-            } else dl = this.nowMs() + ms;                    // WAIT: relative
+            // A timed wait that nobody wakes must return ETIMEDOUT. This path
+            // re-executes on every host wake and used to recompute a RELATIVE
+            // deadline each time (so it slid forever) and never compared an
+            // absolute one: pthread_cond_timedwait with no signaller hung, and
+            // HotSpot's timed parks span between host wakes for ever. The
+            // deadline is now fixed on the first execution (this._deadline,
+            // per thread, as nanosleep and poll do) and checked on re-entry.
+            if (this._deadline == null) {
+              const o = this.RAMOFF + Number(tp - this.base);
+              const v = new DataView(this.wmem.buffer);
+              let ms = Number(v.getBigUint64(o, true)) * 1000 + Number(v.getBigUint64(o + 8, true)) / 1e6;
+              if (op === 9) {                                 // WAIT_BITSET: absolute time
+                if (ms > 1e11) ms = ms - Date.now() + this.nowMs();   // realtime epoch -> engine clock
+              } else ms = this.nowMs() + ms;                  // WAIT: relative
+              this._deadline = ms;
+            } else if (this.nowMs() >= this._deadline) { this._deadline = null; ret(-110n); break; }   // ETIMEDOUT
+            dl = this._deadline;
           }
           this._futexAddr = a1;                               // park() records it on the thread
           this.block(dl); break;                              // re-executes on wake; re-checks *addr

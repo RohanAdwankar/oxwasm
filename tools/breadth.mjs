@@ -107,6 +107,10 @@ if (!existsSync(FORKBLOCK)) {
   try { execFileSync('gcc', ['-O1', '-o', FORKBLOCK,
                              new URL('./fixtures/forkblock.c', import.meta.url).pathname]); } catch {}
 }
+const CONDWAIT = '/tmp/breadth_condwait';
+if (!existsSync(CONDWAIT)) {   // pthread_cond_timedwait with no signaller, three condvar clocks: a timed futex wait must time out
+  try { execFileSync('gcc', ['-O1', '-pthread', '-o', CONDWAIT, new URL('./fixtures/condwait.c', import.meta.url).pathname]); } catch {}
+}
 const GOSTR = '/tmp/breadth_gostrings';
 if (!existsSync(GOSTR)) {
   // Go: the runtime's page allocator (huge PROT_NONE reservations, rcr),
@@ -238,6 +242,7 @@ const CASES = [
   // 40 shared libraries; a synthetic source hashed by the md5 muxer
   ['ffmpeg',  '/usr/bin/ffmpeg',  ['-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', 'testsrc=duration=0.3:size=64x64:rate=10', '-f', 'md5', '-'],
               { memMB: 2048, tree: '/usr/lib/x86_64-linux-gnu/pulseaudio' }],
+  ['condwait',  '/tmp/breadth_condwait', []],
   ['gostrings', '/tmp/breadth_gostrings', [], { memMB: 2048 }],
   ['go-version', '/usr/local/go/bin/go', ['version'], { memMB: 2048, env: ['GOROOT=/usr/local/go', 'GOTELEMETRY=off'] }],
   ['xz',      '/usr/bin/xz',      ['-9', '-c', IN], { memMB: 1536 }],
