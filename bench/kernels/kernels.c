@@ -66,6 +66,21 @@ static uint64_t k_call(uint64_t n) {
   return s;
 }
 
+// 3b. indirect calls: perl's runloop shape (one `call *%rax` per op through
+// a table of pointers, the site megamorphic). Un-pruning turns a direct
+// `call` into a direct wasm call; an indirect one always takes the
+// inline-cache probe and call_indirect - this prices that protocol alone.
+__attribute__((noinline)) static uint64_t leafa(uint64_t x) { return x * 2654435761u + 1; }
+__attribute__((noinline)) static uint64_t leafb(uint64_t x) { return x * 40503u + 3; }
+__attribute__((noinline)) static uint64_t leafc(uint64_t x) { return (x ^ (x >> 7)) + 5; }
+__attribute__((noinline)) static uint64_t leafd(uint64_t x) { return x * 9u + 7; }
+static uint64_t k_callind(uint64_t n) {
+  static uint64_t (*volatile tab[4])(uint64_t) = { leafa, leafb, leafc, leafd };
+  uint64_t s = 0;
+  for (uint64_t i = 0; i < n; i++) s += tab[(i ^ (s >> 3)) & 3](i) ^ tab[s & 3](s);
+  return s;
+}
+
 // 4. unpredictable branches: jcc that a predictor cannot help with
 static uint64_t k_branch(uint64_t n) {
   uint64_t s = 0, x = 12345;
@@ -113,6 +128,7 @@ int main(int argc, char **argv) {
   if (!strcmp(w, "alu"))         r = k_alu(n);
   else if (!strcmp(w, "mem"))    r = k_mem(n, buf, 1024);
   else if (!strcmp(w, "call"))   r = k_call(n);
+  else if (!strcmp(w, "callind")) r = k_callind(n);
   else if (!strcmp(w, "call8"))  r = k_call8(n);
   else if (!strcmp(w, "call64")) r = k_call64(n);
   else if (!strcmp(w, "branch")) r = k_branch(n);

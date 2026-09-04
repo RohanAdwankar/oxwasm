@@ -3973,3 +3973,27 @@ inline-cache probe and `call_indirect`. m4's 8.30x at 200 costs 67%
 more unit text for a reading inside its 8.3-9.1x day-to-day spread.
 The cap stays at 16; perl's lever is the indirect-call protocol and
 the callee prologue, not the closure.
+
+### perl's tax is the indirect-call protocol: a kernel for it
+
+perl's 30M-iteration loop makes 12 function entries per iteration in
+ten pp_ functions (FNPROF), every one reached by the runloop's
+`call *%rax`, and its 7x is ~20 ns per entry over native. A new kernel
+prices exactly that shape: `callind` calls one of four 4-instruction
+leaves through a volatile pointer table, two calls per iteration, the
+site megamorphic. Native 6.9 ns per call; the engine **3.06-3.19x**
+(~14 ns over native per call) where the direct-call kernel is 0.57x on
+the same day. The protocol's parts, A/B'd on it (3 reps, N=60M):
+
+| arm | callind |
+|---|---:|
+| default | 3.19x |
+| `OXWASM_NOXMMCALL=1` (drop the xmm half) | 3.13x |
+| `OXWASM_ABIRELOAD=1` (skip callee-saved reloads) | 2.85x |
+| `OXWASM_NARROW=0` (full spills and reloads) | 3.45x |
+| both levers | 2.88x |
+
+Register traffic is a fifth of it at most (narrowing 8%, the ABI
+reload another 10%); the rest is the inline-cache probe,
+`call_indirect`, the budget/fuel/nest accounting and the callee's own
+entry and exit - priced next from the unit text.
