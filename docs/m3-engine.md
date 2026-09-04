@@ -4105,3 +4105,22 @@ and joined. The one instruction it needed was `emms` (0F 77): ffmpeg's
 `av_emms` after every MMX/SSE DSP call; the decoder threw on it. It
 empties the x87 stack in the interpreter (MMX aliases it) and escapes
 from units. The `ffmpeg` breadth case runs a 0.3-second version.
+
+### java: three gaps closed, one open
+
+HotSpot (OpenJDK 21, `-Xint -version`, the whole JDK tree provisioned)
+walked through three engine gaps in order, each now closed: it reads
+the legacy **vsyscall page** at startup (0xffffffffff600000; now an
+interpreter-only region with the kernel's three `mov eax, nr; syscall;
+ret` stubs, plus `getcpu`); it probes CPUID presence by toggling the
+ID bit through **pushf/popf** (now in the interpreter with the
+arithmetic flags, DF and sticky AC/ID bits; escaped from units); and
+its heap ergonomics read the engine's modest `sysinfo`/meminfo and
+refused ("Too small maximum heap") until given `-Xmx256m`. With that
+it runs 430k interpreted and 8.8k translated slices into VM
+initialisation on its second thread and dies writing through a NULL
+structure pointer (address 0x80) in libjvm, before it has installed
+its SIGSEGV handler - so this is a wrong answer from something
+earlier, not the missing fault delivery that HotSpot will need next
+(safepoint polls, implicit null checks and stack banging all run on
+SIGSEGV). Open.
