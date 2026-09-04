@@ -231,6 +231,7 @@ export function decode(fetch, rip) {
     if (o2 === 0xAC) { const [r, rm] = modrm(osz); return fin({ mnem: 'shrd', dst: rm, src: r, src2: { kind: 'imm', v: immU(1) }, size: osz }); }
     if (o2 === 0xAD) { const [r, rm] = modrm(osz); return fin({ mnem: 'shrd', dst: rm, src: r, src2: { kind: 'reg', r: 1, size: 1 }, size: osz }); }
     if (o2 === 0xA2) return fin({ mnem: 'cpuid' });
+    if (o2 === 0x77) return fin({ mnem: 'emms' });          // MMX emms: ffmpeg's av_emms after every SIMD DSP call
     if (o2 === 0x31) return fin({ mnem: 'rdtsc' });
     if (o2 === 0x01) { const m = b();
       if (m === 0xF9) return fin({ mnem: 'rdtscp' });

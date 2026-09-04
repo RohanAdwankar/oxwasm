@@ -592,6 +592,9 @@ export class CPU {
         else if (leaf === 0x80000008) { a = 0x3027n; }               // 39/48 address bits
         this.regs[0] = a; this.regs[3] = b2; this.regs[1] = c; this.regs[2] = d;
         break; }
+      case 'emms':                                  // empty the x87 stack (MMX aliases it): all tags empty, top 0
+        if (this.fst) { this.ftop = 0; this.fsw = 0; if (this.ftag !== undefined) this.ftag = 0xFFFF; }
+        break;
       case 'x87': {
         // f64-backed x87: 8-slot register stack, control word (rounding mode
         // honored on integer conversion), status word C0/C2/C3. 80-bit memory
