@@ -3876,3 +3876,18 @@ The batch is worth 11% on m4, all of it the narrowing (14% on its
 own); the inliner, tail splice included, is within noise on m4. The
 cold sweep (124 cases across four runs, the last two alone on the box
 after two OOM kills) is green on this head with zero assembler errors.
+
+### branch's residual, revisited on this head
+
+`WATDUMP=dir` on the kernels runner keeps every unit's text. The
+branch loop's unit (rooted at the loop head, 8 copies in one
+`loop`) is near the ideal shape: per iteration one `i64.mul`, one
+`i64.add`, the `test` as a single `i64.and` (with a redundant 32-bit
+mask), `br_if` on `i64.eqz`, and the loop counter compare as a
+subtract; the `$fa`/`$fb` sets are dead and TurboFan drops them. There
+is no lazy-flag materialisation left to remove. Measured on this head
+(5 reps, N calibrated to 1013M): branch **1.17x** against the 1.41x
+last recorded and its 1.07x forced-TurboFan ideal, self-check 1.20x
+and 1.18x; the harness resolves ~2%. The earlier 1.41x was measured
+before the loop-aware layout and the narrowing default; the residual
+now is within a mispredict-dominated loop's noise of its ideal.

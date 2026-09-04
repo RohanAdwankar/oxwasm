@@ -28,6 +28,7 @@ const CACHE = new URL('./watcache/', import.meta.url).pathname;
 mkdirSync(CACHE, { recursive: true });
 let an = 0;
 const assembleWat = (wat) => {
+  if (process.env.WATDUMP) writeFileSync(process.env.WATDUMP + '/kn_' + (an) + '.wat', wat);   // WATDUMP=dir: keep every unit's text
   const h = createHash('sha1').update(wat).digest('hex'), cp = CACHE + h + '.wasm';
   if (existsSync(cp)) return new Uint8Array(readFileSync(cp));
   const w = `/tmp/kn_${process.pid}_${an++}`;
