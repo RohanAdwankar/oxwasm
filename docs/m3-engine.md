@@ -3813,8 +3813,18 @@ out has no such point. The un-prune alone buys nothing; what m4's
 hottest callee needs is a splice that turns a tail-cut jmp inside a
 copy into a call to the sibling followed by the copy's return - the
 caller's `call` still pushed the return address, so the sibling's
-`ret` lands where a normal call's would. That is the next experiment;
-raising the size cap only reaches the 758-instruction case.
+`ret` lands where a normal call's would. That splice is in (a callee's
+tail-cut jmp becomes the call protocol to the sibling and a branch to
+the inlined site's continuation; m4 and bison exact), and it changes
+nothing on m4: with the hot callees un-pruned as well, `409e80` is
+still refused, now as **deopt-insn** for a different instruction - a
+`jmp *%rax` switch at the end of the function (peek_input's character
+class dispatch) that jump-table discovery does not resolve. It runs
+rarely (135 deopts in the whole run) but the inliner refuses any
+instruction that can deopt, because a deopt inside a copy unwinds the
+caller's frame. Un-prune + splice together: 143 → 155 functions
+inlined, m4 s10 unchanged. The inliner is exhausted on m4; what is
+left there is the per-call cost itself, profiled next.
 
 Found while gating this batch: every structured-layout function with
 a jump table called a `$jtr_` resolver that only the dispatch epilogue
