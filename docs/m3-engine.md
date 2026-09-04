@@ -3939,3 +3939,19 @@ lines per site. On this head: call kernel 4.42x → **0.55x**, suite
 exact, 21 breadth cases byte-identical, gzip's unit count unchanged
 (310 against 312 with it off), m4 steady state 8.93x → 8.69x (its hot
 callees are hundreds of instructions; this is not m4's lever).
+
+The gate on the tiny-callee head: the cold sweep is green, 128 cases
+with zero failures and zero assembler errors, run in two pieces after
+the single-process runner was OOM-killed by the memory cgroup at
+7.5 GB resident on case 119 (it accumulates across cases; sweeps run
+in chunks now). Two-size steady state with and without it, 3 reps:
+
+| binary | work | with (16) | `OXWASM_UNPRUNE_TINY=0` |
+|---|---|---:|---:|
+| perl | 30M-iteration loop, 1.2 s native | 6.94x | 7.02x |
+| vim -es | `%s` over 400 k lines | **3.72x** | 4.45x |
+
+vim moves 16%; perl does not - its hot callees (the pp_ ops) are far
+past 16 instructions and stay chained, which is the next question: what
+a larger cap costs in unit size and tier-up against what it buys on
+perl and m4.
