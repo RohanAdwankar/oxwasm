@@ -172,7 +172,16 @@ export class LinuxEngine {
                  phent: main.phentsize, phnum: main.phnum,
                  entry: main.entry + mainBias, base: interpBase };
 
-    this.mem = new Memory([{ base: lo, bytes: this.ram }]);
+    // The legacy vsyscall page (0xffffffffff600000): gettimeofday at +0,
+    // time at +0x400, getcpu at +0x800, each `mov eax, nr; syscall; ret` as
+    // the kernel's emulation executes them. HotSpot probes the page with a
+    // data read at startup and the interpreter faulted on it; it lives only
+    // in this region list (units cannot address it - a call there misses
+    // the dispatch table and the interpreter runs the stub).
+    const vsys = new Uint8Array(4096);
+    for (const [off, nr] of [[0, 96], [0x400, 201], [0x800, 309]])
+      vsys.set([0xb8, nr & 0xff, (nr >> 8) & 0xff, 0, 0, 0x0f, 0x05, 0xc3], off);
+    this.mem = new Memory([{ base: lo, bytes: this.ram }, { base: 0xffffffffff600000n, bytes: vsys }]);
     this.cpu = new CPU(this.mem);
     this.cpu.fsBase = 0n;
     this.cpu.onSyscall = (cpu) => this.syscall(cpu);
@@ -1922,6 +1931,8 @@ export class LinuxEngine {
         v.setBigUint64(o + 8, BigInt(Math.floor((ms % 1000) * 1e6)), true);
         ret(0n); break; }
       case 201: ret(BigInt(Math.floor(Date.now() / 1000))); break;   // time
+      case 309: {                                             // getcpu(cpu*, node*, tcache): one CPU, one node
+        if (a1) this.mem.write(a1, 4n, 0n); if (a2) this.mem.write(a2, 4n, 0n); ret(0n); break; }
       case 188: case 189: case 190: ret(-95n); break;           // setxattr family: ENOTSUP
       case 191: case 192: case 193: ret(-61n); break;           // getxattr family: ENODATA
       case 194: case 195: case 196: ret(0n); break;             // listxattr family: empty list
