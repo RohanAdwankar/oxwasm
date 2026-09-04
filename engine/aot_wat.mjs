@@ -528,6 +528,7 @@ function cyclicBlocks(a0) {
     const insns = a0.blocks[i].insns, last = insns[insns.length - 1], next = last.next;
     if (last.inlineTo !== undefined) return emit(ide(last.inlineTo));
     if (last.inlineRet !== undefined) return emit(ide(last.inlineRet));
+    if (last.inlineTailRet !== undefined) return emit(ide(last.inlineTailRet));
     if (last.edgeT !== undefined) {
       emit(ide(last.edgeT));
       if (last.edgeF !== undefined) emit(ide(last.edgeF));
@@ -646,7 +647,10 @@ export function inlineCallees(a0, fnAddr, resolve, opts = {}) {
       // tail-cut jmp (a sibling call to another known entry) is the same
       // kind of terminator - inlined, bash died on a wild rsp at the next
       // function entry (bisected to `jmp free@plt` at the end of a callee)
-      if (i.mnem === 'udec' || i.mnem === 'jmpind' || i.tailCut) bad = true;
+      // A tail-cut jmp (a sibling call to another known entry) used to be
+      // refused too; it is now spliced as a call to the sibling followed by
+      // the copy's return (see inlinetail) - m4's hottest callee ends in one.
+      if (i.mnem === 'udec' || i.mnem === 'jmpind') bad = true;
     }
     if (bad || size === 0 || size > budget) { no(t, bad ? 'deopt-insn' : 'size=' + size); continue; }
     cand.set(t, { an: c, size });
@@ -721,6 +725,11 @@ export function inlineCallees(a0, fnAddr, resolve, opts = {}) {
       } else if (last.mnem === 'jmp') {
         const ta = (nx + last.rel) & M;
         last.edgeT = inCallee(ta) ? cid(p.copy, ta) : null;
+        // the callee's sibling call: call the sibling, then return to the
+        // inlined site's continuation. The inlined `call` still pushed the
+        // return address, so the sibling's `ret` pops exactly what a call
+        // from here would have pushed.
+        if (last.tailCut && !inCallee(ta)) last.inlineTailRet = p.retTo.toString();
       } else {
         last.edgeN = inCallee(nx) ? cid(p.copy, nx) : null;
       }
@@ -836,6 +845,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     // inside this function now, not frame transitions
     if (last.inlineTo !== undefined) return [ide(last.inlineTo)];
     if (last.inlineRet !== undefined) return [ide(last.inlineRet)];
+    if (last.inlineTailRet !== undefined) return [ide(last.inlineTailRet)];
     // a spliced block resolves its own branches by copy-local id, never by
     // address - `next + rel` would land on the ORIGINAL callee block
     if (last.edgeT !== undefined) return last.edgeF !== undefined
@@ -931,6 +941,9 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       if (t < 0) throw new Error('AOT: inlined return site not a block');
       term.push({kind:'inlineret', t, ta: last.next,
                  pad: last.mnem === 'retn' ? Number(last.n) : 0}); succs.push([t]); }
+    else if (last.inlineTailRet !== undefined) { const t = idxOfEdge(last.inlineTailRet);
+      if (t < 0) throw new Error('AOT: inlined tail-call return site not a block');
+      term.push({kind:'inlinetail', t, ta: (next+last.rel)&MM}); succs.push([t]); }
     // a spliced block's own branches, resolved by copy-local id. `ta`/`fa`
     // stay the REAL guest addresses so a target outside the callee still has
     // somewhere real to deopt to.
@@ -2444,6 +2457,28 @@ function emitUnitFunction(a0, fnAddr, ctx) {
                `(return (call $x_deopt (local.get $rex) (local.get $rsp0)))`); }
       else if (t.t < 0) L.push(...deoptTo(t.ta));
       else { const b = brTo(t.t); if (b) L.push(b); }
+    } else if (t.kind === 'inlinetail') {
+      // a sibling call inside an inlined copy: the call protocol of a normal
+      // call site (spill, chain or direct call, reload), then on to the
+      // inlined site's continuation. The sibling's ret popped the return
+      // address the inlined call pushed, so rsp needs no adjustment here.
+      const target = t.ta;
+      L.push(SA_MARK);
+      if (canDirect(target.toString()))
+        L.push(ftSave(),
+               `(if ${ftOk}`,
+               `  (then ${ftBurn} ${nestUp}(drop (call $f_${target.toString(16)}))${nestDn} ${ftRestore})`,
+               `  (else (drop (call $x_callout (i64.const ${hexs(target)})))))`);
+      else {
+        usesFtr = true;
+        L.push(icResolve(`(i64.const ${hexs(target)})`),
+               ftSave(),
+               `(if ${ftHit}`,
+               `  (then ${ftBurn} ${nestUp}(drop (call_indirect $ft (type $uft) (local.get $fti)))${nestDn} ${ftRestore})`,
+               `  (else (drop (call $x_callout (i64.const ${hexs(target)})))))`);
+      }
+      L.push(RL_MARK);
+      const b = brTo(t.t); if (b) L.push(b);
     } else if (t.kind === 'inlineret') {
       // pop what the inlined call pushed. The continuation is known
       // statically, so the popped address is discarded rather than returned:
