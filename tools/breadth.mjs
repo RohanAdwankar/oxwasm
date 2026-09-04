@@ -234,6 +234,10 @@ const CASES = [
   // xz -9 reserves a 512MB+ dictionary, more than the default guest. Give it
   // room so this case tests compression; the out-of-memory path is covered by
   // the brk fix, where it now exits 1 like native instead of faulting.
+  // ffmpeg: MMX/SSE DSP surface (emms after every SIMD call), worker threads,
+  // 40 shared libraries; a synthetic source hashed by the md5 muxer
+  ['ffmpeg',  '/usr/bin/ffmpeg',  ['-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', 'testsrc=duration=0.3:size=64x64:rate=10', '-f', 'md5', '-'],
+              { memMB: 2048, tree: '/usr/lib/x86_64-linux-gnu/pulseaudio' }],
   ['gostrings', '/tmp/breadth_gostrings', [], { memMB: 2048 }],
   ['go-version', '/usr/local/go/bin/go', ['version'], { memMB: 2048, env: ['GOROOT=/usr/local/go', 'GOTELEMETRY=off'] }],
   ['xz',      '/usr/bin/xz',      ['-9', '-c', IN], { memMB: 1536 }],

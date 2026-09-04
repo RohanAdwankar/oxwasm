@@ -4093,3 +4093,15 @@ binaries at all on this box: yq is a Python entry-point script and
 valgrind a POSIX shell wrapper, and the probe's "no output" was runbin
 refusing a non-ELF. The sweep on this head is green in four chunks
 (129 cases, zero failures).
+
+### ffmpeg transcodes, byte-identical
+
+With its pulseaudio module directory provisioned (`TREE=`; the only
+library runbin's flat /lib scan missed) `ffmpeg -version` prints its
+banner, and a synthetic transcode - `testsrc` for one second at
+64x64, hashed by the md5 muxer - produces **the same MD5 as native**
+(4080e9a80cdd0249b283cfa5c4261025), exit 0, its worker threads run
+and joined. The one instruction it needed was `emms` (0F 77): ffmpeg's
+`av_emms` after every MMX/SSE DSP call; the decoder threw on it. It
+empties the x87 stack in the interpreter (MMX aliases it) and escapes
+from units. The `ffmpeg` breadth case runs a 0.3-second version.
