@@ -3639,3 +3639,173 @@ so its remaining cost is not the burn (an `imul`-fed unpredictable
 branch pair; the lazy-flag materialisation per `test` is the suspect).
 Every straight-line kernel is now within 1.4x of native and two are
 at or past parity.
+
+The real-binary batch on this build (two-size subtraction, 3 reps):
+m4 **7.29x** (30% startup), gzip 2.53x on 267 MB (18%), vim 4.59x (86%,
+an upper bound), sha256sum 2.23x at 69% startup - the last two are
+startup-dominated and only bound the number; sha256sum is re-measured
+below on 800 MB. m4 and vim do not move with the loop work: their
+time is calls, not loops.
+
+sha256sum on 800 MB (40% startup, ±11%): **1.75x**. Its compression
+function is one basic block of several hundred instructions, so
+neither the unroll nor the burn touches it; 1.75x on straight SSE
+and rotate code is a codegen number of its own.
+
+A named CPU profile of m4 on the 200 k-line input (`--cpu-prof` over
+`realab-run.mjs`, 48.7 s sampled including compile): `next_token`
+5.3 s, `peek_input` 2.6 s, five m4 helpers at 1.0-1.4 s each, the
+unit emitter 1.5 s, GC 1.5 s - and 16.7 s in the harness's own file
+provisioning (`read`/`add`), which is startup the two-size subtraction
+removes. `next_token` alone runs twice native m4's whole run: it is a
+jump-table function (the switch over the character class), so it
+takes the dispatch layout, whose every non-fallthrough edge goes
+through the `br_table` dispatcher, and it is excluded from the loop
+unroll for the same reason. That is the next lever for the call-dense
+band: a switch inside a loop should not cost a dispatcher round-trip
+per character.
+
+### Jump tables in the structured layout
+
+A resolved jump table forced the dispatch layout, because its
+computed goto needed `$pc` and the `$L_disp` br_table loop - and in
+that layout *every* non-fallthrough edge of the function pays the
+dispatcher round-trip, not only the switch. `next_token` is exactly
+this shape (a switch over the character class inside the input loop),
+and it was the top of m4's profile.
+
+The structured layout now takes jump-table functions. The table's
+targets are all in `succs`, so `structure()` has already given each
+one a scope label that is in view at the jump site; the computed
+address resolves to its RPO index through the same `$jtr` function,
+and a `br_table` over a vector mapping index → label does the branch
+(`$blk_r` for a forward target, `$loop_r` for a back edge, a
+`$jt_next_i` label for the block that follows by fall-through and so
+has no scope of its own). Anything else - an unknown address, a block
+that is not a table target, `$pc` = -1 - takes the default and deopts
+at the computed address, as before. Functions whose fan-in
+`structure()` cannot nest still fall back to dispatch.
+
+m4 on the 200 k-line input under live tiering (compile included):
+63.2 s → **48.2 s**, output identical to native. Steady state by the
+two-size subtraction: **7.38x** - unchanged, and the per-function
+layout trace (`LAYOUTOF=` in `runbin.mjs`) says why: no m4 function
+reaches the new path, because `next_token` has one jump table on a
+cold path and its layout is decided by something else.
+
+### Why m4's hot functions are in the dispatch layout
+
+`next_token` (181 blocks), and 216 of m4's 683 compiled functions,
+fall back to dispatch with "block/loop overlap". Two causes, one
+fixed:
+
+- **Interleaved layout.** Plain reverse postorder can place a block
+  that is not part of a loop between the loop's blocks (an exit path
+  laid out before a later body block); a forward branch into it then
+  looks like a branch into the loop's index range. The layout is now
+  loop-aware: for every back edge the natural loop's members are
+  compacted to sit contiguously from the header and the interleaved
+  non-members move after the loop's last member (a non-member inside
+  the range cannot branch to a member or the header, so its edges stay
+  forward). `OXWASM_LOOPLAYOUT=0` restores plain RPO. On m4 this
+  compacts 1,811 loops and moves 62,117 blocks, narrows loop ranges
+  (one from [44,352) to [44,89)), and takes 19 functions out of
+  dispatch: 216 → 197.
+- **Second entries.** What remains is real: `block[54,81) vs
+  loop[57,102)` in `next_token` is a forward branch from before the
+  loop's header into a member of the loop - a loop with two entries,
+  which structured control flow cannot express without duplicating
+  the loop rotated at the second entry (node splitting). gcc's
+  cross-jumping and shared tails produce these routinely in optimised
+  code. Whether that duplication is worth building depends on what
+  the dispatch layout costs, measured next with `OXWASM_FORCEDISP=1`
+  on the kernels.
+
+**The dispatch layout costs nothing measurable.** Kernels with every
+function forced into dispatch (`OXWASM_FORCEDISP=1`, 3 reps): alu
+1.33x, scan 1.25x, branch 1.42x, subw 1.37x, against 1.38x, 1.18x,
+1.41x, 1.40x structured. The self-loop `loop` wrap and the unroll work
+in both layouts, and the `br_table` round-trip on the remaining edges
+is in the noise. So node splitting for two-entry loops is not worth
+building, and `next_token`'s 4x per character is not its layout. The
+loop-aware layout and the structured jump tables stay: correct, and
+19 fewer functions in dispatch on m4.
+
+**514 million calls.** A function-entry counter (`OXWASM_COUNTCALLS=1`,
+a word bumped in every prologue, read by `runbin.mjs`) puts the
+200 k-line m4 run at 514,319,979 function entries - 26 million per
+second of its ~20 s steady state, 39 ns per call including the
+callee's work, against native's 5.3 ns for the same calls. At the
+idealcall prices (a narrowed in-unit call ≈ 6.6 ns against a bare
+wasm call's 2.2 and native's ~1.5) the call protocol alone is 2-3 s
+of the 20; the rest is the bodies of very small functions, whose
+prologues, epilogues and register traffic are most of what they do.
+
+**The narrowing pass is off.** The callee-protocol narrowing (both
+halves: the caller's spill before a call and the callee's reload at
+entry cut to what is live) was measured a null on the call kernel and
+left behind `OXWASM_NARROW=1`. The call kernel's leaf touches two
+registers; m4's callees touch more, and on m4 the pass reports what it
+would remove: 163,882 spill stores kept of 520,463 (68% skipped),
+139,671 reload loads kept of 480,946 (71% skipped), over 27,670 call
+sites and 25,218 return sites - static counts, but the shape holds
+dynamically for 514 million calls. Turned on, though, m4 diverges and
+dies on a wild address: the pass predates the loop yield, the unroll,
+the tail cut and the loop-aware layout, and its liveness does not
+model one of them. Bisected next.
+
+**Found and fixed.** The bisect took one step: with the loop yield off
+the narrowed m4 is exact; with it on it dies. The pass tracks *dirty*
+registers (written since the last spill or reload site) and spills
+only those at a call or return, which is sound because a clean
+register's memory copy is current. The shared `$yield` tail is the one
+spill site the pass never sees: it stores every register the function
+touches - and with the narrowed prologue, a register that is not live
+at entry is never reloaded, so until the path writes it its local is
+the zero wasm gives a fresh local, and the tail stored that zero over
+the caller's value. A function that can yield now reloads everything
+it touches at entry; the caller-side spill, the exit spill and the
+post-call reload stay narrowed. m4 is exact on both inputs with the
+pass on.
+
+With the pass on (default now; `OXWASM_NARROW=0` for A/B): the call
+kernel 9.3x → **6.54x**, m4 steady state 7.38x → **6.95x** (two-size,
+3 reps), alu and scan unchanged (1.39x, 1.17x). The kernel's leaf
+touches two registers, which is why it read as a null in isolation;
+at 514 million real calls the 68% of stores and 71% of loads it
+removes are worth 30% on pure calls and 6% on m4.
+
+### A real call profile, and why m4's hot callees are not inlined
+
+`aotCalls` is a threshold detector: it counts an interpreted call target
+up to the tier-up threshold and then never again (compiled-to-compiled
+calls run inside wasm). It cannot rank callees. `OXWASM_FNPROF=1`
+adds one memory increment to every function prologue (a slot hashed
+from the function address into the dead space above `FTMAP`; runbin
+reads the slots back per compiled entry and flags collisions). On the
+m4 s10 input it counts 25.8M entries into 244 functions; the top four
+are 18.7%, 10.5%, 7.9% and 6.9% of all entries, the top twelve are 71%.
+
+`OXWASM_INLINE_ONLY=<those>` then asks the inliner why each was
+refused, and the answer is not a budget tweak:
+
+- the hottest (`409e80`, 18.7%) and three more are **not-in-unit**:
+  they tiered up before their callers, so closure pruning keeps them
+  out of every later unit and the inliner never sees them;
+- the second (`40fe70`, 10.5%) is **758 instructions** against a
+  160-instruction cap;
+- `417160` (1.4%, called from 30 callers) has a **deopt instruction**
+  (an indirect jump or a tail-cut sibling call) that cannot be spliced.
+
+So the inliner's population on m4 is the wrong one by construction:
+the callees worth inlining are exactly the ones hot enough to have
+tiered up on their own. Fixing that means a second compile of a hot
+caller with its hot small callees un-pruned, driven by this profile
+(a re-tier), which is the next item; raising the size cap only reaches
+the 758-instruction case and is priced separately.
+
+Found while gating this batch: every structured-layout function with
+a jump table called a `$jtr_` resolver that only the dispatch epilogue
+emitted, so the unit failed to assemble and fell back to the
+interpreter - 18k such errors in one breadth sweep, all in python3,
+node and php (computed-goto interpreters). Both epilogues emit it now.

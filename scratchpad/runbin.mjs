@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { writeFileSync, unlinkSync } from 'node:fs';
 let an = 0;
+globalThis.__jtabStats = { structured: 0 }; globalThis.__layoutOf = new Map();
 let watBytes = 0, watUnits = 0;
 const assembleWat = (wat) => { watBytes += wat.length; watUnits++; if (process.env.WATDUMP === 'all') writeFileSync('/tmp/claude-0/-home-user-0/39bd4f7f-c25c-5004-92d0-ce544ed5705a/scratchpad/dump/unit_' + watUnits + '.wat', wat); else if (process.env.WATDUMP && wat.includes('$f_' + process.env.WATDUMP)) writeFileSync(process.env.WATDUMP_TO || ('/tmp/claude-0/-home-user-0/39bd4f7f-c25c-5004-92d0-ce544ed5705a/scratchpad/unit_' + process.env.WATDUMP + '.wat'), wat);                       // AOT=1: tier live, like breadth
   const w = `/tmp/rb_${process.pid}_${an++}`; writeFileSync(w + '.wat', wat);
@@ -54,14 +55,30 @@ if (err) {   // where did it die: the mapping holding rip (library + file offset
     console.log('--- last rips (newest first; A=AOT entry/exit): ' + out.join(' ')); }
 }
 const __fdv = new DataView(eng.wmem.buffer), __yt = __fdv.getUint32(0x10000 + 24, true), __yn = __fdv.getUint32(0x10000 + 28, true);
-console.log(`--- yields: top=${__yt} nested=${__yn}`);
+console.log(`--- yields: top=${__yt} nested=${__yn} entries=${__fdv.getBigUint64(0x10000 + 32, true)}`);
+globalThis.__jtabStats ??= { structured: 0 };
+if (process.env.LAYOUTOF) for (const a of process.env.LAYOUTOF.split(',')) console.log(`--- layout ${a}: ${globalThis.__layoutOf.get(a)}`);
+if (globalThis.__inlStats?.rej) console.log(`--- inline rejections (${globalThis.__inlStats.rej.length}):\n` + [...new Set(globalThis.__inlStats.rej)].slice(0, 40).join('\n'));
+console.log(`--- narrow: ${JSON.stringify(globalThis.__narrowStats || {})}`);
+console.log(`--- layouts: ${JSON.stringify(globalThis.__inlStats || {})} jtab=${JSON.stringify(globalThis.__jtabStats)} unroll=${JSON.stringify(globalThis.__unrollStats || {})} deopts=${eng.stats.deopts|0} layout=${JSON.stringify(globalThis.__layoutStats||{})}`);
 console.log(`--- wat: units=${watUnits} bytes=${(watBytes/1e6).toFixed(2)}MB loopHot=${eng.stats.loopHot|0} yieldTop=${eng.stats.loopYieldTop|0} yieldNested=${eng.stats.loopYieldNested|0} aotFns=${eng.aotFns.size}`);
+if (process.env.OXWASM_FNPROF === '1') {   // per-function entry counts (see FNPROF in aot_wat.mjs); top 40, collisions flagged
+  const { fnprofSlot } = await import('../engine/aot_wat.mjs');
+  const dv = new DataView(eng.wmem.buffer), bySlot = new Map(), rows = [];
+  for (const a of eng.aotFns.keys()) { const sl = fnprofSlot(a); (bySlot.get(sl) || bySlot.set(sl, []).get(sl)).push(a); }
+  for (const [sl, as] of bySlot) { const n = dv.getBigUint64(sl, true); if (n) rows.push([n, as]); }
+  rows.sort((x, y) => (y[0] > x[0]) - (y[0] < x[0]));
+  const tot = rows.reduce((s, r) => s + r[0], 0n);
+  console.log(`--- fnprof: ${rows.length} entered fns, ${tot} entries\n` + rows.slice(0, 40).map(([n, as]) => `  ${as.map(a => a.toString(16)).join('|')} x${n} (${(Number(n * 1000n / tot) / 10).toFixed(1)}%)`).join('\n'));
+}
 if (process.env.DUMP) {   // DUMP=hexrip,...: tiering state of given entries + the hottest uncompiled call targets
   console.log(`--- tiering: loopHot=${eng.stats.loopHot|0} yieldTop=${eng.stats.loopYieldTop|0} yieldNested=${eng.stats.loopYieldNested|0} aotFns=${eng.aotFns.size} aotFailed=${eng.aotFailed?.size} ftCount=${eng._ftCount} ftFull=${eng._ftFull} tiers=${JSON.stringify(eng.stats.tiers)}`);
   for (const h of process.env.DUMP.split(',').filter(Boolean)) { const a = BigInt('0x' + h);
     console.log(`  ${h}: aotFns=${eng.aotFns.has(a)} failed=${eng.aotFailed?.has(a)} calls=${eng.aotCalls?.get(a)} trampoline=${eng.isTrampoline(a)}`); }
   console.log('  syscalls: ' + Object.entries(eng.stats.syscalls).sort((x, y) => y[1] - x[1]).slice(0, 10).map(([n, c]) => n + 'x' + c).join(' '));
   const hot = [...(eng.aotCalls ?? [])].filter(([a]) => !eng.aotFns.has(a)).sort((x, y) => y[1] - x[1]).slice(0, 12);
+  const hotAll = [...(eng.aotCalls ?? [])].sort((x, y) => y[1] - x[1]).slice(0, 24);
+  console.log('  hottest call targets: ' + hotAll.map(([a, n]) => a.toString(16) + 'x' + n + (eng.aotFns.has(a) ? '' : '(uncompiled)')).join(' '));
   console.log('  hottest uncompiled call targets: ' + hot.map(([a, n]) => a.toString(16) + 'x' + n + (eng.aotFailed?.has(a) ? '(failed)' : '')).join(' '));
 }
 if (process.env.FILE) { const f = eng.files[process.env.FILE]; console.log('--- file ' + process.env.FILE + ' ---\n' + (f ? Buffer.from(f).toString() : '(missing)')); }

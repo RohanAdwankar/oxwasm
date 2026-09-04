@@ -39,6 +39,8 @@ export const FTHBYTES = FTSLOTS * 16;
 // registered entries, capped to keep the load factor (here 61%) low enough
 // that linear probing stays short
 export const FTMAP_MAX = 20000;
+export const FNPROF_BASE = 0x20000, FNPROF_SLOTS = 1 << 15;   // OXWASM_FNPROF counters: 32768 x i64, in the dead space below FTHASH
+export const fnprofSlot = (a) => FNPROF_BASE + ((Number((BigInt(a) >> 4n) & 0x7fffn)) * 8);
 // Wasm calls nest real host-stack frames, so unlike native calls they can
 // blow the ~1MB stack under deep guest recursion — and a frame's size grows
 // with the FUNCTION's size (V8 spill slots), so post-jump-table units (one
@@ -763,7 +765,7 @@ function structure(N, succs) {
       // engulfs a loop-exit target the way growing a loop's end would).
       if (t.type === 'block')      { t.b = s.b; changed = true; }    // grow later block's begin back
       else if (s.type === 'loop')  { s.e = t.e; changed = true; }    // grow earlier loop's end fwd
-      else throw new Error('AOT: block/loop overlap needs dispatch fallback');
+      else throw new Error(`AOT: block/loop overlap needs dispatch fallback: ${s.type}[${s.b},${s.e}) vs ${t.type}[${t.b},${t.e})`);
     }
   }
   // opening order at a position: larger range (outer) first
@@ -858,6 +860,37 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     order.push(u);
   })(entryIdx);
   order.reverse();                                  // RPO in address-index space
+  // Loop-aware layout. Plain RPO can interleave a block that is NOT part of
+  // a loop between the loop's blocks (an exit path laid out before a later
+  // body block). structure() then sees a forward branch into the loop's
+  // index range - "block/loop overlap" - and the whole function fell back
+  // to the dispatch layout: m4's next_token and every other hot m4
+  // function (216 of 683) ran with a br_table round-trip per edge. For each
+  // back edge u->h the natural loop is h plus every block that reaches a
+  // back-edge source without passing h; those blocks are compacted to sit
+  // contiguously from h, and the interleaved non-members move after the
+  // loop's last member. A non-member inside the range cannot branch to a
+  // member or to h (either would make it a member or a back-edge source),
+  // so its edges stay forward. Outer loops first: an inner compaction only
+  // moves blocks that already sit inside the outer range.
+  if (!(typeof process !== 'undefined' && process.env?.OXWASM_LOOPLAYOUT === '0')) {
+    const pos = new Array(An).fill(-1); order.forEach((a, r) => pos[a] = r);
+    const preds = Array.from({ length: An }, () => []);
+    for (const u of order) for (const v of succAddrIdx(u)) if (v >= 0) preds[v].push(u);
+    const heads = new Map();                        // header addrIdx -> back-edge sources
+    for (const u of order) for (const v of succAddrIdx(u)) if (v >= 0 && pos[v] <= pos[u]) (heads.get(v) ?? heads.set(v, []).get(v)).push(u);
+    const loops = [...heads].sort((a, b) => pos[a[0]] - pos[b[0]]);
+    for (const [h, srcs] of loops) {
+      const mem = new Set([h]); const st = srcs.filter(u => u !== h); for (const u of st) mem.add(u);
+      while (st.length) { const u = st.pop(); for (const p of preds[u]) if (!mem.has(p)) { mem.add(p); st.push(p); } }
+      const hp = pos[h]; let last = hp; for (const m of mem) if (pos[m] > last) last = pos[m];
+      const range = order.slice(hp, last + 1), inL = range.filter(a => mem.has(a)), outL = range.filter(a => !mem.has(a));
+      if (!outL.length) continue;
+      order.splice(hp, range.length, ...inL, ...outL);
+      order.forEach((a, r) => pos[a] = r);
+      (globalThis.__layoutStats ??= { compacted: 0, moved: 0 }).compacted++; globalThis.__layoutStats.moved += outL.length;
+    }
+  }
   const rpoOf = new Array(An).fill(-1);
   order.forEach((addrIdx, r) => rpoOf[addrIdx] = r);
   const blocks = order.map(ai => a0.blocks[ai]);    // blocks laid out in RPO
@@ -1025,12 +1058,20 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   // subwidthtest. Set globalThis.__disableDispatch to poison irreducible
   // CFGs back to the interpreter (see diff/disptest.mjs).
   let mode = 'structured', open = null, closeAfter = null;
-  // A resolved jump table needs the dispatch loop's $pc/$L_disp machinery
-  // (and its edge fan-in is irreducible anyway): go straight to dispatch.
-  if (hasJtab) mode = 'dispatch';
+  // A resolved jump table used to force the dispatch layout (its $pc /
+  // $L_disp machinery). It no longer has to: in the structured layout the
+  // computed goto becomes a br_table over the case blocks' labels - every
+  // jump-table target is in succs, so structure() has given each one a
+  // scope label that is in view at the jump - and m4's tokenizer, a switch
+  // over the character class inside a loop, paid a dispatcher round-trip
+  // per character for it (next_token: 5.3s of a 2.5s native run). Where
+  // structure() still cannot nest the fan-in, dispatch remains the fallback.
+  if (typeof process !== 'undefined' && process.env?.OXWASM_FORCEDISP === '1') mode = 'dispatch';   // A/B: price the dispatch layout
   else try { ({ open, closeAfter } = structure(N, succs)); }
   catch (e) {
     if (!/overlap|irreducible|unclosed|converge/.test(e.message) || globalThis.__disableDispatch) throw e;
+    if (hasJtab && globalThis.__jtabStats) { const fb = (globalThis.__jtabStats.fallback ??= {}); const k = e.message.slice(0, 60); fb[k] = (fb[k] || 0) + 1; }
+    globalThis.__lastStructErr = e.message.slice(0, 120);
     // bisect aid: every dispatch-mode unit gets a global ordinal; a filter
     // can veto (unit poisons instead — interpreted, correct, uncompiled)
     const n = (globalThis.__dispN = (globalThis.__dispN || 0) + 1);
@@ -1038,6 +1079,8 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     mode = 'dispatch';
   }
   const DISP = mode === 'dispatch';
+  if (globalThis.__layoutOf) globalThis.__layoutOf.set(fnAddr.toString(16), mode + (hasJtab ? '+jtab' : '') + ' N=' + N + (globalThis.__lastStructErr ? ' (' + globalThis.__lastStructErr + ')' : ''));
+  globalThis.__lastStructErr = null;
   { const st = globalThis.__inlStats = globalThis.__inlStats || { fns: 0, callees: 0 };
     st[DISP ? 'disp' : 'struct'] = (st[DISP ? 'disp' : 'struct'] || 0) + 1; }
 
@@ -2421,10 +2464,25 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       // still deopts, so resolution is exact by construction.
       L.push(`(local.set $rex ${rd(t.src,8,lnext)})`);
       L.push(`(local.set $pc (call $jtr_${fnAddr.toString(16)} (local.get $rex)))`);
-      L.push(`(br_if $L_disp (i32.ge_s (local.get $pc) (i32.const 0)))`);
-      L.push(SA_MARK);
-      L.push(...tailJmp());
-      L.push(`(return (call $x_deopt (local.get $rex) (local.get $rsp0)))`);
+      if (DISP) {
+        L.push(`(br_if $L_disp (i32.ge_s (local.get $pc) (i32.const 0)))`);
+        L.push(SA_MARK);
+        L.push(...tailJmp());
+        L.push(`(return (call $x_deopt (local.get $rex) (local.get $rsp0)))`);
+      } else {
+        // structured: br_table over RPO index -> the target block's label.
+        // A target that is the next block has no label of its own (it is
+        // reached by falling through), so it gets $jt_next_i, which lands
+        // just past the deopt tail; everything else (an unknown address,
+        // $pc = -1, or a block that is not a table target) takes the
+        // default and deopts at the computed address.
+        const vec = []; for (let r = 0; r < N; r++) vec.push(jtabUnion.has(r) ? (r === i + 1 ? `$jt_next_${i}` : (r <= i ? '$loop_' + r : '$blk_' + r)) : `$jt_dflt_${i}`);
+        L.push(`(block $jt_next_${i} (block $jt_dflt_${i} (br_table ${vec.join(' ')} $jt_dflt_${i} (local.get $pc)))`);
+        L.push(SA_MARK);
+        L.push(...tailJmp());
+        L.push(`(return (call $x_deopt (local.get $rex) (local.get $rsp0))))`);
+        if (globalThis.__jtabStats) globalThis.__jtabStats.structured++;
+      }
     } else if (t.kind === 'deopt') {
       // indirect jump (jump table / tail call) or undecodable byte:
       // hand the frame to the engine at the computed target / that rip
@@ -2476,8 +2534,11 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     // OXWASM_NARROW_ONLY=hexaddr,hexaddr narrows just those functions - the
     // bisect lever for attributing a narrowing miscompile inside one unit
     const onlyN = typeof process !== 'undefined' && process.env?.OXWASM_NARROW_ONLY;
+    // On by default since the yield fix below: call kernel 9.3x -> 6.5x, m4
+    // 7.38x -> 6.95x on 514M calls. OXWASM_NARROW=0 / globalThis.__narrow =
+    // false turns it off for A/B.
     const narrowOn = (globalThis.__narrow ??
-      (typeof process !== 'undefined' && process.env?.OXWASM_NARROW === '1')) &&
+      !(typeof process !== 'undefined' && process.env?.OXWASM_NARROW === '0')) &&
       (!onlyN || onlyN.split(',').includes(fnAddr.toString(16)));
     const regs16 = Array.from({length: 16}, (_, r) => r);
     // OXWASM_NOXMMCALL=1 is a PRICING PROBE, not a mode: it drops the xmm
@@ -2634,7 +2695,15 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       }
       // the prologue reload runs once at function entry: keep what is live
       // into the entry block, plus r4 ($rsp0 and the frame setup read it)
-      entryKeep = liveIn[0] | (1 << 4);
+      // ... unless this function can yield: the shared $yield tail spills every
+      // touched register, and a register the narrowed prologue did not
+      // reload holds an uninitialised local until the path writes it - the
+      // tail would store that zero over the caller's value (m4 with the
+      // narrowing on died on a wild address; with the yield off it was
+      // exact). A yielding function reloads everything it touches; the
+      // caller-side spill, the exit spill and the post-call reload stay
+      // narrowed.
+      entryKeep = usesYield ? null : (liveIn[0] | (1 << 4));
     }
     }
     // a marker that survives would poison the unit at wat2wasm; fail loudly
@@ -2646,7 +2715,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   let wat = `  (func $${name} (export "${name}") (result i64)\n`;
   for (let r=0;r<16;r++) wat += `    (local $r${r} ${isI32(r)?'i32':'i64'})\n`;
   wat += '    (local $fa i64) (local $fb i64) (local $fr i64) (local $cf i64) (local $rsp0 i64) (local $rex i64)\n';
-  if (DISP) wat += '    (local $pc i32)\n';
+  if (DISP || hasJtab) wat += '    (local $pc i32)\n';
   if (usesFtr) wat += '    (local $fti i32)\n';
   if (usesFts) wat += '    (local $fts i32)\n';
   if (usesIcp) wat += '    (local $icp i32)\n';
@@ -2657,6 +2726,13 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   for (const r of xUsed) if (entryKeep === null || (entryKeep & ((0x10000<<r)|0))) wat += '    ' + xReload(r) + '\n';
   wat += '    (local.set $rsp0 (local.get $r4))\n';
   wat += '    ' + ftInc + '\n';       // entry tax: this frame\'s stack weight
+  if (typeof process !== 'undefined' && process.env?.OXWASM_COUNTCALLS === '1') wat += `    (i64.store (i32.const ${FTMAP + 32}) (i64.add (i64.load (i32.const ${FTMAP + 32})) (i64.const 1)))\n`;
+  // OXWASM_FNPROF=1: a per-function entry counter (diagnosis only). aotCalls
+  // is a threshold detector that stops at tier-up, so it cannot rank callees;
+  // this counts every prologue entry, compiled-to-compiled calls included.
+  // Slots hash the function address into the dead space above FTMAP;
+  // runbin reads them back per compiled entry and flags slot collisions.
+  if (typeof process !== 'undefined' && process.env?.OXWASM_FNPROF === '1') { const sl = fnprofSlot(fnAddr); wat += `    (i64.store (i32.const ${sl}) (i64.add (i64.load (i32.const ${sl})) (i64.const 1)))\n`; }   // measurement: function entries
   // one yield exit per function (see FTLOOP): a back edge whose budget is
   // spent and whose head resolves sets $rex and br's here; the spill and the
   // return-or-deopt are emitted once, not per edge
@@ -2669,6 +2745,22 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     `    (i32.store (i32.const ${FTYNEST}) (i32.add (i32.load (i32.const ${FTYNEST})) (i32.const 1)))\n` +
     `    (return (call $x_deopt (local.get $rex) (local.get $rsp0)))\n`;
   if (usesYield) wat += '    (block $yield\n';
+  // The jump-table resolver: address -> RPO index for every table target, a
+  // balanced binary-search tree of ifs (log2(n) compares per computed
+  // goto). Both layouts call it; it was emitted by the dispatch epilogue
+  // only, so every structured function with a jump table referenced an
+  // undefined $jtr_ and the whole unit failed to assemble (18k such errors
+  // in one breadth sweep - the units fell back to the interpreter).
+  const jtrFunc = () => {
+    if (!hasJtab) return '';
+    const pairs = [...jtabUnion].map(j => [blocks[j].start, j]).sort((x,y) => x[0] < y[0] ? -1 : 1);
+    const bs = (lo, hi) => {
+      if (hi - lo === 1) return `(if (result i32) (i64.eq (local.get $a) (i64.const ${hexs(pairs[lo][0])})) (then (i32.const ${pairs[lo][1]})) (else (i32.const -1)))`;
+      const mid = (lo + hi) >> 1;
+      return `(if (result i32) (i64.lt_u (local.get $a) (i64.const ${hexs(pairs[mid][0])}))\n      (then ${bs(lo, mid)})\n      (else ${bs(mid, hi)}))`;
+    };
+    return `  (func $jtr_${fnAddr.toString(16)} (param $a i64) (result i32)\n    ${bs(0, pairs.length)}\n  )\n`;
+  };
   if (DISP) {
     // flat br_table dispatch: $pc holds the current block's RPO index. Block
     // bodies run in order; a non-fallthrough edge sets $pc and br's $L_disp.
@@ -2691,18 +2783,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     wat += '    ))\n';                                                 // close loop + exit block
     if (usesYield) wat += '    (unreachable))\n' + yieldTail();          // close $yield; its tail follows
     wat += '    (unreachable)\n  )\n';
-    if (hasJtab) {
-      // address -> RPO index for every jump-table target, as a balanced
-      // binary-search tree of ifs: log2(n) compares per computed goto
-      const pairs = [...jtabUnion].map(j => [blocks[j].start, j]).sort((x,y) => x[0] < y[0] ? -1 : 1);
-      const bs = (lo, hi) => {
-        if (hi - lo === 1) return `(if (result i32) (i64.eq (local.get $a) (i64.const ${hexs(pairs[lo][0])})) (then (i32.const ${pairs[lo][1]})) (else (i32.const -1)))`;
-        const mid = (lo + hi) >> 1;
-        return `(if (result i32) (i64.lt_u (local.get $a) (i64.const ${hexs(pairs[mid][0])}))\n      (then ${bs(lo, mid)})\n      (else ${bs(mid, hi)}))`;
-      };
-      wat += `  (func $jtr_${fnAddr.toString(16)} (param $a i64) (result i32)\n    ${bs(0, pairs.length)}\n  )\n`;
-    }
-    return wat;
+    return wat + jtrFunc();
   }
   for (let i=0;i<N;i++) {
     for (const s of open[i]) wat += s.type==='loop' ? `      (loop ${s.label}\n` : `      (block ${s.label}\n`;
@@ -2711,7 +2792,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   }
   if (usesYield) wat += '    (unreachable))\n' + yieldTail();            // close $yield; its tail follows
   wat += '    (unreachable)\n  )\n';        // every path leaves via ret/deopt
-  return wat;
+  return wat + jtrFunc();
 }
 
 // ---- unit driver -----------------------------------------------------------
