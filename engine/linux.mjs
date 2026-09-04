@@ -305,6 +305,30 @@ export class LinuxEngine {
     dv.setUint32(FTMAP, this._ftCount, true);
   }
 
+  // ---- mmap arena: bump pointer plus a sorted list of holes munmap returned
+  _mmapTake(len) {
+    const holes = (this._mmapHoles ??= []);
+    for (let i = 0; i < holes.length; i++) {
+      const h = holes[i], sz = h[1] - h[0];
+      if (sz < len) continue;
+      const at = h[0];
+      if (sz === len) holes.splice(i, 1); else h[0] += len;
+      return at;
+    }
+    const at = this.mmapNext; this.mmapNext += len; return at;
+  }
+  _mmapGive(lo, len) {
+    const base = this._mmapBase ?? 0n, hi = lo + len;
+    if (lo < base || hi > this.mmapNext || len <= 0n) return;   // not the arena's (fixed spans, brk): leave it
+    const holes = (this._mmapHoles ??= []);
+    let i = 0; while (i < holes.length && holes[i][1] < lo) i++;
+    // merge with a hole ending at lo and/or starting at hi
+    let nlo = lo, nhi = hi;
+    if (i < holes.length && holes[i][1] === lo) { nlo = holes[i][0]; holes.splice(i, 1); }
+    if (i < holes.length && holes[i][0] === hi) { nhi = holes[i][1]; holes.splice(i, 1); }
+    if (nhi === this.mmapNext) { this.mmapNext = nlo; return; }  // top of the arena: shrink the bump instead
+    holes.splice(i, 0, [nlo, nhi]);
+  }
   aotImports() { return { js: { mem: this.wmem, ftab: this.ftab }, env: this.aotEnv() }; }
 
   // Rebuild the in-memory (addr, slot) dispatch map from aotFns. Snapshot
@@ -1522,9 +1546,13 @@ export class LinuxEngine {
         const len = align(a2, PAGE);
         const flags = cpu.regs[10], fdArg = Number(BigInt.asIntN(32, cpu.regs[8] & 0xFFFFFFFFn));
         const FIXED = 0x10n, ANON = 0x20n;
-        const at = (flags & FIXED) ? a1 : this.mmapNext;
-        if (!(flags & FIXED)) this.mmapNext += len;
-        else if (a1 < (this._mmapBase ?? 0n) || a1 >= this.mmapNext) {   // outside the arena: remember the span
+        // Un-fixed mappings come first-fit from the holes munmap left, then
+        // from the bump pointer. The arena was bump-only and never reused:
+        // Go's runtime probes a dozen 64 MB arena hints (each returned
+        // elsewhere, unmapped, retried) and then a 512 MB summary, and
+        // exhausted a 3 GB slab in reservations it had already released.
+        const at = (flags & FIXED) ? a1 : this._mmapTake(len);
+        if (flags & FIXED) if (a1 < (this._mmapBase ?? 0n) || a1 >= this.mmapNext) {   // outside the arena: remember the span
           this._fixedLo = this._fixedLo === undefined ? a1 : (a1 < this._fixedLo ? a1 : this._fixedLo);
           const hi = a1 + len; this._fixedHi = this._fixedHi === undefined ? hi : (hi > this._fixedHi ? hi : this._fixedHi);
         }
@@ -1556,6 +1584,7 @@ export class LinuxEngine {
         const lo = a1, hi = a1 + a2;
         const inR = (k) => k >= lo && k < hi;
         this._unmapRange(lo, hi);                            // shared-mapping write-back
+        this._mmapGive(lo, align(a2, PAGE));                 // the arena reuses it
         let hit = false;
         for (const k of this.aotFns.keys()) if (inR(k)) { this.aotFns.delete(k); hit = true; }
         for (const k of this.aotFailed) if (inR(k)) this.aotFailed.delete(k);
@@ -3432,7 +3461,7 @@ export class LinuxEngine {
     // unlocked)
     for (const L of this._fsMeta().rlocks?.values() ?? []) for (const x of L) if (x.owner === t.proc) x.owner = ceng;
     this._copyLiveRam(ceng);                                 // the child's view, before rollback (live ranges only)
-    ceng.brk = this.brk; ceng.mmapNext = this.mmapNext;
+    ceng.brk = this.brk; ceng.mmapNext = this.mmapNext; ceng._mmapHoles = (this._mmapHoles || []).map(h => [h[0], h[1]]);
     ceng.execRanges = this.execRanges.slice();
     if (this.execRangesStatic) ceng.execRangesStatic = this.execRangesStatic.slice();
     ceng.maps = (this.maps ?? []).map(m => ({ ...m }));
