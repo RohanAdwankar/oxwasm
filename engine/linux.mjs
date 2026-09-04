@@ -1615,8 +1615,10 @@ export class LinuxEngine {
         v.setBigUint64(off + 8, max, true);
         ret(0n); break; }
       case 267: {                                            // readlinkat: /proc/self/exe -> argv0
+        // the real path, as readlink (89) already answers: Go's os.Executable
+        // re-execs the binary by this name for its telemetry child
         const buf = cpu.regs[2], sz = cpu.regs[10] ?? cpu.regs[8];
-        const p = new TextEncoder().encode('/prog');
+        const p = new TextEncoder().encode(this.argv0 || '/prog');
         this.ram.set(p.subarray(0, Number(sz)), Number(buf - this.base));
         ret(BigInt(Math.min(p.length, Number(sz)))); break; }
       case 318: {                                            // getrandom
