@@ -443,6 +443,7 @@ export class LinuxEngine {
         // when already compiled (diagnosis: the upper bound of a re-tier that
         // un-prunes a hot caller's hot small callees so they can be inlined)
         skip: (c) => this._ftSeen.has(BigInt(c)) && !UNPRUNE.has(c),
+        tinyMemo: (this._tinyMemo ??= new Map()),
         // the tiering call profile, so the inliner can pick targets by how
         // often they are actually called rather than by what fits a budget
         hot: this.aotCalls,

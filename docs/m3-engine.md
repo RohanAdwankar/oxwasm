@@ -3918,3 +3918,24 @@ engine reads 1.74x and 1.11x at the same N today against this head's
 1.79x and 1.10x, so the 1.38x/0.61x last recorded were a different
 day's calibration (N, box), not a different engine. Trend claims need
 both arms measured in one sitting.
+
+### Closure pruning was the call kernel's whole gap; tiny callees stay in
+
+The call kernel's unit had no direct call in it: its 4-instruction
+leaf tiers up before the loop, so every later unit is pruned of it and
+reaches it through the `$ftr` chain (hash probe, `call_indirect`,
+budget save/restore) at all 30 sites. Kept in the unit
+(`OXWASM_UNPRUNE=4018b5`) the direct call is inlined by V8 and the
+kernel reads **0.56x** against 4.42x chained - the whole gap, and past
+native.
+
+So pruning now has one exception: a callee that analyses to at most
+`OXWASM_UNPRUNE_TINY` (16) instructions with no undecodable byte or
+indirect jump stays in every unit that calls it, already compiled or
+not; the verdict is memoised per engine. The earlier un-prune
+experiment that doubled gzip's unit and quadrupled its tier-up used
+the inliner's 160-instruction budget as "small"; at 16 a copy is a few
+lines per site. On this head: call kernel 4.42x → **0.55x**, suite
+exact, 21 breadth cases byte-identical, gzip's unit count unchanged
+(310 against 312 with it off), m4 steady state 8.93x → 8.69x (its hot
+callees are hundreds of instructions; this is not m4's lever).

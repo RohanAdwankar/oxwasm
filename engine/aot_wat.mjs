@@ -2906,6 +2906,17 @@ export function compileUnitWat(mem, entry, opts = {}) {
   const ONLY = (typeof process !== 'undefined' && process.env?.OXWASM_INLINE_ONLY) || '';
   const INLINE_ONLY = ONLY ? new Set(ONLY.split(',').map(h => BigInt('0x' + h.trim()).toString())) : null;
   const { guestBase, ramBase, maxFuncs = 96, maxInsns = 20000, skip } = opts;
+  const TINY = opts.tiny ?? Number((typeof process !== 'undefined' && process.env?.OXWASM_UNPRUNE_TINY) ?? 16);
+  const tinyMemo = opts.tinyMemo || new Map();
+  const isTiny = (a) => {
+    if (!(TINY > 0)) return false;
+    const k = a.toString(); if (tinyMemo.has(k)) return tinyMemo.get(k);
+    let ok = false;
+    try { const t = analyze(mem, a, { maxInsns: TINY, noJtab: true, entries: opts.entries ?? null, callTargets: opts.callTargets ?? null });
+          ok = t.blocks.every(b => b.insns.every(i => i.mnem !== 'udec' && i.mnem !== 'jmpind')); }
+    catch { ok = false; }
+    tinyMemo.set(k, ok); return ok;
+  };
   const funcs = new Map();                       // addrStr -> analysis
   const poisoned = new Set();                    // addrStr -> engine-only (callout)
   const pending = [entry];
@@ -2918,7 +2929,17 @@ export function compileUnitWat(mem, entry, opts = {}) {
     // it again would duplicate its whole body in this unit (CPython's eval
     // loop compiled 7 overlapping 5.9MB closures, one per hot loop head).
     // Not poisoned: call sites emit the $ftr chain, not a callout.
-    if (skip && k !== entry.toString() && skip(k)) continue;
+    // Tiny callees are the exception to pruning: a hot leaf that tiered up
+    // before its caller is otherwise reached through the $ftr chain (hash
+    // probe, call_indirect, budget save/restore) at every site, and the call
+    // kernel measured that chain as its WHOLE gap - 4.42x chained against
+    // 0.56x with the 4-instruction leaf in the unit (V8 inlines a direct
+    // call to it). The earlier "un-prune small callees" experiment doubled
+    // gzip's unit and quadrupled its tier-up because "small" was the
+    // inliner's 160-instruction budget; at TINY (default 16) instructions
+    // the duplication is a few lines per site. OXWASM_UNPRUNE_TINY=0 turns
+    // it off; the per-address verdict is memoised across units in opts.tinyMemo.
+    if (skip && k !== entry.toString() && skip(k) && !isTiny(a)) continue;
     try {
       let an;
       try { an = analyze(mem, a, { maxInsns, noJtab: !!globalThis.__noJtab, entries: opts.entries ?? null, callTargets: opts.callTargets ?? null }); }
