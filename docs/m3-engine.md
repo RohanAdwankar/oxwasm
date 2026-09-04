@@ -3955,3 +3955,21 @@ vim moves 16%; perl does not - its hot callees (the pp_ ops) are far
 past 16 instructions and stay chained, which is the next question: what
 a larger cap costs in unit size and tier-up against what it buys on
 perl and m4.
+
+**A larger cap does not pay.** `OXWASM_UNPRUNE_TINY` at 16, 64 and
+200 on the same box, same sitting (3 reps; unit text from one runbin
+pass of the 30M-iteration perl loop):
+
+| cap | perl units / text | perl | m4 |
+|---|---|---:|---:|
+| 16 | 243 / 126 MB | 7.31x | 8.96x |
+| 64 | 246 / 133 MB | 7.31x | 9.13x |
+| 200 | 252 / 211 MB | 7.45x | 8.30x |
+
+perl is flat because its hot calls are INDIRECT (`call *%rax` through
+`PL_ppaddr`, one per op): un-pruning only turns direct `call`
+instructions into direct wasm calls; a `callind` always takes the
+inline-cache probe and `call_indirect`. m4's 8.30x at 200 costs 67%
+more unit text for a reading inside its 8.3-9.1x day-to-day spread.
+The cap stays at 16; perl's lever is the indirect-call protocol and
+the callee prologue, not the closure.
