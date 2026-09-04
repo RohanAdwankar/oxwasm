@@ -1058,6 +1058,18 @@ export class CPU {
         const a = this.get(insn.dst); const r = c ? ((a >> c) | (a << (w - c))) & M : a & M;
         if (raw) this.f.cf = Number((r >> (w - 1n)) & 1n);
         this.set(insn.dst, r); break; }
+      case 'rcl': case 'rcr': {                     // rotate through carry, one bit at a time (rare: Go's runtime)
+        const w = BigInt(S*8), raw = this.get(insn.src) & (S === 8 ? 63n : 31n);
+        const c = S <= 2 ? raw % (w + 1n) : raw;
+        let a = this.get(insn.dst) & M, cf = BigInt(this.f.cf); const a0 = a;
+        for (let i = 0n; i < c; i++) {
+          if (insn.mnem === 'rcl') { const n = (a >> (w - 1n)) & 1n; a = ((a << 1n) | cf) & M; cf = n; }
+          else { const n = a & 1n; a = (a >> 1n) | (cf << (w - 1n)); cf = n; }
+        }
+        if (c) { this.f.cf = Number(cf);
+          // OF (count 1): rcl = MSB(result) ^ CF(after); rcr = MSB(original) ^ CF(before) = MSB(original) ^ MSB(result)
+          if (c === 1n) this.f.of = Number(insn.mnem === 'rcl' ? ((a >> (w - 1n)) & 1n) ^ cf : ((a0 >> (w - 1n)) & 1n) ^ ((a >> (w - 1n)) & 1n)); }
+        this.set(insn.dst, a); break; }
       case 'push': this.push(this.get(insn.src)); break;
       case 'pop': this.set(insn.dst, this.pop()); break;
       case 'jmp': this.rip = (next + insn.rel) & MASK[8]; break;

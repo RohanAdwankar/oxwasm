@@ -26,6 +26,7 @@ node ptytest.mjs
 node jrnltest.mjs
 node pushmemtest.mjs
 node callmemtest.mjs
+node rcrtest.mjs
 node packedtest.mjs
 node threadtest.mjs
 node subwidthtest.mjs

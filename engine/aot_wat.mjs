@@ -401,7 +401,7 @@ export function analyze(mem, entry, { maxInsns = 20000, noJtab = false, entries 
     //    CPU state, which syncOut/syncIn do not touch, so escaping at every
     //    x87 instruction keeps that state exact while the integer/SSE parts
     //    of the same function still compile (strtod, printf float paths).
-    if (['hlt','ud2','int3','int','cpuid','fxsave','fxrstor','stmxcsr','ldmxcsr','x87'].includes(insn.mnem)) {
+    if (['hlt','ud2','int3','int','cpuid','fxsave','fxrstor','stmxcsr','ldmxcsr','x87','rcl','rcr'].includes(insn.mnem)) {   // rcl/rcr: rare, interpreter-only
       insnAt.set(key, { mnem: 'udec', rip, next: rip + BigInt(insn.len), len: insn.len });
       continue;
     }

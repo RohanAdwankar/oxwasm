@@ -60,7 +60,7 @@ export function decode(fetch, rip) {
   }
   const fin = (o) => (o.len = i, o);
   const ALU = { 0: 'add', 1: 'or', 2: 'adc', 3: 'sbb', 4: 'and', 5: 'sub', 6: 'xor', 7: 'cmp' };
-  const SHIFT = { 0: 'rol', 1: 'ror', 4: 'shl', 5: 'shr', 7: 'sar' };
+  const SHIFT = { 0: 'rol', 1: 'ror', 2: 'rcl', 3: 'rcr', 4: 'shl', 5: 'shr', 7: 'sar' };   // rcl/rcr: Go's runtime (page-allocator bit math) uses rcr
 
   const op = p;
   // ALU r/m,r and r,r/m families: base opcodes 0x00,0x08,0x20,0x28,0x30,0x38

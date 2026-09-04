@@ -221,7 +221,7 @@ const CASES = [
   ['gzip',    '/bin/gzip',        ['-9', '-c', IN]],
   ['diff',    '/usr/bin/diff',    ['-u', IN, IN]],
   ['sh',      '/bin/sh',          ['-c', 'echo start; for i in 1 2 3; do echo line $i; done; echo done']],
-  ['rg',      '/usr/bin/rg',      ['--no-config', '-n', 'the', IN]],   // ripgrep (Rust): fstatat on dir fds with AT_EMPTY_PATH, NULL-path probes
+  ['rg',      '/usr/bin/rg',      ['--no-config', '-n', 'line 1', IN]],   // ripgrep (Rust): fstatat on dir fds with AT_EMPTY_PATH, NULL-path probes
   ['perl',    '/usr/bin/perl',    ['-e', 'my $s=0; $s+=$_ for 1..100; print "sum=$s\n"; print join(",", map { $_*$_ } 1..8), "\n"']],
   ['openssl', '/usr/bin/openssl', ['dgst', '-sha256', IN]],
   ['openssl-b64', '/usr/bin/openssl', ['enc', '-base64', '-in', IN]],
