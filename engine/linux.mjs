@@ -2172,12 +2172,17 @@ export class LinuxEngine {
       case 5: case 262: {                                     // fstat / newfstatat
         const isAt = nr === 262;
         let size = null, mode = 0o020620, statPath = null;    // default: char dev (tty)
-        if (isAt) {
+        // newfstatat(fd, "", AT_EMPTY_PATH) is fstat(fd): take the fd path
+        // below for every handle kind (ripgrep stats its directory fds this
+        // way, and the file-only branch that lived here threw on a dir
+        // handle's missing bytes)
+        // (a NULL path with AT_EMPTY_PATH is fstat too - Linux 6.11 allows it
+        // and Rust's std uses it; reading the path first faulted at 0)
+        const byFd = !isAt || ((cpu.regs[10] & 0x1000n) && (a2 === 0n || this.atPath(a1, a2) === ''));
+        if (!byFd) {
+          if (a2 === 0n) { ret(-14n); break; }                // EFAULT: NULL path without AT_EMPTY_PATH (Rust's std probes this)
           const p = this.atPath(a1, a2);
-          if (p === '' && (cpu.regs[10] & 0x1000n)) {         // AT_EMPTY_PATH: stat the fd
-            const h = this.fds.get(Number(a1));
-            if (h) { size = h.bytes.length; mode = this.fileMode(h.bytes); statPath = h.path ?? null; }
-          } else if ((cpu.regs[10] & 0x100n) && !p.endsWith('/') &&   // AT_SYMLINK_NOFOLLOW
+          if ((cpu.regs[10] & 0x100n) && !p.endsWith('/') &&   // AT_SYMLINK_NOFOLLOW
                      this._fsMeta().links.has(this.norm(p))) {
             statPath = this.norm(p);
             size = this._fsMeta().links.get(statPath).length; mode = 0o120777;
