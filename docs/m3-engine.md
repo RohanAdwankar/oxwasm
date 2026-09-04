@@ -4088,5 +4088,8 @@ provisioned. The engine gaps, each landed with a case or a suite test:
   translated; two cases (`gostrings`, a Go binary built at sweep start,
   and `go-version`) guard it.
 
-Still open: yq (a Go binary) produces nothing and times out; valgrind
-the same.
+yq and valgrind, the two "silent" probes, turned out not to be
+binaries at all on this box: yq is a Python entry-point script and
+valgrind a POSIX shell wrapper, and the probe's "no output" was runbin
+refusing a non-ELF. The sweep on this head is green in four chunks
+(129 cases, zero failures).
