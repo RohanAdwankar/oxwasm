@@ -36,6 +36,8 @@ class DeoptUnwind { constructor(rip) { this.rip = rip; } }
 // (rax still holds the syscall number) and either completes or blocks again.
 class BlockUnwind { constructor(rip) { this.rip = rip; } }
 
+const UNPRUNE = new Set(((typeof process !== 'undefined' && process.env?.OXWASM_UNPRUNE) || '').split(',').filter(Boolean).map(h => BigInt('0x' + h).toString()));
+
 export class LinuxEngine {
   // threshold: legacy tier-1.5 loop JIT trigger. Defaults OFF — it miscompiles
   // a vfprintf loop in glibc (wrong digits past the 22nd output byte) and the
@@ -197,6 +199,7 @@ export class LinuxEngine {
     this.aotFailed = new Set();
     this.tierMs = 0;                          // sync translation time this slice (host zeroes; see tierMsMax)
     this.aotCalls = new Map();                // call-target profile
+    this._unprune = UNPRUNE;
     this.aotCallThreshold = aotCallThreshold;
     this.aotLoopThreshold = aotLoopThreshold;
     if (assembleWat) {
@@ -436,7 +439,10 @@ export class LinuxEngine {
         // prune the closure at functions already in the dispatch map: calls
         // reach them via $ftr chaining, so re-including their bodies only
         // duplicates translation work and module bytes
-        skip: (c) => this._ftSeen.has(BigInt(c)),
+        // OXWASM_UNPRUNE=hex,hex: keep these callees in every closure even
+        // when already compiled (diagnosis: the upper bound of a re-tier that
+        // un-prunes a hot caller's hot small callees so they can be inlined)
+        skip: (c) => this._ftSeen.has(BigInt(c)) && !UNPRUNE.has(c),
         // the tiering call profile, so the inliner can pick targets by how
         // often they are actually called rather than by what fits a budget
         hot: this.aotCalls,
