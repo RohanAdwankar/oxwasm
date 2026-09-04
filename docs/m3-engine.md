@@ -3799,10 +3799,22 @@ refused, and the answer is not a budget tweak:
 
 So the inliner's population on m4 is the wrong one by construction:
 the callees worth inlining are exactly the ones hot enough to have
-tiered up on their own. Fixing that means a second compile of a hot
-caller with its hot small callees un-pruned, driven by this profile
-(a re-tier), which is the next item; raising the size cap only reaches
-the 758-instruction case and is priced separately.
+tiered up on their own. The obvious fix is a second compile of a hot
+caller with its hot small callees un-pruned, driven by this profile (a
+re-tier). `OXWASM_UNPRUNE=hex,hex` measures its upper bound by
+exempting those callees from pruning in every unit, and the bound is
+nil: 143 → 154 functions inlined, 870 → 894 callees, m4 s10 unchanged
+(24.8/25.6s vs 26.0/29.4s). Asked again with the callees in the
+closure, the inliner refuses the hottest (`409e80`) and `4164c0` as
+**deopt-insn**: each ends in a tail-cut jmp (a sibling call to
+another known entry), which the splice cannot carry because the copy's
+`ret` has been rewritten into a branch to the return point and a jmp
+out has no such point. The un-prune alone buys nothing; what m4's
+hottest callee needs is a splice that turns a tail-cut jmp inside a
+copy into a call to the sibling followed by the copy's return - the
+caller's `call` still pushed the return address, so the sibling's
+`ret` lands where a normal call's would. That is the next experiment;
+raising the size cap only reaches the 758-instruction case.
 
 Found while gating this batch: every structured-layout function with
 a jump table called a `$jtr_` resolver that only the dispatch epilogue
