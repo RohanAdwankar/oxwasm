@@ -1784,8 +1784,11 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   let usesFtr = false, usesFts = false, usesYield = false;
   // in-unit call sites bump the nesting word only when the yield is on (it is
   // what the yield's nested-frame rule reads); off, the call site is as before
-  const nestUp = LOOPYIELD ? `(i32.store (i32.const ${FTNEST}) (i32.add (i32.load (i32.const ${FTNEST})) (i32.const 1))) ` : '';
-  const nestDn = LOOPYIELD ? ` (i32.store (i32.const ${FTNEST}) (i32.sub (i32.load (i32.const ${FTNEST})) (i32.const 1)))` : '';
+  // OXWASM_NOACCT=1 is a PRICING PROBE: drops the nest counter and the chain
+  // fuel from every call site (unsound for slicing; node-only measurement)
+  const NOACCT = typeof process !== 'undefined' && process.env?.OXWASM_NOACCT === '1';
+  const nestUp = (LOOPYIELD && !NOACCT) ? `(i32.store (i32.const ${FTNEST}) (i32.add (i32.load (i32.const ${FTNEST})) (i32.const 1))) ` : '';
+  const nestDn = (LOOPYIELD && !NOACCT) ? ` (i32.store (i32.const ${FTNEST}) (i32.sub (i32.load (i32.const ${FTNEST})) (i32.const 1)))` : '';
   // Stack accounting is entry-tax-only: a function bumps FTDEPTH by its
   // weight (frame size grows with function size — V8 spill slots) and never
   // decrements on ret; instead every call site snapshots the word and
@@ -1799,9 +1802,10 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   // dispatch thereafter was refused — 99.5% of residual interp ran with the
   // budget word saturated (measured).
   const ftW = Math.min(96, Math.max(1, blocks.reduce((s, b) => s + b.insns.length, 0) >> 9));
-  const ftOk  = `(i32.and (i32.lt_u (i32.load (i32.const ${FTDEPTH})) (i32.const ${FTDLIMIT})) (i32.ne (i32.load (i32.const ${FTFUEL})) (i32.const 0)))`;
+  const ftOk  = NOACCT ? `(i32.lt_u (i32.load (i32.const ${FTDEPTH})) (i32.const ${FTDLIMIT}))`
+    : `(i32.and (i32.lt_u (i32.load (i32.const ${FTDEPTH})) (i32.const ${FTDLIMIT})) (i32.ne (i32.load (i32.const ${FTFUEL})) (i32.const 0)))`;
   const ftHit = `(i32.and (i32.ge_s (local.get $fti) (i32.const 0)) ${ftOk})`;
-  const ftBurn = `(i32.store (i32.const ${FTFUEL}) (i32.sub (i32.load (i32.const ${FTFUEL})) (i32.const 1)))`;
+  const ftBurn = NOACCT ? '' : `(i32.store (i32.const ${FTFUEL}) (i32.sub (i32.load (i32.const ${FTFUEL})) (i32.const 1)))`;
   const ftInc = `(i32.store (i32.const ${FTDEPTH}) (i32.add (i32.load (i32.const ${FTDEPTH})) (i32.const ${ftW})))`;
   const ftDec = `(i32.store (i32.const ${FTDEPTH}) (i32.sub (i32.load (i32.const ${FTDEPTH})) (i32.const ${ftW})))`;
   const ftSave = () => { usesFts = true; return `(local.set $fts (i32.load (i32.const ${FTDEPTH})))`; };

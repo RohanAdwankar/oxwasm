@@ -3997,3 +3997,19 @@ Register traffic is a fifth of it at most (narrowing 8%, the ABI
 reload another 10%); the rest is the inline-cache probe,
 `call_indirect`, the budget/fuel/nest accounting and the callee's own
 entry and exit - priced next from the unit text.
+
+**The accounting is free and the floor is 1.47x.** `OXWASM_NOACCT=1`
+(a pricing probe: no nest counter, no chain fuel at any call site)
+reads callind 3.09x against 3.08x - the budget/fuel/nest words cost
+nothing measurable, as the idealcall `budget` arm said of the depth
+check. `bench/kernels/idealcallind.mjs` is the same loop as
+hand-written wasm, state in locals, four leaves reached only through
+`call_indirect` on a 4-entry table: **1.47x** native (1213 ms against
+825 ms for 120M calls, same result value). So V8's indirect call is
+the floor at 1.47x and the engine's protocol around it is the other
+half: at 3.08x it adds ~11 ns per call over that floor, spread across
+the inline-cache probe (a dependent mul/shift/load/compare chain
+before the call), the return-address push and pop, the depth
+save/check/restore, and the callee's two entry loads and three exit
+stores. Narrowing and the ABI reload are the only pieces priced above
+5% each; there is no single item left in it.
