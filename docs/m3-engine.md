@@ -4041,3 +4041,52 @@ precise entry-reload set for yielding functions is worth 1-2% here,
 same as on m4. There is no single lever left in the call-dense band;
 what remains is the sum of a protocol at 2x V8's own floor and the
 per-entry cost of large interpreter functions.
+
+### Breadth batch 5: Rust and Go binaries
+
+Sixteen new binaries probed. curl, gpg, zip, as, strip, ar and strace
+passed as they were; ffmpeg and java only need their library trees
+provisioned. The engine gaps, each landed with a case or a suite test:
+
+- **Rust std stats directory fds** with `newfstatat(fd, "",
+  AT_EMPTY_PATH)` and probes NULL paths; the file-only branch threw
+  on a directory handle and the NULL read faulted at 0. The form now
+  takes fstat's per-handle logic and a NULL path without the flag is
+  EFAULT. ripgrep runs (`rg`); the rustup proxy on PATH runs to its
+  own "no default toolchain" message.
+- **Go's runtime** reserves address space in bulk: a dozen 64 MB arena
+  hints (each returned elsewhere, unmapped, retried) and a 512 MB page
+  summary. The mmap arena was bump-only and never reclaimed munmapped
+  ranges, so a 3 GB slab ran dry on reservations Go had released;
+  munmap now returns arena ranges to a first-fit hole list.
+- Go's page allocator uses **`rcr`**; the decoder threw. rcl/rcr run in
+  the interpreter (count masked as the CPU does, 8/16-bit mod 9/17, OF
+  at count 1) and deopt from units; `rcrtest.mjs` (8 sizes × 67 counts
+  × 2 carry states, CF always, OF at count 1) is bit-exact in both
+  tiers.
+- Go re-execs itself by `/proc/self/exe`; readlinkat answered the
+  literal '/prog' and readlink argv0. Both answer the absolute argv0
+  now, '/prog' for a relative one, and '/prog' resolves to the image
+  (busybox re-execs itself the same way and its shell test aborted on a
+  relative name).
+- **A translator bug that only Go tripped.** `go version` ran under
+  the interpreter and panicked translated: "invalid Getenv GOOS", a
+  `strings.Contains` over a constant table returning false. Unit-number
+  bisects converged on nothing, and so did a function-veto bisect: the
+  culprit was reached inside other units' closures. An allow-list
+  bisect (`FNALLOW`, compile only these functions, as roots or closure
+  members, tiny exception included) over the 612 functions of a
+  40-line reproducer named `runtime.memequal`. Its `memeqbody` ends in
+  `sub; shl %cl; sete`, with a `je` from an earlier `cmp` into the sete
+  block. The cross-block flag dataflow gave a block ending in an
+  unmodeled writer (the variable-count shift) an EMPTY out-set, so the
+  sete block saw only the cmp's definition and compiled against it;
+  on the shl path it read the wrong flags and memequal answered false
+  for every 1-7 byte string. A clobbered block now propagates a kill
+  sentinel and a consumer it reaches poisons the function into the
+  interpreter, as the design intended. `go version` prints its version
+  translated; two cases (`gostrings`, a Go binary built at sweep start,
+  and `go-version`) guard it.
+
+Still open: yq (a Go binary) produces nothing and times out; valgrind
+the same.
