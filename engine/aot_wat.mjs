@@ -1348,6 +1348,21 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   // expansion is the full list, identical to the pre-narrowing emitter's
   // output up to whitespace.
   const SA_MARK = '\x00SA\x00', SX_MARK = '\x00SX\x00', RL_MARK = '\x00RL\x00';
+  // RC: the reload after a CALL. The SysV ABI makes rbx, rbp, r12-r15
+  // callee-saved, and the guest's own compiler already relies on that at
+  // every call site it emitted, so their memory copies after the callee
+  // returns equal what this frame spilled - which is what the locals still
+  // hold. Skipping their reload is free of new assumptions: a callee that
+  // clobbers them breaks the native program the same way. rsp stays
+  // reloaded (the local holds the post-push value; the callee's ret popped
+  // it). Syscalls keep the full RL (the kernel path is not a guest callee).
+  // OPT-IN (OXWASM_ABIRELOAD=1), not the default: hand-written asm may pass
+  // values back in callee-saved registers - the suite's call-mem test does
+  // (its callee accumulates in rbx) and read exit 8 for 100 with this on.
+  // "Any unmodified program" includes such code, so the default stays exact.
+  // Measured: call kernel 4.94x -> 4.17x, m4 steady state 8.93x -> 8.65x.
+  const RC_MARK = (typeof process !== 'undefined' && process.env?.OXWASM_ABIRELOAD === '1') ? '\x00RC\x00' : RL_MARK;
+  const CS_MASK = (1 << 3) | (1 << 5) | (1 << 12) | (1 << 13) | (1 << 14) | (1 << 15);
 
   // ---- operand / instruction emit (identical semantics to the dispatch version) ----
   const hexs = (v) => BigInt.asIntN(64, v).toString();
@@ -2269,7 +2284,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
                    `  (then ${ftBurn} ${nestUp}(drop (call_indirect $ft (type $uft) (local.get $fti)))${nestDn} ${ftRestore})`,
                    `  (else (drop (call $x_callout (i64.const ${hexs(target)})))))`);
           }
-          L.push(RL_MARK);
+          L.push(RC_MARK);
           break; }
         case 'callind': {   // compute target BEFORE the push moves rsp
           const t = T(); L.push(`(local.set ${t} ${rd(insn.src,8,next)})`);
@@ -2282,7 +2297,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
                  `(if ${ftHit}`,
                  `  (then ${ftBurn} ${nestUp}(drop (call_indirect $ft (type $uft) (local.get $fti)))${nestDn} ${ftRestore})`,
                  `  (else (drop (call $x_callout (local.get ${t})))))`);
-          L.push(RL_MARK);
+          L.push(RC_MARK);
           break; }
         case 'syscall':
           // pass this syscall's guest rip: a BLOCKING syscall (poll/select/
@@ -2484,7 +2499,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
                `  (then ${ftBurn} ${nestUp}(drop (call_indirect $ft (type $uft) (local.get $fti)))${nestDn} ${ftRestore})`,
                `  (else (drop (call $x_callout (i64.const ${hexs(target)})))))`);
       }
-      L.push(RL_MARK);
+      L.push(RC_MARK);
       const b = brTo(t.t); if (b) L.push(b);
     } else if (t.kind === 'inlineret') {
       // pop what the inlined call pushed. The continuation is known
@@ -2595,11 +2610,12 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       ...xS.map(xSpill),
     ].join('\n      ');
     const rlFull = [...regs16.filter(touched).map(reloadR), ...xS.map(xReload)].join('\n      ');
+    const rlCall = [...regs16.filter(r => touched(r) && !(CS_MASK & (1 << r))).map(reloadR), ...xS.map(xReload)].join('\n      ');
     if (!narrowOn) {
       // off: every marker becomes the full list; no scan, no dataflow
       const sa = expandFull(false), sX = expandFull(true);
       for (let b = 0; b < N; b++) if (bodies[b].indexOf('\x00') !== -1)
-        bodies[b] = bodies[b].replaceAll(SA_MARK, sa).replaceAll(SX_MARK, sX).replaceAll(RL_MARK, rlFull);
+        bodies[b] = bodies[b].replaceAll(SA_MARK, sa).replaceAll(SX_MARK, sX).replaceAll(RL_MARK, rlFull).replaceAll('\x00RC\x00', rlCall);
     } else {
     const bit = new Map();                      // '$rN'/'$xN' -> dataflow bit
     for (let r = 0; r < 16; r++) if (touched(r)) bit.set('$r'+r, 1 << r);
@@ -2615,7 +2631,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     // per-block transfer as (kill, gen): OUT = (IN & ~kill) | gen, and every
     // spill marker's mask as a snapshot of (kill, gen) at its position
     {
-      const RE = /\x00(?:S[AX]|RL)\x00|\(local\.set (\$[rx]\d+)/g;
+      const RE = /\x00(?:S[AX]|R[LC])\x00|\(local\.set (\$[rx]\d+)/g;
       const kills = new Array(N).fill(0), gens = new Array(N).fill(0);
       const marks = Array.from({length: N}, () => []);
       for (let b = 0; b < N; b++) {
@@ -2662,7 +2678,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
 
     // ---- backward: liveness -> reload expansion (on the spill-expanded text)
     {
-      const evRE = /\x00RL\x00|\(local\.(get|set) (\$[rx]\d+)/g;
+      const evRE = /\x00R[LC]\x00|\(local\.(get|set) (\$[rx]\d+)/g;
       const events = Array.from({length: N}, () => []);   // {use|def|rl, bit, at}
       for (let b = 0; b < N; b++) {
         const body = bodies[b], ev = events[b];
@@ -2686,7 +2702,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
         evRE.lastIndex = 0;
         while ((m = evRE.exec(body)) !== null) {
           gap(pos, m.index); pos = m.index;
-          if (m[0][0] === '\x00') { ev.push({ k: 2, at: m.index }); continue; }
+          if (m[0][0] === '\x00') { ev.push({ k: 2, at: m.index, cs: m[0][2] === 'C' }); continue; }
           const bb = bit.get(m[2]);
           if (bb === undefined) continue;
           if (m[1] === 'get') ev.push({ k: 0, bit: bb });
@@ -2703,7 +2719,8 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           const e = ev[i];
           if (e.k === 0) live |= e.bit;
           else if (e.k === 1) { if (e.d === 0) live &= ~e.bit; }     // conditional defs don't kill
-          else { if (rec) rec.push({ at: e.at, live }); live = 0; }  // reload defines all it keeps
+          else { if (rec) rec.push({ at: e.at, live, cs: e.cs });
+                 live = e.cs ? (live & CS_MASK) : 0; }               // reload defines all it keeps; callee-saved live through a call
         }
         return live;
       };
@@ -2727,7 +2744,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
         rec.sort((a, c) => a.at - c.at);        // reverse walk recorded back-to-front
         let out = '', last = 0;
         for (const mk of rec) {
-          const txt = rlExpand(mk.live);
+          const txt = rlExpand(mk.cs ? (mk.live & ~CS_MASK) : mk.live);
           stats.rlSites++; const k = nOps(txt, '.load');
           stats.rlLoads += k; stats.rlSkipped += nOps(rlFull, '.load') - k;
           out += bodies[b].slice(last, mk.at) + txt;

@@ -3891,3 +3891,30 @@ last recorded and its 1.07x forced-TurboFan ideal, self-check 1.20x
 and 1.18x; the harness resolves ~2%. The earlier 1.41x was measured
 before the loop-aware layout and the narrowing default; the residual
 now is within a mispredict-dominated loop's noise of its ideal.
+
+### The ABI-trusting reload: 16% on pure calls, opt-in
+
+After a call the reload can skip rbx, rbp and r12-r15: the guest's
+compiler relied on them being callee-saved at every call site it
+emitted, so their memory copies after the callee returns equal what
+this frame spilled, which the locals still hold. rsp stays reloaded
+(the local holds the post-push value) and syscalls keep the full
+reload. In the backward pass those registers stay live through the
+call instead of being defined by the reload, so a callee-saved value
+live after the call is reloaded at entry. Measured on this head: call
+kernel 4.94x → **4.17x**, m4 steady state 8.93x → **8.65x**; breadth
+m4/bison/python3/sh/perl/gzip and 14 more byte-identical.
+
+It is `OXWASM_ABIRELOAD=1`, not the default: the suite's call-mem test
+(hand-written asm whose callee accumulates into rbx and whose caller
+reads it) exits 8 instead of 100 with it on. "Any unmodified program"
+includes code that passes values back in callee-saved registers, so
+the default stays exact, and the number stands as the price of that.
+
+Also from this pass: the kernel table on this head reads alu 1.82x,
+mem 1.15x, subw 1.01x, muldiv 1.01x, scan 1.15x, branch 1.17x, call
+4.71x. alu and mem are not a regression of the batch: the pre-batch
+engine reads 1.74x and 1.11x at the same N today against this head's
+1.79x and 1.10x, so the 1.38x/0.61x last recorded were a different
+day's calibration (N, box), not a different engine. Trend claims need
+both arms measured in one sitting.
