@@ -3831,3 +3831,28 @@ a jump table called a `$jtr_` resolver that only the dispatch epilogue
 emitted, so the unit failed to assemble and fell back to the
 interpreter - 18k such errors in one breadth sweep, all in python3,
 node and php (computed-goto interpreters). Both epilogues emit it now.
+
+### next_token per entry, from the block profile
+
+`OXWASM_BLKPROF=40fe70` counts entries per block of one function (the
+upper half of the FNPROF dead space; runbin prints slots, resolved
+against the function's address range). On m4 s10 `next_token` is
+entered 2.73M times and thirteen of its blocks run exactly once per
+entry: it is called once per token, runs a straight-line path of
+~80 instructions with two calls (one in-unit direct, one to the
+pruned `peek_input` through the `$ftr` chain) and returns; the
+per-character work is in `peek_input`, not here. Its 93 ns per entry
+(254 ms of wasm self time over 2.73M entries in the s10 profile) is
+spread thin: the prologue reloads all 16 registers because the
+function can yield (the precise entry set for yielding functions is
+still open), the reload after the chained call is the full 16 because
+in the dispatch layout every register is live at the dispatch head,
+thirteen `br_table` round-trips, and two call protocols. No single
+item is more than ~10% of the function. The two reload sets are the
+concrete levers left in it, worth perhaps 10% of `next_token`.
+
+Also from this batch's gating, the resolver fix priced against the
+pre-batch engine (cold breadth cases, compile included): python3
+270.8 s → 49.1 s, php 105.5 s → 25.8 s. Those are the structured-layout
+jump tables working on computed-goto interpreters; the earlier
+"733 s" and "72 s" were the broken intermediate.
