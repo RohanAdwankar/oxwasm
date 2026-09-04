@@ -3457,6 +3457,11 @@ Kernels harness, 7 reps, N auto-calibrated (alu at 6.5G iterations):
 | muldiv | 1.59x | **1.00x** |
 | scan | 1.57x | 1.60x |
 
+The real-binary batch on the same build is unchanged within its
+noise (m4 7.74x, vim 4.86x, gzip 2.67x on the small input): their hot
+paths are call-dense or were tiered already, and none of them runs a
+single loop long enough for the yield to matter.
+
 alu and mem are within 1.4x of native and muldiv at parity - the
 straight-line kernels whose top-tier ideal is parity; what is left of
 their gap is the Liftoff phase before the background TurboFan job
@@ -3465,3 +3470,123 @@ did not move: its loop is `jmp`-closed and was yielding all along, so
 its 3.5x is codegen (the sub-word merges), not tier occupancy - the
 next straight-line item. The call kernel's 9.3x is the same protocol
 as before at a different auto-calibrated N.
+
+**A per-frame local for the budget: worse, reverted.** subw's loop
+body is fifteen wasm ops and the burn adds three memory operations
+per iteration (load, store, reload of FTLOOP), so the obvious next
+step was a per-frame local: initialised to N at entry, decremented at
+back edges, refilled on a loophot miss, no memory at all. Back to
+back, 5 reps each, same session:
+
+| kernel | memory word | local |
+|---|---:|---:|
+| alu | 1.40x | 1.80x |
+| subw | 3.47x | 4.13x |
+| scan | 1.59x | 1.93x |
+
+Worse across the board, by a similar margin, and reverted. The
+reading that fits is that V8's dynamic tiering budget is an estimate
+of *code bytes executed*: a shorter loop body decrements it more
+slowly, the TurboFan job is requested later, and the Liftoff phase -
+which these ratios are still made of - grows. The three memory ops are
+cheap next to that. The memory word stays; what this measures is how
+much of the remaining straight-line gap is Liftoff occupancy, which
+the next probe (the harness under `--no-liftoff`) bounds directly.
+
+### The burn is the straight-line gap
+
+The `--no-liftoff` harness settled the tier question the opposite way
+from what the local-budget result suggested: forced TurboFan reads
+alu 1.41x, mem 1.30x, subw 3.48x, scan 1.58x - the *same* numbers as
+the default build. These loops already run in TurboFan; what is left
+is codegen. And the codegen difference to the old parity table (alu
+0.87x, subw 1.07x, measured before the yield existed) is the yield
+emission itself. Three arms under `--no-liftoff`, 3 reps:
+
+| kernel | yield off | memory word | local counter |
+|---|---:|---:|---:|
+| alu | **1.01x** | 1.41x | 1.77x |
+| subw | **1.93x** | 3.48x | 4.24x |
+| scan | **1.23x** | 1.58x | 1.95x |
+
+The burn - load, decrement, store, reload, test, and the cold probe
+with its `call $ftr` and the `br $yield` exit sitting inside the loop
+body - costs 40% on alu, 80% on subw, 28% on scan under TurboFan. The
+local-counter variant is worse than the memory word, which reads as
+register pressure: the guest's sixteen registers already live in i64
+locals, and a loop-carried counter is one more value the allocator
+has to keep in a machine register. (subw's 1.93x with the yield off is
+its own codegen item: the 32-bit ops each wrap and extend, and the
+byte read masks.)
+
+So the loop yield buys tier occupancy at 30-80% of the loop, which
+is still a net win against Liftoff's 3-5x but is the next thing to
+make cheaper: burn less (every k-th edge, or one burn per loop rather
+than per back edge), keep the probe and exit out of the loop body, or
+count in something the allocator does not have to carry.
+
+Two more arms split the burn itself (forced TurboFan, 3 reps): the
+read-modify-write alone, with no probe and no exit in the loop, reads
+alu 1.39x, subw 2.85x, scan 1.71x - on alu it *is* the whole cost; a
+single-load form of the same burn (`local.tee` of the decremented
+value) was no better and noisier. A per-iteration store-and-reload of
+one word costs two to three cycles on loops native runs in two, and
+no arrangement of the same per-iteration operations recovers it. The
+count has to happen less often: unroll single-block self-loops k
+times with one burn per k iterations, which divides the cost by k on
+exactly the loops that pay it.
+
+### Unrolling the loops that pay the burn
+
+The burn cannot be made cheaper per iteration; it can be made rarer.
+The emitter now unrolls the two loop shapes gcc produces for counted
+and while loops, when the blocks are short (≤24 instructions) and
+contain no call, syscall, indirect jump or undecodable byte:
+
+- a **single-block self-loop** (`body; cmp; jcc head`): the block is
+  emitted k times inside its `loop`, wrapped in a `(block $sx_i)`;
+  copies 0..k-2 test the loop's *exit* condition and `br $sx_i` out
+  (or branch to the exit block, or deopt, as the original edge did),
+  falling through into the next copy on the loop-back; the last copy
+  keeps the real terminator, and with it the one burn per k
+  iterations;
+- the **two-block while shape** (`head: cmp; jcc exit` /
+  `body: ...; jmp head`, the body reachable only from the head): k
+  copies of (head, body), every head copy exiting through `$sx_i`,
+  body copies 0..k-2 falling into the next head copy, the last body
+  copy keeping its `jmp` terminator and burn. The body block's own
+  slot is emitted empty.
+
+A copy is byte-for-byte the block's own code, so the lazy-flag state
+entering copy c+1 is the state the analyzer already meets at the head
+from the back edge, and every exit takes the edge the original block
+took. `OXWASM_UNROLL` sets k (1 disables); default 8.
+
+Kernels harness, 5 reps, default tiers:
+
+| kernel | before | k=4 | k=8 |
+|---|---:|---:|---:|
+| alu | 1.40x | 1.33x | **1.36x** |
+| mem | 1.31x | 0.66x | **0.62x** |
+| subw | 3.50x | 1.63x | **1.36x** |
+| scan | 1.60x | 1.56x | 1.62x |
+| branch | 1.37x | - | 1.37x |
+| muldiv | 1.00x | - | 1.05x |
+
+mem now runs *faster than gcc -O2* (the native loop is not unrolled;
+the engine's is), subw drops from 3.5x to 1.36x, alu moves only from
+1.40x to 1.36x - its yield-off ideal is 1.01x, so something in the
+unrolled body still costs it, most likely register pressure across a
+13-instruction block copied eight times (k=4 reads the same, so it is
+not the unroll factor alone). scan and branch are multi-block loops
+with several back edges and are not unrolled yet; that is the general
+case (duplicate the loop's whole block set k times with the internal
+labels renamed) and the next step for the burn.
+
+One detour on the way: the first build "hung" on alu. It was not a
+hang - a counter line referenced a `stats` object that lives in the
+narrowing pass's scope, every unit compile threw at its first
+unrolled block, the try/catch around tier-up swallowed it, and the
+run was the interpreter alone. The unit emitter throwing is
+indistinguishable from a hang from outside; the debug prints that
+found it are gone again.

@@ -1651,7 +1651,60 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     `  (then ${ftBurn} ${ftDec} (return_call_indirect $ft (type $uft) (local.get $fti))))`,
   ]; };
 
+  // A single-block self-loop with a plain conditional terminator is emitted
+  // UNROLL times inside its loop: copies 0..k-2 leave through $sx_i on the
+  // loop's exit condition and fall through into the next copy on the loop
+  // back, the last copy keeps the real terminator - and with it the ONE burn
+  // of the loop-yield budget per k iterations. Under forced TurboFan the
+  // per-iteration read-modify-write of that budget word was 40% of alu, 80%
+  // of subw and 28% of scan (yield off: 1.01x, 1.93x, 1.23x native); a
+  // loop-carried local was worse still (register pressure). Restricted to
+  // short blocks without calls, syscalls or undecodable bytes; a copy is
+  // byte-for-byte the block's own code, so the flag state entering copy
+  // c+1 is the state the analyzer already meets at the head from the back
+  // edge. OXWASM_UNROLL=1 disables (k), default 8.
+  // The two-block shape gcc emits for a while loop - head `cmp; jcc exit`,
+  // body `...; jmp head` - unrolls the same way: k copies of (head, body),
+  // every head copy exits through $sx_i, body copies 0..k-2 fall into the
+  // next head copy, the last body copy keeps its terminator (and the burn).
+  // The body block is then emitted empty in its own slot.
+  const UNROLL = (typeof process !== 'undefined' && +process.env?.OXWASM_UNROLL) || 8;
+  const plainBlock = (j) => {
+    const blk = blocks[j], last = blk.insns[blk.insns.length-1];
+    if (last.edgeT !== undefined || last.edgeN !== undefined || last.tailCut) return false;
+    if (blk.insns.length > 24) return false;
+    for (const x of blk.insns) if (['call','callind','syscall','udec','jmpind','int','hlt','ud2','int3','x87'].includes(x.mnem) || x.inlineTo) return false;
+    return true;
+  };
+  const consumed = new Set();                       // body blocks emitted inside their head's unroll
+  const unrollPlan = (i) => {                       // -> { k, body: i (self) | i+1 (two-block) } or null
+    if (!LOOPYIELD || UNROLL <= 1 || consumed.has(i)) return null;
+    const t = term[i];
+    if (!t || t.kind !== 'jcc' || t.t === t.f || !plainBlock(i)) return null;
+    if (t.t === i || t.f === i) return { k: UNROLL, body: i };
+    if (t.t === i + 1 || t.f === i + 1) {
+      const u = term[i + 1];
+      if (!u || u.kind !== 'jmp' || u.t !== i || !plainBlock(i + 1)) return null;
+      for (let q = 0; q < N; q++) if (q !== i && succs[q].includes(i + 1)) return null;   // the body has one way in
+      return { k: UNROLL, body: i + 1 };
+    }
+    return null;
+  };
   function emitBlock(i) {
+    if (consumed.has(i)) return '';
+    const plan = unrollPlan(i);
+    if (!plan) return emitBlockOnce(i, 0, 1, 'self');
+    const { k, body } = plan;
+    (globalThis.__unrollStats ??= { blocks: 0 }).blocks++;
+    const parts = [];
+    if (body === i) { for (let c = 0; c < k; c++) parts.push(emitBlockOnce(i, c, k, 'self')); }
+    else {
+      consumed.add(body);
+      for (let c = 0; c < k; c++) { parts.push(emitBlockOnce(i, c, k, 'head')); parts.push(emitBlockOnce(body, c, k, 'body')); }
+    }
+    return `(block $sx_${i}\n      ` + parts.join('\n      ') + ')';
+  }
+  function emitBlockOnce(i, copy, k, role) {
     const blk = blocks[i]; const L = [];
     const producers = new Set();
     for (let idx = 0; idx < blk.insns.length; idx++) if (matProducers.has(i+':'+idx)) producers.add(idx);
@@ -2286,6 +2339,20 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     // native would if the bytes are truly garbage.
     const deoptTo = (addr) => [`(local.set $rex (i64.const ${hexs(addr)}))`,
       SA_MARK, `(return (call $x_deopt (local.get $rex) (local.get $rsp0)))`];
+    if (k > 1 && role === 'body' && copy < k - 1) return L.join('\n      ');   // fall into the next head copy
+    if (t.kind === 'jcc' && k > 1 && (role === 'head' || copy < k - 1)) {
+      // an unrolled copy: exit on the loop's exit condition, otherwise fall
+      // through into what follows (the next copy, or this copy's body)
+      const c = cond(last.cond);
+      const contJ = role === 'head' ? i + 1 : i;
+      const backOnTaken = t.t === contJ, exitJ = backOnTaken ? t.f : t.t;
+      const exitCond = backOnTaken ? `(i32.eqz ${c})` : c;
+      const after = role === 'head' ? i + 2 : i + 1;            // the block that follows the loop
+      const exitEdge = exitJ < 0 ? deoptTo(backOnTaken ? t.fa : t.ta).join(' ')
+                     : exitJ === after ? `(br $sx_${i})` : goto(exitJ);
+      L.push(`(if ${exitCond} (then ${exitEdge}))`);
+      return L.join('\n      ');
+    }
     if (t.kind === 'jcc') {
       const c = cond(last.cond);
       const T = t.t, F = t.f;

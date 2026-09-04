@@ -6,7 +6,7 @@ import { execFileSync } from 'node:child_process';
 import { writeFileSync, unlinkSync } from 'node:fs';
 let an = 0;
 let watBytes = 0, watUnits = 0;
-const assembleWat = (wat) => { watBytes += wat.length; watUnits++; if (process.env.WATDUMP && wat.includes('$f_' + process.env.WATDUMP)) writeFileSync(process.env.WATDUMP_TO || ('/tmp/claude-0/-home-user-0/39bd4f7f-c25c-5004-92d0-ce544ed5705a/scratchpad/unit_' + process.env.WATDUMP + '.wat'), wat);                       // AOT=1: tier live, like breadth
+const assembleWat = (wat) => { watBytes += wat.length; watUnits++; if (process.env.WATDUMP === 'all') writeFileSync('/tmp/claude-0/-home-user-0/39bd4f7f-c25c-5004-92d0-ce544ed5705a/scratchpad/dump/unit_' + watUnits + '.wat', wat); else if (process.env.WATDUMP && wat.includes('$f_' + process.env.WATDUMP)) writeFileSync(process.env.WATDUMP_TO || ('/tmp/claude-0/-home-user-0/39bd4f7f-c25c-5004-92d0-ce544ed5705a/scratchpad/unit_' + process.env.WATDUMP + '.wat'), wat);                       // AOT=1: tier live, like breadth
   const w = `/tmp/rb_${process.pid}_${an++}`; writeFileSync(w + '.wat', wat);
   execFileSync('wat2wasm', ['--enable-tail-call', '--debug-names', w + '.wat', '-o', w + '.wasm']);
   const b = new Uint8Array(readFileSync(w + '.wasm')); try { unlinkSync(w+'.wat'); unlinkSync(w+'.wasm'); } catch {} return b; };
