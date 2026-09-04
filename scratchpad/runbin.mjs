@@ -1,6 +1,6 @@
 // generic: run a provisioned binary under the engine, print exit/stdout/stderr
 import { LinuxEngine } from '../engine/linux.mjs';
-import { readFileSync, readdirSync, lstatSync, realpathSync } from 'node:fs';
+import { readFileSync, readdirSync, lstatSync, realpathSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { writeFileSync, unlinkSync } from 'node:fs';
@@ -37,7 +37,7 @@ const nap = new Int32Array(new SharedArrayBuffer(4));
 // child-engine tracing: arm every child engine's strace ring as it appears
 const seenEng = new Set();
 const armChildren = (e) => { for (const c of e.children ?? []) if (c.eng && !seenEng.has(c.eng)) { seenEng.add(c.eng); c.eng._label = `pid${c.pid}`; if (process.env.STRACE) c.eng.strace = []; armChildren(c.eng); } };
-try { while (eng.exitCode === null) { armChildren(eng); if (process.env.DBG) { eng.run(2e5); console.error(`<slice rip=${eng.cpu.rip.toString(16)} interp=${eng.stats.interpreted} aot=${eng.stats.aotRuns} blocked=${JSON.stringify(eng.blocked)}>`); } else eng.run(5e7);
+try { while (eng.exitCode === null) { armChildren(eng); if (process.env.STOPFILE && existsSync(process.env.STOPFILE)) { console.error(`<stopfile rip=${eng.cpu.rip.toString(16)} interp=${eng.stats.interpreted} aot=${eng.stats.aotRuns} blocked=${JSON.stringify(eng.blocked)} threads=${eng.threads.map(t => t.id + ':' + t.state).join(' ')} strace=${(eng.strace || []).slice(-10).join(' | ')}>`); process.exit(3); } if (process.env.DBG) { eng.run(2e5); console.error(`<slice rip=${eng.cpu.rip.toString(16)} interp=${eng.stats.interpreted} aot=${eng.stats.aotRuns} blocked=${JSON.stringify(eng.blocked)}>`); } else eng.run(5e7);
   if (eng.blocked) { const dl = eng.blocked.deadline; if (dl != null && isFinite(dl)) { const ms = dl - eng.nowMs(); if (ms > 0) { Atomics.wait(nap, 0, 0, Math.min(ms, 1000)); guard--; } } eng.wake(); }
   if (++guard > (process.env.GUARD ? +process.env.GUARD : 20000)) { err='no exit'; break; } } }
 catch (e) { err = e.stack || e.message; }
