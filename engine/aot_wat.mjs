@@ -1744,7 +1744,16 @@ function emitUnitFunction(a0, fnAddr, ctx) {
         // Model that as a sentinel def so any consumer it can reach poisons
         // the unit instead of silently reading uninitialized flag locals.
         if (b === 0) nin.add('EXT');
-        const nout = killsFlags[b] ? new Set() : localDef[b] ? new Set([localDef[b]]) : nin;
+        // A block that ends with the flags clobbered by an unmodeled writer
+        // (a variable-count shift, say) must hand its successors a sentinel,
+        // not an EMPTY set: empty meant "no producer reaches from here" and a
+        // consumer reached both through the clobber and through a real
+        // producer compiled against the real one alone. Go's memeqbody ends
+        // in `sub; shl %cl; sete` with a `je` from an earlier cmp into the
+        // sete block: the sete read the cmp's flags on the shl path and
+        // runtime.memequal answered false for any 1-7 byte string, which
+        // took the whole go tool down ("invalid Getenv GOOS").
+        const nout = killsFlags[b] ? new Set(['KILL']) : localDef[b] ? new Set([localDef[b]]) : nin;
         const diff = (a, c) => a.size !== c.size || [...c].some(k=>!a.has(k));
         if (diff(inDefs[b], nin)) { inDefs[b] = nin; changed = true; }
         if (diff(outDefs[b], nout)) { outDefs[b] = new Set(nout); changed = true; }
@@ -1772,7 +1781,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       else if (p === -2) throw new Error('AOT: unmodeled flag producer '+clob.mnem+' @ '+clob.rip.toString(16));
       else {                                        // producer is cross-block
         if (!blkFlagIn[b]) throw new Error('AOT: cross-block flags for '+(insns[j].mnem==='jcc'?'jcc':insns[j].mnem)+' @ '+insns[j].rip.toString(16));
-        for (const key of inDefs[b]) if (key !== 'EXT') matProducers.add(key);
+        for (const key of inDefs[b]) if (key !== 'EXT' && key !== 'KILL') matProducers.add(key);
       }
     }
   }
@@ -2943,6 +2952,7 @@ export function compileUnitWat(mem, entry, opts = {}) {
     // inliner's 160-instruction budget; at TINY (default 16) instructions
     // the duplication is a few lines per site. OXWASM_UNPRUNE_TINY=0 turns
     // it off; the per-address verdict is memoised across units in opts.tinyMemo.
+    if (opts.veto && k !== entry.toString() && opts.veto(k)) continue;   // bisect aid: an explicit veto beats the tiny exception
     if (skip && k !== entry.toString() && skip(k) && !isTiny(a)) continue;
     try {
       let an;

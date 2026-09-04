@@ -466,7 +466,9 @@ export class LinuxEngine {
         // OXWASM_UNPRUNE=hex,hex: keep these callees in every closure even
         // when already compiled (diagnosis: the upper bound of a re-tier that
         // un-prunes a hot caller's hot small callees so they can be inlined)
-        skip: (c) => (this._ftSeen.has(BigInt(c)) && !UNPRUNE.has(c)) || (this.fnVeto?.has(c) ?? false),   // fnVeto: bisect aid - never compile these (chained, interpreted)
+        skip: (c) => this._ftSeen.has(BigInt(c)) && !UNPRUNE.has(c),
+        // bisect aids: fnVeto never compiles these; fnAllow compiles only these (roots and closure members)
+        veto: (this.fnVeto || this.fnAllow) ? (c) => (this.fnVeto?.has(c) ?? false) || (this.fnAllow ? !this.fnAllow.has(c) : false) : null,
         tinyMemo: (this._tinyMemo ??= new Map()),
         // the tiering call profile, so the inliner can pick targets by how
         // often they are actually called rather than by what fits a budget
@@ -1123,7 +1125,7 @@ export class LinuxEngine {
     switch (self) {
       case '/proc/self/cmdline': return enc(argv.join('\0') + '\0');
       case '/proc/self/environ': return enc((this.env ?? []).join('\0') + '\0');
-      case '/proc/self/exe': return this._ctor?.elfBytes;
+      case '/proc/self/exe': case '/prog': return this._ctor?.elfBytes;   // '/prog': what readlink answers for a relative argv0
       case '/proc/self/comm': return enc(comm + '\n');
       case '/proc/self/maps': case '/proc/self/smaps': {
         const hx = (v) => BigInt.asUintN(64, v).toString(16).padStart(12, '0');
@@ -1617,8 +1619,10 @@ export class LinuxEngine {
       case 267: {                                            // readlinkat: /proc/self/exe -> argv0
         // the real path, as readlink (89) already answers: Go's os.Executable
         // re-execs the binary by this name for its telemetry child
+        // (absolute only: busybox re-execs itself by this name and aborted
+        // on a relative argv0; '/prog' resolves to the image in lookup())
         const buf = cpu.regs[2], sz = cpu.regs[10] ?? cpu.regs[8];
-        const p = new TextEncoder().encode(this.argv0 || '/prog');
+        const p = new TextEncoder().encode(this.argv0?.startsWith('/') ? this.argv0 : '/prog');
         this.ram.set(p.subarray(0, Number(sz)), Number(buf - this.base));
         ret(BigInt(Math.min(p.length, Number(sz)))); break; }
       case 318: {                                            // getrandom
@@ -2333,7 +2337,7 @@ export class LinuxEngine {
         put(260, 'x86_64'); ret(0n); break; }
       case 89: {                                              // readlink(path, buf, sz)
         const p = this.readPath(a1);
-        if (p === '/proc/self/exe') { const b = new TextEncoder().encode(this.argv0 || '/prog');
+        if (p === '/proc/self/exe') { const b = new TextEncoder().encode(this.argv0?.startsWith('/') ? this.argv0 : '/prog');
           this.jsnap(a2, Math.min(b.length, Number(a3)));
           this.ram.set(b.subarray(0, Number(a3)), Number(a2 - this.base));
           ret(BigInt(Math.min(b.length, Number(a3)))); break; }
