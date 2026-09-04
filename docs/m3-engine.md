@@ -3856,3 +3856,23 @@ pre-batch engine (cold breadth cases, compile included): python3
 270.8 s → 49.1 s, php 105.5 s → 25.8 s. Those are the structured-layout
 jump tables working on computed-goto interpreters; the earlier
 "733 s" and "72 s" were the broken intermediate.
+
+### The batch, priced on m4 steady state
+
+`bench/vsnative.mjs`, 200 k against 20 k lines of the regenerated
+input (the earlier 200 k file was gone; this one is the same three
+macros with `sq(i%100) fact(i%10) rep(i%7)`, native steady state
+1.9 s where the earlier file's was 3.0 s, so ratios are not comparable
+across the two inputs), 3 reps, the box otherwise idle:
+
+| arm | steady state |
+|---|---|
+| pre-batch engine (3552ac4) | 10.03x |
+| this head | **8.93x** |
+| this head, `OXWASM_NARROW=0` | 10.37x |
+| this head, `OXWASM_INLINE=0` | 8.98x |
+
+The batch is worth 11% on m4, all of it the narrowing (14% on its
+own); the inliner, tail splice included, is within noise on m4. The
+cold sweep (124 cases across four runs, the last two alone on the box
+after two OOM kills) is green on this head with zero assembler errors.
