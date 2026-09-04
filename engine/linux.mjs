@@ -466,7 +466,7 @@ export class LinuxEngine {
         // OXWASM_UNPRUNE=hex,hex: keep these callees in every closure even
         // when already compiled (diagnosis: the upper bound of a re-tier that
         // un-prunes a hot caller's hot small callees so they can be inlined)
-        skip: (c) => this._ftSeen.has(BigInt(c)) && !UNPRUNE.has(c),
+        skip: (c) => (this._ftSeen.has(BigInt(c)) && !UNPRUNE.has(c)) || (this.fnVeto?.has(c) ?? false),   // fnVeto: bisect aid - never compile these (chained, interpreted)
         tinyMemo: (this._tinyMemo ??= new Map()),
         // the tiering call profile, so the inliner can pick targets by how
         // often they are actually called rather than by what fits a budget
