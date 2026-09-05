@@ -149,6 +149,10 @@ const MADV = '/tmp/breadth_madv';
 if (!existsSync(MADV)) {   // madvise(MADV_DONTNEED) reads back zeros (jemalloc's startup probe); mlock succeeds
   try { execFileSync('gcc', ['-O1', '-o', MADV, new URL('./fixtures/madv.c', import.meta.url).pathname]); } catch {}
 }
+const SOCKPAIR = '/tmp/breadth_sockpair';
+if (!existsSync(SOCKPAIR)) {   // socketpair(AF_UNIX): both directions, EOF after the peer closes, a child on the other end
+  try { execFileSync('gcc', ['-O1', '-o', SOCKPAIR, new URL('./fixtures/sockpair.c', import.meta.url).pathname]); } catch {}
+}
 const RUST = '/root/.rustup/toolchains/stable-x86_64-unknown-linux-gnu';
 const RHELLO = '/tmp/breadth_rhello';
 if (!existsSync(RHELLO) && existsSync(RUST + '/bin/rustc')) {
@@ -295,6 +299,7 @@ const CASES = [
   ['java-hello', '/usr/lib/jvm/java-21-openjdk-amd64/bin/java', ['-Xint', '-XX:+UseSerialGC', '-Xshare:off', '-Xmx256m', '-cp', '/tmp/breadth_jhello', 'Hello'],
               { memMB: 3072, tree: ['/usr/lib/jvm/java-21-openjdk-amd64', '/tmp/breadth_jhello'] }],
   ['madv',    '/tmp/breadth_madv', []],
+  ['sockpair', '/tmp/breadth_sockpair', []],   // cargo spawns rustc over one (std's spawn error channel)
   ['rhello',  '/tmp/breadth_rhello', []],
   // rustc and clang: LLVM in-process (a 147 MB librustc_driver, libLLVM 118
   // MB), jemalloc's madvise probe, C++ exception tables; clang's output is
@@ -612,6 +617,7 @@ const engine = (bin, args, stdin, opts = {}) => {
       files, mtimes, memMB: opts.memMB || 512, assembleWat, stdin });
 
   if (process.env.BREADTH_STRACE) eng.strace = [];
+  if (opts.childMemMB) eng.childMemMB = opts.childMemMB;   // execve'd children (default 256 MB; a rustc child needs more)
   if (process.env.AOTFAIL) eng.onAotFail = (a, m) => {   // AOTFAIL=1: every refused translation with its reason; an overlap also shows the bytes and the image
     let extra = '';
     const ov = /overlapping decode: ([0-9a-f]+) inside ([0-9a-f]+)/.exec(String(m));
