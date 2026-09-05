@@ -301,6 +301,10 @@ const CASES = [
   // the whole -O2 pipeline compared as text
   ['rustc-version', RUST + '/bin/rustc', ['--version', '--verbose'], { memMB: 3072, tree: RUST + '/lib' }],
   ['clang-S', '/usr/bin/clang', ['-S', '-O2', '-o', '-', HELLO_C], { memMB: 2048 }],
+  // cargo (libgit2, libcurl and OpenSSL linked in). `--verbose` also runs
+  // lsb_release, a Python script natively, so its "os:" line is a
+  // provisioning question rather than an engine one; the plain form is exact
+  ['cargo-version', RUST + '/bin/cargo', ['--version'], { memMB: 2048, tree: RUST + '/lib' }],
   // rustc optimising and emitting a crate in-process: seven threads, ~3,300
   // units, the PIC-table guard-vs-case-test bug fell out of it (450 s cold)
   ['rustc-asm', RUST + '/bin/rustc', ['-O', '--emit=asm', '--crate-type', 'bin', '-o', '/tmp/breadth_tiny.s', TINY_RS],
