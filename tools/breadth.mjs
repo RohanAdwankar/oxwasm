@@ -154,6 +154,20 @@ const SOCKPAIR = '/tmp/breadth_sockpair';
 if (!existsSync(SOCKPAIR)) {   // socketpair(AF_UNIX): both directions, EOF after the peer closes, a child on the other end
   try { execFileSync('gcc', ['-O1', '-o', SOCKPAIR, new URL('./fixtures/sockpair.c', import.meta.url).pathname]); } catch {}
 }
+const PSELECT = '/tmp/breadth_pselect';
+if (!existsSync(PSELECT)) {   // pselect6/ppoll with a temporary signal mask, SIGCHLD blocked outside the wait (make -j's wait loop)
+  try { execFileSync('gcc', ['-O1', '-o', PSELECT, new URL('./fixtures/pselect.c', import.meta.url).pathname]); } catch {}
+}
+const MAKEJ = '/tmp/breadth_make';
+try {   // a three-target Makefile for make -j2: parallel recipes through sh, the jobserver pipe, pselect6 + SIGCHLD
+  execFileSync('mkdir', ['-p', MAKEJ]);
+  writeFileSync(MAKEJ + '/Makefile', [
+    'all: a.txt b.txt c.txt', '\tcat a.txt b.txt c.txt | sort > all.txt', '\twc -l all.txt',
+    'a.txt:', "\tseq 1 200 | sed 's/^/a /' > a.txt",
+    'b.txt:', "\tseq 1 300 | awk '{print \"b\", $$1*2}' > b.txt",
+    'c.txt:', "\tprintf 'c one\\nc two\\nc three\\n' > c.txt", ''].join('\n'));
+  for (const f of ['a.txt', 'b.txt', 'c.txt', 'all.txt']) try { execFileSync('rm', ['-f', MAKEJ + '/' + f]); } catch {}
+} catch {}
 const RENAMEDIR = '/tmp/breadth_renamedir';
 if (!existsSync(RENAMEDIR)) {   // rename(2) on directories, renameat2 NOREPLACE (rustc's incremental session finalisation)
   try { execFileSync('gcc', ['-O1', '-o', RENAMEDIR, new URL('./fixtures/renamedir.c', import.meta.url).pathname]); } catch {}
@@ -314,7 +328,11 @@ const CASES = [
               { memMB: 3072, tree: ['/usr/lib/jvm/java-21-openjdk-amd64', '/tmp/breadth_jhello'] }],
   ['madv',    '/tmp/breadth_madv', []],
   ['sockpair', '/tmp/breadth_sockpair', []],
-  ['renamedir', '/tmp/breadth_renamedir', []],   // directory rename, renameat2 NOREPLACE (rustc's incremental session finalisation)   // cargo spawns rustc over one (std's spawn error channel)
+  ['renamedir', '/tmp/breadth_renamedir', []],
+  ['pselect',  '/tmp/breadth_pselect', []],   // the wait's temporary mask, EINTR after the handler, the deadline dropped with it
+  ['make-j2',  '/usr/bin/make', ['-j2', '-C', MAKEJ],
+              { tree: MAKEJ, bins: ['/bin/sh', '/usr/bin/sh', '/usr/bin/cat', '/usr/bin/sort', '/usr/bin/wc', '/usr/bin/seq', '/usr/bin/sed', '/usr/bin/awk', '/usr/bin/printf'],
+                outFile: MAKEJ + '/all.txt', childMemMB: 512 }],   // a vfork-window child's sigaction must not touch the parent's table   // directory rename, renameat2 NOREPLACE (rustc's incremental session finalisation)   // cargo spawns rustc over one (std's spawn error channel)
   ['rhello',  '/tmp/breadth_rhello', []],
   // rustc and clang: LLVM in-process (a 147 MB librustc_driver, libLLVM 118
   // MB), jemalloc's madvise probe, C++ exception tables; clang's output is

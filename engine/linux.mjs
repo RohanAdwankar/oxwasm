@@ -25,6 +25,7 @@ const BRANCHY = new Set(['jmp','jcc','call','ret','retn','jmpind','callind','sys
 const PIPE_CAP = 65536;                       // Linux default pipe capacity
 // syscalls that sleep: a timer expiring on their entry interrupts them
 const SLEEPY = new Set([34, 35, 230, 130, 128, 7, 271, 23, 270, 232, 281, 61, 202]);
+const NORESTART = new Set([23, 270, 7, 271, 232, 281, 35, 230, 34, 130]);   // EINTR after a handler even under SA_RESTART (signal(7))
 const SYNTH_DIRS = new Set(['/proc', '/proc/self', '/proc/self/fd', '/proc/self/task', '/proc/sys', '/proc/sys/kernel',
                             '/proc/sys/kernel/random', '/proc/sys/vm', '/proc/sys/fs', '/dev', '/dev/pts', '/dev/fd']);
 class DeoptUnwind { constructor(rip) { this.rip = rip; } }
@@ -1917,6 +1918,7 @@ export class LinuxEngine {
           xserver: this.xserver });
         if (this.strace) ceng.strace = [];                   // a traced parent traces its children
         if (this.childMemMB !== undefined) ceng.childMemMB = this.childMemMB;   // grandchildren too (cargo -> rustc -> cc -> collect2 -> ld)
+        ceng.sigign = new Set(t.proc?.sigign ?? this.sigign ?? []);   // exec keeps ignored signals ignored (handlers reset to default)
         if (this.onChildEngine) { ceng.onChildEngine = this.onChildEngine; this.onChildEngine(ceng, argv); }   // tooling: see every execve'd image, grandchildren included, even ones reaped inside one run slice
         const skipped = [];
         const srcFds = t.proc ? t.proc.fds : this.fds;
@@ -2575,7 +2577,14 @@ export class LinuxEngine {
       case 13: {                                              // rt_sigaction(sig, act*, oldact*, sz)
         const sig = Number(a1);
         if (sig < 1 || sig > 64 || sig === 9 || sig === 19) { ret(-22n); break; }   // EINVAL
-        const acts = (this.sigact ??= new Map());
+        // A fork child still in its vfork window shares this engine, but its
+        // handlers are its own: posix_spawn (make, cargo) resets the
+        // spawnattr signals to SIG_DFL in the child before exec, and doing
+        // that on the parent's table erased make's SIGCHLD handler, so the
+        // second job's exit was discarded and make waited in pselect6 forever.
+        const tcur = this.threads[this.ti];
+        const acts = tcur.proc ? (tcur.proc.sigact ??= new Map(this.sigact ?? [])) : (this.sigact ??= new Map());
+        const ign = tcur.proc ? (tcur.proc.sigign ??= new Set(this.sigign ?? [])) : (this.sigign ??= new Set());
         if (a3) {                                             // report the old action
           const o = acts.get(sig) ?? { handler: 0n, flags: 0n, restorer: 0n, mask: 0n };
           this.jsnap(a3, 32);
@@ -2586,7 +2595,7 @@ export class LinuxEngine {
           const act = { handler: this.mem.read(a2, 8n), flags: this.mem.read(a2 + 8n, 8n),
                         restorer: this.mem.read(a2 + 16n, 8n), mask: this.mem.read(a2 + 24n, 8n) };
           if (act.handler === 0n || act.handler === 1n) acts.delete(sig); else acts.set(sig, act);
-          if (act.handler === 1n) (this.sigign ??= new Set()).add(sig); else this.sigign?.delete(sig);
+          if (act.handler === 1n) ign.add(sig); else ign.delete(sig);
         }
         ret(0n); break; }
       case 14: {                                              // rt_sigprocmask(how, set*, oldset*, sz)
@@ -3063,6 +3072,15 @@ export class LinuxEngine {
         else if (a3 === 0n) timeoutMs = -1;
         else { const o = this.RAMOFF + Number(a3 - this.base);
                timeoutMs = Number(v.getBigUint64(o, true)) * 1000 + Number(v.getBigUint64(o + 8, true)) / 1e6; }
+        // ppoll's sigmask (r10): the wait runs under it and the caller's mask
+        // comes back afterwards - through the signal frame when a signal
+        // interrupts (see _sigDeliver's savedMask), in line when an fd is
+        // ready or the timeout expires. make -j2 blocks SIGCHLD and waits in
+        // pselect6 with a mask that admits it; ignoring the mask left the
+        // signal pending forever and the build parked after its first two
+        // recipes.
+        const tmask = nr === 271 && cpu.regs[10] ? this.mem.read(cpu.regs[10], 8n) : null;
+        const unmask = this._waitMaskIn(cpu, tmask); if (unmask === 'sig') break;
         const readyR = (h) => !h ? false
           : h.sock ? !!(h.sock.conn && h.sock.conn.readable())
           : h.pipe ? (h.pipe.chunks.length > 0 || !!h.pipe.weof)
@@ -3100,7 +3118,7 @@ export class LinuxEngine {
           }
         }
         if (ready > 0 || timeoutMs === 0 || (this._deadline != null && now >= this._deadline)) {
-          this._deadline = null; ret(BigInt(ready)); break;
+          this._deadline = null; unmask(); ret(BigInt(ready)); break;
         }
         this._deadline ??= (timeoutMs < 0 ? Infinity : now + timeoutMs);
         this.block(this._capByTimerfd(this._deadline)); break; }
@@ -3113,6 +3131,9 @@ export class LinuxEngine {
           const sec = Number(v.getBigUint64(o, true)), sub = Number(v.getBigUint64(o + 8, true));
           timeoutMs = nr === 23 ? sec * 1000 + sub / 1000 : sec * 1000 + sub / 1e6;
         }
+        let tmask = null;                                    // pselect6: r9 -> { const sigset_t *ss; size_t ss_len }
+        if (nr === 270 && cpu.regs[9]) { const ssp = this.mem.read(cpu.regs[9], 8n); if (ssp) tmask = this.mem.read(ssp, 8n); }
+        const unmask = this._waitMaskIn(cpu, tmask); if (unmask === 'sig') break;
         const readyR = (h) => !h ? false
           : h.sock ? !!(h.sock.conn && h.sock.conn.readable())
           : h.pipe ? (h.pipe.chunks.length > 0 || !!h.pipe.weof)
@@ -3134,7 +3155,7 @@ export class LinuxEngine {
             new Uint8Array(this.wmem.buffer, o, 128).fill(0);
             for (const fd of set) v.setUint8(o + (fd >> 3), v.getUint8(o + (fd >> 3)) | (1 << (fd & 7))); };
           store(rp, rd); store(wp, wr); store(ep, []);
-          ret(BigInt(rd.length + wr.length)); break;
+          unmask(); ret(BigInt(rd.length + wr.length)); break;
         }
         this._deadline ??= (timeoutMs < 0 ? Infinity : now + timeoutMs);
         this.block(this._capByTimerfd(this._deadline)); break; }
@@ -3287,6 +3308,20 @@ export class LinuxEngine {
     t.sigmask = from.sigmask; t.pending = 0n; t.eintr = false; t.suspendOld = null;
     t.altstack = isFork ? from.altstack : null;
   }
+  // A wait with a temporary signal mask (ppoll, pselect6). Installs the mask
+  // (SIGKILL/SIGSTOP stay unblockable), delivers a newly admitted pending
+  // signal at once (EINTR; the frame restores the caller's mask), and
+  // returns the function that puts the caller's mask back on a normal
+  // return. Re-executions of a blocked wait keep the first saved mask.
+  _waitMaskIn(cpu, tmask) {
+    if (tmask === null) return () => {};
+    const t = this._ts(this.threads[this.ti]);
+    t.suspendOld ??= t.sigmask;
+    t.sigmask = tmask & ~((1n << 8n) | (1n << 18n));
+    const sig = this._sigDeliverable(t);
+    if (sig) { if (globalThis.__sigtrace) console.error(`<waitmask sig=${sig} pending=${t.pending.toString(16)} tmask=${tmask.toString(16)} old=${t.suspendOld.toString(16)}>`); this._deadline = null; cpu.regs[0] = BigInt.asUintN(64, -4n); this._sigDeliver(cpu, t, sig, cpu.rip); return 'sig'; }   // EINTR after the handler; the wait's deadline goes with it
+    return () => { if (t.suspendOld !== null) { t.sigmask = t.suspendOld; t.suspendOld = null; } };
+  }
   _ts(t) { if (t.sigmask === undefined) { t.sigmask = 0n; t.pending = 0n; t.eintr = false; t.suspendOld = null; t.altstack = null; } return t; }
   _sigDeliverable(t) {
     const bits = t.pending & ~t.sigmask;
@@ -3304,6 +3339,7 @@ export class LinuxEngine {
     if (this._execed) return;
     const bit = 1n << BigInt(sig - 1);
     const act = this.sigact?.get(sig);
+    if (globalThis.__sigtrace) console.error(`<raise0 sig=${sig} tid=${tid} act=${act ? act.handler?.toString(16) : 'none'} ignored=${!act && this._sigDefaultIgnored(sig)} label=${this._label ?? 'main'}>`);
     if (!act && this._sigDefaultIgnored(sig)) return;                          // SIG_IGN / default-ignore: discarded
     let t = null;
     const live = (x) => x.state !== 'dead';
@@ -3476,13 +3512,20 @@ export class LinuxEngine {
     const sig = this._sigDeliverable(t);
     if (!sig) { t.eintr = false; return false; }
     const act = this.sigact.get(sig);
+    if (globalThis.__sigtrace) console.error(`<sigentry nr=${nr} sig=${sig} eintr=${t.eintr} pending=${t.pending.toString(16)} mask=${t.sigmask.toString(16)} act=${!!act} flags=${act?.flags?.toString(16)} rip=${cpu.rip.toString(16)}>`);
     if (!act) { t.eintr = false; this._sigDefault(t, sig); return this.exitCode !== null; }
     if (t.eintr) {
       t.eintr = false;
       // pause/sigsuspend always return EINTR; others restart under SA_RESTART
-      const restart = (act.flags & 0x10000000n) && nr !== 34 && nr !== 130;
+      // signal(7): select/pselect6, poll/ppoll, epoll_wait/epoll_pwait,
+      // nanosleep/clock_nanosleep, pause and sigsuspend are never restarted
+      // after a handler, whatever SA_RESTART says. make -j2 waits in
+      // pselect6 with SA_RESTART on its SIGCHLD handler: restarting it ran
+      // the handler and went back to sleep, and the finished job was never
+      // reaped.
+      const restart = (act.flags & 0x10000000n) && !NORESTART.has(nr);
       if (restart) this._sigDeliver(cpu, t, sig, BigInt.asUintN(64, cpu.rip - 2n));
-      else { if (nr === 35 || nr === 230) this._deadline = null;
+      else { if (SLEEPY.has(nr)) this._deadline = null;   // the wait is over: a later timed wait must not inherit this one's deadline (an interrupted ppoll left Infinity behind and the next 30 ms ppoll never returned)
              cpu.regs[0] = BigInt.asUintN(64, -4n); this._sigDeliver(cpu, t, sig, cpu.rip); }
       return true;
     }
@@ -3633,7 +3676,7 @@ export class LinuxEngine {
     ceng.maps = (this.maps ?? []).map(m => ({ ...m }));
     ceng.cwd = this.cwd;                                     // the child's cwd (its chdir stays with it)
     ceng.fds = t.proc.fds; ceng.cloexec = new Set(this.cloexec);
-    ceng.sigact = new Map(this.sigact ?? []); ceng.sigign = new Set(this.sigign ?? []);
+    ceng.sigact = new Map(t.proc.sigact ?? this.sigact ?? []); ceng.sigign = new Set(t.proc.sigign ?? this.sigign ?? []);   // the window's own dispositions go with it
     ceng.termios = this.termios; ceng.ptys = this.ptys; ceng.ttyWin = this.ttyWin;
     ceng.env = this.env; ceng.argv0 = this.argv0;
     const c = ceng.cpu;
