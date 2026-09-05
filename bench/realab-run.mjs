@@ -2,6 +2,8 @@
 // Prints a single RESULT line: milliseconds, exit code, and a hash of stdout
 // so the A/B can prove the two configurations ran the same program.
 import { LinuxEngine } from '../engine/linux.mjs';
+import { setFlagsFromString } from 'node:v8';
+if (process.env.WASM_LAZY === '1') setFlagsFromString('--wasm-lazy-compilation');   // WASM_LAZY=1: V8 compiles each wasm function at its first call (pricing lever: most translated functions of a compiler run are never entered)
 import { readFileSync, readdirSync, lstatSync, realpathSync, statSync,
          writeFileSync, existsSync, mkdirSync, unlinkSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
