@@ -4252,3 +4252,10 @@ caught it: serve the packed page, headless Chromium, File > New > OK,
 two strokes, pass iff ink appeared - 17 s on the shipped page. It runs
 alongside the sweep from now on; the node sweep cannot see a
 browser-only failure.
+
+A survey after the PIC tables: python3 structures 29 switch tables,
+perl 30, bc 2. What the layout stats still list as "fallback" is the
+dispatch layout in a handful of shared libc functions (`block/loop
+overlap`): the switch is a `br_table` there too, inside the relooper
+loop rather than in structured blocks. No translator item is left in
+jump tables.
