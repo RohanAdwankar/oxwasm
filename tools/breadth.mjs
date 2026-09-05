@@ -608,6 +608,14 @@ const engine = (bin, args, stdin, opts = {}) => {
       files, mtimes, memMB: opts.memMB || 512, assembleWat, stdin });
 
   if (process.env.BREADTH_STRACE) eng.strace = [];
+  if (process.env.AOTFAIL) eng.onAotFail = (a, m) => {   // AOTFAIL=1: every refused translation with its reason; an overlap also shows the bytes and the image
+    let extra = '';
+    const ov = /overlapping decode: ([0-9a-f]+) inside ([0-9a-f]+)/.exec(String(m));
+    if (ov) { try { const at = BigInt('0x' + ov[2]); const bs = []; for (let i = 0n; i < 12n; i++) bs.push(Number(eng.mem.read(at + i, 1n)).toString(16).padStart(2, '0'));
+      const mp = (eng.maps || []).find(x => at >= x.at && at < x.at + x.len);
+      extra = ` bytes ${bs.join(' ')}${mp ? ' in ' + mp.path.split('/').pop() + '+' + (at - mp.at + BigInt(mp.fileOff)).toString(16) : ''}`; } catch {} }
+    console.log(`         <aotfail ${a.toString(16)}: ${String(m).slice(0, 160)}${extra}>`);
+  };
   const t0 = process.hrtime.bigint();
   let err = null;
   try {
