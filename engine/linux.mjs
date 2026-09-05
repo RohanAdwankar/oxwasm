@@ -148,7 +148,7 @@ export class LinuxEngine {
     // handful of grows during a warm GIMP menu cycle cost 12% of it. Sizing
     // it once, before any instance exists, is free.
     this.ftab = new WebAssembly.Table({ element: 'anyfunc', initial: FTMAP_MAX });
-    this._ftCount = 0; this._ftSeen = new Set();
+    this._ftCount = 0; this._ftSeen = new Set(); this._entries = null;
     this.regview = new BigInt64Array(this.wmem.buffer, 0, 16);
     this.fsview = new BigInt64Array(this.wmem.buffer, 128, 1);   // fs base for AOT TLS accesses
     this.xmmview = new BigInt64Array(this.wmem.buffer, 256, 32); // 16 xmm regs (2 words each) for AOT SIMD
@@ -225,7 +225,7 @@ export class LinuxEngine {
     const k = t;
     if (this.aotFns.has(k) || this.aotFailed.has(k)) return;
     const n = (this.aotCalls.get(k) || 0) + 1;
-    this.aotCalls.set(k, n);
+    this.aotCalls.set(k, n); this._entryAdd(k);
     if (n >= this.aotCallThreshold) this.tierUpAot(t);
   }
 
@@ -282,7 +282,7 @@ export class LinuxEngine {
   // compiled code make indirect calls / cross-unit calls / indirect tail
   // jumps without a JS boundary or regfile sync.
   registerAotFn(a, f) {
-    this.aotFns.set(a, f);
+    this.aotFns.set(a, f); this._entryAdd(a);
     // __noFtab bisect lever: an empty map makes every $ftr miss, so all
     // sites take their pre-existing x_callout / x_deopt fallbacks
     // Past FTMAP_MAX the function is never mapped, so every cross-unit call to
@@ -298,7 +298,7 @@ export class LinuxEngine {
     // to grow with the ceiling - it is 40% loaded today.
     if (!f || globalThis.__noFtab || this._ftSeen.has(a)) return;
     if (this._ftCount >= FTMAP_MAX) { this._ftFull = (this._ftFull || 0) + 1; return; }
-    this._ftSeen.add(a);
+    this._ftSeen.add(a); this._entryAdd(a);
     const idx = this._ftCount++;
     this.ftab.set(idx, f);
     const dv = new DataView(this.wmem.buffer);
@@ -375,7 +375,7 @@ export class LinuxEngine {
     // open addressing has no in-place delete: clearing and reinserting is
     // the only way to drop an entry (a blacklisted unit, a restored image)
     new Uint8Array(this.wmem.buffer, FTHASH, FTHBYTES).fill(0);
-    this._ftCount = 0; this._ftSeen = new Set();
+    this._ftCount = 0; this._ftSeen = new Set(); this._entries = null;
     for (const [a, f] of this.aotFns)
       if (f && !f.jsStub) this.registerAotFn(a, f);
   }
@@ -425,7 +425,7 @@ export class LinuxEngine {
           catch (e) { this.aotFailed.add(k); if (this.onAotFail) this.onAotFail(entry, e.message); }
           return;
         }
-        this.aotFns.set(k, null);              // placeholder: profiling stops re-triggering
+        this.aotFns.set(k, null); this._entryAdd(k);   // placeholder: profiling stops re-triggering
         WebAssembly.instantiate(bytes, this.aotImports())
           .then(({ instance }) => {
             for (const name of Object.keys(instance.exports))
@@ -502,7 +502,7 @@ export class LinuxEngine {
         throw new DeoptUnwind(v);
       };
       stub.jsStub = true;             // not table-eligible: rebuildFtmap skips it
-      this.aotFns.set(k, stub);
+      this.aotFns.set(k, stub); this._entryAdd(k);
       return;
     }
     // the slice budget (checked above, before the trampoline probe) bounds the
@@ -3745,13 +3745,19 @@ export class LinuxEngine {
     this.files[h.path] = nb;                                 // growable buffer: refresh the map ref
     this._hardRefresh(h.path, nb);                           // ... and every hard-link alias
   }
+  // every function entry the engine knows of, kept incrementally: rebuilding
+  // it from the three maps per unit translation was 2.6% of a clang run
+  // (41k entries x 1,800 units). Unmapped code leaves stale entries behind,
+  // which only means a call's fall-through may be cut at an address that
+  // was an entry; a snapshot restore or a funcref-table reset starts over.
   _knownEntries() {
-    const e = new Set();
-    for (const k of this.aotCalls.keys()) e.add(k.toString());
-    for (const k of this.aotFns.keys()) e.add(k.toString());
-    for (const k of this._ftSeen) e.add(k.toString());
-    return e;
+    if (!this._entries) { const e = this._entries = new Set();
+      for (const k of this.aotCalls.keys()) e.add(k.toString());
+      for (const k of this.aotFns.keys()) e.add(k.toString());
+      for (const k of this._ftSeen) e.add(k.toString()); }
+    return this._entries;
   }
+  _entryAdd(k) { if (this._entries) this._entries.add(k.toString()); }
   _killProcSiblings(t) {
     for (const x of this.threads) if (x !== t && x.proc === t.proc && x.state !== 'dead') {
       x.state = 'dead'; if (x.ctid) { try { this.mem.write(x.ctid, 4n, 0n); } catch {} }

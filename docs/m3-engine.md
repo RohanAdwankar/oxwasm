@@ -4539,3 +4539,21 @@ timers, bash-trap, sigpipe-sh, make, cmake-P) stay exact. Also fixed
 on the way: a trailing comment in runbin had swallowed the SIGTRACE,
 AOTFAIL and DBG levers on the same line, which is why the first
 traces printed nothing.
+
+A CPU profile of clang-S (262 s, `--cpu-prof`, warm wat cache) splits
+the run differently from the phase counters: 67 s (25%) is the host
+blocked in `read` on the assembler broker's fifo, i.e. wat2wasm's own
+time on 2.05 GB of text; 41 s (16%) is garbage collection, almost all
+of it the emitted strings; emit proper is about 55 s (`emitUnitFunction`
+39 s self plus block emission); analysis, decoding and block formation
+about 26 s; wasm instantiation 6 s; and `_knownEntries`, rebuilt from
+three maps on every unit, 7 s. The text volume is the common root of
+three of those: at 50 KB of wat per function nothing in it dominates
+(leading whitespace 9%, the wrapped-register address form 10%, the
+32-bit masks 6%), so a real cut means emitting something denser than
+this wat. Landed from this profile: a poisoned callee re-emits only
+the texts that reached it (13k re-emits in the rustc compile were a
+third of its emit phase), and the known-entries set is incremental.
+The next lever is structural: hand the broker a unit and keep running
+while it assembles, registering the module when the bytes come back,
+as the browser already does with its off-thread assembler.

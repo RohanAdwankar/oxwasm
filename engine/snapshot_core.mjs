@@ -13,7 +13,7 @@ const resetFtmap = (eng) => {
   // but permanently unmapped — every in-wasm resolution missed).
   if (eng.rebuildFtmap) return eng.rebuildFtmap();
   new DataView(eng.wmem.buffer).setUint32(0x10000, 0, true);
-  eng._ftCount = 0; if (eng._ftSeen) eng._ftSeen = new Set();
+  eng._ftCount = 0; if (eng._ftSeen) eng._ftSeen = new Set(); eng._entries = null;
 };
 
 // Environment-independent restore. `assets.blobs`/`assets.mem` are byte
