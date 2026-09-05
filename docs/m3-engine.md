@@ -4203,3 +4203,7 @@ spawn as the fallback. runbin and the breadth harness use it.
 cases (cache cleared) is green and quicker throughout (python3 25 s,
 node 51 s). The kernels and vs-native benches still spawn directly -
 they subtract startup, so it only costs them wall time.
+The full cold sweep through the broker (cache cleared, 164 case runs
+in four chunks, zero failures) took **39 minutes**, against over an
+hour before; the last chunk carries java-version, java-hello, ffmpeg
+and node-jit and is 14 of those minutes.

@@ -19,6 +19,8 @@
 //  3. Two reps. Now REPS (default 7) with a median, which does not chase
 //     the one lucky run the way best-of does.
 import { LinuxEngine } from '../../engine/linux.mjs';
+import { makeAssembler } from '../../tools/assemble.mjs';
+const asm = makeAssembler({ tag: 'kn' });
 import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -31,11 +33,7 @@ const assembleWat = (wat) => {
   if (process.env.WATDUMP) writeFileSync(process.env.WATDUMP + '/kn_' + (an) + '.wat', wat);   // WATDUMP=dir: keep every unit's text
   const h = createHash('sha1').update(wat).digest('hex'), cp = CACHE + h + '.wasm';
   if (existsSync(cp)) return new Uint8Array(readFileSync(cp));
-  const w = `/tmp/kn_${process.pid}_${an++}`;
-  writeFileSync(w + '.wat', wat);
-  execFileSync('wat2wasm', ['--enable-tail-call', w + '.wat', '-o', w + '.wasm']);
-  const b = new Uint8Array(readFileSync(w + '.wasm'));
-  try { unlinkSync(w + '.wat'); unlinkSync(w + '.wasm'); } catch {}
+  const b = asm(wat);                              // pre-forked broker (tools/assemble.mjs): cheap spawns from a big process
   try { writeFileSync(cp, b); } catch {}
   return b;
 };
