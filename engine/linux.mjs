@@ -1593,7 +1593,7 @@ export class LinuxEngine {
           if (this._mmapFree(a1, len)) fixedAt = a1; else { ret(-17n); break; }
         }
         // a fixed mapping over arena space takes it out of the holes / bump
-        if (fixedAt !== null) this._mmapCarve(fixedAt, len);
+        if (fixedAt !== null) { this._unmapRange(fixedAt, fixedAt + len); this._mmapCarve(fixedAt, len); }   // replaces whatever was mapped there
         const at = fixedAt !== null ? fixedAt : this._mmapTake(len);
         if (fixedAt !== null) if (a1 < (this._mmapBase ?? 0n) || a1 >= this.mmapNext) {   // outside the arena: remember the span
           this._fixedLo = this._fixedLo === undefined ? a1 : (a1 < this._fixedLo ? a1 : this._fixedLo);
@@ -2764,7 +2764,15 @@ export class LinuxEngine {
           ret(BigInt(fd)); break;
         }
         ret(0n); break; }                                     // F_GETFD/F_SETFD/...
-      case 28: ret(0n); break;                                // madvise
+      case 28: {                                             // madvise(addr, len, advice)
+        // MADV_DONTNEED drops the pages: anonymous memory reads back as
+        // zeros, a private file mapping re-faults the file's bytes. jemalloc
+        // probes the first shape at startup (fill a page, DONTNEED it, read
+        // it back) and falls back to memset purging with a warning when the
+        // bytes survive; rustc carried that warning.
+        if (a3 === 4n && a2 > 0n) this._madvDontneed(a1 & ~(PAGE - 1n), align(a1 + a2, PAGE));
+        ret(0n); break; }
+      case 149: case 150: case 151: case 152: ret(0n); break;   // mlock/munlock/mlockall/munlockall: nothing swaps here (gpg's "insecure memory" warning otherwise)
       case 110: ret(BigInt(this.threads[this.ti].proc ? (this.pid ?? 1) : (this.ppid ?? 0))); break;   // getppid
       // Job control: a shell loops on getpgrp() != tcgetpgrp(fd) until they
       // agree, so these must match what TIOCGPGRP reports. Leaving getpgrp
@@ -3154,10 +3162,41 @@ export class LinuxEngine {
     const g = this._fsMeta().hard?.get(this.norm(path)); if (!g) return;
     for (const q of g) if (this.files[q] !== undefined) this.files[q] = nb;
   }
+  // Take [lo, hi) out of the file-mapping table: shared pages under it are
+  // written back first, and a mapping only partly covered is trimmed or
+  // split so the table keeps describing what is actually mapped. ld.so
+  // reserves a library's whole span, overlays the segments MAP_FIXED and
+  // unmaps the gaps: with whole-entry removal only, the reservation stayed
+  // on the table and later anonymous pages in the reused holes were taken
+  // for file-backed (madvise left jemalloc's probe page unzeroed).
   _unmapRange(lo, hi) {
     if (!this.maps) return;
-    for (const m of this.maps) if (m.shared && m.at < hi && m.at + m.len > lo) this._writeBackMap(m);
-    this.maps = this.maps.filter(m => !(m.at >= lo && m.at + m.len <= hi));
+    const out = [];
+    for (const m of this.maps) {
+      const mhi = m.at + m.len;
+      if (mhi <= lo || m.at >= hi) { out.push(m); continue; }
+      if (m.shared) this._writeBackMap(m);
+      if (m.at < lo) out.push({ ...m, len: lo - m.at });
+      if (mhi > hi) out.push({ ...m, at: hi, len: mhi - hi, fileOff: m.fileOff + Number(hi - m.at) });
+    }
+    this.maps = out;
+  }
+  // madvise(MADV_DONTNEED): zero the range, then put a private file
+  // mapping's bytes back where the range crosses one (its pages re-fault
+  // from the file); shared mappings keep their pages, they hold dirty data
+  // this engine writes back lazily.
+  _madvDontneed(lo, hi) {
+    const off0 = Number(lo - this.base), off1 = Number(hi - this.base);
+    if (off0 < 0 || off1 > this.ram.length || off1 <= off0) return;
+    const over = (this.maps || []).filter(m => m.at < hi && m.at + m.len > lo);
+    if (over.some(m => m.shared)) return;
+    this.ram.fill(0, off0, off1);
+    for (const m of over) {
+      const a = m.at > lo ? m.at : lo, b = m.at + m.len < hi ? m.at + m.len : hi;
+      const cur = this.files[m.path] ?? m.h.bytes; if (!cur) continue;
+      const fo = m.fileOff + Number(a - m.at), n = Math.min(Number(b - a), Math.max(0, cur.length - fo));
+      if (n > 0) this.ram.set(cur.subarray(fo, fo + n), Number(a - this.base));
+    }
   }
   _flushSharedMaps() { for (const m of this.maps ?? []) if (m.shared) this._writeBackMap(m); }
 

@@ -4266,3 +4266,35 @@ sweep on head 68dd1b2, cold wat cache, four chunks, 164/164
 byte-identical to native in 39 minutes. Nothing shipped this batch
 changes translation, so the sweep is a regression check, not a
 performance measurement.
+
+### Breadth batch 7: LLVM in-process (rustc, clang), gpg, a Rust binary
+
+Five cases, five byte-identical: a `rustc -O` hello (HashMap, fmt,
+f64 parse/print), `rustc --version --verbose` (the 147 MB
+librustc_driver plus libLLVM 21), `clang -S -O2` on hello.c (the whole
+-O2 pipeline, output compared as text, 171 s cold), `gpg --print-md
+SHA256`, and a madvise fixture. Two kernel gaps fell out, both in
+what madvise and mlock said rather than in translation:
+
+- **`MADV_DONTNEED` did nothing.** jemalloc probes it at startup: fill
+  a page, DONTNEED it, read it back; when the bytes survive it warns
+  ("MADV_DONTNEED does not work (memset will be used instead)") and
+  purges with memset. rustc carried the warning on stderr. Anonymous
+  pages now read back as zeros and a private file mapping's pages
+  re-fault from the file; shared mappings keep their pages (they hold
+  dirty data the engine writes back lazily).
+- **The file-mapping table kept stale entries.** munmap removed an
+  entry only when the range covered it whole, and a MAP_FIXED overlay
+  did not touch it at all. ld.so reserves a library's whole span,
+  overlays the segments MAP_FIXED and unmaps the gaps, so reservations
+  stayed on the table and anonymous pages in the reused holes were
+  taken for file-backed: the first madvise cut refused to zero
+  jemalloc's page because it "overlapped a file mapping". Partial
+  unmaps and fixed overlays now trim or split the entries.
+- **mlock/munlock/mlockall/munlockall** answered ENOSYS; gpg printed
+  "Warning: using insecure memory!". They succeed now (nothing swaps
+  here).
+
+`cargo --version` through the rustup proxy fails the same way native
+would without `~/.rustup/settings.toml` ("no default is configured"),
+so it is not a case; the toolchain's own cargo is.

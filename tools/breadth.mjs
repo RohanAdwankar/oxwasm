@@ -145,6 +145,33 @@ if (!existsSync(GOSTR)) {
       { cwd: '/tmp', env: { ...process.env, CGO_ENABLED: '0', GO111MODULE: 'off', GOCACHE: '/tmp/breadth_gocache', GOFLAGS: '-trimpath' } });
   } catch (e) { console.log('  (go build unavailable: ' + String(e.stderr || e.message).split('\n')[0] + ')'); }
 }
+const MADV = '/tmp/breadth_madv';
+if (!existsSync(MADV)) {   // madvise(MADV_DONTNEED) reads back zeros (jemalloc's startup probe); mlock succeeds
+  try { execFileSync('gcc', ['-O1', '-o', MADV, new URL('./fixtures/madv.c', import.meta.url).pathname]); } catch {}
+}
+const RUST = '/root/.rustup/toolchains/stable-x86_64-unknown-linux-gnu';
+const RHELLO = '/tmp/breadth_rhello';
+if (!existsSync(RHELLO) && existsSync(RUST + '/bin/rustc')) {
+  // Rust std: HashMap (SipHash, SSE2 probing), fmt, f64 parse/print, panic
+  // machinery linked in; the binary is a PIE against libc + libgcc_s
+  try {
+    writeFileSync('/tmp/breadth_hello.rs', [
+      'use std::collections::HashMap;',
+      'fn main() {',
+      '    let mut m: HashMap<String, usize> = HashMap::new();',
+      '    let text = "the quick brown fox jumps over the lazy dog the fox";',
+      '    for w in text.split_whitespace() { *m.entry(w.to_string()).or_insert(0) += 1; }',
+      '    let mut v: Vec<_> = m.iter().collect();',
+      '    v.sort();',
+      '    for (k, c) in v { println!("{k}: {c}"); }',
+      '    let s: f64 = (1..=1000).map(|i| (i as f64).sqrt()).sum();',
+      '    println!("sum sqrt = {s:.6}");',
+      '    let r: Result<u32, _> = "12x".parse::<u32>();',
+      '    println!("{:?}", r.is_err());',
+      '}', ''].join('\n'));
+    execFileSync(RUST + '/bin/rustc', ['-O', '-o', RHELLO, '/tmp/breadth_hello.rs'], { cwd: '/tmp' });
+  } catch (e) { console.log('  (rustc unavailable: ' + String(e.stderr || e.message).split('\n')[0] + ')'); }
+}
 const PROCFS = '/tmp/breadth_procfs';
 if (!existsSync(PROCFS)) {
   try { execFileSync('gcc', ['-O1', '-pthread', '-o', PROCFS,
@@ -263,6 +290,14 @@ const CASES = [
               { memMB: 3072, tree: '/usr/lib/jvm/java-21-openjdk-amd64' }],
   ['java-hello', '/usr/lib/jvm/java-21-openjdk-amd64/bin/java', ['-Xint', '-XX:+UseSerialGC', '-Xshare:off', '-Xmx256m', '-cp', '/tmp/breadth_jhello', 'Hello'],
               { memMB: 3072, tree: ['/usr/lib/jvm/java-21-openjdk-amd64', '/tmp/breadth_jhello'] }],
+  ['madv',    '/tmp/breadth_madv', []],
+  ['rhello',  '/tmp/breadth_rhello', []],
+  // rustc and clang: LLVM in-process (a 147 MB librustc_driver, libLLVM 118
+  // MB), jemalloc's madvise probe, C++ exception tables; clang's output is
+  // the whole -O2 pipeline compared as text
+  ['rustc-version', RUST + '/bin/rustc', ['--version', '--verbose'], { memMB: 3072, tree: RUST + '/lib' }],
+  ['clang-S', '/usr/bin/clang', ['-S', '-O2', '-o', '-', HELLO_C], { memMB: 2048 }],
+  ['gpg-md',  '/usr/bin/gpg',     ['--batch', '--print-md', 'SHA256', IN], { memMB: 1024 }],   // libgcrypt: mlock'd secure memory, a fresh ~/.gnupg
   ['xz',      '/usr/bin/xz',      ['-9', '-c', IN], { memMB: 1536 }],
   ['xz-1',    '/usr/bin/xz',      ['-1', '-c', IN]],
   ['gzip',    '/bin/gzip',        ['-9', '-c', IN]],
