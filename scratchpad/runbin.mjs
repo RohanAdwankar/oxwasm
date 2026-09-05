@@ -101,6 +101,10 @@ if (process.env.OXWASM_FNPROF === '1') {   // per-function entry counts (see FNP
   const tot = rows.reduce((s, r) => s + r[0], 0n);
   { const hb = {}; let never = 0; for (const [sl, as] of bySlot) { const n = Number(dv.getBigUint64(sl, true)); if (!n) { never += as.length; continue; } const bk = n < 4 ? '<4' : n < 16 ? '<16' : n < 64 ? '<64' : n < 256 ? '<256' : n < 4096 ? '<4096' : '>=4096'; hb[bk] = (hb[bk] || 0) + as.length; }
     console.log(`--- fnprof hist (translated fns by entry count; never = translated but never entered): never=${never} ${JSON.stringify(hb)} roots=${[...eng.aotFns.keys()].filter(a => (eng.aotCalls.get(a) || 0) >= eng.aotCallThreshold).length}`); }   // OXWASM_FNPROF=1 also prints this histogram
+  if (globalThis.__aotPhase?.big) {   // OXWASM_PHASE=1 too: entry counts of the giant (>=2000 insn) functions, weighted by instructions
+    const big = globalThis.__aotPhase.big, byN = {}; let fns = 0, insns = 0;
+    for (const [k, n] of big) { if (!eng.aotFns.has(BigInt(k))) continue; fns++; insns += n; const e = Number(dv.getBigUint64(fnprofSlot(BigInt(k)), true)); const bk = e === 0 ? 'never' : e < 4 ? '<4' : e < 16 ? '<16' : e < 64 ? '<64' : e < 256 ? '<256' : '>=256'; const r = byN[bk] ??= [0, 0]; r[0]++; r[1] += n; }
+    console.log(`--- giants: ${fns} translated fns of >=2000 insns, ${insns} insns; by entries [fns, insns]: ${JSON.stringify(byN)}`); }
   console.log(`--- fnprof: ${rows.length} entered fns, ${tot} entries\n` + rows.slice(0, 40).map(([n, as]) => `  ${as.map(a => a.toString(16)).join('|')} x${n} (${(Number(n * 1000n / tot) / 10).toFixed(1)}%)`).join('\n'));
 }
 if (process.env.OXWASM_BLKPROF) {   // per-block entry counts of the named functions: top 40 by guest block address

@@ -39,6 +39,11 @@ class BlockUnwind { constructor(rip) { this.rip = rip; } }
 
 const CLOSURE_ALL = typeof process !== 'undefined' && process.env?.OXWASM_CLOSURE_ALL === '1';
 const CLOSURE_MIN = Number((typeof process !== 'undefined' && process.env?.OXWASM_CLOSURE_MIN) || 3);   // observed calls a callee needs to join a closure; 3 priced against m4 steady state (not worse) and clang -S (50 s -> 45 s)
+// Size gate for tier-up by call count: a function of n instructions needs
+// max(threshold, n >> SIZEGATE_SHIFT) observed calls, capped at 256, before it
+// is emitted (2,000 insns -> 31 calls, 13,000 -> 203). OXWASM_SIZEGATE=0 off.
+const SIZEGATE = !(typeof process !== 'undefined' && process.env?.OXWASM_SIZEGATE === '0');
+const SIZEGATE_SHIFT = Number((typeof process !== 'undefined' && process.env?.OXWASM_SIZEGATE_SHIFT) || 6);
 const UNPRUNE = new Set(((typeof process !== 'undefined' && process.env?.OXWASM_UNPRUNE) || '').split(',').filter(Boolean).map(h => BigInt('0x' + h).toString()));
 
 export class LinuxEngine {
@@ -229,7 +234,7 @@ export class LinuxEngine {
     const n = (this.aotCalls.get(k) || 0) + 1;
     this.aotCalls.set(k, n); this._entryAdd(k);
     if (n === 1) (this._callTargets ??= new Set()).add(k.toString());   // the string view compileUnitWat takes; rebuilt per tier-up it was 5 s of clang -S
-    if (n >= this.aotCallThreshold) this.tierUpAot(t);
+    if (n >= this.aotCallThreshold && n >= (this._sizeDefer?.get(k) ?? 0)) { this._gateCalls = true; try { this.tierUpAot(t); } finally { this._gateCalls = false; } }
   }
 
   // A PLT/IFUNC stub is `endbr64?; jmp *GOT` — compiling it just deopts back
@@ -402,6 +407,8 @@ export class LinuxEngine {
     for (const k of this.aotCalls.keys()) if (inR(k)) { this.aotCalls.delete(k); this._callTargets?.delete(k.toString()); }
     for (const k of this._ftSeen) if (inR(k)) { this._ftSeen.delete(k); this._entries?.delete(k.toString()); }
     if (this._failMemo) for (const k of this._failMemo.keys()) if (inR(BigInt(k))) this._failMemo.delete(k);
+    if (this._sizeDefer) for (const k of this._sizeDefer.keys()) if (inR(k)) this._sizeDefer.delete(k);
+    if (this._sizeMemo) for (const k of this._sizeMemo.keys()) if (inR(BigInt(k))) this._sizeMemo.delete(k);
     if (this._tinyMemo) for (const k of this._tinyMemo.keys()) if (inR(BigInt(k))) this._tinyMemo.delete(k);
     if (this._inflight) for (const u of this._inflight) if (u.funcs.some(inR)) {
       u.cancelled = true;
@@ -564,7 +571,19 @@ export class LinuxEngine {
         // bisect aids: fnVeto never compiles these; fnAllow compiles only these (roots and closure members)
         veto: (this.fnVeto || this.fnAllow) ? (c) => (this.fnVeto?.has(c) ?? false) || (this.fnAllow ? !this.fnAllow.has(c) : false) : null,
         tinyMemo: (this._tinyMemo ??= new Map()),
-        failMemo: (this._failMemo ??= new Map()),          // callees whose analysis failed once: poisoned without re-analysis (cleared per range by _invalidateCode)
+        failMemo: (this._failMemo ??= new Map()),
+        sizeMemo: (this._sizeMemo ??= new Map()),          // sizes of callees the size gate refused (cleared per range by _invalidateCode)
+        // size gate (see SIZEGATE): giant callees need the calls whatever rooted
+        // the unit; a giant ROOT is gated only when the call profile asked for it
+        sizeGate: SIZEGATE ? (c, n, isRoot) => {
+          if (isRoot && !this._gateCalls) return 0;                   // a loop-head root has proven its heat on back edges
+          const need = Math.min(256, Math.max(this.aotCallThreshold, n >> SIZEGATE_SHIFT));
+          if (need <= this.aotCallThreshold) return 0;
+          const have = this.aotCalls.get(BigInt(c)) || 0;
+          if (have >= need) return 0;
+          if (isRoot) (this._sizeDefer ??= new Map()).set(BigInt(c), need);
+          return need;
+        } : null,          // callees whose analysis failed once: poisoned without re-analysis (cleared per range by _invalidateCode)
         // the tiering call profile, so the inliner can pick targets by how
         // often they are actually called rather than by what fits a budget
         hot: this.aotCalls,
@@ -647,7 +666,8 @@ export class LinuxEngine {
       if (inst.exports.drive) this.aotDrive = inst.exports.drive;
       if (!this.aotFns.has(k)) throw new Error('entry missing from unit');
       this.stats.tiers.aot = (this.stats.tiers.aot || 0) + 1;
-    } catch (e) { this.aotFailed.add(k);
+    } catch (e) { if (e.deferred) { this.stats.sizeDeferred = (this.stats.sizeDeferred || 0) + 1; return; }   // size gate: not a failure, re-tiers at the count it named
+      this.aotFailed.add(k);
       if (this.onAotFail) this.onAotFail(entry, e.message);
     } finally { if (t0c) this.tierMs += performance.now() - t0c; }
   }

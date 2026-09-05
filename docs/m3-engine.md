@@ -4709,6 +4709,31 @@ instructions 2.58M to 0.44M, the run 156 s to 143 s; 312 memo hits.
 Roots are never memoised, so a function that fails as a callee still
 gets its own attempt when its profile makes it a root.
 
+**Size gate.** Joining the per-function entry counter with the analysis
+sizes on rustc-asm: 549 translated functions of 2,000 instructions or
+more held 2.44M instructions, and 76% of those instructions belonged to
+functions entered fewer than 16 times after translation (161 never).
+A giant costs its instruction count to emit, assemble and instantiate,
+and the call threshold of 4 does not know its size. The engine now asks
+for more observed calls the bigger the function: max(threshold,
+n >> 6) capped at 256 (2,000 instructions need 31 calls, 13,000 need
+203). A root that falls short is deferred, not failed - profileTarget
+re-tiers it at the count the gate named; a callee that falls short
+stays out of the closure and its size is remembered so later closures
+refuse it without analysing it again (without the memo, analysis went
+UP 8 s: every closure re-analysed the refused giants). Loop-head roots
+are exempt as roots (their heat is proven on back edges) but their
+giant callees are gated like any other. `OXWASM_SIZEGATE=0` turns it
+off, `OXWASM_SIZEGATE_SHIFT` moves the slope.
+
+rustc-asm on the idle machine: 109 s (analysis 25.7 s, emit 23.0 s;
+against 143 s under contention with the failure memo alone), breadth
+96 s warm; clang-S 27 s to 16 s warm; m4 steady state interleaved
+7.92x / 7.68x gated against 8.71x / 7.70x ungated. The sweep over the
+failure memo and lazy compilation was 182 of 182 exact (the last chunk
+already ran with the gate); rustc-asm, clang-S, python3, gzip, m4 and
+recycle exact under the final gate.
+
 What the gated clang profile (40 s) leaves: the emitter 4.7 s self plus
 4.5 s of garbage collection, 3.9 s of module instantiation even with
 lazy compilation, 2.9 s of decode plus analysis, 1.6 s interpreting

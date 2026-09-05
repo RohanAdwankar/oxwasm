@@ -3052,6 +3052,9 @@ export function compileUnitWat(mem, entry, opts = {}) {
     // re-analysed 2.58M instructions of such callees, 9.8 s of a 152 s run.
     // Roots are never memoised - a root that fails must throw to its caller.
     if (opts.failMemo && k !== entry.toString() && opts.failMemo.has(k)) { poisoned.add(k); if (PHASE) PH.memoFail = (PH.memoFail ?? 0) + 1; continue; }
+    // a callee the size gate refused before is refused again without analysis
+    // while its call count is still short (its size is remembered)
+    if (opts.sizeMemo && opts.sizeGate && k !== entry.toString() && opts.sizeMemo.has(k) && opts.sizeGate(k, opts.sizeMemo.get(k), false)) { if (PHASE) PH.memoSize = (PH.memoSize ?? 0) + 1; continue; }
     try {
       let an;
       try { const tA = PHASE ? performance.now() : 0;
@@ -3059,7 +3062,8 @@ export function compileUnitWat(mem, entry, opts = {}) {
             if (PHASE) { PH.analyzed++; let n = 0; for (const b of an.blocks) n += b.insns.length; PH.analyzedInsns += n;
               if (PH.seen.has(k)) { PH.dup = (PH.dup ?? 0) + 1; PH.dupInsns = (PH.dupInsns ?? 0) + n; PH.dupMs = (PH.dupMs ?? 0) + performance.now() - tA; } else PH.seen.add(k);
               const bk = n < 100 ? '<100' : n < 500 ? '<500' : n < 2000 ? '<2000' : n < 8000 ? '<8000' : '>=8000';   // per-size buckets: [analyses, ms, insns]
-              const h = (PH.hist ??= {})[bk] ??= [0, 0, 0]; h[0]++; h[1] += performance.now() - tA; h[2] += n; } }
+              const h = (PH.hist ??= {})[bk] ??= [0, 0, 0]; h[0]++; h[1] += performance.now() - tA; h[2] += n;
+              if (n >= 2000) (PH.big ??= new Map()).set(k, n); } }   // giant functions by address, joined with OXWASM_FNPROF entry counts in runbin
       catch (e) {
         // jump-table discovery can push a function over the size budget;
         // it compiled before the feature, so retry without it
@@ -3094,9 +3098,18 @@ export function compileUnitWat(mem, entry, opts = {}) {
         if (t0?.mnem === 'jmpind' &&
             ((t0.src?.kind === 'mem' && t0.src.ripRel) || an.blocks.length === 1))
           throw new Error('trampoline -> callout'); }
+      // Size gate: a giant function costs its instruction count to emit and
+      // assemble, and on rustc-asm 76% of the giant instructions translated
+      // belonged to functions entered fewer than 16 times afterwards. The
+      // engine's gate asks for more observed calls the bigger the function;
+      // a root that fails it is deferred (the engine re-tiers it at the
+      // count the gate names), a callee simply stays out of this closure.
+      if (opts.sizeGate) { let n = 0; for (const b of an.blocks) n += b.insns.length;
+        const need = opts.sizeGate(k, n, k === entry.toString());
+        if (need) { if (k === entry.toString()) throw Object.assign(new Error('size gate: ' + n + ' insns, ' + need + ' calls needed'), { deferred: need }); if (opts.sizeMemo) opts.sizeMemo.set(k, n); continue; } }
       funcs.set(k, an);
       for (const c of an.calls) if (!funcs.has(c) && !poisoned.has(c)) pending.push(BigInt(c));
-    } catch (e) { poisoned.add(k); if (k === entry.toString()) throw e; if (opts.failMemo) opts.failMemo.set(k, e.message); }
+    } catch (e) { poisoned.add(k); if (k === entry.toString()) throw e; if (opts.failMemo && !e.deferred) opts.failMemo.set(k, e.message); }
   }
   if (PHASE) { PH.analyze += performance.now() - ta0; PH.units++; }
   // Emitting records which callees a text reaches directly (a wasm `call`,
