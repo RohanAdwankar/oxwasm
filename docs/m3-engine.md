@@ -4656,3 +4656,20 @@ harnesses sets V8's lazy wasm compilation: clang -S 45 s to 39 s, exact.
 On m4 steady state it read 9.16x / 8.89x against 8.99x / 8.59x eager,
 both rounds leaning the same way inside the noise band, so it stays
 opt-in until it can be measured on an idle machine.
+
+Three smaller items from the same profile. The emitted wat carried a
+six-space indent on every line, 9% of a unit's text; dropped, unit
+text is 6% smaller and emit time unchanged (the emitter's cost is not
+in the characters). A second broker shell for deferred units was
+priced a third time, on clang -S this time (37.5 s / 39.6 s against
+38.2 s with one): null, so it stays opt-in. And the synchronous
+assembler path, which PLT stubs of a few lines take, waited behind
+every deferred closure unit ahead of it in the queue - 1.3 s of the
+40 s clang run for stubs that assemble in a millisecond; synchronous
+requests now have their own shell, clang -S 38 s to 34-36 s.
+
+What the gated clang profile (40 s) leaves: the emitter 4.7 s self plus
+4.5 s of garbage collection, 3.9 s of module instantiation even with
+lazy compilation, 2.9 s of decode plus analysis, 1.6 s interpreting
+2.5M steps, and the guest's own translated execution. No single bucket
+is above 12%.
