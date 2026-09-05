@@ -4429,3 +4429,6 @@ while runbin's loop is synchronous, so state is sampled through files
 (`SAMPLEFILE` prints the tree and continues, `STOPFILE` prints and
 exits), and children reaped inside one run slice are invisible to a
 sweep of `eng.children`, hence the `onChildEngine` hook.
+
+With the directory rename in, the case's guest stderr is native's two
+lines exactly ("Compiling", "Finished"); the warning is gone.
