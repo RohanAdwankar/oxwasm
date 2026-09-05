@@ -3,7 +3,7 @@
 // so the A/B can prove the two configurations ran the same program.
 import { LinuxEngine } from '../engine/linux.mjs';
 import { setFlagsFromString } from 'node:v8';
-if (process.env.WASM_LAZY === '1') setFlagsFromString('--wasm-lazy-compilation');   // WASM_LAZY=1: V8 compiles each wasm function at its first call (pricing lever: most translated functions of a compiler run are never entered)
+if (process.env.WASM_LAZY !== '0') setFlagsFromString('--wasm-lazy-compilation');   // V8 compiles each wasm function at its first call: most translated functions of a compiler run are never entered (clang -S 45 s -> 39 s), m4 steady state neutral on a quiet machine; WASM_LAZY=0 restores eager
 import { readFileSync, readdirSync, lstatSync, realpathSync, statSync,
          writeFileSync, existsSync, mkdirSync, unlinkSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
