@@ -4298,3 +4298,40 @@ what madvise and mlock said rather than in translation:
 `cargo --version` through the rustup proxy fails the same way native
 would without `~/.rustup/settings.toml` ("no default is configured"),
 so it is not a case; the toolchain's own cargo is.
+
+### The rustc compile: a PIC-table guard that was a case test
+
+`rustc -O --emit=asm` on a two-function crate (LLVM optimising and
+emitting in-process, seven threads, 1,974 units, 1 GB of wat) died
+after 188 s with a wasm out-of-bounds access in a translated LLVM
+function. The function's memory matched the file (a new
+`TEXTCHECK=1` lever in runbin compares every mapped file's guest bytes
+with the file at exit: only data segments differed, all relocation
+targets), and the run failed identically on the previous engine, so
+it was not the day's mapping change. The dumped unit showed the
+translation of an entry at a bare `jmp rel32` starting one byte late:
+`push rbp; add [rax],eax; ...` are the jmp's own bytes from +1. The
+analyzer's block for the entry held the `jmp` *and* the instructions
+decoded from +1, so the emitter, which handles a jmp only as a block's
+last instruction, dropped it and ran into the misaligned stream.
+
+The misaligned stream came from a PIC jump table read with 32 entries
+where the switch had 11. In `SemiNCAInfo::FindRoots` LLVM bounds-checks
+a copy of the index (`lea -0x1e(%rax),%ecx; cmp $0xb,%cl; jae`), then
+tests one case on the original (`cmp $0x1f,%eax; je`), then subtracts
+and loads. The guard finder walked up from the load and took the first
+`cmp $K, %idx` it met, the case test, as the bound. Two of the 32
+"entries" pointed inside real instructions, and one of the phantom
+leaders sat one byte past the `jmp` the fatal entry was rooted at.
+
+The rule is now: the guard is the compare an unsigned branch consumes.
+`ja`/`jbe` make K the last index (K+1 entries); `jae`/`jb` make K the
+count. A `cmp` on the index that any other branch consumes ends the
+walk with no table (the jump stays an indirect-jump deopt, which is
+correct and merely slower). The `jae` form had been off by one all
+along, reading one entry past every such table; the extra entry
+happened to land on plausible code in python and perl. Three shapes
+are pinned in `engine/diff/picguardtest.mjs` (ja, jae, and the
+FindRoots shape), each also checked for overlapping decode. rustc's
+compile then runs to completion with the assembly byte-identical to
+native.
