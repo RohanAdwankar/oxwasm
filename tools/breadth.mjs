@@ -726,6 +726,7 @@ for (const [name, bin, args, opts] of CASES) {
   if (same) { pass++;
     console.log(`  ok   ${name.padEnd(9)} ${String(nat.out.length).padStart(8)}B out, ` +
                 `${eng.units} fns, ${(eng.ms).toFixed(0)}ms yields=${eng.yields}`);
+    if (process.env.BREADTH_STDERR && eng.stderr) console.log(`         guest stderr: ${JSON.stringify(eng.stderr.slice(0, 600))}`);   // BREADTH_STDERR=1: show it on success too (warnings the byte compare cannot see)
     if (eng.unknown.length) console.log(`         ENOSYS syscalls: ${eng.unknown.join(' ')}`);
     if (eng.ioctls.length) console.log(`         ENOTTY ioctls: ${eng.ioctls.join(' ')}`); }
   else { fail++;
