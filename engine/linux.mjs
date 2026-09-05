@@ -393,6 +393,7 @@ export class LinuxEngine {
 
   tierUpAot(entry) {
     const k = entry;
+    if (this.pumpAsm) this.pumpAsm();                       // deferred units whose bytes are back register first
     if (this.aotFns.has(k) || this.aotFailed.has(k)) return;
     // Entry-keyed precompiled units (browser manifest): registering one costs
     // no translation at all — the wasm bytes are instantiated off-thread and
@@ -519,7 +520,7 @@ export class LinuxEngine {
         // OXWASM_UNPRUNE=hex,hex: keep these callees in every closure even
         // when already compiled (diagnosis: the upper bound of a re-tier that
         // un-prunes a hot caller's hot small callees so they can be inlined)
-        skip: (c) => this._ftSeen.has(BigInt(c)) && !UNPRUNE.has(c),
+        skip: (c) => (this._ftSeen.has(BigInt(c)) || (this._pendingFns !== undefined && this._pendingFns.has(c))) && !UNPRUNE.has(c),
         // bisect aids: fnVeto never compiles these; fnAllow compiles only these (roots and closure members)
         veto: (this.fnVeto || this.fnAllow) ? (c) => (this.fnVeto?.has(c) ?? false) || (this.fnAllow ? !this.fnAllow.has(c) : false) : null,
         tinyMemo: (this._tinyMemo ??= new Map()),
@@ -553,6 +554,28 @@ export class LinuxEngine {
           .then(({ instance }) => this.finishAotUnit(unit, instance))
           .catch((e) => { this.aotFns.delete(k); this.aotFailed.add(k);
                           if (this.onAotFail) this.onAotFail(entry, e.message); });
+        return;
+      }
+      // Deferred assembly (node): hand the text to the broker and keep
+      // running; the unit registers from a later pumpAsm() when the bytes
+      // are back. A clang profile had the host blocked a quarter of its run
+      // in readSync on the broker's fifo, i.e. wat2wasm's own time serialised
+      // with everything else. Same placeholder protocol as asyncCompile, and
+      // the unit's functions count as seen for closure pruning meanwhile.
+      if (this.assembleWatDeferred) {
+        this.aotFns.set(k, null);
+        for (const a of unit.funcs) (this._pendingFns ??= new Set()).add(a.toString());
+        this.assembleWatDeferred(unit.wat, (bytes, err) => {
+          for (const a of unit.funcs) this._pendingFns.delete(a.toString());
+          if (err) { this.aotFns.delete(k); this.aotFailed.add(k); if (this.onAotFail) this.onAotFail(entry, err.message); return; }
+          try {
+            if (this.onUnitBytes) this.onUnitBytes(k, bytes);
+            const inst = new WebAssembly.Instance(new WebAssembly.Module(bytes), this.aotImports());
+            this.aotFns.delete(k);                       // the placeholder; finishAotUnit registers the real export
+            this.finishAotUnit(unit, inst);
+            if (!this.aotFns.has(k)) throw new Error('entry missing from unit');
+          } catch (e) { this.aotFns.delete(k); this.aotFailed.add(k); if (this.onAotFail) this.onAotFail(entry, e.message); }
+        });
         return;
       }
       const bytes = this.assembleWat(unit.wat);
@@ -1918,6 +1941,7 @@ export class LinuxEngine {
           xserver: this.xserver });
         if (this.strace) ceng.strace = [];                   // a traced parent traces its children
         if (this.childMemMB !== undefined) ceng.childMemMB = this.childMemMB;   // grandchildren too (cargo -> rustc -> cc -> collect2 -> ld)
+        if (this.assembleWatDeferred) { ceng.assembleWatDeferred = this.assembleWatDeferred; ceng.pumpAsm = this.pumpAsm; }
         ceng.sigign = new Set(t.proc?.sigign ?? this.sigign ?? []);   // exec keeps ignored signals ignored (handlers reset to default)
         if (this.onChildEngine) { ceng.onChildEngine = this.onChildEngine; this.onChildEngine(ceng, argv); }   // tooling: see every execve'd image, grandchildren included, even ones reaped inside one run slice
         const skipped = [];
@@ -3663,6 +3687,7 @@ export class LinuxEngine {
       xserver: o.xserver, mtimes: o.mtimes, tty: o.tty, ttyRows: o.ttyRows, ttyCols: o.ttyCols, stdin: o.stdin });
     if (this.strace) ceng.strace = [];                       // a traced parent traces its children
     if (this.childMemMB !== undefined) ceng.childMemMB = this.childMemMB;
+    if (this.assembleWatDeferred) { ceng.assembleWatDeferred = this.assembleWatDeferred; ceng.pumpAsm = this.pumpAsm; }
     if (this.onChildEngine) { ceng.onChildEngine = this.onChildEngine; this.onChildEngine(ceng, o.argv); }
     // record locks the child took inside its window are owned by its proc
     // record; from here on its identity is the new engine (it conflicted
@@ -3879,6 +3904,7 @@ export class LinuxEngine {
   // messages made a mild blur take minutes). While either side makes
   // progress, keep alternating.
   run(maxSteps = 5e9) {
+    if (this.pumpAsm) this.pumpAsm();
     if (this._execed) {                // main process tail-exec'd: pump the replacement
       this.pumpChildren();
       const c = this._execed;
