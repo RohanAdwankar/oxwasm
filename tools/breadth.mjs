@@ -732,6 +732,10 @@ for (const [name, bin, args, opts] of CASES) {
     console.log(`  ok   ${name.padEnd(9)} ${String(nat.out.length).padStart(8)}B out, ` +
                 `${eng.units} fns, ${(eng.ms).toFixed(0)}ms yields=${eng.yields}`);
     if (process.env.BREADTH_STDERR && eng.stderr) console.log(`         guest stderr: ${JSON.stringify(eng.stderr.slice(0, 600))}`);   // BREADTH_STDERR=1: show it on success too (warnings the byte compare cannot see)
+    if (process.env.BREADTH_MEM) {   // guest-written entries whose bytes live inside a wasm memory would pin that memory for the rest of the run
+      const big = Object.entries(files).filter(([k, v]) => v && v.buffer && v.buffer.byteLength > (64 << 20) && v.byteLength < v.buffer.byteLength).map(([k, v]) => `${k}(${v.byteLength}B in a ${(v.buffer.byteLength / 1e6) | 0}MB buffer)`);
+      if (big.length) console.log(`         file entries viewing large buffers: ${big.length}: ${big.slice(0, 6).join(' ')}`);
+    }
     if (process.env.BREADTH_MEM) { const m = process.memoryUsage(); console.log(`         host rss ${(m.rss / 1e6) | 0}MB heap ${(m.heapUsed / 1e6) | 0}MB ext ${(m.external / 1e6) | 0}MB ab ${(m.arrayBuffers / 1e6) | 0}MB`); }   // BREADTH_MEM=1: host memory after each case (a chunk was OOM-killed at 13.7 GB)
     if (eng.unknown.length) console.log(`         ENOSYS syscalls: ${eng.unknown.join(' ')}`);
     if (eng.ioctls.length) console.log(`         ENOTTY ioctls: ${eng.ioctls.join(' ')}`); }
