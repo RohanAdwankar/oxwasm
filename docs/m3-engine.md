@@ -4366,3 +4366,35 @@ the next sweep: the chunk list is read by substring, so a name like
 only survives while the session stays active: the container is
 reclaimed when the session idles, which killed two earlier attempts
 mid-chunk.
+
+### Breadth batch 8: cargo builds a crate
+
+`cargo build --offline` on a no-dependency crate is a process tree:
+cargo probes `rustc -vV` and `rustc --print` over pipes, then spawns
+the compile, which spawns `cc` for the link, which runs collect2 and
+ld. Three things fell out before rustc ran at all:
+
+- **Child engines had 256 MB.** The default suits GIMP's plug-ins; a
+  rustc child could not map its 265 MB of shared libraries and ld.so
+  exited 127, which cargo reported as `rustc -vV` failing. The size is
+  now an option (`childMemMB`, runbin `CHILDMEM`) and grandchildren
+  inherit it.
+- **`socketpair` was ENOSYS.** std's spawn reports exec failures to
+  the parent over a CLOEXEC socketpair, and cargo's compile spawn
+  takes that path (a `pre_exec` hook for the jobserver rules out
+  posix_spawn). AF_UNIX stream pairs are now two crossed pipe buffers:
+  each end reads its own and writes its peer's, the pipe helpers
+  (reader/writer liveness, EOF sweep at close and exec) understand the
+  `peer` field, and `recv` on such an end drains like `read` (std
+  reads the channel with recv; the first cut answered ENOTSOCK and
+  cargo's worker thread panicked). The `sockpair` fixture pins both
+  directions, poll readiness, EOF after the peer closes, and a child
+  on the other end.
+- **Seeing the children.** Children are reaped out of `eng.children`,
+  so a run-loop sweep misses ones that live inside one slice; the
+  engine now offers an `onChildEngine` hook (inherited by
+  grandchildren) and runbin's `KIDS=1` prints every child's argv,
+  exit, stderr and syscall tail. `STRACEERR=38` prints every syscall
+  answering a given errno as it happens, which is how socketpair was
+  found among statx, clone3 and rseq (all ENOSYS by design, with glibc
+  and std fallbacks).

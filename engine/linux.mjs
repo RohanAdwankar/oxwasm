@@ -1681,11 +1681,19 @@ export class LinuxEngine {
         const p = new TextEncoder().encode(this.argv0?.startsWith('/') ? this.argv0 : '/prog');
         this.ram.set(p.subarray(0, Number(sz)), Number(buf - this.base));
         ret(BigInt(Math.min(p.length, Number(sz)))); break; }
-      case 318: {                                            // getrandom
-        const buf = a1, len = Number(a2);
+      case 318: {                                            // getrandom(buf, len, flags)
+        const buf = a1, len = Number(a2), off = Number(buf - this.base);
+        // len 0 touches nothing and answers 0 whatever the pointer: Rust std
+        // probes availability with a zero-length buffer at a dangling
+        // pointer (address 1), and copying zero bytes to a negative offset
+        // threw a RangeError that killed rustc under cargo
+        if (len === 0) { ret(0n); break; }
+        if (off < 0 || off + len > this.ram.length) {         // a pointer outside guest memory: EFAULT, as the kernel answers
+          if (!this._efaultNoted) { this._efaultNoted = true; console.error(`<getrandom EFAULT buf=${buf.toString(16)} len=${len} base=${this.base.toString(16)} ram=${this.ram.length.toString(16)} rip=${cpu.rip.toString(16)} tid=${this.threads[this.ti]?.id}>`); }
+          ret(-14n); break; }
         const bytes = new Uint8Array(len);
         crypto.getRandomValues(bytes.subarray(0, Math.min(len, 65536)));
-        this.ram.set(bytes, Number(buf - this.base));
+        this.ram.set(bytes, off);
         ret(BigInt(len)); break; }
       case 16: {                                             // ioctl
         const req = Number(a2 & 0xffffffffn), h = this.fds.get(Number(a1));
@@ -2176,24 +2184,7 @@ export class LinuxEngine {
           break;
         }
         if (h.pipe) {                                         // drain the shared pipe buffer
-          const want = Number(a3); let dst = Number(a2 - this.base), got = 0;
-          while (got < want && h.pipe.chunks.length) {
-            const c = h.pipe.chunks[0], avail = c.length - h.pipe.off;
-            const take = Math.min(avail, want - got);
-            this.jsnap(this.base + BigInt(dst), take);
-            this.ram.set(c.subarray(h.pipe.off, h.pipe.off + take), dst);
-            dst += take; got += take; h.pipe.off += take;
-            if (h.pipe.off >= c.length) { h.pipe.chunks.shift(); h.pipe.off = 0; }
-          }
-          if (got > 0) { h.pipe.size = Math.max(0, (h.pipe.size ?? 0) - got); this.wakeAllBlk(); }   // a blocked writer may fit now
-          // empty: EOF only once the writing side is gone (weof — set when a
-          // child process holding the write end exits); otherwise BLOCK like
-          // a real pipe — the plug-in wire protocol reads before data arrives
-          if (got === 0 && want > 0 && !h.pipe.weof) {
-            if (h.nonblock) { ret(-11n); break; }             // EAGAIN
-            this.block(null); break;
-          }
-          ret(BigInt(got)); break;
+          const r = this._pipeDrain(h, a2, Number(a3)); if (r !== null) ret(r); break;
         }
         if (h.tfd) {                                          // timerfd: 8-byte expiration count
           this._tfdTick(h.tfd);
@@ -2918,6 +2909,10 @@ export class LinuxEngine {
         const r = writeChunk(Number(a1), a2, Number(a3)); if (r === -4096) break; ret(r === undefined ? a3 : BigInt(r)); break; }
       case 45: {                                              // recvfrom
         const h = this.fds.get(Number(a1));
+        if (h?.pipe) {                                        // a socketpair end (std reads its spawn error channel with recv)
+          const nb = h.nonblock || !!(Number(cpu.regs[10]) & 0x40);   // MSG_DONTWAIT
+          const r = this._pipeDrain({ ...h, nonblock: nb }, a2, Number(a3)); if (r !== null) ret(r); break;
+        }
         if (!h?.sock?.conn) { ret(-88n); break; }
         const data = h.sock.conn.read(Number(a3));
         if (data === null) { if (h.sock.nonblock) ret(-11n); else this.block(null); break; }
@@ -3699,6 +3694,29 @@ export class LinuxEngine {
     if (this._vforkBudget !== undefined) { this.aotBudget = this._vforkBudget; this._vforkBudget = undefined; }
   }
 
+  // read(2)/recv(2) on a pipe or socketpair end: copy out what is buffered;
+  // empty means EOF only once the writing side is gone (weof - set when a
+  // process holding the write end exits or closes it), otherwise BLOCK like
+  // a real pipe (EAGAIN when non-blocking) - the plug-in wire protocol reads
+  // before data arrives. Returns the count, -11n, or null after arranging
+  // the block (the syscall re-executes once woken).
+  _pipeDrain(h, addr, want) {
+    let dst = Number(addr - this.base), got = 0;
+    while (got < want && h.pipe.chunks.length) {
+      const c = h.pipe.chunks[0], avail = c.length - h.pipe.off;
+      const take = Math.min(avail, want - got);
+      this.jsnap(this.base + BigInt(dst), take);
+      this.ram.set(c.subarray(h.pipe.off, h.pipe.off + take), dst);
+      dst += take; got += take; h.pipe.off += take;
+      if (h.pipe.off >= c.length) { h.pipe.chunks.shift(); h.pipe.off = 0; }
+    }
+    if (got > 0) { h.pipe.size = Math.max(0, (h.pipe.size ?? 0) - got); this.wakeAllBlk(); }   // a blocked writer may fit now
+    if (got === 0 && want > 0 && !h.pipe.weof) {
+      if (h.nonblock) return -11n;
+      this.block(null); return null;
+    }
+    return BigInt(got);
+  }
   _pipeWriterAlive(buf) {
     let root = this; while (root.parentEng) root = root.parentEng;
     const seen = new Set();
@@ -3740,7 +3758,7 @@ export class LinuxEngine {
       const e = c.eng;
       if (e.exitCode === null) {
         if (e.blocked) e.wake();
-        try { e.run(3e5); } catch (err) { c.exited = 127; c.error = err.message; }
+        try { e.run(3e5); } catch (err) { c.exited = 127; c.error = err.message; c.errorStack = err.stack; }   // errorStack: where in the engine a child died (tooling)
       }
       if (c.exited === null && e.exitCode !== null) {
         c.exited = e.exitCode;
