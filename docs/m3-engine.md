@@ -4654,8 +4654,14 @@ and module instantiation was 7 s, V8 compiling every function of every
 unit eagerly although most are never entered. `WASM_LAZY=1` in the
 harnesses sets V8's lazy wasm compilation: clang -S 45 s to 39 s, exact.
 On m4 steady state it read 9.16x / 8.89x against 8.99x / 8.59x eager,
-both rounds leaning the same way inside the noise band, so it stays
-opt-in until it can be measured on an idle machine.
+both rounds leaning the same way inside the noise band. On the idle
+machine, two interleaved rounds: lazy 7.05x / 7.28x against eager
+7.06x / 7.15x, neutral, so lazy compilation is now the harness default
+(`WASM_LAZY=0` restores eager); a six-case compiler subset is exact under
+it, clang-S 27 s to 20 s warm. (The idle-machine m4 figure itself, 7.05x
+against 8.5-9x for every measurement taken while a sweep ran, says how
+much the day's absolute numbers carry the sweep's contention; the A/Bs
+were interleaved, so their comparisons hold.)
 
 Three smaller items from the same profile. The emitted wat carried a
 six-space indent on every line, 9% of a unit's text; dropped, unit
