@@ -339,7 +339,7 @@ export function compileFunctionWatDispatch(mem, entry, { guestBase, ramBase, max
     }
     const last = blk.insns[blk.insns.length-1].mnem;
     if (!['jmp','jcc','ret','retn','leave'].includes(last)) L.push(goto(blk.insns[blk.insns.length-1].next));
-    return L.join('\n      ');
+    return L.join('\n');
   }
 
   const bodies = blocks.map(block);
@@ -2656,7 +2656,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       if (t.t < 0) L.push(...deoptTo(t.ta));
       else { const b = brTo(t.t); if (b) L.push(b); }
     }
-    return L.join('\n      ');
+    return L.join('\n');
   }
 
   const bodies = []; for (let i=0;i<N;i++) bodies.push(emitBlock(i));
@@ -2713,9 +2713,9 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     const expandFull = (sx) => [
       ...regs16.filter(r => touched(r) && !(sx && savedI32(r))).map(spillR),
       ...xS.map(xSpill),
-    ].join('\n      ');
-    const rlFull = [...regs16.filter(touched).map(reloadR), ...xS.map(xReload)].join('\n      ');
-    const rlCall = [...regs16.filter(r => touched(r) && !(CS_MASK & (1 << r))).map(reloadR), ...xS.map(xReload)].join('\n      ');
+    ].join('\n');
+    const rlFull = [...regs16.filter(touched).map(reloadR), ...xS.map(xReload)].join('\n');
+    const rlCall = [...regs16.filter(r => touched(r) && !(CS_MASK & (1 << r))).map(reloadR), ...xS.map(xReload)].join('\n');
     if (!narrowOn) {
       // off: every marker becomes the full list; no scan, no dataflow
       const sa = expandFull(false), sX = expandFull(true);
@@ -2765,7 +2765,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       const expand = (sx, mask) => [
         ...regs16.filter(r => touched(r) && !(sx && savedI32(r)) && (mask & (1 << r))).map(spillR),
         ...[...xUsed].filter(x => mask & ((0x10000 << x) | 0)).map(xSpill),
-      ].join('\n      ');
+      ].join('\n');
       for (let b = 0; b < N; b++) {
         if (!marks[b].length) continue;
         let out = '', last = 0;
@@ -2841,7 +2841,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       const rlExpand = (mask) => [
         ...regs16.filter(r => touched(r) && (mask & (1 << r))).map(reloadR),
         ...[...xUsed].filter(x => mask & ((0x10000 << x) | 0)).map(xReload),
-      ].join('\n      ');
+      ].join('\n');
       for (let b = 0; b < N; b++) {
         if (!events[b].some(e => e.k === 2)) continue;
         let lo = 0; for (const s of succs[b]) if (s >= 0) lo |= liveIn[s];
