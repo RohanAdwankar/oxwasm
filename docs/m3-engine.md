@@ -4643,5 +4643,16 @@ their caller tiered up. `OXWASM_CLOSURE_MIN=N` prices the gate at N
 observed calls: at 3, clang -S 50 s to 45 s (wat 390 MB to 288 MB,
 emit 15.2 s to 11.7 s), rustc --version 646 to 556 translated
 functions, and m4 steady state 8.70x / 9.00x against 9.22x / 9.76x at
-1 (interleaved rounds under a running sweep; not worse). The default
-moves to 3 once the sweep has run over the gate at 1.
+1 (interleaved rounds under a running sweep; not worse). The sweep over
+the gate at 1 was green (182 cases in five chunks); the default is now 3
+and the sweep runs again over it.
+
+Two more items from the gated clang profile (46 s): the call-target
+string set passed to the analyzer was rebuilt from the whole profile at
+every tier-up, 5 s of the run at 2,900 units (now kept incrementally);
+and module instantiation was 7 s, V8 compiling every function of every
+unit eagerly although most are never entered. `WASM_LAZY=1` in the
+harnesses sets V8's lazy wasm compilation: clang -S 45 s to 39 s, exact.
+On m4 steady state it read 9.16x / 8.89x against 8.99x / 8.59x eager,
+both rounds leaning the same way inside the noise band, so it stays
+opt-in until it can be measured on an idle machine.
