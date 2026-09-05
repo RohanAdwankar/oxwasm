@@ -38,7 +38,7 @@ class DeoptUnwind { constructor(rip) { this.rip = rip; } }
 class BlockUnwind { constructor(rip) { this.rip = rip; } }
 
 const CLOSURE_ALL = typeof process !== 'undefined' && process.env?.OXWASM_CLOSURE_ALL === '1';
-const CLOSURE_MIN = Number((typeof process !== 'undefined' && process.env?.OXWASM_CLOSURE_MIN) || 1);   // observed calls a callee needs to join a closure (pricing lever)
+const CLOSURE_MIN = Number((typeof process !== 'undefined' && process.env?.OXWASM_CLOSURE_MIN) || 3);   // observed calls a callee needs to join a closure; 3 priced against m4 steady state (not worse) and clang -S (50 s -> 45 s)
 const UNPRUNE = new Set(((typeof process !== 'undefined' && process.env?.OXWASM_UNPRUNE) || '').split(',').filter(Boolean).map(h => BigInt('0x' + h).toString()));
 
 export class LinuxEngine {
