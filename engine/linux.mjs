@@ -228,6 +228,7 @@ export class LinuxEngine {
     if (this.aotFns.has(k) || this.aotFailed.has(k)) return;
     const n = (this.aotCalls.get(k) || 0) + 1;
     this.aotCalls.set(k, n); this._entryAdd(k);
+    if (n === 1) (this._callTargets ??= new Set()).add(k.toString());   // the string view compileUnitWat takes; rebuilt per tier-up it was 5 s of clang -S
     if (n >= this.aotCallThreshold) this.tierUpAot(t);
   }
 
@@ -541,7 +542,7 @@ export class LinuxEngine {
         // call's fall-through at one (a noreturn callee's neighbour)
         entries: this._knownEntries(),
         // ... and the addresses actually seen called: what a tail jmp may target
-        callTargets: new Set([...this.aotCalls.keys()].map(k => k.toString())),
+        callTargets: (this._callTargets ??= new Set()),
         // hosts whose assembler is wabt.js (itself wasm) choke on multi-MB
         // closure texts — child engines cap the unit size and chain instead
         ...(this.unitMaxFuncs ? { maxFuncs: this.unitMaxFuncs } : {}),
