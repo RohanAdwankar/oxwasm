@@ -38,6 +38,7 @@ class DeoptUnwind { constructor(rip) { this.rip = rip; } }
 class BlockUnwind { constructor(rip) { this.rip = rip; } }
 
 const CLOSURE_ALL = typeof process !== 'undefined' && process.env?.OXWASM_CLOSURE_ALL === '1';
+const CLOSURE_MIN = Number((typeof process !== 'undefined' && process.env?.OXWASM_CLOSURE_MIN) || 1);   // observed calls a callee needs to join a closure (pricing lever)
 const UNPRUNE = new Set(((typeof process !== 'undefined' && process.env?.OXWASM_UNPRUNE) || '').split(',').filter(Boolean).map(h => BigInt('0x' + h).toString()));
 
 export class LinuxEngine {
@@ -529,7 +530,7 @@ export class LinuxEngine {
         // profiled at its callouts and tiers up as its own root; its call sites
         // then hit through $ftr. OXWASM_CLOSURE_ALL=1 restores the ungated walk.
         skip: (c) => ((this._ftSeen.has(BigInt(c)) || (this._pendingFns !== undefined && this._pendingFns.has(c))) && !UNPRUNE.has(c))
-                  || (!CLOSURE_ALL && !this.aotCalls.has(BigInt(c))),
+                  || (!CLOSURE_ALL && (this.aotCalls.get(BigInt(c)) || 0) < CLOSURE_MIN),
         // bisect aids: fnVeto never compiles these; fnAllow compiles only these (roots and closure members)
         veto: (this.fnVeto || this.fnAllow) ? (c) => (this.fnVeto?.has(c) ?? false) || (this.fnAllow ? !this.fnAllow.has(c) : false) : null,
         tinyMemo: (this._tinyMemo ??= new Map()),
