@@ -19,8 +19,9 @@ import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 
 const files = {}, mtimes = {};
+const byReal = new Map();   // /lib/x86_64-linux-gnu and /usr/lib/x86_64-linux-gnu are one directory: one copy of the bytes (the doubled copy was half of a 4 GB floor)
 const add = (g, h) => {
-  try { files[g] = new Uint8Array(readFileSync(h)); mtimes[g] = Math.floor(statSync(h).mtimeMs / 1000); }
+  try { let b = byReal.get(h); if (!b) { b = new Uint8Array(readFileSync(h)); byReal.set(h, b); } files[g] = b; mtimes[g] = Math.floor(statSync(h).mtimeMs / 1000); }
   catch {}
 };
 for (const d of ['/lib/x86_64-linux-gnu', '/usr/lib/x86_64-linux-gnu', '/lib64']) {
@@ -712,6 +713,10 @@ let pass = 0, fail = 0;
 const failures = [];
 for (const [name, bin, args, opts] of CASES) {
   if (!pick(name)) continue;
+  // V8 does not collect a finished case's wasm memory on its own pressure
+  // accounting: without this a chunk of 50 cases grew to 13.7 GB and was
+  // OOM-killed (run with --expose-gc; a no-op without it)
+  if (globalThis.gc) globalThis.gc();
   if (!existsSync(bin)) { console.log(`  SKIP ${name.padEnd(9)} (${bin} not present)`); continue; }
   const stdin = STDIN[name] || null;
   if (opts && opts.tree) for (const t of [].concat(opts.tree)) walk(t);
@@ -727,6 +732,7 @@ for (const [name, bin, args, opts] of CASES) {
     console.log(`  ok   ${name.padEnd(9)} ${String(nat.out.length).padStart(8)}B out, ` +
                 `${eng.units} fns, ${(eng.ms).toFixed(0)}ms yields=${eng.yields}`);
     if (process.env.BREADTH_STDERR && eng.stderr) console.log(`         guest stderr: ${JSON.stringify(eng.stderr.slice(0, 600))}`);   // BREADTH_STDERR=1: show it on success too (warnings the byte compare cannot see)
+    if (process.env.BREADTH_MEM) { const m = process.memoryUsage(); console.log(`         host rss ${(m.rss / 1e6) | 0}MB heap ${(m.heapUsed / 1e6) | 0}MB ext ${(m.external / 1e6) | 0}MB ab ${(m.arrayBuffers / 1e6) | 0}MB`); }   // BREADTH_MEM=1: host memory after each case (a chunk was OOM-killed at 13.7 GB)
     if (eng.unknown.length) console.log(`         ENOSYS syscalls: ${eng.unknown.join(' ')}`);
     if (eng.ioctls.length) console.log(`         ENOTTY ioctls: ${eng.ioctls.join(' ')}`); }
   else { fail++;
