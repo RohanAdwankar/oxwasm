@@ -4668,6 +4668,19 @@ every deferred closure unit ahead of it in the queue - 1.3 s of the
 40 s clang run for stubs that assemble in a millisecond; synchronous
 requests now have their own shell, clang -S 38 s to 34-36 s.
 
+**A race the deferred path opened.** The sweep over the new defaults
+failed one case in 182: recycle, the page-recycle fixture (tier code A
+on an rwx page, munmap it, map code B at the same address), printed
+A's answer once. munmap drops address-keyed translations, but a unit
+still in the assembler's queue is not in any table yet; when its bytes
+came back it registered A's translation over B's page. The browser's
+off-thread compile has the same window. Both paths now record in-flight
+units; invalidation (munmap, mremap) cancels those holding any address
+in the range, and a cancelled unit is discarded when it lands.
+Invalidation also clears the call profile, the closure-pruning set and
+the known-entry set for the range, so recycled code profiles and joins
+closures afresh rather than inheriting the old code's history.
+
 What the gated clang profile (40 s) leaves: the emitter 4.7 s self plus
 4.5 s of garbage collection, 3.9 s of module instantiation even with
 lazy compilation, 2.9 s of decode plus analysis, 1.6 s interpreting
