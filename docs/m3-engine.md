@@ -4489,3 +4489,17 @@ flat ~2.3 GB per chunk where the killed chunks had climbed past 12 GB.
 Clean gate on b642e2e: the five-chunk cold sweep with `--expose-gc`,
 181 passes, 0 failures, no chunk killed, 67 minutes, every chunk flat
 at 2.3-3.8 GB except while cargo-build's own tree runs.
+
+### Where a compiler-scale run spends its time
+
+`OXWASM_PHASE=1` on rustc-asm (rustc -O emitting assembly for a
+two-function crate, 20,464 translated functions, 3,329 units, 1.77 GB
+of wat): of 778 s wall, analysis took 305 s, emit 152 s, inlining 16 s
+(the funcref scan is nothing). Translation is 61% of the run before
+the assembler's own time is counted, and 4,110 unit translations
+re-emitted 13,176 functions, so closure duplication is a large part of
+it. For programs of this size the engine is translation-bound, not
+execution-bound: an analysis cache keyed by function address (valid
+until the code's pages change) and less closure duplication are the
+levers, and they belong to the steady-state work rather than to
+breadth.
