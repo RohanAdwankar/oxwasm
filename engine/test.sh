@@ -37,6 +37,7 @@ node hintnoptest.mjs
 node entryflagtest.mjs
 node addflagtest.mjs
 node adctest.mjs
+node picguardtest.mjs
 node enginetest.mjs
 node atomictest.mjs
 node fcmptest.mjs

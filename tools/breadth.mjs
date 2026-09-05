@@ -172,6 +172,10 @@ if (!existsSync(RHELLO) && existsSync(RUST + '/bin/rustc')) {
     execFileSync(RUST + '/bin/rustc', ['-O', '-o', RHELLO, '/tmp/breadth_hello.rs'], { cwd: '/tmp' });
   } catch (e) { console.log('  (rustc unavailable: ' + String(e.stderr || e.message).split('\n')[0] + ')'); }
 }
+const TINY_RS = '/tmp/breadth_tiny.rs';
+if (!existsSync(TINY_RS)) writeFileSync(TINY_RS, [
+  'pub fn fib(n: u32) -> u64 { if n < 2 { n as u64 } else { fib(n - 1) + fib(n - 2) } }',
+  'fn main() { println!("{}", fib(20)); }', ''].join('\n'));
 const PROCFS = '/tmp/breadth_procfs';
 if (!existsSync(PROCFS)) {
   try { execFileSync('gcc', ['-O1', '-pthread', '-o', PROCFS,
@@ -297,6 +301,10 @@ const CASES = [
   // the whole -O2 pipeline compared as text
   ['rustc-version', RUST + '/bin/rustc', ['--version', '--verbose'], { memMB: 3072, tree: RUST + '/lib' }],
   ['clang-S', '/usr/bin/clang', ['-S', '-O2', '-o', '-', HELLO_C], { memMB: 2048 }],
+  // rustc optimising and emitting a crate in-process: seven threads, ~3,300
+  // units, the PIC-table guard-vs-case-test bug fell out of it (450 s cold)
+  ['rustc-asm', RUST + '/bin/rustc', ['-O', '--emit=asm', '--crate-type', 'bin', '-o', '/tmp/breadth_tiny.s', TINY_RS],
+              { memMB: 3072, tree: RUST + '/lib', bins: [TINY_RS], outFile: '/tmp/breadth_tiny.s' }],
   ['gpg-md',  '/usr/bin/gpg',     ['--batch', '--print-md', 'SHA256', IN], { memMB: 1024 }],   // libgcrypt: mlock'd secure memory, a fresh ~/.gnupg
   ['xz',      '/usr/bin/xz',      ['-9', '-c', IN], { memMB: 1536 }],
   ['xz-1',    '/usr/bin/xz',      ['-1', '-c', IN]],

@@ -495,10 +495,23 @@ export function analyze(mem, entry, { maxInsns = 20000, noJtab = false, entries 
     // table's end are small numbers that land inside the plausibility
     // window and would become phantom block leaders splitting real
     // instructions (perl and awk faulted that way). No guard, no table.
+    // The guard is the compare an UNSIGNED branch consumes (`ja`/`jae`
+    // to the default, `jb`/`jbe` into the switch): a `cmp $K, %idx; je`
+    // between the guard and the load is a case test, not a bound. LLVM
+    // put one there (FindRoots in libLLVM: `cmp $0x1f, %eax; je` after
+    // bounds-checking a copy of the index in %cl), the table was read
+    // with 32 entries instead of 11, two of them landed inside real
+    // instructions, and the misaligned stream swallowed a `jmp` at a
+    // deopt target: rustc's compile died on a wild address.
     const idx = ld.src.index; let cur = ld, n = -1;
     for (let s = 0; s < 12 && n < 0; s++) {
       const q = byNext.get(cur.rip.toString()); if (!q || q.mnem === 'udec') break;
-      if (q.mnem === 'cmp' && q.dst?.kind === 'reg' && q.dst.r === idx && q.src?.kind === 'imm') n = Number(q.src.v) + 1;
+      if (q.mnem === 'cmp' && q.dst?.kind === 'reg' && q.dst.r === idx && q.src?.kind === 'imm') {
+        const br = insnAt.get(q.next.toString());
+        if (br?.mnem === 'jcc' && (br.cond === 'a' || br.cond === 'ae' || br.cond === 'b' || br.cond === 'be'))
+          n = Number(q.src.v) + (br.cond === 'a' || br.cond === 'be' ? 1 : 0);   // ja/jbe: K is the last index; jae/jb: K is the count
+        else break;                                          // a case test on the index: no guard between here and the load
+      }
       else if (wrReg(q, idx) && q.mnem !== 'movzx' && q.mnem !== 'mov' && q.mnem !== 'sub' && q.mnem !== 'add' && q.mnem !== 'lea') break;
       cur = q;
     }
