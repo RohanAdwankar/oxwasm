@@ -111,6 +111,21 @@ const CONDWAIT = '/tmp/breadth_condwait';
 if (!existsSync(CONDWAIT)) {   // pthread_cond_timedwait with no signaller, three condvar clocks: a timed futex wait must time out
   try { execFileSync('gcc', ['-O1', '-pthread', '-o', CONDWAIT, new URL('./fixtures/condwait.c', import.meta.url).pathname]); } catch {}
 }
+const JHELLO = '/tmp/breadth_jhello';
+if (!existsSync(JHELLO + '/Hello.class')) {   // Java: HotSpot's runtime-generated template interpreter running bytecode
+  try {
+    execFileSync('mkdir', ['-p', JHELLO]);
+    writeFileSync(JHELLO + '/Hello.java', [
+      'public class Hello {',
+      '  public static void main(String[] a) {',
+      '    long s = 0; for (int i = 0; i < 200000; i++) s += (i * 7L) % 13;',
+      '    StringBuilder b = new StringBuilder(); for (int i = 0; i < 5; i++) b.append(i).append(\',\');',
+      '    System.out.println("hello from java " + s + " " + b + " " + Integer.toHexString(0xCAFE) + " " + Math.sqrt(2.0));',
+      '  }',
+      '}', ''].join('\n'));
+    execFileSync('/usr/lib/jvm/java-21-openjdk-amd64/bin/javac', ['-d', JHELLO, JHELLO + '/Hello.java'], { env: { PATH: process.env.PATH } });
+  } catch (e) { console.log('  (javac unavailable: ' + String(e.stderr || e.message).split('\n')[0] + ')'); }
+}
 const GOSTR = '/tmp/breadth_gostrings';
 if (!existsSync(GOSTR)) {
   // Go: the runtime's page allocator (huge PROT_NONE reservations, rcr),
@@ -249,6 +264,8 @@ const CASES = [
   // mappings over holes, and glibc's PIC jump tables all fell out of it
   ['java-version', '/usr/lib/jvm/java-21-openjdk-amd64/bin/java', ['-Xint', '-XX:+UseSerialGC', '-Xshare:off', '-Xmx256m', '-version'],
               { memMB: 3072, tree: '/usr/lib/jvm/java-21-openjdk-amd64' }],
+  ['java-hello', '/usr/lib/jvm/java-21-openjdk-amd64/bin/java', ['-Xint', '-XX:+UseSerialGC', '-Xshare:off', '-Xmx256m', '-cp', '/tmp/breadth_jhello', 'Hello'],
+              { memMB: 3072, tree: ['/usr/lib/jvm/java-21-openjdk-amd64', '/tmp/breadth_jhello'] }],
   ['xz',      '/usr/bin/xz',      ['-9', '-c', IN], { memMB: 1536 }],
   ['xz-1',    '/usr/bin/xz',      ['-1', '-c', IN]],
   ['gzip',    '/bin/gzip',        ['-9', '-c', IN]],

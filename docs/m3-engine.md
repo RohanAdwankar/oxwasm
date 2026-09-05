@@ -4172,3 +4172,18 @@ compiled, banner printed, exit 0): the loop-rooted interaction parked
 above ran through the chain form of exactly these switches. Suite
 exact; perl, perl-fork, awk, awk-prog, gzip, m4, python3, jq, bc, git
 byte-identical.
+
+**Java bytecode runs translated.** A hello-world class - a 200k-iteration
+long loop, StringBuilder, `Integer.toHexString`, `Math.sqrt` - prints
+exactly what native prints (`hello from java 1199992 0,1,2,3,4, cafe
+1.4142135623730951`), exit 0, ten JVM threads, 325 s cold. That is
+HotSpot's template interpreter - machine code the JVM generates at
+startup into its code cache - executing bytecode under the engine's
+own translation, on top of the VM init that took the vsyscall page,
+pushf/popf, timed futex waits, hole-carving fixed mappings and PIC
+jump tables to reach. The sweep on this head is green in four chunks
+(164 case runs, zero failures); `java-version` and `java-hello` are
+cases.
+For steady state the structured tables are not a lever on m4 (8.55x,
+inside its 8.3-9.1x spread); they are a correctness and generality
+change first.
