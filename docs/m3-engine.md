@@ -4398,3 +4398,34 @@ ld. Three things fell out before rustc ran at all:
   answering a given errno as it happens, which is how socketpair was
   found among statx, clone3 and rseq (all ENOSYS by design, with glibc
   and std fallbacks).
+
+Then rustc ran under cargo and died with a JavaScript RangeError, the
+parent recording the child as exit 127 and cargo waiting on a pipe that
+never closed. The child's error stack (kept on the child record now)
+pointed at getrandom: Rust std probes availability with a zero-length
+buffer at a dangling pointer (address 1), Linux answers 0 without
+touching memory, and the engine's zero-byte copy to a negative offset
+threw. Zero-length getrandom now answers 0 whatever the pointer, and a
+pointer outside guest memory answers EFAULT instead of throwing.
+
+With rustc through, the link failed: rust-lld rejected an empty
+`-plugin-opt=`. gcc expands `%(lto_wrapper)` in its link spec from
+wherever it found `lto-wrapper`, and with that file not provisioned the
+option is empty; GNU ld tolerates it, rust-lld does not. A provisioning
+matter, recorded on the case. The remaining warning, "error finalizing
+incremental compilation session directory", was rename(2) on a
+directory: directories exist here as path prefixes plus the mkdir set,
+and rename moved a single file entry. A directory rename now moves
+every entry under the prefix (files, symlinks, mkdir'd subdirectories,
+mtimes); renameat and renameat2 (NOREPLACE) route to the same code.
+The `renamedir` fixture pins the tree move, an empty directory, a
+directory over a file, a move into itself and NOREPLACE.
+
+`cargo build --offline` on the crate then finishes in 468 s cold with
+the binary byte-identical to native's: cargo, rustc (7 threads), cc,
+collect2, ld.lld and rust-lld, 3,805 translated functions across the
+tree. Two host-loop lessons from the chase: signal handlers never fire
+while runbin's loop is synchronous, so state is sampled through files
+(`SAMPLEFILE` prints the tree and continues, `STOPFILE` prints and
+exits), and children reaped inside one run slice are invisible to a
+sweep of `eng.children`, hence the `onChildEngine` hook.

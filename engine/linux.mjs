@@ -1240,6 +1240,36 @@ export class LinuxEngine {
     return m;
   }
   fsBump() { this._fsMeta().v++; }
+  // rename(2) for a file, a symlink or a DIRECTORY. Directories exist here
+  // only as prefixes of file paths plus the mkdir set, so a directory rename
+  // moves every entry under the old prefix. rustc finalises an incremental
+  // session by renaming its `-working` directory and warned on every build
+  // when only files could move. flags: RENAME_NOREPLACE (1) -> EEXIST when
+  // the target exists; RENAME_EXCHANGE (2) is not modelled (EINVAL).
+  _rename(po, pn, flags) {
+    if (po === pn) return 0n;
+    const m = this._fsMeta();
+    const exists = (q) => this.files[q] !== undefined || m.links.has(q) || this.isDir(q);
+    if (flags & 2) return -22n;
+    if ((flags & 1) && exists(pn)) return -17n;
+    const mv = (a, b) => { if (this.mtimes && this.mtimes[a] !== undefined) { this.mtimes[b] = this.mtimes[a]; delete this.mtimes[a]; } };
+    if (this.files[po] !== undefined) {
+      if (this.isDir(pn) && this.files[pn] === undefined) return -21n;   // EISDIR: a file over a directory
+      this.files[pn] = this.files[po]; delete this.files[po]; m.links.delete(pn); mv(po, pn); this.fsBump(); return 0n;
+    }
+    if (m.links.has(po)) { m.links.set(pn, m.links.get(po)); m.links.delete(po); delete this.files[pn]; mv(po, pn); this.fsBump(); return 0n; }
+    if (this.isDir(po)) {
+      if (this.files[pn] !== undefined || m.links.has(pn)) return -20n;   // ENOTDIR: a directory over a file
+      if (pn.startsWith(po + '/')) return -22n;                          // into itself
+      const pre = po + '/', npre = pn + '/';
+      for (const k of Object.keys(this.files)) if (k.startsWith(pre)) { const nk = npre + k.slice(pre.length); this.files[nk] = this.files[k]; delete this.files[k]; mv(k, nk); }
+      for (const [k, t] of [...m.links]) if (k.startsWith(pre)) { m.links.set(npre + k.slice(pre.length), t); m.links.delete(k); }
+      for (const d of [...m.dirs]) if (d === po || d.startsWith(pre)) { m.dirs.delete(d); m.dirs.add(pn + d.slice(po.length)); }
+      if (!m.dirs.has(pn)) m.dirs.add(pn);                               // an empty directory survives the move
+      mv(po, pn); this.fsBump(); return 0n;
+    }
+    return -2n;
+  }
   // a guest path is a directory iff some provided file lives under it,
   // or the guest mkdir'd it
   isDir(p) {
@@ -2842,9 +2872,11 @@ export class LinuxEngine {
         h.bytes = nb; if (h.path && this.files[h.path] !== undefined) this.files[h.path] = nb;
         ret(0n); break; }
       case 82: {                                              // rename(old, new)
-        const po = this.norm(this.readPath(a1)), pn = this.norm(this.readPath(a2));
-        if (this.files[po] === undefined) { ret(-2n); break; }
-        this.files[pn] = this.files[po]; delete this.files[po]; this.fsBump(); ret(0n); break; }
+        ret(this._rename(this.norm(this.readPath(a1)), this.norm(this.readPath(a2)), 0)); break; }
+      case 264: {                                             // renameat(olddirfd, old, newdirfd, new)
+        ret(this._rename(this.norm(this.atPath(a1, a2)), this.norm(this.atPath(a3, cpu.regs[10])), 0)); break; }
+      case 316: {                                             // renameat2(olddirfd, old, newdirfd, new, flags)
+        ret(this._rename(this.norm(this.atPath(a1, a2)), this.norm(this.atPath(a3, cpu.regs[10])), Number(cpu.regs[8]))); break; }
       case 95: ret(0o022n); break;                            // umask
       case 137: case 138: {                                   // statfs / fstatfs: tmpfs-ish dummy
         const buf = a2, o = this.RAMOFF + Number(buf - this.base);
