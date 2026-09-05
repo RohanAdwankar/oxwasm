@@ -80,6 +80,14 @@ const pad4 = (n) => (n + 3) & ~3;
 // ---- the server ------------------------------------------------------------
 import { builtinFont } from './font5x7.mjs';
 
+// Debug hooks read from the environment ONCE, behind typeof: `process` is
+// not declared in a browser, and `process?.env` still throws ReferenceError
+// there. A per-request read of it in the atom/font handlers took every
+// InternAtom and OpenFont down in the packed GIMP page - the File menu never
+// appeared - from 855590d until this line.
+const XFONTTRACE = typeof process !== 'undefined' && !!process.env?.XFONTTRACE;
+const XFONTDBG = typeof process !== 'undefined' && !!process.env?.XFONTDBG;
+
 export class XServer {
   constructor({ width = 800, height = 600, fonts = {} } = {}) {
     this.W = width; this.H = height;
@@ -517,7 +525,7 @@ export class XServer {
     }
   }
   expose(w, x, y, ww, hh) {
-    if (process?.env?.XFONTTRACE)
+    if (XFONTTRACE)
       console.error(`<xexpose 0x${w.id.toString(16)} ${ww}x${hh} mask=0x${(w.eventMask||0).toString(16)}`
         + `${!w.conn ? ' NOCONN' : ''}${!(w.eventMask & 0x8000) ? ' NO-EXPOSUREMASK' : ''}>`);
     if (!w.conn || !(w.eventMask & 0x8000)) return;
@@ -535,12 +543,12 @@ export class XServer {
     // for. XCreateFontSet failing shows up here as the pattern Xlib probes;
     // wrapping handle() from outside a test turned out not to work, so the
     // hook lives in the server.
-    if (process?.env?.XFONTTRACE && (op === 16 || op === 17)) {
+    if (XFONTTRACE && (op === 16 || op === 17)) {
       if (op === 17) console.error(`<xfont GetAtomName ${v.getUint32(4, true)} -> ${this.atoms[v.getUint32(4, true)] ?? '(none)'}>`);
       else { let n = ''; const ln = v.getUint16(4, true); for (let i = 0; i < ln; i++) n += String.fromCharCode(req[8 + i]);
              console.error(`<xfont InternAtom "${n}">`); }
     }
-    if (process?.env?.XFONTTRACE && (op === 74 || op === 76 || op === 75 || op === 77)) {
+    if (XFONTTRACE && (op === 74 || op === 76 || op === 75 || op === 77)) {
       // what text actually reaches the server, and for which drawable
       let t = '';
       if (op === 76 || op === 77) { const n = req[1];
@@ -549,7 +557,7 @@ export class XServer {
         for (let i = 0; i < n && 18 + i < req.length; i++) t += String.fromCharCode(req[18 + i]); }
       console.error(`<xtext op=${op} drawable=0x${v.getUint32(4, true).toString(16)} "${t}">`);
     }
-    if (process?.env?.XFONTTRACE && op >= 45 && op <= 52) {
+    if (XFONTTRACE && op >= 45 && op <= 52) {
       const NM = { 45:'OpenFont', 46:'CloseFont', 47:'QueryFont', 48:'QueryTextExtents',
                    49:'ListFonts', 50:'ListFontsWithInfo', 51:'SetFontPath', 52:'GetFontPath' };
       let txt = '';
@@ -838,7 +846,7 @@ export class XServer {
         const maxn = u16(4), n = u16(6);
         const pat = str(8, n);
         const names = this.listFonts(pat).slice(0, maxn);
-        if (process?.env?.XFONTDBG) console.error(`<ListFonts "${pat}" -> ${JSON.stringify(names.slice(0,2))}>`);
+        if (XFONTDBG) console.error(`<ListFonts "${pat}" -> ${JSON.stringify(names.slice(0,2))}>`);
         let total = 0; for (const nm of names) total += 1 + nm.length;
         this.reply(conn, 0, 0, total, (r) => {
           r.u16(8, names.length);

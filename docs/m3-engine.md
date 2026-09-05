@@ -4207,3 +4207,43 @@ The full cold sweep through the broker (cache cleared, 164 case runs
 in four chunks, zero failures) took **39 minutes**, against over an
 hour before; the last chunk carries java-version, java-hello, ffmpeg
 and node-jit and is 14 of those minutes.
+
+### The shipped GIMP page on the current engine
+
+The regression check that mattered: the shipped page had not been
+rebuilt since Aug 30 (its embedded engine is exactly commit 95ff27e),
+and rebuilding it exposed three things in turn.
+
+1. A units-only repack cannot work once the emitter needs a runtime
+   import the old shell lacks: units emitted after the loop yield
+   import `env.loophot`, every recompiled unit failed to instantiate,
+   GIMP ran interpreted and the File menu timed out. The page's
+   snapshot memory image survives only as its sidecars, so a full
+   xpack run is impossible; `tools/gui/reshell.mjs` splices the
+   current engine modules into the shipped shell and swaps the units
+   container, keeping state/mem/rom. xpack's fixed engine module list
+   had gone stale on the way (xserver imports font5x7.mjs); both tools
+   now walk the import closure.
+2. With the current engine and even the shipped units, the File menu
+   never appeared. A bisect over the 96 engine commits since 95ff27e
+   (re-shell on each commit's engine, Chromium stroke check) named
+   855590d - a node-only trace hook in the X server that read
+   `process?.env?.XFONTTRACE` per atom/font request. `process` is not
+   declared in a browser and optional chaining does not save an
+   undeclared identifier: every InternAtom and OpenFont threw, and a
+   menu popup needs both. The hooks now read the environment once,
+   behind `typeof process`. A restore-side bug was fixed on the way (a
+   restored engine had no mmap arena base, so the new hole list could
+   hand live memory out twice); it was real, but not this.
+3. Twenty-four stale headless Chromium instances from chains the
+   hourly container restarts had killed sat on cdp_draw's fixed
+   debugging port and answered its probes with a wedged page; the
+   probe also bailed on a page still applying units at its first
+   window query. Both fixed in the tool.
+
+Shipped: the re-shelled page (current engine, 10 modules) with the
+units recompiled by the current emitter (5,744 of 7,810 recompiled,
+2,066 keep old bytes: trampolines and export-losing units; the
+container is 88.1 → 86.4 MB raw with PIC jump tables). Chromium: File >
+New > OK, five strokes, ink drawn, **19.8 ms median input-to-paint**
+against 21.3 ms for the old page the same night. Suite exact.
