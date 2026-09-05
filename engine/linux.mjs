@@ -387,7 +387,34 @@ export class LinuxEngine {
   // off-thread paths (async assemble, async compile): a placeholder null is
   // already in aotFns for the entry, so `get` — not `has` — is what decides
   // whether an address still needs registering.
+  // Code in [lo, hi) is gone (munmap, mremap away): drop every artifact keyed
+  // in the range - compiled units, failures, the loop tier, both profiles, the
+  // closure-pruning and known-entry sets (a fresh mapping here must be able
+  // to join closures again) - cancel in-flight units that hold any of it, and
+  // rebuild the dispatch hash if anything compiled was dropped.
+  _invalidateCode(lo, hi) {
+    const inR = (k) => k >= lo && k < hi;
+    let hit = false;
+    for (const k of this.aotFns.keys()) if (inR(k)) { this.aotFns.delete(k); hit = true; }
+    for (const k of this.aotFailed) if (inR(k)) this.aotFailed.delete(k);
+    if (this.compiled) for (const k of this.compiled.keys()) if (inR(k)) this.compiled.delete(k);
+    if (this.profile) for (const k of this.profile.keys()) if (inR(k)) this.profile.delete(k);
+    for (const k of this.aotCalls.keys()) if (inR(k)) { this.aotCalls.delete(k); this._callTargets?.delete(k.toString()); }
+    for (const k of this._ftSeen) if (inR(k)) { this._ftSeen.delete(k); this._entries?.delete(k.toString()); }
+    if (this._inflight) for (const u of this._inflight) if (u.funcs.some(inR)) {
+      u.cancelled = true;
+      if (this._pendingFns) for (const a of u.funcs) this._pendingFns.delete(a.toString());
+    }
+    if (hit) this.rebuildFtmap();
+  }
   finishAotUnit(unit, instance) {
+    this._inflight?.delete(unit);
+    // An in-flight unit (deferred assembly, or the browser's off-thread
+    // compile) whose code was munmapped meanwhile: registering it would put
+    // the OLD code's translation at the address the guest has since reused.
+    // The recycle fixture caught this once in an 182-case sweep under
+    // deferred assembly: A's answer from a page that now held B.
+    if (unit.cancelled) return;
     for (const a of unit.funcs)
       if (!this.aotFns.get(a)) this.registerAotFn(a, instance.exports['f_' + a.toString(16)]);
     if (instance.exports.drive) this.aotDrive = instance.exports.drive;
@@ -557,6 +584,7 @@ export class LinuxEngine {
       // same entry on every call while the worker is busy.
       if (this.assembleWatAsync) {
         this.aotFns.set(k, null);
+        (this._inflight ??= new Set()).add(unit);
         this.assembleWatAsync(unit.wat)
           .then((bytes) => {
             if (this.onUnitBytes) this.onUnitBytes(k, bytes);
@@ -576,8 +604,11 @@ export class LinuxEngine {
       if (this.assembleWatDeferred) {
         this.aotFns.set(k, null);
         for (const a of unit.funcs) (this._pendingFns ??= new Set()).add(a.toString());
+        (this._inflight ??= new Set()).add(unit);
         this.assembleWatDeferred(unit.wat, (bytes, err) => {
           for (const a of unit.funcs) this._pendingFns.delete(a.toString());
+          this._inflight.delete(unit);
+          if (unit.cancelled) return;                    // its code was recycled while it assembled
           if (err) { this.aotFns.delete(k); this.aotFailed.add(k); if (this.onAotFail) this.onAotFail(entry, err.message); return; }
           try {
             if (this.onUnitBytes) this.onUnitBytes(k, bytes);
@@ -598,6 +629,7 @@ export class LinuxEngine {
       // dispatch site treats a null entry as not-compiled.
       if (this.asyncCompile) {
         this.aotFns.set(k, null);
+        (this._inflight ??= new Set()).add(unit);
         WebAssembly.instantiate(bytes, this.aotImports())
           .then(({ instance }) => this.finishAotUnit(unit, instance))
           .catch((e) => { this.aotFns.delete(k); this.aotFailed.add(k);
@@ -1730,12 +1762,7 @@ export class LinuxEngine {
         const inR = (k) => k >= lo && k < hi;
         this._unmapRange(lo, hi);                            // shared-mapping write-back
         this._mmapGive(lo, align(a2, PAGE));                 // the arena reuses it
-        let hit = false;
-        for (const k of this.aotFns.keys()) if (inR(k)) { this.aotFns.delete(k); hit = true; }
-        for (const k of this.aotFailed) if (inR(k)) this.aotFailed.delete(k);
-        if (this.compiled) for (const k of this.compiled.keys()) if (inR(k)) this.compiled.delete(k);
-        if (this.profile) for (const k of this.profile.keys()) if (inR(k)) this.profile.delete(k);
-        if (hit) this.rebuildFtmap();
+        this._invalidateCode(lo, hi);
         ret(0n); break; }
       case 10: ret(0n); break;                               // mprotect (no page prot here)
       case 273: ret(0n); break;                              // set_robust_list
@@ -2972,9 +2999,7 @@ export class LinuxEngine {
         this.ram.copyWithin(o0, Number(a1 - this.base), Number(a1 - this.base) + Number(oldLen));
         for (const m of this.maps ?? []) if (m.at === a1) { m.at = at; m.len = newLen; }   // the record follows the pages
         for (const t of this.threads) t.cpu.icache?.clear();
-        let hit = false;
-        for (const k of this.aotFns.keys()) if (k >= a1 && k < a1 + oldLen) { this.aotFns.delete(k); hit = true; }
-        if (hit) this.rebuildFtmap();
+        this._invalidateCode(a1, a1 + oldLen);
         ret(at); break; }
       case 26: {                                              // msync(addr, len, flags)
         for (const m of this.maps ?? []) if (m.shared && m.at < a1 + a2 && m.at + m.len > a1) this._writeBackMap(m);
