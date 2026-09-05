@@ -4445,3 +4445,11 @@ the flag; the sweep script passes it), and the 4 GB floor was the
 library provisioning read twice, once under `/lib` and once under
 `/usr/lib`; the bytes are shared by realpath now, as runbin already
 did (its probe baseline went 4.3 GB to 1.5 GB earlier today).
+
+Gate for batch 8 on head cb8d07c: every defined case green (chunks 1-4
+of the sweep, 158 passes, plus the 21 cases the killed chunks had not
+reached, run separately with `--expose-gc`). One thing the memory
+lines show even with collection: after cargo-build and rustc-asm the
+host keeps ~2.7 GB of JS heap and ~12 GB of wasm memory that light
+cases never free; something in a run with children or threads is
+retained after the case ends. Open item.
