@@ -4124,3 +4124,23 @@ its SIGSEGV handler - so this is a wrong answer from something
 earlier, not the missing fault delivery that HotSpot will need next
 (safepoint polls, implicit null checks and stack banging all run on
 SIGSEGV). Open.
+
+**java, translated: an unlocated tiering interaction.** With the timed
+futex fix `java -Xint -version` runs interpreter-only. Translated it
+dies at a NULL class mirror in VM init, deterministically per
+configuration, and the culprit moves: with loop-head roots off (no
+back-edge tier-up) it passes; with the loop threshold at 100k it
+passes; at 30k it fails and vetoing one unit, glibc's
+`pthread_mutex_trylock` (rooted through a backward `jmp` to its entry),
+makes it pass; at the default threshold that veto no longer helps and
+another unit takes its place. trylock's translation passes two C
+differentials (four mutex kinds, contention, a second thread), the
+engine's shadow mode finds only dead-flag differences at returns in
+libc, and the JVM's debug log is identical up to the fault whether or
+not trylock is vetoed. So this is not one miscompiled function: some
+mechanism around loop-rooted units misbehaves in HotSpot's threaded
+init and which unit exposes it depends on tiering order. Levers that
+do NOT change it: loop yield, unroll, loop layout, inliner, tiny
+un-prune, tail cuts, narrowing, TLAB, compressed oops. Parked with
+the tools it produced: `LOOPUNITS`, `LOOPTHRESH`, `FNALLOW`/`FNVETO`,
+`UNITVETOADDR`, `SHADOWLIB`, `STOPFILE`.
