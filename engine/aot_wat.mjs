@@ -3050,7 +3050,8 @@ export function compileUnitWat(mem, entry, opts = {}) {
       let an;
       try { const tA = PHASE ? performance.now() : 0;
             an = analyze(mem, a, { maxInsns, noJtab: !!globalThis.__noJtab, entries: opts.entries ?? null, callTargets: opts.callTargets ?? null });
-            if (PHASE) { PH.analyzed++; PH.seen.add(k); let n = 0; for (const b of an.blocks) n += b.insns.length; PH.analyzedInsns += n;
+            if (PHASE) { PH.analyzed++; let n = 0; for (const b of an.blocks) n += b.insns.length; PH.analyzedInsns += n;
+              if (PH.seen.has(k)) { PH.dup = (PH.dup ?? 0) + 1; PH.dupInsns = (PH.dupInsns ?? 0) + n; PH.dupMs = (PH.dupMs ?? 0) + performance.now() - tA; } else PH.seen.add(k);
               const bk = n < 100 ? '<100' : n < 500 ? '<500' : n < 2000 ? '<2000' : n < 8000 ? '<8000' : '>=8000';   // per-size buckets: [analyses, ms, insns]
               const h = (PH.hist ??= {})[bk] ??= [0, 0, 0]; h[0]++; h[1] += performance.now() - tA; h[2] += n; } }
       catch (e) {
