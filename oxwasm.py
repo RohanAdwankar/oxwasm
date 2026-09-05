@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+"""oxwasm — package unmodified Linux software as a single static HTML file.
+
+    oxwasm build --kernel vmlinuz --initrd initrd.gz -o linux.html
+    oxwasm build boot.iso -o out.html
+    oxwasm build --kernel vmlinuz disk.img -o app.html
+    oxwasm build app.AppImage           # roadmap: see the error it prints
+
+The output is one self-contained .html: open it from disk, from a static
+host, or email it to someone. No server, no network, no install. Inside is
+a WASM x86 machine (v86) booting the exact bytes you gave it. Payloads are
+gzip-compressed and inflated in-browser with DecompressionStream.
+"""
+import argparse
+import base64
+import gzip
+import json
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+RUNTIME = os.environ.get("OXWASM_RUNTIME", os.path.join(HERE, "runtime"))
+
+def is_elf64_x86_64(path):
+    try:
+        with open(path, "rb") as f:
+            h = f.read(20)
+        return h[:4] == b"\x7fELF" and h[4] == 2 and h[18:20] == b"\x3e\x00"
+    except OSError:
+        return False
+
+
+def cmd_build_m3(target, args):
+    """x86-64 ELF or AppImage -> single HTML on the M3 engine (tier-0
+    interpreter + runtime x86-64 -> WebAssembly AOT, assembled in-page)."""
+    import subprocess
+    cmd = ["node", os.path.join(HERE, "tools", "m3pack.mjs"), target,
+           "-o", args.out, "--title", args.title if args.title != "oxwasm" else os.path.basename(target)]
+    for a in (args.app_arg or []):
+        cmd += ["--arg", a]
+    for fspec in (args.app_file or []):
+        cmd += ["--file", fspec]
+    subprocess.run(cmd, check=True)
+
+
+def gzb64(path_or_bytes, level=6):
+    data = path_or_bytes
+    if isinstance(data, str):
+        with open(data, "rb") as f:
+            data = f.read()
+    return base64.b64encode(gzip.compress(data, level)).decode()
+
+
+def runtime_file(name):
+    p = os.path.join(RUNTIME, name)
+    if not os.path.exists(p):
+        sys.exit(f"error: runtime file missing: {p}\nrun ./fetch-runtime.sh first")
+    return p
+
+
+def build_html(*, title, memory_mb, vga_mb, cmdline, images, out, split_state=False,
+               split_disk=False):
+    cfg = {"memory_mb": memory_mb, "vga_mb": vga_mb, "cmdline": cmdline}
+    if split_disk and "hda" in images:
+        src = images.pop("hda")
+        sidecar = out + ".disk.img"
+        if os.path.abspath(src) != os.path.abspath(sidecar):
+            import shutil; shutil.copyfile(src, sidecar)
+        cfg["hda_url"] = os.path.basename(sidecar)
+        cfg["hda_size"] = os.path.getsize(sidecar)
+        print(f"oxwasm: wrote {sidecar} ({cfg['hda_size']/1e6:.1f} MB, "
+              f"served lazily via Range requests)")
+    if split_state and "state" in images:
+        sidecar = out + ".state.gz"
+        with open(images.pop("state"), "rb") as f, open(sidecar, "wb") as g:
+            g.write(gzip.compress(f.read(), 6))
+        cfg["state_url"] = os.path.basename(sidecar)
+        print(f"oxwasm: wrote {sidecar} ({os.path.getsize(sidecar)/1e6:.1f} MB, host next to the HTML)")
+    html = TEMPLATE
+    html = html.replace("__TITLE__", title)
+    html = html.replace("__CONFIG__", json.dumps(cfg))
+    html = html.replace("__LIBV86__", open(runtime_file("libv86.js")).read())
+    html = html.replace("__WASM_B64__", gzb64(runtime_file("v86.wasm"), 9))
+    html = html.replace("__BIOS_B64__", gzb64(runtime_file("bios.bin"), 9))
+    html = html.replace("__VGABIOS_B64__", gzb64(runtime_file("vgabios.bin"), 9))
+    for slot in ("bzimage", "initrd", "cdrom", "hda", "state"):
+        marker = "__%s_B64__" % slot.upper()
+        html = html.replace(marker, gzb64(images[slot]) if slot in images else "")
+    with open(out, "w") as f:
+        f.write(html)
+    print(f"oxwasm: wrote {out} ({os.path.getsize(out)/1e6:.1f} MB, fully self-contained)")
+
+
+def cmd_build(args):
+    images = {}
+    if args.target:
+        t = args.target
+        low = t.lower()
+        if not os.path.exists(t):
+            sys.exit(f"error: no such file: {t}")
+        if low.endswith(".appimage") or is_elf64_x86_64(t):
+            return cmd_build_m3(t, args)          # M3 lane: x86-64 -> wasm JIT
+        if low.endswith(".iso"):
+            images["cdrom"] = t
+        else:
+            images["hda"] = t
+    if args.kernel:
+        images["bzimage"] = args.kernel
+        if args.initrd:
+            images["initrd"] = args.initrd
+    if args.state:
+        images["state"] = args.state
+    if not images:
+        sys.exit("error: nothing to boot; give a TARGET or --kernel/--initrd")
+    build_html(title=args.title, memory_mb=args.memory, vga_mb=args.vga_memory,
+               cmdline=args.cmdline, images=images, out=args.out,
+               split_state=args.split_state, split_disk=args.split_disk)
+
+
+def main():
+    p = argparse.ArgumentParser(prog="oxwasm", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    b = sub.add_parser("build", help="package a guest into a single HTML file")
+    b.add_argument("target", nargs="?", help=".iso / disk image / .AppImage")
+    b.add_argument("--kernel", help="bzImage for direct Linux boot")
+    b.add_argument("--initrd", help="initramfs to pair with --kernel")
+    b.add_argument("--cmdline", default="console=ttyS0 console=tty0 rdinit=/init",
+                   help="kernel command line")
+    b.add_argument("--memory", type=int, default=256, help="guest RAM in MB")
+    b.add_argument("--vga-memory", type=int, default=16, help="VGA RAM in MB")
+    b.add_argument("--state", help="v86 save_state image: restore-to-ready instead of booting")
+    b.add_argument("--split-disk", action="store_true",
+                   help="serve the disk as a sidecar fetched lazily over HTTP Range "
+                        "requests — snapshots then exclude disk contents (much smaller)")
+    b.add_argument("--split-state", action="store_true",
+                   help="serve the state as a sidecar .state.gz fetched over HTTP "
+                        "(streamed + DecompressionStream) instead of inlining it — "
+                        "much faster load; needs the HTML hosted, not opened from disk")
+    b.add_argument("--title", default="oxwasm", help="page title")
+    b.add_argument("--app-arg", action="append",
+                   help="argument passed to an M3-lane program (repeatable)")
+    b.add_argument("--app-file", action="append", metavar="GUEST=HOST",
+                   help="file preloaded into the M3-lane guest FS (repeatable)")
+    b.add_argument("-o", "--out", default="out.html")
+    b.set_defaults(func=cmd_build)
+    args = p.parse_args()
+    args.func(args)
+
+
+TEMPLATE = r"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__</title>
+<style>
+  html,body{margin:0;height:100%;background:#0b0e14;color:#c8ccd4;
+    font:14px/1.5 ui-monospace,Menlo,Consolas,monospace}
+  #wrap{min-height:100%;display:flex;flex-direction:column;align-items:center;
+    justify-content:center;gap:14px;padding:16px;box-sizing:border-box}
+  #status{color:#7d8590;font-size:12px}
+  #screen_container{background:#000;padding:10px;border-radius:8px;
+    box-shadow:0 0 0 1px #1d2330,0 12px 40px rgba(0,0,0,.6);cursor:default}
+  #screen_container>div{white-space:pre;font:14px/14px ui-monospace,Menlo,Consolas,monospace}
+  #screen_container>canvas{display:block}
+  #foot{color:#4a5160;font-size:11px}
+  #foot b{color:#7d8590}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="status">unpacking machine&hellip;</div>
+  <div id="screen_container" tabindex="0"><div></div><canvas style="display:none"></canvas></div>
+  <div id="foot"><b>oxwasm</b> &middot; an unmodified operating system, executing in this tab &middot; no server, works offline &middot; click the screen to type</div>
+</div>
+<script>__LIBV86__</script>
+<script>
+"use strict";
+var CONFIG = __CONFIG__;
+var statusEl = document.getElementById("status");
+async function fetchState(url){
+  statusEl.textContent = "fetching machine state\u2026";
+  var resp = await fetch(url);
+  if(!resp.ok) throw new Error("state fetch failed: " + resp.status);
+  var ds = new Response(resp.body.pipeThrough(new DecompressionStream("gzip")));
+  return await ds.arrayBuffer();
+}
+async function unpack(s){
+  if(!s) return null;
+  var bin = atob(s), n = bin.length, u = new Uint8Array(n);
+  for(var i=0;i<n;i++) u[i] = bin.charCodeAt(i);
+  var ds = new Response(new Blob([u]).stream().pipeThrough(new DecompressionStream("gzip")));
+  return await ds.arrayBuffer();
+}
+(async function(){
+  var PAYLOAD = {
+    wasm:     await unpack("__WASM_B64__"),
+    bios:     await unpack("__BIOS_B64__"),
+    vga_bios: await unpack("__VGABIOS_B64__"),
+    bzimage:  await unpack("__BZIMAGE_B64__"),
+    initrd:   await unpack("__INITRD_B64__"),
+    cdrom:    await unpack("__CDROM_B64__"),
+    hda:      await unpack("__HDA_B64__"),
+    state:    CONFIG.state_url ? await fetchState(CONFIG.state_url) : await unpack("__STATE_B64__")
+  };
+  var opts = {
+    wasm_fn: function(env){
+      return WebAssembly.instantiate(PAYLOAD.wasm, env).then(function(r){return r.instance.exports;});
+    },
+    screen_container: document.getElementById("screen_container"),
+    memory_size: CONFIG.memory_mb << 20,
+    vga_memory_size: CONFIG.vga_mb << 20,
+    bios: {buffer: PAYLOAD.bios},
+    vga_bios: {buffer: PAYLOAD.vga_bios},
+    cmdline: CONFIG.cmdline,
+    autostart: true,
+    disable_speaker: true
+  };
+  if(PAYLOAD.bzimage) opts.bzimage = {buffer: PAYLOAD.bzimage};
+  if(PAYLOAD.initrd)  opts.initrd  = {buffer: PAYLOAD.initrd};
+  if(PAYLOAD.cdrom)   opts.cdrom   = {buffer: PAYLOAD.cdrom};
+  if(PAYLOAD.hda)     opts.hda     = {buffer: PAYLOAD.hda};
+  if(CONFIG.hda_url)  opts.hda     = {url: CONFIG.hda_url, size: CONFIG.hda_size, async: true};
+  if(PAYLOAD.state)   opts.initial_state = {buffer: PAYLOAD.state};
+
+  var emulator = window.emulator = new V86(opts);
+  window.__serial = "";                       // observable from test harnesses
+  emulator.add_listener("serial0-output-byte", function(b){
+    window.__serial += String.fromCharCode(b);
+  });
+  emulator.add_listener("emulator-started", function(){
+    statusEl.textContent = "machine started — booting…";
+  });
+  setInterval(function(){
+    var t = document.getElementById("screen_container").firstElementChild.textContent;
+    if(/[$#] $/m.test(t)) statusEl.textContent = "ready — this is a real shell; click and type";
+  }, 500);
+  document.getElementById("screen_container").addEventListener("click", function(){ this.focus(); });
+})();
+</script>
+</body>
+</html>
+"""
+
+if __name__ == "__main__":
+    main()

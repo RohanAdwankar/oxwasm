@@ -1,0 +1,4 @@
+resample-native*
+resample-clang*
+resample-gcc*
+*.o

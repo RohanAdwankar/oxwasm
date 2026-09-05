@@ -1,0 +1,39 @@
+#!/bin/busybox sh
+# oxwasm generic graphical init. Knows nothing about any specific
+# application: it brings up the console devices, the mouse, and X, then
+# runs whatever /etc/oxwasm-run contains (written by pack-app at build
+# time). Any app is just a different /etc/oxwasm-run.
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+/bin/busybox mount -t proc proc /proc
+/bin/busybox mount -t sysfs sysfs /sys
+/bin/busybox mount -t devtmpfs devtmpfs /dev 2>/dev/null
+/bin/busybox mount -t tmpfs tmpfs /tmp
+/bin/busybox mount -t tmpfs tmpfs /run
+exec > /dev/ttyS0 2>&1        # init log -> serial (VGA stays clean for X)
+echo "oxinit: starting"
+
+# load any guest kernel modules dropped in /lib/modules (e.g. psmouse)
+for m in /lib/modules/*.ko; do
+  [ -e "$m" ] && /bin/busybox insmod "$m" && echo "oxinit: loaded $(basename "$m")"
+done
+
+export HOME=/root DISPLAY=:0 XKB_BINDIR=/usr/bin
+echo "oxinit: starting Xorg"
+/usr/lib/xorg/Xorg :0 -config /etc/X11/xorg.conf -logfile /var/log/Xorg.0.log -noreset vt01 &
+n=0
+while [ ! -S /tmp/.X11-unix/X0 ] && [ $n -lt 120 ]; do /bin/busybox sleep 1; n=$((n+1)); done
+if [ ! -S /tmp/.X11-unix/X0 ]; then
+  echo "oxinit: XORG FAILED, log follows:"; /bin/busybox cat /var/log/Xorg.0.log
+  exec /bin/busybox sh
+fi
+echo "oxinit: X up after ${n}s"
+
+# optional window manager, then the application — both from build-time config
+[ -r /etc/oxwasm-wm ] && { echo "oxinit: WM $(cat /etc/oxwasm-wm)"; sh /etc/oxwasm-wm & /bin/busybox sleep 1; }
+cd /root
+if [ -r /etc/oxwasm-run ]; then
+  echo "oxinit: exec $(cat /etc/oxwasm-run)"
+  exec sh /etc/oxwasm-run
+fi
+echo "oxinit: no /etc/oxwasm-run; dropping to shell"
+exec /bin/busybox sh

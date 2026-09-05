@@ -1,0 +1,36 @@
+// Interaction soak on the packed GIMP page: menus open/close, tool select.
+import { spawn } from 'node:child_process';
+import { writeFileSync } from 'node:fs';
+const page = process.argv[2];
+const chrome = spawn('/opt/pw-browsers/chromium', ['--headless','--disable-gpu','--no-sandbox','--remote-debugging-port=9337','--window-size=1100,900','about:blank'],{stdio:'ignore'});
+await new Promise(r=>setTimeout(r,2500));
+const list = await (await fetch('http://127.0.0.1:9337/json')).json();
+const ws = new WebSocket(list[0].webSocketDebuggerUrl);
+await new Promise(r=>ws.onopen=r);
+let id=0; const waiting=new Map();
+ws.onmessage=(ev)=>{const m=JSON.parse(ev.data); if(m.id&&waiting.has(m.id)){waiting.get(m.id)(m.result);waiting.delete(m.id);}};
+const cmd=(m2,p={})=>new Promise(res=>{const i=++id;waiting.set(i,res);ws.send(JSON.stringify({id:i,method:m2,params:p}))});
+await cmd('Page.enable'); await cmd('Runtime.enable');
+await cmd('Page.navigate',{url:'file://'+page});
+for (let i=0;i<90;i++){ await new Promise(r=>setTimeout(r,1000));
+  if ((await cmd('Runtime.evaluate',{expression:'window.__oxReady===true'})).result.value) break; }
+await new Promise(r=>setTimeout(r,3000));
+const q=async(e)=>(await cmd('Runtime.evaluate',{expression:e})).result.value;
+const guest=async(gx,gy)=>{ const r=JSON.parse(await q('JSON.stringify(document.getElementById("screen").getBoundingClientRect())'));
+  const sx=r.width/1024; return [r.x+gx*sx, r.y+gy*sx]; };
+const click=async(gx,gy)=>{ const [x,y]=await guest(gx,gy);
+  await cmd('Input.dispatchMouseEvent',{type:'mouseMoved',x,y});
+  await cmd('Input.dispatchMouseEvent',{type:'mousePressed',x,y,button:'left',buttons:1,clickCount:1});
+  await cmd('Input.dispatchMouseEvent',{type:'mouseReleased',x,y,button:'left',buttons:0,clickCount:1}); };
+const key=async(code,vk)=>{ await cmd('Input.dispatchKeyEvent',{type:'keyDown',code,key:'x',windowsVirtualKeyCode:vk});
+  await cmd('Input.dispatchKeyEvent',{type:'keyUp',code,key:'x',windowsVirtualKeyCode:vk}); };
+const shot=async(n)=>{ const s=await cmd('Page.captureScreenshot',{format:'png'});
+  writeFileSync(process.argv[3]+'_'+n+'.png', Buffer.from(s.data,'base64')); };
+const stat=async(l)=>console.log(l, await q('document.getElementById("stat").textContent'));
+await stat('start:');
+await click(424,383); await new Promise(r=>setTimeout(r,10000)); await shot('file'); await stat('file-menu:');
+await key('Escape',27); await new Promise(r=>setTimeout(r,8000)); await shot('esc'); await stat('escaped:');
+await click(878,383); await new Promise(r=>setTimeout(r,10000)); await shot('windows'); await stat('windows-menu:');
+await key('Escape',27); await new Promise(r=>setTimeout(r,8000));
+await click(143,588); await new Promise(r=>setTimeout(r,10000)); await shot('tool'); await stat('tool-select:');
+chrome.kill(); process.exit(0);

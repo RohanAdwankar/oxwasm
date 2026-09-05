@@ -1,0 +1,15 @@
+# ninja fixture (docs/m3-engine.md): a five-edge graph whose sources are
+# themselves generated, so a dry run (-n) prints every command in
+# dependency order without spawning any of them
+rule gen
+  command = echo "int f(void){return 1;}" > $out
+rule cc
+  command = cc -c $in -o $out
+rule link
+  command = cc $in -o $out
+build a.c: gen
+build b.c: gen
+build a.o: cc a.c
+build b.o: cc b.c
+build prog: link a.o b.o
+default prog
