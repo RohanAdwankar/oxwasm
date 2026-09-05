@@ -2766,6 +2766,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
         ...regs16.filter(r => touched(r) && !(sx && savedI32(r)) && (mask & (1 << r))).map(spillR),
         ...[...xUsed].filter(x => mask & ((0x10000 << x) | 0)).map(xSpill),
       ].join('\n');
+      const fullStores = [nOps(expandFull(false), '.store'), nOps(expandFull(true), '.store')];   // once, not per marker (it was rebuilt at every site for a statistic)
       for (let b = 0; b < N; b++) {
         if (!marks[b].length) continue;
         let out = '', last = 0;
@@ -2773,7 +2774,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           const mask = (IN[b] & ~mk.kill) | mk.gen;
           const txt = expand(mk.sx, mask);
           stats.sites++; const k = nOps(txt, '.store');
-          stats.spills += k; stats.skipped += nOps(expandFull(mk.sx), '.store') - k;
+          stats.spills += k; stats.skipped += fullStores[mk.sx ? 1 : 0] - k;
           out += bodies[b].slice(last, mk.at) + txt;
           last = mk.at + 4;                     // marker is 4 chars
         }
@@ -2838,6 +2839,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           if (li !== liveIn[b]) { liveIn[b] = li; changed = true; }
         }
       }
+      const rlFullLoads = nOps(rlFull, '.load');
       const rlExpand = (mask) => [
         ...regs16.filter(r => touched(r) && (mask & (1 << r))).map(reloadR),
         ...[...xUsed].filter(x => mask & ((0x10000 << x) | 0)).map(xReload),
@@ -2851,7 +2853,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
         for (const mk of rec) {
           const txt = rlExpand(mk.cs ? (mk.live & ~CS_MASK) : mk.live);
           stats.rlSites++; const k = nOps(txt, '.load');
-          stats.rlLoads += k; stats.rlSkipped += nOps(rlFull, '.load') - k;
+          stats.rlLoads += k; stats.rlSkipped += rlFullLoads - k;
           out += bodies[b].slice(last, mk.at) + txt;
           last = mk.at + 4;
         }
