@@ -4503,3 +4503,39 @@ execution-bound: an analysis cache keyed by function address (valid
 until the code's pages change) and less closure duplication are the
 levers, and they belong to the steady-state work rather than to
 breadth.
+
+### Breadth batch 9 opens with make -j2: four signal gaps
+
+`make -j2` on a three-target Makefile parked after its first two
+recipes. Four things, each needed for the fix:
+
+- **ppoll/pselect6 ignored their signal mask.** make blocks SIGCHLD
+  and waits in pselect6 with a mask that admits it. The wait now runs
+  under the temporary mask (SIGKILL/SIGSTOP stay unblockable): a
+  newly admitted pending signal is delivered at once with EINTR, an
+  interrupting signal restores the caller's mask through the signal
+  frame, and a normal return restores it in line.
+- **An interrupted wait left its deadline behind.** Only nanosleep's
+  EINTR path cleared `_deadline`; an interrupted ppoll left Infinity,
+  and the next ppoll with a 30 ms timeout inherited it and never
+  returned. Every sleepy syscall's EINTR path clears it now.
+- **A vfork-window child's sigaction wrote the parent's table.**
+  posix_spawn resets the spawnattr signals to SIG_DFL in the child
+  before exec; with one process-wide table, make lost its SIGCHLD
+  handler as soon as it spawned a job, and the second job's exit was
+  discarded as default-ignored. The window child now gets its own
+  copy, which goes with it into the exec'd image (ignored signals stay
+  ignored across exec, as on Linux).
+- **SA_RESTART restarted pselect6.** signal(7): select, poll, epoll
+  and nanosleep are never restarted after a handler. Restarting ran
+  make's handler and went straight back to sleep. A NORESTART set
+  covers them.
+
+Found with the `pselect` fixture (blocked SIGCHLD, a child exiting
+during pselect and ppoll, a timed ppoll, a ready fd) and the
+`make-j2` case (parallel recipes through sh, the jobserver pipe, the
+output file compared to native). The signal-heavy cases (signal,
+timers, bash-trap, sigpipe-sh, make, cmake-P) stay exact. Also fixed
+on the way: a trailing comment in runbin had swallowed the SIGTRACE,
+AOTFAIL and DBG levers on the same line, which is why the first
+traces printed nothing.
