@@ -402,6 +402,28 @@ export class LinuxEngine {
     if (this.unitBytes) {
       const bytes = this.unitBytes(k);
       if (bytes) {
+        // A synchronous host (node: breadth, runbin, the benches) never
+        // returns to the event loop while the guest runs, so an async
+        // instantiate's promise stays pending for the whole job: the child
+        // never received its cached units (interpreted instead), and the
+        // reaction closure pinned the engine - a cargo build that spawns
+        // rustc three times kept every engine and its 2 GB memory alive until
+        // exit (sweep chunks were OOM-killed at 13.7 GB). Instantiate in
+        // line unless the host wants compilation off the main thread.
+        const registerAll = (instance) => {
+          for (const name of Object.keys(instance.exports))
+            if (name.startsWith('f_')) {
+              const a = BigInt('0x' + name.slice(2));
+              if (!this.aotFns.get(a)) this.registerAotFn(a, instance.exports[name]);
+            }
+          if (instance.exports.drive) this.aotDrive = instance.exports.drive;
+          this.stats.tiers.aot = (this.stats.tiers.aot || 0) + 1;
+        };
+        if (!this.asyncCompile && typeof process !== 'undefined') {
+          try { registerAll(new WebAssembly.Instance(new WebAssembly.Module(bytes), this.aotImports())); }
+          catch (e) { this.aotFailed.add(k); if (this.onAotFail) this.onAotFail(entry, e.message); }
+          return;
+        }
         this.aotFns.set(k, null);              // placeholder: profiling stops re-triggering
         WebAssembly.instantiate(bytes, this.aotImports())
           .then(({ instance }) => {

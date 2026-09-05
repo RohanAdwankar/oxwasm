@@ -4453,3 +4453,23 @@ lines show even with collection: after cargo-build and rustc-asm the
 host keeps ~2.7 GB of JS heap and ~12 GB of wasm memory that light
 cases never free; something in a run with children or threads is
 retained after the case ends. Open item.
+
+The retainer, from a heap snapshot of a three-minute reproducer (cargo
+on a crate with a syntax error, then a light case, then `gc()`): every
+surviving engine hung off a pending `WebAssembly.instantiate` promise
+(V8's `AsyncInstantiateCompileResultResolver` global handle) whose
+`.then` reaction captured the engine. The per-binary child unit cache
+hands a repeat spawn its compiled units through that async path, and a
+synchronous host never returns to the event loop while the guest runs,
+so the promise stayed pending for the whole job. Two consequences: the
+repeat child never received its cached units and ran them interpreted,
+and the reaction pinned the child, its parent through `parentEng`, and
+every 2 GB memory. cargo spawns rustc three times, which is why only
+the cargo cases retained. Cached units are now instantiated in line
+unless the host asked for off-thread compilation (`asyncCompile`) or
+is a browser. Interpreter-only runs never retained, which was the
+first bisect. The tools that found it: `BREADTH_MEM=1` per-case
+memory lines, a reproducer that drops the engine and collects, a
+181 MB heap snapshot, and `scratchpad/snapwalk.py`, a numpy retainer
+walk that prints the root-to-object chain (five seconds on this
+snapshot).
