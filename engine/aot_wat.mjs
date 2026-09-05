@@ -373,12 +373,25 @@ export function analyze(mem, entry, { maxInsns = 20000, noJtab = false, entries 
   const jmpinds = [];             // `jmp *reg` sites awaiting jump-table discovery
   const jtabs = new Map();        // jmpind rip str -> BigInt[] targets read from its table
   let lo = entry, hi = entry;     // decoded range, the plausibility window for table entries
+  // Byte fetch for the decoder. mem.read per byte cost a BigInt add, a
+  // region lookup and a DataView per byte, 5 us an instruction across every
+  // function size (clang: 6.8 M instructions analysed at that rate). One
+  // region lookup per instruction and plain indexing after; the slow path
+  // stays for a page-arrival guard (streamed restore) or a fetch that leaves
+  // the region.
+  let fr = null;
+  const fetcher = (rip) => {
+    if (mem.pend !== null || typeof mem.find !== 'function') return (i) => Number(mem.read(rip + BigInt(i), 1n));
+    if (fr === null || rip < fr.base || rip >= fr.end) fr = mem.find(rip);   // throws on a fault, as read did
+    const off = Number(rip - fr.base), b = fr.bytes, end = b.length;
+    return (i) => { const o = off + i; return o < end ? b[o] : Number(mem.read(rip + BigInt(i), 1n)); };
+  };
   const drain = () => { while (work.length) {
     const rip = work.pop(); const key = rip.toString();
     if (seen.has(key)) continue; seen.add(key);
     if (count++ > maxInsns) throw new Error('function too large');
     let insn;
-    try { insn = decode((i) => Number(mem.read(rip + BigInt(i), 1n)), rip); }
+    try { insn = decode(fetcher(rip), rip); }
     catch (e) {
       // Undecodable bytes (padding, data, an unsupported encoding) become a
       // deopt point: if control ever actually reaches it, the engine resumes
@@ -2987,7 +3000,7 @@ export function compileUnitWat(mem, entry, opts = {}) {
   // wall clock has already produced one withdrawn conclusion.
   const PHASE = typeof process !== 'undefined' && process.env?.OXWASM_PHASE === '1';
   const PH = PHASE ? (globalThis.__aotPhase ??= { analyze: 0, inline: 0, emit: 0, ftscan: 0,
-                                                  chars: 0, rounds: 0, units: 0, reemit: 0 }) : null;
+                                                  chars: 0, rounds: 0, units: 0, reemit: 0, analyzed: 0, analyzedInsns: 0, seen: new Set() }) : null;
   // Note on what inlining can NOT reach. Closure pruning drops a callee the
   // host already has compiled and mapped, so a callee that tiered up before
   // its caller is invisible to the inliner. Un-pruning small callees to get
@@ -3035,7 +3048,11 @@ export function compileUnitWat(mem, entry, opts = {}) {
     if (skip && k !== entry.toString() && skip(k) && !isTiny(a)) continue;
     try {
       let an;
-      try { an = analyze(mem, a, { maxInsns, noJtab: !!globalThis.__noJtab, entries: opts.entries ?? null, callTargets: opts.callTargets ?? null }); }
+      try { const tA = PHASE ? performance.now() : 0;
+            an = analyze(mem, a, { maxInsns, noJtab: !!globalThis.__noJtab, entries: opts.entries ?? null, callTargets: opts.callTargets ?? null });
+            if (PHASE) { PH.analyzed++; PH.seen.add(k); let n = 0; for (const b of an.blocks) n += b.insns.length; PH.analyzedInsns += n;
+              const bk = n < 100 ? '<100' : n < 500 ? '<500' : n < 2000 ? '<2000' : n < 8000 ? '<8000' : '>=8000';   // per-size buckets: [analyses, ms, insns]
+              const h = (PH.hist ??= {})[bk] ??= [0, 0, 0]; h[0]++; h[1] += performance.now() - tA; h[2] += n; } }
       catch (e) {
         // jump-table discovery can push a function over the size budget;
         // it compiled before the feature, so retry without it

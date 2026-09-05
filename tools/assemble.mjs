@@ -10,9 +10,13 @@
 import { spawn, execFileSync, execSync } from 'node:child_process';
 import { mkdtempSync, openSync, writeSync, readSync, writeFileSync, readFileSync, unlinkSync, existsSync, rmSync, constants as FSC } from 'node:fs';
 
-export function makeAssembler({ debugNames = false, tag = 'oxasm' } = {}) {
+export function makeAssembler({ debugNames = false, tag = 'oxasm', workers = +(process.env.OXWASM_ASM_WORKERS || 1) } = {}) {
   const flags = ['--enable-tail-call', ...(debugNames ? ['--debug-names'] : [])];
   let n = 0;
+  // workers > 1: extra broker shells, each with its own fifo pair and queue;
+  // deferred submissions go to the least loaded one, so several wat2wasm run
+  // at once while the guest continues. The synchronous path uses shell 0.
+  const extra = [];
   const direct = (wat) => {                        // fallback: spawn from here
     const w = `/tmp/${tag}_${process.pid}_${n++}`; writeFileSync(w + '.wat', wat);
     try { execFileSync('wat2wasm', [...flags, w + '.wat', '-o', w + '.wasm']); return new Uint8Array(readFileSync(w + '.wasm')); }
@@ -34,19 +38,28 @@ export function makeAssembler({ debugNames = false, tag = 'oxasm' } = {}) {
     const line = Buffer.alloc(4096);
     broker = { sh, inFd, outFd, dir, line, buf: '', pending: [] };
     process.on('exit', () => { try { sh.kill(); } catch {} try { rmSync(dir, { recursive: true, force: true }); } catch {} });
+    for (let w = 1; w < workers; w++) {
+      const d2 = mkdtempSync(`/tmp/${tag}w${w}_`), in2 = d2 + '/in', out2 = d2 + '/out';
+      execSync(`mkfifo "${in2}" "${out2}"`);
+      const sh2 = spawn('sh', ['-c', `while IFS= read -r p; do wat2wasm ${flags.join(' ')} "$p.wat" -o "$p.wasm" 2>"$p.err"; echo $?; done <"${in2}" >"${out2}"`], { stdio: ['ignore', 'ignore', 'inherit'] });
+      sh2.unref();
+      const b2 = { sh: sh2, inFd: openSync(in2, 'w'), outFd: openSync(out2, FSC.O_RDONLY | FSC.O_NONBLOCK), dir: d2, line: Buffer.alloc(4096), buf: '', pending: [] };
+      extra.push(b2);
+      process.on('exit', () => { try { sh2.kill(); } catch {} try { rmSync(d2, { recursive: true, force: true }); } catch {} });
+    }
   } catch (e) { broker = null; if (process.env.OXWASM_ASMDEBUG) console.error('<assembler broker unavailable: ' + e.message + '>'); }
   const nap = new Int32Array(new SharedArrayBuffer(4));
   // read whatever status lines are available now (non-blocking); returns the
   // complete lines, keeping a partial one for next time
-  const readLines = () => {
+  const readLines = (b = broker) => {
     for (;;) {
       let k;
-      try { k = readSync(broker.outFd, broker.line, 0, broker.line.length, null); }
+      try { k = readSync(b.outFd, b.line, 0, b.line.length, null); }
       catch (e) { if (e.code === 'EAGAIN') break; throw e; }
       if (k <= 0) { if (k === 0) throw new Error('assembler broker closed'); break; }
-      broker.buf += broker.line.toString('utf8', 0, k);
+      b.buf += b.line.toString('utf8', 0, k);
     }
-    const parts = broker.buf.split('\n'); broker.buf = parts.pop(); return parts;
+    const parts = b.buf.split('\n'); b.buf = parts.pop(); return parts;
   };
   const finish = (w, status) => {                  // status line -> bytes, or throws with wat2wasm's message
     try {
@@ -57,21 +70,22 @@ export function makeAssembler({ debugNames = false, tag = 'oxasm' } = {}) {
   // Deferred jobs answered so far: the shell answers in request order, so
   // each status line belongs to the oldest pending job. Returns how many
   // callbacks ran.
-  const pump = () => {
-    if (!broker || !broker.pending.length) return 0;
+  const pumpOne = (b) => {
+    if (!b.pending.length) return 0;
     let done = 0;
-    for (const st of readLines()) {
-      const job = broker.pending.shift(); if (!job) break;
+    for (const st of readLines(b)) {
+      const job = b.pending.shift(); if (!job) break;
       let bytes = null, err = null;
       try { bytes = finish(job.w, st); } catch (e) { err = e; }
       done++; try { job.cb(bytes, err); } catch (e) { if (process.env.OXWASM_ASMDEBUG) console.error('<assembler callback threw: ' + e.message + '>'); }
     }
     return done;
   };
+  const pump = () => { if (!broker) return 0; let d = pumpOne(broker); for (const b of extra) d += pumpOne(b); return d; };
   const viaBroker = (wat) => {
     // a synchronous request behind deferred ones must wait for their answers
     // first, or the status lines would be attributed to the wrong jobs
-    while (broker.pending.length) { if (!pump()) Atomics.wait(nap, 0, 0, 1); }
+    while (broker.pending.length) { if (!pumpOne(broker)) Atomics.wait(nap, 0, 0, 1); }
     const w = `${broker.dir}/u${n++}`; writeFileSync(w + '.wat', wat);
     writeSync(broker.inFd, w + '\n');
     let lines;
@@ -84,10 +98,11 @@ export function makeAssembler({ debugNames = false, tag = 'oxasm' } = {}) {
   // err) runs from a later pump(). Without a broker the call is synchronous.
   asm.submit = (wat, cb) => {
     if (!broker) { let b = null, e = null; try { b = direct(wat); } catch (x) { e = x; } cb(b, e); return; }
-    const w = `${broker.dir}/u${n++}`; writeFileSync(w + '.wat', wat);
-    writeSync(broker.inFd, w + '\n'); broker.pending.push({ w, cb });
+    let b = broker; for (const x of extra) if (x.pending.length < b.pending.length) b = x;   // least loaded shell
+    const w = `${b.dir}/u${n++}`; writeFileSync(w + '.wat', wat);
+    writeSync(b.inFd, w + '\n'); b.pending.push({ w, cb });
   };
   asm.pump = pump;
-  asm.pendingCount = () => broker ? broker.pending.length : 0;
+  asm.pendingCount = () => broker ? broker.pending.length + extra.reduce((a, b) => a + b.pending.length, 0) : 0;
   return asm;
 }
