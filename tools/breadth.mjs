@@ -11,6 +11,7 @@
 //   node tools/breadth.mjs            # every case
 //   node tools/breadth.mjs sort grep  # only cases whose name matches
 import { LinuxEngine } from '../engine/linux.mjs';
+import { makeAssembler } from './assemble.mjs';
 import { readFileSync, readdirSync, lstatSync, realpathSync, statSync, writeFileSync,
          existsSync, mkdirSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
@@ -204,15 +205,11 @@ add(HELLO_CPP, HELLO_CPP);
 // wat2wasm for the AOT tier; cached by text hash so repeat cases are cheap
 const CACHE = new URL('../bench/kernels/watcache/', import.meta.url).pathname;
 mkdirSync(CACHE, { recursive: true });
-let an = 0;
+const asm = makeAssembler({ tag: 'bw' });
 const assembleWat = (wat) => {
   const h = createHash('sha1').update(wat).digest('hex'), cp = CACHE + h + '.wasm';
   if (existsSync(cp)) return new Uint8Array(readFileSync(cp));
-  const w = `/tmp/bw_${process.pid}_${an++}`;
-  writeFileSync(w + '.wat', wat);
-  execFileSync('wat2wasm', ['--enable-tail-call', w + '.wat', '-o', w + '.wasm']);
-  const b = new Uint8Array(readFileSync(w + '.wasm'));
-  try { unlinkSync(w + '.wat'); unlinkSync(w + '.wasm'); } catch {}
+  const b = asm(wat);                              // pre-forked broker: the spawn is not paid from a multi-GB process
   try { writeFileSync(cp, b); } catch {}
   return b;
 };

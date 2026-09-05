@@ -4187,3 +4187,19 @@ cases.
 For steady state the structured tables are not a lever on m4 (8.55x,
 inside its 8.3-9.1x spread); they are a correctness and generality
 change first.
+
+### The cold-run tax was the fork, not the assembler
+
+A CPU profile of the cold `java -version` run (230 s) put 80% in
+`spawnSync`. wat2wasm itself is quick - 40 ms per MB of text, and a
+spawn from a small process costs 4 ms - but a spawn from a process
+holding a 3 GB guest costs 133 ms, because fork copies the parent's
+page tables, and 960 units each paid it. `tools/assemble.mjs` is a
+pre-forked broker: a tiny shell started before the engine grows,
+handed unit paths over one FIFO and answering an exit status over
+another, synchronously (a blocking read on the FIFO), with a direct
+spawn as the fallback. runbin and the breadth harness use it.
+**`java -version` cold: 230 s → 50 s**; a cold breadth chunk of 16
+cases (cache cleared) is green and quicker throughout (python3 25 s,
+node 51 s). The kernels and vs-native benches still spawn directly -
+they subtract startup, so it only costs them wall time.
