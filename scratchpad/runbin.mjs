@@ -13,7 +13,8 @@ const assembleWat = (wat) => { watBytes += wat.length; watUnits++; if (process.e
 const asm = makeAssembler({ debugNames: true, tag: 'rb' });   // pre-forked: 4 ms a unit instead of 133 from a 3 GB process
 const bin = process.argv[2], args = process.argv.slice(3);
 const files = {}, mtimes = {};
-const add = (g, h = g) => { try { files[g] = new Uint8Array(readFileSync(h)); mtimes[g] = 1; } catch {} };
+const byReal = new Map();   // /lib/x86_64-linux-gnu and /usr/lib/x86_64-linux-gnu are one directory: share the bytes (the doubled copy was half of a 4 GB baseline)
+const add = (g, h = g) => { try { let b = byReal.get(h); if (!b) { b = new Uint8Array(readFileSync(h)); byReal.set(h, b); } files[g] = b; mtimes[g] = 1; } catch {} };
 for (const d of ['/lib/x86_64-linux-gnu', '/usr/lib/x86_64-linux-gnu', '/lib64']) {
   let e; try { e = readdirSync(d); } catch { continue; }
   for (const f of e) { try { const r = realpathSync(join(d, f)); if (lstatSync(r).isFile()) add(join(d, f), r); } catch {} }
