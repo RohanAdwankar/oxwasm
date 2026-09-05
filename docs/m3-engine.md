@@ -4485,3 +4485,7 @@ cases stay byte-identical.
 dispatch layout, packed ops, flags, rcl/rcr, picguard, threads) is
 green on b642e2e; the full breadth sweep with `--expose-gc` runs at a
 flat ~2.3 GB per chunk where the killed chunks had climbed past 12 GB.
+
+Clean gate on b642e2e: the five-chunk cold sweep with `--expose-gc`,
+181 passes, 0 failures, no chunk killed, 67 minutes, every chunk flat
+at 2.3-3.8 GB except while cargo-build's own tree runs.
