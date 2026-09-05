@@ -4473,3 +4473,10 @@ memory lines, a reproducer that drops the engine and collects, a
 181 MB heap snapshot, and `scratchpad/snapwalk.py`, a numpy retainer
 walk that prints the root-to-object chain (five seconds on this
 snapshot).
+
+After the fix the reproducer frees everything (heap 10 MB, external
+memory back to the provisioning floor), the cargo run itself is 162 s
+to 125 s because the repeat rustc children now get their cached units,
+and in the harness the case after cargo-build sees 61 MB of heap and
+2.5 GB external where it saw 2.7 GB and 12 GB. Six child-spawning
+cases stay byte-identical.
