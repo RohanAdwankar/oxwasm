@@ -4639,6 +4639,9 @@ ungated 9.02x / 8.48x (noise band), and the gated small run starts
 2.5 s sooner. Differentials green. The gated clang run still shows
 1,838 translated functions never entered and 867 entered fewer than
 four times: these callees were seen called once to three times before
-their caller tiered up, so a gate at the call threshold rather than at
-one call is the obvious next step, to be priced against steady state
-the same way.
+their caller tiered up. `OXWASM_CLOSURE_MIN=N` prices the gate at N
+observed calls: at 3, clang -S 50 s to 45 s (wat 390 MB to 288 MB,
+emit 15.2 s to 11.7 s), rustc --version 646 to 556 translated
+functions, and m4 steady state 8.70x / 9.00x against 9.22x / 9.76x at
+1 (interleaved rounds under a running sweep; not worse). The default
+moves to 3 once the sweep has run over the gate at 1.
