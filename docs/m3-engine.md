@@ -4586,3 +4586,59 @@ fifo wait was a quarter of the synchronous run, so half of it is now
 overlapped; the rest is wat2wasm still being one process behind the
 translator's output rate (a second broker shell would take the other
 half).
+
+The full sweep ran under deferred assembly: 182 cases, byte-identical,
+zero assembler errors, 44 minutes in five chunks. Deferred assembly is
+now the default in both harnesses (`ASYNC_ASM=0` restores synchronous
+assembly for A/B). The second broker shell was tried
+(`OXWASM_ASM_WORKERS=N` adds shells) and gained nothing measurable on
+m4 or gzip under the sweep's CPU contention; it stays opt-in.
+
+### What the analysis histogram said, and the lever it pointed at
+
+The phase profile (`OXWASM_PHASE=1`) now counts analyses, instructions
+analysed, distinct entries, duplicate analyses and their time, and
+buckets analyses by size. On clang-S: 15,329 analyses over 11,303
+distinct entries, linear at 4.4-5.5 µs per instruction in every size
+bucket, so there is no super-linear bucket to fix; the duplicates
+(26% of analyses) are the tiny callees deliberately re-analysed into
+every unit and cost 118 ms of 1.6 s on the gated run below. An
+analysis cache by address is not worth building. A cheaper fetch
+(one region lookup per instruction instead of one per byte) took
+analysis on rustc --version from 2404 to 1939 ms; that is the
+per-instruction lever, and it is small.
+
+The large lever was in what gets analysed at all. A per-function entry
+counter (`OXWASM_FNPROF=1`, now with a histogram) on rustc --version:
+1,259 functions translated, 244 of them roots the call profile made
+hot; 733 were never entered after translation and 250 more fewer than
+four times. The closure walk was translating the cold branches of hot
+functions: every call target reachable from a root, whatever the
+profile said about it.
+
+**Profile-gated closure.** The closure now skips a callee the call
+profile has never seen called (tiny callees excepted, as before); a
+gated callee that turns out hot is profiled at its callouts and tiers
+up as its own root, and its call sites then hit through `$ftr`.
+`OXWASM_CLOSURE_ALL=1` restores the ungated walk. Measured, all exact:
+
+| run | ungated | gated |
+|---|---:|---:|
+| rustc --version, functions translated | 1,259 | 587 |
+| rustc --version, wat text | 69 MB | 34 MB |
+| rustc --version, wall | 12.1 s | 9.7 s |
+| clang -S -O2 hello.c (runbin, deferred assembly) | 203 s | **51 s** |
+| clang -S, functions translated | 11,303 analysed | 4,436 |
+| clang -S, emit / analyze | 51.6 s / 35.4 s | 15.7 s / 8.6 s |
+| breadth clang-S (warm wat cache) | 203 s | 37 s |
+| breadth python3 | 37 s | 18 s |
+
+Steady state is unaffected where it was feared it would be: m4 on the
+3.3 MB input, two interleaved rounds, gated 8.55x / 8.47x against
+ungated 9.02x / 8.48x (noise band), and the gated small run starts
+2.5 s sooner. Differentials green. The gated clang run still shows
+1,838 translated functions never entered and 867 entered fewer than
+four times: these callees were seen called once to three times before
+their caller tiered up, so a gate at the call threshold rather than at
+one call is the obvious next step, to be priced against steady state
+the same way.

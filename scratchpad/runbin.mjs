@@ -26,7 +26,7 @@ for (const d of (process.env.TREE || '').split(':').filter(Boolean)) walk(d);   
 const eng = new LinuxEngine(new Uint8Array(readFileSync(bin)),
   { argv: [bin, ...args], env: ['PATH=/usr/bin', 'HOME=/root', 'LANG=C', ...(process.env.EXTRAENV || '').split(' ').filter(Boolean)], files, mtimes, memMB: process.env.MEM ? +process.env.MEM : 512, assembleWat: process.env.AOT ? assembleWat : undefined, ...(process.env.LOOPUNITS === '0' ? { aotLoopThreshold: Infinity } : process.env.LOOPTHRESH ? { aotLoopThreshold: +process.env.LOOPTHRESH } : {}) });   // LOOPTHRESH=N: loop-head roots tier up after N back edges   // LOOPUNITS=0: no loop-head roots (bisects veto whole functions)
 if (process.env.KIDS) eng.onChildEngine = (ce, argv) => { ce._label = (argv || [])[0]; seenEng.add(ce); if (eng.strace) ce.strace = new (eng.strace.constructor)(); };   // children trace like the parent (STRACENR/STRACEERR filters included)   // KIDS=1: record every child engine at creation (the run-loop sweep misses ones reaped within a slice)
-if (process.env.ASYNC_ASM) { eng.assembleWatDeferred = (w, cb) => asm.submit(w, cb); eng.pumpAsm = () => asm.pump(); }   // ASYNC_ASM=1: units assemble while the guest keeps running
+if (process.env.AOT && process.env.ASYNC_ASM !== '0') { eng.assembleWatDeferred = (w, cb) => asm.submit(w, cb); eng.pumpAsm = () => asm.pump(); }   // units assemble while the guest keeps running (default); ASYNC_ASM=0: synchronous assembly
 if (process.env.CHILDMEM) eng.childMemMB = +process.env.CHILDMEM;   // CHILDMEM=MB: execve'd children get this much (default 256: a rustc child could not map its 265 MB of libraries and ld.so exited 127)
 if (process.env.UNITLOG) eng.onUnitWat = (n, entry, unit) => console.error(`<unit ${n} entry ${entry.toString(16)} fns ${unit.funcs?.length ?? '?'}${process.env.UNITLOG === 'fns' ? ' ' + (unit.funcs || []).map(a => a.toString(16)).join(' ') : ''}>`);
 if (process.env.FNALLOW) { const ok = new Set(process.env.FNALLOW.split(',').filter(Boolean).map(h => BigInt('0x' + h).toString())); eng.fnAllow = ok; eng.unitFilter = (n, entry) => ok.has(entry.toString()); }   // FNALLOW=hex,hex: compile only these functions
@@ -97,6 +97,8 @@ if (process.env.OXWASM_FNPROF === '1') {   // per-function entry counts (see FNP
   for (const [sl, as] of bySlot) { const n = dv.getBigUint64(sl, true); if (n) rows.push([n, as]); }
   rows.sort((x, y) => (y[0] > x[0]) - (y[0] < x[0]));
   const tot = rows.reduce((s, r) => s + r[0], 0n);
+  { const hb = {}; let never = 0; for (const [sl, as] of bySlot) { const n = Number(dv.getBigUint64(sl, true)); if (!n) { never += as.length; continue; } const bk = n < 4 ? '<4' : n < 16 ? '<16' : n < 64 ? '<64' : n < 256 ? '<256' : n < 4096 ? '<4096' : '>=4096'; hb[bk] = (hb[bk] || 0) + as.length; }
+    console.log(`--- fnprof hist (translated fns by entry count; never = translated but never entered): never=${never} ${JSON.stringify(hb)} roots=${[...eng.aotFns.keys()].filter(a => (eng.aotCalls.get(a) || 0) >= eng.aotCallThreshold).length}`); }   // OXWASM_FNPROF=1 also prints this histogram
   console.log(`--- fnprof: ${rows.length} entered fns, ${tot} entries\n` + rows.slice(0, 40).map(([n, as]) => `  ${as.map(a => a.toString(16)).join('|')} x${n} (${(Number(n * 1000n / tot) / 10).toFixed(1)}%)`).join('\n'));
 }
 if (process.env.OXWASM_BLKPROF) {   // per-block entry counts of the named functions: top 40 by guest block address

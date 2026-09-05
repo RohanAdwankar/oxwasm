@@ -37,6 +37,7 @@ class DeoptUnwind { constructor(rip) { this.rip = rip; } }
 // (rax still holds the syscall number) and either completes or blocks again.
 class BlockUnwind { constructor(rip) { this.rip = rip; } }
 
+const CLOSURE_ALL = typeof process !== 'undefined' && process.env?.OXWASM_CLOSURE_ALL === '1';
 const UNPRUNE = new Set(((typeof process !== 'undefined' && process.env?.OXWASM_UNPRUNE) || '').split(',').filter(Boolean).map(h => BigInt('0x' + h).toString()));
 
 export class LinuxEngine {
@@ -520,7 +521,15 @@ export class LinuxEngine {
         // OXWASM_UNPRUNE=hex,hex: keep these callees in every closure even
         // when already compiled (diagnosis: the upper bound of a re-tier that
         // un-prunes a hot caller's hot small callees so they can be inlined)
-        skip: (c) => (this._ftSeen.has(BigInt(c)) || (this._pendingFns !== undefined && this._pendingFns.has(c))) && !UNPRUNE.has(c),
+        // Profile gate: a callee the profile has never seen called stays out of
+        // the closure too (tiny ones excepted, below). On rustc --version 733 of
+        // 1259 translated functions were never entered after translation and
+        // 250 more fewer than four times: the closure walk was translating the
+        // cold branches of hot functions. A gated callee that turns out hot is
+        // profiled at its callouts and tiers up as its own root; its call sites
+        // then hit through $ftr. OXWASM_CLOSURE_ALL=1 restores the ungated walk.
+        skip: (c) => ((this._ftSeen.has(BigInt(c)) || (this._pendingFns !== undefined && this._pendingFns.has(c))) && !UNPRUNE.has(c))
+                  || (!CLOSURE_ALL && !this.aotCalls.has(BigInt(c))),
         // bisect aids: fnVeto never compiles these; fnAllow compiles only these (roots and closure members)
         veto: (this.fnVeto || this.fnAllow) ? (c) => (this.fnVeto?.has(c) ?? false) || (this.fnAllow ? !this.fnAllow.has(c) : false) : null,
         tinyMemo: (this._tinyMemo ??= new Map()),

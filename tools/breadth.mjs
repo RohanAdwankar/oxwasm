@@ -671,7 +671,7 @@ const engine = (bin, args, stdin, opts = {}) => {
       files, mtimes, memMB: opts.memMB || 512, assembleWat, stdin });
 
   if (process.env.BREADTH_STRACE) eng.strace = [];
-  if (process.env.ASYNC_ASM) { eng.assembleWatDeferred = assembleWatDeferred; eng.pumpAsm = () => asm.pump(); }   // ASYNC_ASM=1: deferred assembly (A/B)
+  if (process.env.ASYNC_ASM !== '0') { eng.assembleWatDeferred = assembleWatDeferred; eng.pumpAsm = () => asm.pump(); }   // deferred assembly, default since the 182-case sweep under it was green; ASYNC_ASM=0 assembles synchronously (A/B)
   if (opts.childMemMB) eng.childMemMB = opts.childMemMB;   // execve'd children (default 256 MB; a rustc child needs more)
   if (process.env.AOTFAIL) eng.onAotFail = (a, m) => {   // AOTFAIL=1: every refused translation with its reason; an overlap also shows the bytes and the image
     let extra = '';
