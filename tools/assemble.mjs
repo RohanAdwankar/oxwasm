@@ -22,31 +22,31 @@ export function makeAssembler({ debugNames = false, tag = 'oxasm', workers = +(p
     try { execFileSync('wat2wasm', [...flags, w + '.wat', '-o', w + '.wasm']); return new Uint8Array(readFileSync(w + '.wasm')); }
     finally { for (const s of ['.wat', '.wasm']) { try { unlinkSync(w + s); } catch {} } }
   };
-  let broker = null;
-  try {
-    const dir = mkdtempSync(`/tmp/${tag}_`);
-    const inF = dir + '/in', outF = dir + '/out';
+  let broker = null, syncB = null;
+  // one pre-forked shell per queue: a fifo pair, a status-line buffer and the
+  // deferred jobs waiting on it. The shell opens `in` for reading first, then
+  // `out` for writing; pair them in that order. `out` is opened non-blocking
+  // so a deferred submit can be pumped without waiting; the synchronous path
+  // spins on EAGAIN with 1 ms naps instead.
+  const mkShell = (suffix) => {
+    const dir = mkdtempSync(`/tmp/${tag}${suffix}_`), inF = dir + '/in', outF = dir + '/out';
     execSync(`mkfifo "${inF}" "${outF}"`);
     const sh = spawn('sh', ['-c',
       `while IFS= read -r p; do wat2wasm ${flags.join(' ')} "$p.wat" -o "$p.wasm" 2>"$p.err"; echo $?; done <"${inF}" >"${outF}"`],
       { stdio: ['ignore', 'ignore', 'inherit'] });
     sh.unref();
-    // the shell opens `in` for reading first, then `out` for writing; pair them in that order
-    // `out` is opened non-blocking so a deferred submit can be pumped without
-    // waiting; the synchronous path spins on EAGAIN with 1 ms naps instead
-    const inFd = openSync(inF, 'w'), outFd = openSync(outF, FSC.O_RDONLY | FSC.O_NONBLOCK);
-    const line = Buffer.alloc(4096);
-    broker = { sh, inFd, outFd, dir, line, buf: '', pending: [] };
+    const b = { sh, inFd: openSync(inF, 'w'), outFd: openSync(outF, FSC.O_RDONLY | FSC.O_NONBLOCK), dir, line: Buffer.alloc(4096), buf: '', pending: [] };
     process.on('exit', () => { try { sh.kill(); } catch {} try { rmSync(dir, { recursive: true, force: true }); } catch {} });
-    for (let w = 1; w < workers; w++) {
-      const d2 = mkdtempSync(`/tmp/${tag}w${w}_`), in2 = d2 + '/in', out2 = d2 + '/out';
-      execSync(`mkfifo "${in2}" "${out2}"`);
-      const sh2 = spawn('sh', ['-c', `while IFS= read -r p; do wat2wasm ${flags.join(' ')} "$p.wat" -o "$p.wasm" 2>"$p.err"; echo $?; done <"${in2}" >"${out2}"`], { stdio: ['ignore', 'ignore', 'inherit'] });
-      sh2.unref();
-      const b2 = { sh: sh2, inFd: openSync(in2, 'w'), outFd: openSync(out2, FSC.O_RDONLY | FSC.O_NONBLOCK), dir: d2, line: Buffer.alloc(4096), buf: '', pending: [] };
-      extra.push(b2);
-      process.on('exit', () => { try { sh2.kill(); } catch {} try { rmSync(d2, { recursive: true, force: true }); } catch {} });
-    }
+    return b;
+  };
+  try {
+    broker = mkShell('');
+    // Synchronous requests (PLT stubs, a few lines each) get their own shell:
+    // behind the deferred queue they waited for every closure unit ahead of
+    // them to assemble first - 1.3 s of a 40 s clang -S, for stubs that
+    // assemble in a millisecond.
+    syncB = mkShell('s');
+    for (let w = 1; w < workers; w++) extra.push(mkShell('w' + w));
   } catch (e) { broker = null; if (process.env.OXWASM_ASMDEBUG) console.error('<assembler broker unavailable: ' + e.message + '>'); }
   const nap = new Int32Array(new SharedArrayBuffer(4));
   // read whatever status lines are available now (non-blocking); returns the
@@ -83,13 +83,10 @@ export function makeAssembler({ debugNames = false, tag = 'oxasm', workers = +(p
   };
   const pump = () => { if (!broker) return 0; let d = pumpOne(broker); for (const b of extra) d += pumpOne(b); return d; };
   const viaBroker = (wat) => {
-    // a synchronous request behind deferred ones must wait for their answers
-    // first, or the status lines would be attributed to the wrong jobs
-    while (broker.pending.length) { if (!pumpOne(broker)) Atomics.wait(nap, 0, 0, 1); }
-    const w = `${broker.dir}/u${n++}`; writeFileSync(w + '.wat', wat);
-    writeSync(broker.inFd, w + '\n');
+    const w = `${syncB.dir}/u${n++}`; writeFileSync(w + '.wat', wat);
+    writeSync(syncB.inFd, w + '\n');
     let lines;
-    for (;;) { lines = readLines(); if (lines.length) break; Atomics.wait(nap, 0, 0, 1); }
+    for (;;) { lines = readLines(syncB); if (lines.length) break; Atomics.wait(nap, 0, 0, 1); }
     if (lines.length > 1 && process.env.OXWASM_ASMDEBUG) console.error('<assembler: unexpected extra status lines>');
     return finish(w, lines[0]);
   };
