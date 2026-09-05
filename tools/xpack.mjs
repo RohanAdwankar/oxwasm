@@ -162,7 +162,12 @@ for (const name of ['6x13', '6x13B', '9x15', '9x15B', '6x10']) {
 }
 
 // ---- engine modules as import-map data: URLs -------------------------------
-const MODS = ['interp', 'decode', 'jit2', 'jitsimd', 'aot_wat', 'linux', 'xserver', 'pcf', 'snapshot_core'];
+// every engine module reachable from the roots by import (a fixed list went
+// stale: xserver grew font5x7.mjs and the packed shell could not resolve it)
+const MODS = (() => { const roots = ['linux', 'xserver', 'snapshot_core', 'pcf', 'jit2', 'jitsimd'], seen = [];
+  const walk = (m) => { if (seen.includes(m)) return; seen.push(m);
+    for (const [, d] of readFileSync(join(ENGINE, m + '.mjs'), 'utf8').matchAll(/from '\.\/(\w+)\.mjs'/g)) walk(d); };
+  roots.forEach(walk); return seen; })();
 const importMap = { imports: {} };
 for (const m of MODS) {
   const src = readFileSync(join(ENGINE, m + '.mjs'), 'utf8').replace(/from '\.\/(\w+)\.mjs'/g, "from 'ox/$1'");

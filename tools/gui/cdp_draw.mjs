@@ -76,7 +76,10 @@ const clickUntil = async (what, doClick, pred, settleMs) => {
   }
   console.log(`${what} never appeared`); process.exit(1);
 };
-let main = mainWin(await wins());
+// the restored page may still be applying units (a rebuilt engine tiers a
+// little more at boot); poll for the first mapped toplevel instead of bailing
+let main = null;
+for (let t = 0; t < 40 && !main; t++) { main = mainWin(await wins()); if (!main) await sleep(1500); }
 if (!main) { console.log('no main window found'); process.exit(1); }
 // the File menu popup is a tall narrow window titled like the app
 const menu = await clickUntil('File menu',
