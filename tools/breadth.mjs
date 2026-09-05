@@ -153,6 +153,10 @@ const SOCKPAIR = '/tmp/breadth_sockpair';
 if (!existsSync(SOCKPAIR)) {   // socketpair(AF_UNIX): both directions, EOF after the peer closes, a child on the other end
   try { execFileSync('gcc', ['-O1', '-o', SOCKPAIR, new URL('./fixtures/sockpair.c', import.meta.url).pathname]); } catch {}
 }
+const RENAMEDIR = '/tmp/breadth_renamedir';
+if (!existsSync(RENAMEDIR)) {   // rename(2) on directories, renameat2 NOREPLACE (rustc's incremental session finalisation)
+  try { execFileSync('gcc', ['-O1', '-o', RENAMEDIR, new URL('./fixtures/renamedir.c', import.meta.url).pathname]); } catch {}
+}
 const RUST = '/root/.rustup/toolchains/stable-x86_64-unknown-linux-gnu';
 const RHELLO = '/tmp/breadth_rhello';
 if (!existsSync(RHELLO) && existsSync(RUST + '/bin/rustc')) {
@@ -180,6 +184,15 @@ const TINY_RS = '/tmp/breadth_tiny.rs';
 if (!existsSync(TINY_RS)) writeFileSync(TINY_RS, [
   'pub fn fib(n: u32) -> u64 { if n < 2 { n as u64 } else { fib(n - 1) + fib(n - 2) } }',
   'fn main() { println!("{}", fib(20)); }', ''].join('\n'));
+const CRATE = '/tmp/breadth_crate';
+if (existsSync(RUST + '/bin/cargo')) {   // a no-dependency crate for `cargo build`; a stale target/ from the last native run must not be provisioned
+  try {
+    execFileSync('rm', ['-rf', CRATE + '/target']);
+    execFileSync('mkdir', ['-p', CRATE + '/src']);
+    writeFileSync(CRATE + '/Cargo.toml', '[package]\nname = "bc"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\n');
+    writeFileSync(CRATE + '/src/main.rs', 'fn fib(n: u32) -> u64 { if n < 2 { n as u64 } else { fib(n - 1) + fib(n - 2) } }\nfn main() { println!("fib(25) = {}", fib(25)); }\n');
+  } catch {}
+}
 const PROCFS = '/tmp/breadth_procfs';
 if (!existsSync(PROCFS)) {
   try { execFileSync('gcc', ['-O1', '-pthread', '-o', PROCFS,
@@ -299,7 +312,8 @@ const CASES = [
   ['java-hello', '/usr/lib/jvm/java-21-openjdk-amd64/bin/java', ['-Xint', '-XX:+UseSerialGC', '-Xshare:off', '-Xmx256m', '-cp', '/tmp/breadth_jhello', 'Hello'],
               { memMB: 3072, tree: ['/usr/lib/jvm/java-21-openjdk-amd64', '/tmp/breadth_jhello'] }],
   ['madv',    '/tmp/breadth_madv', []],
-  ['sockpair', '/tmp/breadth_sockpair', []],   // cargo spawns rustc over one (std's spawn error channel)
+  ['sockpair', '/tmp/breadth_sockpair', []],
+  ['renamedir', '/tmp/breadth_renamedir', []],   // directory rename, renameat2 NOREPLACE (rustc's incremental session finalisation)   // cargo spawns rustc over one (std's spawn error channel)
   ['rhello',  '/tmp/breadth_rhello', []],
   // rustc and clang: LLVM in-process (a 147 MB librustc_driver, libLLVM 118
   // MB), jemalloc's madvise probe, C++ exception tables; clang's output is
@@ -310,6 +324,20 @@ const CASES = [
   // lsb_release, a Python script natively, so its "os:" line is a
   // provisioning question rather than an engine one; the plain form is exact
   ['cargo-version', RUST + '/bin/cargo', ['--version'], { memMB: 2048, tree: RUST + '/lib' }],
+  // The whole build tree in one case: cargo probes rustc over pipes, spawns
+  // the compile over a socketpair error channel, rustc (7 threads) spawns cc
+  // for the link, cc runs collect2, collect2 runs rustc's gcc-ld/ld.lld
+  // wrapper, which runs rust-lld. The binary is compared to native's. 7.5
+  // min cold. lto-wrapper must be present or gcc emits an empty
+  // -plugin-opt= that rust-lld rejects.
+  ['cargo-build', RUST + '/bin/cargo', ['build', '--offline', '--manifest-path', CRATE + '/Cargo.toml'],
+              { memMB: 3072, childMemMB: 2048, env: ['RUSTC=' + RUST + '/bin/rustc'], nativeEnv: { RUSTC: RUST + '/bin/rustc' },
+                tree: [RUST + '/lib', CRATE, '/usr/lib/gcc/x86_64-linux-gnu/13'],
+                bins: [RUST + '/bin/rustc', '/usr/bin/cc', '/usr/bin/gcc', '/usr/bin/x86_64-linux-gnu-gcc-13',
+                       '/usr/libexec/gcc/x86_64-linux-gnu/13/collect2', '/usr/libexec/gcc/x86_64-linux-gnu/13/lto-wrapper',
+                       '/usr/libexec/gcc/x86_64-linux-gnu/13/liblto_plugin.so', '/usr/bin/ld', '/usr/bin/x86_64-linux-gnu-ld',
+                       '/usr/bin/x86_64-linux-gnu-ld.bfd', '/usr/bin/as', '/usr/bin/x86_64-linux-gnu-as'],
+                outFile: CRATE + '/target/debug/bc' }],
   // rustc optimising and emitting a crate in-process: seven threads, ~3,300
   // units, the PIC-table guard-vs-case-test bug fell out of it (450 s cold)
   ['rustc-asm', RUST + '/bin/rustc', ['-O', '--emit=asm', '--crate-type', 'bin', '-o', '/tmp/breadth_tiny.s', TINY_RS],
@@ -603,8 +631,8 @@ const pick = (n) => !only.length || only.some(o => n.includes(o));
 // the shell's 128+sig so it compares against the engine's default-action code
 const SIGN = { SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGILL: 4, SIGTRAP: 5, SIGABRT: 6,
                SIGBUS: 7, SIGFPE: 8, SIGKILL: 9, SIGSEGV: 11, SIGPIPE: 13, SIGTERM: 15 };
-const native = (bin, args, stdin) => {
-  try { const out = execFileSync(bin, args, { input: stdin, maxBuffer: 1 << 28 });
+const native = (bin, args, stdin, nativeEnv) => {
+  try { const out = execFileSync(bin, args, { input: stdin, maxBuffer: 1 << 28, ...(nativeEnv ? { env: { ...process.env, ...nativeEnv } } : {}) });
         return { out, code: 0 }; }
   catch (e) { return { out: e.stdout ?? Buffer.alloc(0),
                        code: e.status ?? (e.signal ? 128 + (SIGN[e.signal] || 0) : -1) }; }
@@ -688,7 +716,7 @@ for (const [name, bin, args, opts] of CASES) {
   const stdin = STDIN[name] || null;
   if (opts && opts.tree) for (const t of [].concat(opts.tree)) walk(t);
   if (opts && opts.bins) for (const b of opts.bins) add(b, b);   // child-exec binaries
-  const nat = native(bin, args, stdin);
+  const nat = native(bin, args, stdin, opts && opts.nativeEnv);   // nativeEnv: variables the native oracle needs too (cargo's RUSTC)
   // outFile case: native wrote the file to the real FS; read it as the oracle
   if (opts && opts.outFile) { try { nat.out = readFileSync(opts.outFile); } catch { nat.out = Buffer.alloc(0); } }
   const eng = engine(bin, args, stdin, opts);
