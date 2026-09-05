@@ -4345,3 +4345,14 @@ function stays interpreted: slow and right, where the emitted unit was
 fast and wrong. The check costs one pass over the sorted addresses.
 `picguardtest` pins a jump into the middle of an instruction as
 "overlapping decode".
+
+The first cut refused seven malloc-path functions in every program:
+glibc branches one byte into `lock cmpxchg` to run the plain
+`cmpxchg` when the process is single-threaded, so two instructions
+share their last four bytes. That overlap is allowed when both end at
+the same address, and that address becomes a block leader so the two
+paths rejoin there; before, the lock path fell through into the
+middle of a block and deopted on every execution. Function counts are
+back to their earlier values (awk 537, python 2350) with no refusals
+reported under the new `AOTFAIL=1` breadth lever, which prints each
+refused translation with its reason, bytes and image.
