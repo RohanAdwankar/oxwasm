@@ -567,9 +567,17 @@ export function analyze(mem, entry, { maxInsns = 20000, noJtab = false, entries 
   // a phantom leader inside a real instruction produces (a jump table
   // read past its end): refusing the function keeps it interpreted,
   // which is slow and right, where the emitted unit was fast and wrong.
+  // The one legitimate overlap is a skipped prefix: glibc's malloc branches
+  // one byte into `lock cmpxchg` to run the plain `cmpxchg` when the process
+  // is single-threaded. Both instructions end at the same address, so that
+  // address becomes a leader and the two blocks rejoin there (before, the
+  // lock path fell through into the middle of a block and deopted).
   for (let i = 1; i < addrs.length; i++) {
-    const p = insnAt.get(addrs[i - 1].toString());
-    if (addrs[i] < addrs[i - 1] + BigInt(p.len)) throw new Error(`overlapping decode: ${addrs[i].toString(16)} inside ${addrs[i - 1].toString(16)}`);
+    const p = insnAt.get(addrs[i - 1].toString()), q = insnAt.get(addrs[i].toString());
+    if (addrs[i] < addrs[i - 1] + BigInt(p.len)) {
+      if (q.next === p.next) leaders.add(p.next.toString());
+      else throw new Error(`overlapping decode: ${addrs[i].toString(16)} inside ${addrs[i - 1].toString(16)}`);
+    }
   }
   const blocks = []; let cur = null;
   for (const a of addrs) { if (leaders.has(a.toString())) { cur = { start: a, insns: [] }; blocks.push(cur); } cur.insns.push(insnAt.get(a.toString())); }
