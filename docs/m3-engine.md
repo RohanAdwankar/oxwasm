@@ -4356,3 +4356,13 @@ middle of a block and deopted on every execution. Function counts are
 back to their earlier values (awk 537, python 2350) with no refusals
 reported under the new `AOTFAIL=1` breadth lever, which prints each
 refused translation with its reason, bytes and image.
+
+Gate for batch 7, the guard rule and the integrity check: the cold
+breadth sweep on head fc3f6f3, five chunks plus the four cases the
+chunk list's substring filter missed, 175/175 byte-identical to native
+in 58 minutes (rustc-asm 642 s and clang-S 231 s of it). Two notes for
+the next sweep: the chunk list is read by substring, so a name like
+`java-version` does not pick up `java-hello`, and a background run
+only survives while the session stays active: the container is
+reclaimed when the session idles, which killed two earlier attempts
+mid-chunk.
