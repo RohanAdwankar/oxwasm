@@ -4557,3 +4557,9 @@ third of its emit phase), and the known-entries set is incremental.
 The next lever is structural: hand the broker a unit and keep running
 while it assembles, registering the module when the bytes come back,
 as the browser already does with its off-thread assembler.
+
+Measured on rustc-asm with the selective re-emit: re-emitted
+functions 13,176 to 789, emit 152 s to 113 s, wat text 2.79 GB to
+2.07 GB (less to assemble and collect), the run 778 s to 731 s with
+the same 3,329 units and 20,464 functions. Analysis is unchanged at
+298 s and is the next target.
