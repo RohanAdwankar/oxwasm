@@ -4580,3 +4580,9 @@ behind pending ones drains them first. Child engines inherit it. Cold
 (every unit through wat2wasm), byte-identical: gcc-c 68 s to 54 s,
 m4 13.9 s to 11.7 s, python3 39 s to 37 s. Opt-in as `ASYNC_ASM=1`
 in runbin and breadth until the sweep has run under it.
+
+clang-S cold under deferred assembly: 231 s to 203 s (12%), exact. The
+fifo wait was a quarter of the synchronous run, so half of it is now
+overlapped; the rest is wat2wasm still being one process behind the
+translator's output rate (a second broker shell would take the other
+half).
