@@ -16,7 +16,7 @@ const args = process.argv.slice(2);
 const src = args[0], dst = args[1]; let unitsPath = null;
 for (let i = 2; i < args.length; i++) if (args[i] === '--units') unitsPath = args[++i];
 if (!src || !dst) { console.error('usage: reshell SRCDIR DSTDIR [--units new.units.gz]'); process.exit(1); }
-const ENGINE = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'engine');
+const ENGINE = process.env.OX_ENGINE_DIR || join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'engine');   // OX_ENGINE_DIR: re-shell on another engine checkout (bisects)
 // every engine module reachable from the roots by import (a fixed list went
 // stale: xserver grew font5x7.mjs and the packed shell could not resolve it)
 const MODS = (() => { const roots = ['linux', 'xserver', 'snapshot_core', 'pcf', 'jit2', 'jitsimd'], seen = [];

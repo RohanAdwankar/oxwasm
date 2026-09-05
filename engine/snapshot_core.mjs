@@ -91,6 +91,12 @@ export function restoreEngineCore(eng, xs, assets, CPUctor, inflate) {
   const dnow = eng.nowMs() - Number(state.now);
   const rebase = (d) => d == null ? null : Number(d) + dnow;
   eng.base = state.base; eng.brk = state.brk; eng.mmapNext = state.mmapNext; eng.stackTop = state.stackTop;
+  // The mmap arena base: munmap hands ranges above it back for reuse. An old
+  // state has none; without it the hole list treated every munmap below
+  // mmapNext (GIMP's file mappings, plug-in scratch) as reusable arena and
+  // handed live memory out twice - the shipped page lost its File menu on a
+  // rebuilt engine. A restored engine's arena starts where its mmapNext is.
+  eng._mmapBase = state._mmapBase ?? state.mmapNext; eng._mmapHoles = [];
   eng.execRanges = state.execRanges.map(([a, b]) => [BigInt(a), BigInt(b)]);
   eng.execRangesStatic = (state.execRangesStatic ?? state.execRanges).map(([a, b]) => [BigInt(a), BigInt(b)]);  // loop tiers stay on the pre-widening ground
   eng.maps = state.maps;

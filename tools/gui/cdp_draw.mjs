@@ -55,9 +55,9 @@ const click=async(gx,gy)=>{ const [x,y]=await guest(gx,gy);
 // image window wherever it actually is. Offsets calibrated from a
 // default-layout run: File=(+20,+13) New=(+48,+52) of main, OK=(+328,+238)
 // of the dialog, strokes from (+76,+80) of the image window.
-const winsQ = `(() => { const xs = window.__oxXs; if (!xs) return "[]";
+const winsQ = `(() => { const xs = window.__oxXs; if (!xs) return JSON.stringify([{noxs: true, eng: typeof window.__oxEng, ready: window.__oxReady, href: location.href}]);
   return JSON.stringify(xs.root.children.filter(c=>c.mapped).map(c=>({x:c.x,y:c.y,w:c.w,h:c.h,n:(xs.wmName&&xs.wmName(c))||""}))); })()`;
-const wins = async () => JSON.parse(await q(winsQ));
+const wins = async () => { const w = JSON.parse(await q(winsQ)); if (w[0]?.noxs) { if (process.env.WINS) console.log('no __oxXs yet', JSON.stringify(w[0])); return []; } return w; };
 const wdump = async (tag) => { if (process.env.WINS) console.log('wins', tag, JSON.stringify(await wins())); };
 const mainWin = (ws) => ws.filter(w => w.w >= 400 && w.h >= 150)
   .sort((a, b) => (b.w * b.h) - (a.w * a.h))[0];

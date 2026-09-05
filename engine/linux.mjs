@@ -327,7 +327,8 @@ export class LinuxEngine {
     const at = this.mmapNext; this.mmapNext += len; return at;
   }
   _mmapFree(lo, len) {                              // is [lo, lo+len) unmapped as far as the arena knows?
-    const hi = lo + len, base = this._mmapBase ?? 0n;
+    if (this._mmapBase === undefined) return false; // no arena knowledge (an engine restored from an old state): never claim free
+    const hi = lo + len, base = this._mmapBase;
     if (lo < base) return false;                    // below the arena: ELF, brk - not ours to say
     if (lo >= this.mmapNext) return hi - this.base <= BigInt(this.ram.length);
     for (const h of (this._mmapHoles ??= [])) if (lo >= h[0] && hi <= h[1]) return true;
@@ -346,7 +347,8 @@ export class LinuxEngine {
     if (lo >= (this._mmapBase ?? 0n) && hi > this.mmapNext && lo <= this.mmapNext) this.mmapNext = hi;
   }
   _mmapGive(lo, len) {
-    const base = this._mmapBase ?? 0n, hi = lo + len;
+    if (this._mmapBase === undefined) return;       // no arena knowledge: reuse nothing
+    const base = this._mmapBase, hi = lo + len;
     if (lo < base || hi > this.mmapNext || len <= 0n) return;   // not the arena's (fixed spans, brk): leave it
     const holes = (this._mmapHoles ??= []);
     let i = 0; while (i < holes.length && holes[i][1] < lo) i++;
@@ -3518,7 +3520,7 @@ export class LinuxEngine {
     // unlocked)
     for (const L of this._fsMeta().rlocks?.values() ?? []) for (const x of L) if (x.owner === t.proc) x.owner = ceng;
     this._copyLiveRam(ceng);                                 // the child's view, before rollback (live ranges only)
-    ceng.brk = this.brk; ceng.mmapNext = this.mmapNext; ceng._mmapHoles = (this._mmapHoles || []).map(h => [h[0], h[1]]);
+    ceng.brk = this.brk; ceng.mmapNext = this.mmapNext; ceng._mmapBase = this._mmapBase; ceng._mmapHoles = (this._mmapHoles || []).map(h => [h[0], h[1]]);
     ceng.execRanges = this.execRanges.slice();
     if (this.execRangesStatic) ceng.execRangesStatic = this.execRangesStatic.slice();
     ceng.maps = (this.maps ?? []).map(m => ({ ...m }));
