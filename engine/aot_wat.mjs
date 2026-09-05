@@ -3075,16 +3075,24 @@ export function compileUnitWat(mem, entry, opts = {}) {
     } catch (e) { poisoned.add(k); if (k === entry.toString()) throw e; }
   }
   if (PHASE) { PH.analyze += performance.now() - ta0; PH.units++; }
-  const canDirect = (k) => funcs.has(k) && !poisoned.has(k);
+  // Emitting records which callees a text reaches directly (a wasm `call`,
+  // or an inlined body), so that when a callee poisons only the texts that
+  // named it are emitted again. The whole unit used to be re-emitted per
+  // round: in a rustc compile (LLVM functions with unsupported SSE forms
+  // poisoning routinely) that re-emitted 13,176 functions on top of the
+  // 20,464 the run needed, a third of the emit phase.
+  let emitting = null; const uses = new Map();
+  const canDirect = (k) => { const ok = funcs.has(k) && !poisoned.has(k); if (ok && emitting !== null) uses.get(emitting).add(k); return ok; };
   const ctx = { guestBase, ramBase, canDirect };
-  // emit; a failure poisons that function and re-emits — its callers switch
-  // from direct wasm calls to callout escapes
+  // emit; a failure poisons that function and re-emits its direct callers -
+  // they switch from direct wasm calls to callout escapes
   const texts = new Map();
   for (let round = 0; ; round++) {
     if (round > 16) throw new Error('AOT: poison did not converge');
-    texts.clear(); let repoison = false;
+    let repoison = false;
     for (const [k, an] of funcs) {
-      if (poisoned.has(k)) continue;
+      if (poisoned.has(k) || texts.has(k)) continue;
+      emitting = k; uses.set(k, new Set());
       try {
         // Inlining is opt-in while it is being measured. It never changes what
         // the unit CONTAINS - the callee keeps its own standalone function for
@@ -3101,6 +3109,7 @@ export function compileUnitWat(mem, entry, opts = {}) {
                   (st.rej = st.rej || []).push(BigInt(t).toString(16) + ':' + why + ' in ' + k);
                 } : null });
             if (m) { use = m;
+              for (const t of m.inlined) uses.get(k).add(typeof t === 'string' ? t : BigInt(t).toString());   // an inlined body is a use too
               globalThis.__inlStats = globalThis.__inlStats || { fns: 0, callees: 0 };
               globalThis.__inlStats.fns++; globalThis.__inlStats.callees += m.inlined.length; }
           } catch { /* a merge that does not hold: emit the function unmodified */ }
@@ -3121,8 +3130,14 @@ export function compileUnitWat(mem, entry, opts = {}) {
         poisoned.add(k); repoison = true;
       }
     }
-    if (PHASE) { PH.rounds++; if (round > 0) PH.reemit += texts.size; }
+    emitting = null;
+    if (PHASE) PH.rounds++;
     if (!repoison) break;
+    // only the texts that reach a poisoned function directly are stale
+    let stale = 0;
+    for (const [k, u] of uses) if (texts.has(k)) { for (const c of u) if (poisoned.has(c)) { texts.delete(k); stale++; break; } }
+    if (PHASE) PH.reemit += stale;
+    if (!stale) break;                     // nothing named the poisoned function: the texts stand
   }
   let wat = '(module\n  (import "js" "mem" (memory 4096))\n';
   wat += '  (import "env" "syscall" (func $x_syscall (param i64)))\n';
