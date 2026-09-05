@@ -4432,3 +4432,16 @@ sweep of `eng.children`, hence the `onChildEngine` hook.
 
 With the directory rename in, the case's guest stderr is native's two
 lines exactly ("Compiling", "Finished"); the warning is gone.
+
+### The harness was eating the box, not the engine
+
+The gate sweep after batch 8 lost a chunk to the OOM killer at 13.7 GB
+RSS after fifty cases, and the next chunk was at 12 GB with seven
+cases to go. With `--expose-gc` and a collection between cases the
+RSS stays flat at 4.5 GB, so nothing leaks: V8 simply never collected
+a finished case's `WebAssembly.Memory` under its own pressure
+accounting. The harness now collects between cases (a no-op without
+the flag; the sweep script passes it), and the 4 GB floor was the
+library provisioning read twice, once under `/lib` and once under
+`/usr/lib`; the bytes are shared by realpath now, as runbin already
+did (its probe baseline went 4.3 GB to 1.5 GB earlier today).
