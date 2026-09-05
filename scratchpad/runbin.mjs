@@ -118,7 +118,7 @@ if (process.env.DUMP) {   // DUMP=hexrip,...: tiering state of given entries + t
   console.log('  hottest call targets: ' + hotAll.map(([a, n]) => a.toString(16) + 'x' + n + (eng.aotFns.has(a) ? '' : '(uncompiled)')).join(' '));
   console.log('  hottest uncompiled call targets: ' + hot.map(([a, n]) => a.toString(16) + 'x' + n + (eng.aotFailed?.has(a) ? '(failed)' : '')).join(' '));
 }
-if (globalThis.__aotPhase) console.log('--- phase:', JSON.stringify(globalThis.__aotPhase, (k, v) => typeof v === 'number' ? Math.round(v) : v));   // OXWASM_PHASE=1: translation time by phase (ms)
+if (globalThis.__aotPhase) { const ph = globalThis.__aotPhase; console.log('--- phase:', JSON.stringify({ ...ph, seen: ph.seen ? ph.seen.size : 0 }, (k, v) => typeof v === 'number' ? Math.round(v) : v)); }   // OXWASM_PHASE=1: translation time by phase (ms)
 if (process.env.FILEOUT) { const [g, h] = process.env.FILEOUT.split(':'); const f = eng.files[g]; if (f) { writeFileSync(h, f); console.log(`--- fileout ${g} -> ${h} (${f.length} bytes)`); } else console.log(`--- fileout ${g} missing`); }   // FILEOUT=guest:host - copy a guest file out as bytes
 if (process.env.FILE) { const f = eng.files[process.env.FILE]; console.log('--- file ' + process.env.FILE + ' ---\n' + (f ? Buffer.from(f).toString() : '(missing)')); }
 if (eng.stderr&&eng.stderr.length) console.log('--- stderr ---\n' + eng.stderr.join('').slice(0, process.env.STDERRMAX ? +process.env.STDERRMAX : 4000));
