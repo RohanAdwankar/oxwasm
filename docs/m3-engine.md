@@ -4695,6 +4695,20 @@ the gate: rustc-asm 642 s to **158 s**, cargo-build 350-390 s to
 **148 s**, clang-S 203 s to **27 s**, java-hello 98 s. The whole sweep
 took 32 minutes against 58 before batch 8.
 
+**Failed callees were re-analysed in every unit that reached them.** The
+phase profile of the gated rustc-asm (152 s) put 41.6 s in analysis and
+35.2 s in emit, and 5,797 of its 12,104 analyses were duplicates - not
+the tiny callees this time but 2.58M instructions, 9.8 s. A callee whose
+analysis or emit fails (LLVM functions with unsupported SSE forms, the
+routine case) is poisoned in its unit and registered nowhere, so the
+next unit that reached it analysed it from scratch and failed the same
+way. The engine now keeps a failure memo across units (cleared per
+range with the other invalidation): a memoised callee is poisoned
+without analysis. rustc-asm: analysis 42.5 s to 35.4 s, duplicate
+instructions 2.58M to 0.44M, the run 156 s to 143 s; 312 memo hits.
+Roots are never memoised, so a function that fails as a callee still
+gets its own attempt when its profile makes it a root.
+
 What the gated clang profile (40 s) leaves: the emitter 4.7 s self plus
 4.5 s of garbage collection, 3.9 s of module instantiation even with
 lazy compilation, 2.9 s of decode plus analysis, 1.6 s interpreting

@@ -3046,6 +3046,12 @@ export function compileUnitWat(mem, entry, opts = {}) {
     // it off; the per-address verdict is memoised across units in opts.tinyMemo.
     if (opts.veto && k !== entry.toString() && opts.veto(k)) continue;   // bisect aid: an explicit veto beats the tiny exception
     if (skip && k !== entry.toString() && skip(k) && !isTiny(a)) continue;
+    // A callee whose analysis or emit failed in an earlier unit fails the
+    // same way in this one (the bytes have not changed; the engine clears the
+    // memo when they do): poison it without analysing again. rustc-asm
+    // re-analysed 2.58M instructions of such callees, 9.8 s of a 152 s run.
+    // Roots are never memoised - a root that fails must throw to its caller.
+    if (opts.failMemo && k !== entry.toString() && opts.failMemo.has(k)) { poisoned.add(k); if (PHASE) PH.memoFail = (PH.memoFail ?? 0) + 1; continue; }
     try {
       let an;
       try { const tA = PHASE ? performance.now() : 0;
@@ -3090,7 +3096,7 @@ export function compileUnitWat(mem, entry, opts = {}) {
           throw new Error('trampoline -> callout'); }
       funcs.set(k, an);
       for (const c of an.calls) if (!funcs.has(c) && !poisoned.has(c)) pending.push(BigInt(c));
-    } catch (e) { poisoned.add(k); if (k === entry.toString()) throw e; }
+    } catch (e) { poisoned.add(k); if (k === entry.toString()) throw e; if (opts.failMemo) opts.failMemo.set(k, e.message); }
   }
   if (PHASE) { PH.analyze += performance.now() - ta0; PH.units++; }
   // Emitting records which callees a text reaches directly (a wasm `call`,
@@ -3146,6 +3152,10 @@ export function compileUnitWat(mem, entry, opts = {}) {
       catch (e) {
         if (k === entry.toString()) throw e;
         poisoned.add(k); repoison = true;
+        // an emit failure is a property of the function's own instructions
+        // (the inlining retry above already ran): remember it, so the next
+        // unit that reaches this callee poisons it without analysing it
+        if (opts.failMemo) opts.failMemo.set(k, e.message);
       }
     }
     emitting = null;

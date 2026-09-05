@@ -401,6 +401,8 @@ export class LinuxEngine {
     if (this.profile) for (const k of this.profile.keys()) if (inR(k)) this.profile.delete(k);
     for (const k of this.aotCalls.keys()) if (inR(k)) { this.aotCalls.delete(k); this._callTargets?.delete(k.toString()); }
     for (const k of this._ftSeen) if (inR(k)) { this._ftSeen.delete(k); this._entries?.delete(k.toString()); }
+    if (this._failMemo) for (const k of this._failMemo.keys()) if (inR(BigInt(k))) this._failMemo.delete(k);
+    if (this._tinyMemo) for (const k of this._tinyMemo.keys()) if (inR(BigInt(k))) this._tinyMemo.delete(k);
     if (this._inflight) for (const u of this._inflight) if (u.funcs.some(inR)) {
       u.cancelled = true;
       if (this._pendingFns) for (const a of u.funcs) this._pendingFns.delete(a.toString());
@@ -562,6 +564,7 @@ export class LinuxEngine {
         // bisect aids: fnVeto never compiles these; fnAllow compiles only these (roots and closure members)
         veto: (this.fnVeto || this.fnAllow) ? (c) => (this.fnVeto?.has(c) ?? false) || (this.fnAllow ? !this.fnAllow.has(c) : false) : null,
         tinyMemo: (this._tinyMemo ??= new Map()),
+        failMemo: (this._failMemo ??= new Map()),          // callees whose analysis failed once: poisoned without re-analysis (cleared per range by _invalidateCode)
         // the tiering call profile, so the inliner can pick targets by how
         // often they are actually called rather than by what fits a budget
         hot: this.aotCalls,
