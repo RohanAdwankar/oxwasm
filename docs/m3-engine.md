@@ -4563,3 +4563,20 @@ functions 13,176 to 789, emit 152 s to 113 s, wat text 2.79 GB to
 2.07 GB (less to assemble and collect), the run 778 s to 731 s with
 the same 3,329 units and 20,464 functions. Analysis is unchanged at
 298 s and is the next target.
+
+### Deferred assembly: the guest runs while wat2wasm works
+
+The clang profile put a quarter of the run in the host blocked on the
+broker's fifo. The broker now takes a submission and answers later:
+`asm.submit(wat, cb)` writes the text and the request line and returns;
+`asm.pump()` reads whatever status lines are back (the fifo is opened
+non-blocking; the shell answers in request order, so each line belongs
+to the oldest pending job) and runs the callbacks, which instantiate
+and register the unit. The engine's `assembleWatDeferred` path sets the
+same null placeholder the browser's off-thread compile uses, counts the
+unit's functions as seen for closure pruning while they are pending,
+and pumps at every run slice and every tier-up; a synchronous request
+behind pending ones drains them first. Child engines inherit it. Cold
+(every unit through wat2wasm), byte-identical: gcc-c 68 s to 54 s,
+m4 13.9 s to 11.7 s, python3 39 s to 37 s. Opt-in as `ASYNC_ASM=1`
+in runbin and breadth until the sweep has run under it.

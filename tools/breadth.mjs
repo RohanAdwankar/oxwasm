@@ -269,12 +269,19 @@ add(HELLO_CPP, HELLO_CPP);
 const CACHE = new URL('../bench/kernels/watcache/', import.meta.url).pathname;
 mkdirSync(CACHE, { recursive: true });
 const asm = makeAssembler({ tag: 'bw' });
+const NOCACHE = !!process.env.BREADTH_NOCACHE;   // BREADTH_NOCACHE=1: every unit through wat2wasm (assembly-time A/Bs)
 const assembleWat = (wat) => {
   const h = createHash('sha1').update(wat).digest('hex'), cp = CACHE + h + '.wasm';
-  if (existsSync(cp)) return new Uint8Array(readFileSync(cp));
+  if (!NOCACHE && existsSync(cp)) return new Uint8Array(readFileSync(cp));
   const b = asm(wat);                              // pre-forked broker: the spawn is not paid from a multi-GB process
-  try { writeFileSync(cp, b); } catch {}
+  if (!NOCACHE) try { writeFileSync(cp, b); } catch {}
   return b;
+};
+// deferred form: a cached unit answers at once, the rest come back from a pump
+const assembleWatDeferred = (wat, cb) => {
+  const h = createHash('sha1').update(wat).digest('hex'), cp = CACHE + h + '.wasm';
+  if (!NOCACHE && existsSync(cp)) { cb(new Uint8Array(readFileSync(cp)), null); return; }
+  asm.submit(wat, (b, e) => { if (b && !NOCACHE) try { writeFileSync(cp, b); } catch {} cb(b, e); });
 };
 
 // tree: provision a whole directory (an interpreter is not one file - without
@@ -664,6 +671,7 @@ const engine = (bin, args, stdin, opts = {}) => {
       files, mtimes, memMB: opts.memMB || 512, assembleWat, stdin });
 
   if (process.env.BREADTH_STRACE) eng.strace = [];
+  if (process.env.ASYNC_ASM) { eng.assembleWatDeferred = assembleWatDeferred; eng.pumpAsm = () => asm.pump(); }   // ASYNC_ASM=1: deferred assembly (A/B)
   if (opts.childMemMB) eng.childMemMB = opts.childMemMB;   // execve'd children (default 256 MB; a rustc child needs more)
   if (process.env.AOTFAIL) eng.onAotFail = (a, m) => {   // AOTFAIL=1: every refused translation with its reason; an overlap also shows the bytes and the image
     let extra = '';
