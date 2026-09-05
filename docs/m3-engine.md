@@ -4335,3 +4335,13 @@ are pinned in `engine/diff/picguardtest.mjs` (ja, jae, and the
 FindRoots shape), each also checked for overlapping decode. rustc's
 compile then runs to completion with the assembly byte-identical to
 native.
+
+The guard fix removes the cause; a check in the analyzer removes the
+failure mode. After block formation every function is now refused when
+two decoded instructions overlap or when a jmp, jcc, ret or indirect
+jump sits anywhere but last in its block, and a deopt point always
+ends its block (the label after it starts a new one). A refused
+function stays interpreted: slow and right, where the emitted unit was
+fast and wrong. The check costs one pass over the sorted addresses.
+`picguardtest` pins a jump into the middle of an instruction as
+"overlapping decode".

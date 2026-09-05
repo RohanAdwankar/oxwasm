@@ -556,8 +556,27 @@ export function analyze(mem, entry, { maxInsns = 20000, noJtab = false, entries 
     if (insn.mnem === 'jcc') { leaders.add(((insn.next+insn.rel)&M).toString()); leaders.add(insn.next.toString()); }
     if (insn.mnem === 'jmp') leaders.add(((insn.next+insn.rel)&M).toString()); }
   for (const [, ts] of jtabs) for (const t of ts) leaders.add(t.toString());
+  // a deopt point ends its block; whatever was decoded right after it (a
+  // label some other path reaches) starts a new one, it is never a
+  // fall-through of the escape
+  for (const a of addrs) { const insn = insnAt.get(a.toString()); if (insn.mnem === 'udec') leaders.add(insn.next.toString()); }
+  // Decode integrity. Two instructions may not overlap, and a jmp/ret/
+  // indirect jump may only end a block: the emitter handles those as a
+  // block's last instruction, so one in the middle would be dropped and
+  // the bytes after it run as if it were not there. Both shapes are what
+  // a phantom leader inside a real instruction produces (a jump table
+  // read past its end): refusing the function keeps it interpreted,
+  // which is slow and right, where the emitted unit was fast and wrong.
+  for (let i = 1; i < addrs.length; i++) {
+    const p = insnAt.get(addrs[i - 1].toString());
+    if (addrs[i] < addrs[i - 1] + BigInt(p.len)) throw new Error(`overlapping decode: ${addrs[i].toString(16)} inside ${addrs[i - 1].toString(16)}`);
+  }
   const blocks = []; let cur = null;
   for (const a of addrs) { if (leaders.has(a.toString())) { cur = { start: a, insns: [] }; blocks.push(cur); } cur.insns.push(insnAt.get(a.toString())); }
+  for (const b of blocks) for (let i = 0; i < b.insns.length - 1; i++) {
+    const m = b.insns[i].mnem;
+    if (m === 'jmp' || m === 'jcc' || m === 'ret' || m === 'retn' || m === 'jmpind') throw new Error(`terminator inside a block: ${m} at ${b.insns[i].rip.toString(16)}`);
+  }
   const bidx = new Map(blocks.map((b,i)=>[b.start.toString(), i]));
   return { blocks, bidx, M, calls, jtabs };
 }

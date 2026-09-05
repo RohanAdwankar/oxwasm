@@ -9,6 +9,7 @@
 //       old rule took the case test for the bound, read 32 entries, and
 //       two phantom leaders landed inside real instructions, hiding a jmp
 //       (rustc's compile died on a wild address).
+//   t4: a jump into the middle of an instruction: refused as overlapping decode
 // Every decoded instruction must start where the previous one ended
 // (no overlapping decode) - the property the phantom leaders broke.
 import { analyze } from '../aot_wat.mjs';
@@ -67,6 +68,12 @@ t3: movzx eax, byte [r14 - 0x18]
         lea r10, [rbx*8]
         and r10, -0x20
         ret
+
+t4: test eax, eax                                 ; a jump into the middle of an instruction: the analyzer must refuse
+    jz .mid
+    mov dword [rdx + rcx + 4], 1                  ; 8 bytes; .mid is 3 bytes in
+.mid equ $ - 5
+    ret
 `;
 writeFileSync(join(dir, 't.asm'), ASM);
 execFileSync('nasm', ['-f', 'bin', '-o', join(dir, 't.bin'), join(dir, 't.asm')]);
@@ -93,5 +100,10 @@ const check = (name, want) => {
 check('t1', 11);
 check('t2', 4);
 check('t3', 0);
+syms.t4 = find([0x85, 0xc0, 0x74]);                             // test eax,eax; jz
+{ let threw = null; try { analyze(mem, BigInt(ORG + syms.t4), {}); } catch (e) { threw = e.message; }
+  const ok = /overlapping decode/.test(threw || '');
+  if (!ok) fails++;
+  console.log(`${ok ? 'ok  ' : 'FAIL'} t4: jump into an instruction ${threw ? 'refused (' + threw + ')' : 'was ACCEPTED'}`); }
 if (fails) { console.log(`picguardtest: ${fails} FAILED`); process.exit(1); }
 console.log('picguardtest: all ok');
