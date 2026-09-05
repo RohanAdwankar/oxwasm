@@ -1482,18 +1482,19 @@ export class LinuxEngine {
         this.wakeAllBlk(); return;
       }
       if (h?.pipe) {
+        const pb = h.peer ?? h.pipe;                         // a socketpair end writes the OTHER end's buffer (wpipe is the pty field)
         // no read end open anywhere in the process tree: SIGPIPE, and EPIPE
         // if the writer survives it (handler installed or SIG_IGN) — this is
         // what ends `yes | head -1` instead of letting yes fill a dead pipe
-        if (!this._pipeReaderAlive(h.pipe)) { this.raiseSignal(13, null, { pid: 0, code: 0 }); return -32; }
+        if (!this._pipeReaderAlive(pb)) { this.raiseSignal(13, null, { pid: 0, code: 0 }); return -32; }
         // A pipe holds 64KB: a writer that finds it full BLOCKS until a reader
         // drains it (EAGAIN if non-blocking). Without a bound, a compiled
         // `yes` pushed gigabytes of chunks before `head` ever ran.
-        if ((h.pipe.size ?? 0) >= PIPE_CAP) {
+        if ((pb.size ?? 0) >= PIPE_CAP) {
           if (h.nonblock) return -11;
           this.block(null); return -4096;                    // re-executed once woken
         }
-        h.pipe.chunks.push(bytes); h.pipe.size = (h.pipe.size ?? 0) + bytes.length; this.wakeAllBlk(); return;
+        pb.chunks.push(bytes); pb.size = (pb.size ?? 0) + bytes.length; this.wakeAllBlk(); return;
       }
       if (h?.ev) {                                           // eventfd: add to the counter
         let v = 0n; for (let i = 7; i >= 0; i--) v = (v << 8n) | BigInt(bytes[i] ?? 0);
@@ -1555,6 +1556,20 @@ export class LinuxEngine {
         this.jsnap(a1, 8);
         const v = new DataView(this.wmem.buffer), o = this.RAMOFF + Number(a1 - this.base);
         v.setUint32(o, rfd, true); v.setUint32(o + 4, wfd, true);
+        ret(0n); break; }
+      case 53: {                                             // socketpair(domain, type, protocol, sv)
+        // AF_UNIX stream pair as two crossed pipe buffers: each end reads its
+        // own buffer and writes the other's. cargo spawns rustc over one
+        // (std's spawn error channel) and reported "Function not implemented".
+        if (Number(a1) !== 1) { ret(-97n); break; }          // EAFNOSUPPORT
+        const b1 = { chunks: [], pos: 0, off: 0, size: 0 }, b2 = { chunks: [], pos: 0, off: 0, size: 0 };
+        const nb = !!(Number(a2) & 0x800);
+        const f1 = this.allocFd(); this.fds.set(f1, null); const f2 = this.allocFd(); this.fds.delete(f1);
+        this.fds.set(f1, { pipe: b1, peer: b2, mode: 'rw', nonblock: nb });
+        this.fds.set(f2, { pipe: b2, peer: b1, mode: 'rw', nonblock: nb });
+        if (Number(a2) & 0x80000) { this.cloexec.add(f1); this.cloexec.add(f2); }
+        const sv = cpu.regs[10];
+        this.jsnap(sv, 8); this.mem.write(sv, 4n, BigInt(f1)); this.mem.write(sv + 4n, 4n, BigInt(f2));
         ret(0n); break; }
       case 12: {                                             // brk
         // Linux answers a brk it cannot satisfy by returning the break
@@ -1841,6 +1856,8 @@ export class LinuxEngine {
           aotCallThreshold: this.aotCallThreshold, aotLoopThreshold: this.aotLoopThreshold,
           xserver: this.xserver });
         if (this.strace) ceng.strace = [];                   // a traced parent traces its children
+        if (this.childMemMB !== undefined) ceng.childMemMB = this.childMemMB;   // grandchildren too (cargo -> rustc -> cc -> collect2 -> ld)
+        if (this.onChildEngine) { ceng.onChildEngine = this.onChildEngine; this.onChildEngine(ceng, argv); }   // tooling: see every execve'd image, grandchildren included, even ones reaped inside one run slice
         const skipped = [];
         const srcFds = t.proc ? t.proc.fds : this.fds;
         for (const [fd, h] of srcFds) {
@@ -2212,7 +2229,7 @@ export class LinuxEngine {
         h.pos += n; ret(BigInt(n)); break; }
       case 3: { const cfd = Number(a1), ch = this.fds.get(cfd);
         this.fds.delete(cfd); this.cloexec.delete(cfd);
-        if (ch?.pipe && ch.mode === 'w') this._pipeEofSweep([ch]);
+        if (ch?.pipe && (ch.mode === 'w' || ch.peer)) this._pipeEofSweep([ch]);
         if (ch && this._fsMeta().flocks?.size) this._flockRelease(ch);
         if (ch && this._fsMeta().rlocks?.size) this._rlockClose(ch);
         ret(0n); break; }                                     // close
@@ -2221,7 +2238,7 @@ export class LinuxEngine {
         for (const fd of [...this.fds.keys()]) if (fd >= first && fd <= last) {
           if (fl & 4) { this.cloexec.add(fd); continue; }     // CLOSE_RANGE_CLOEXEC
           const ch = this.fds.get(fd); this.fds.delete(fd); this.cloexec.delete(fd);
-          if (ch?.pipe && ch.mode === 'w') this._pipeEofSweep([ch]);
+          if (ch?.pipe && (ch.mode === 'w' || ch.peer)) this._pipeEofSweep([ch]);
           if (ch && this._fsMeta().flocks?.size) this._flockRelease(ch);
           if (ch && this._fsMeta().rlocks?.size) this._rlockClose(ch);
         }
@@ -3553,6 +3570,8 @@ export class LinuxEngine {
       assembleWat: o.assembleWat, aotCallThreshold: o.aotCallThreshold, aotLoopThreshold: o.aotLoopThreshold,
       xserver: o.xserver, mtimes: o.mtimes, tty: o.tty, ttyRows: o.ttyRows, ttyCols: o.ttyCols, stdin: o.stdin });
     if (this.strace) ceng.strace = [];                       // a traced parent traces its children
+    if (this.childMemMB !== undefined) ceng.childMemMB = this.childMemMB;
+    if (this.onChildEngine) { ceng.onChildEngine = this.onChildEngine; this.onChildEngine(ceng, o.argv); }
     // record locks the child took inside its window are owned by its proc
     // record; from here on its identity is the new engine (it conflicted
     // with its own lock otherwise - F_SETLKW spun forever after the parent
@@ -3688,7 +3707,7 @@ export class LinuxEngine {
       const tables = [e.fds];
       if (e._mainFds) tables.push(e._mainFds);
       for (const t of e.threads ?? []) if (t.state !== 'dead' && t.proc?.fds) tables.push(t.proc.fds);
-      for (const tb of tables) for (const [, h] of tb) if (h?.pipe === buf && h.mode === 'w') return true;
+      for (const tb of tables) for (const [, h] of tb) if ((h?.pipe === buf && h.mode === 'w') || h?.peer === buf) return true;
       for (const c of e.children ?? []) if (c.eng && c.exited === null && c.eng.exitCode === null && scan(c.eng)) return true;
       return false;
     };
@@ -3702,14 +3721,14 @@ export class LinuxEngine {
       const tables = [e.fds];
       if (e._mainFds) tables.push(e._mainFds);
       for (const t of e.threads ?? []) if (t.state !== 'dead' && t.proc?.fds) tables.push(t.proc.fds);
-      for (const tb of tables) for (const [, h] of tb) if (h?.pipe === buf && h.mode === 'r') return true;
+      for (const tb of tables) for (const [, h] of tb) if (h?.pipe === buf && h.mode !== 'w') return true;   // 'r', or a socketpair end ('rw')
       for (const c of e.children ?? []) if (c.eng && c.exited === null && c.eng.exitCode === null && scan(c.eng)) return true;
       return false;
     };
     return scan(root);
   }
   _pipeEofSweep(handles) {
-    for (const h of handles) if (h?.pipe && h.mode === 'w' && !h.pipe.weof && !this._pipeWriterAlive(h.pipe)) h.pipe.weof = true;
+    for (const h of handles) { const wb = h?.peer ?? (h?.pipe && h.mode === 'w' ? h.pipe : null); if (wb && !wb.weof && !this._pipeWriterAlive(wb)) wb.weof = true; }
     this.wakeAllBlk();
     let root = this; while (root.parentEng) root = root.parentEng;
     if (root !== this) root.wakeAllBlk();
