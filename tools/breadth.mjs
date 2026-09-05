@@ -11,6 +11,8 @@
 //   node tools/breadth.mjs            # every case
 //   node tools/breadth.mjs sort grep  # only cases whose name matches
 import { LinuxEngine } from '../engine/linux.mjs';
+import { setFlagsFromString } from 'node:v8';
+if (process.env.WASM_LAZY === '1') setFlagsFromString('--wasm-lazy-compilation');   // WASM_LAZY=1: V8 compiles each wasm function at its first call (pricing lever: most translated functions of a compiler run are never entered)
 import { makeAssembler } from './assemble.mjs';
 import { readFileSync, readdirSync, lstatSync, realpathSync, statSync, writeFileSync,
          existsSync, mkdirSync, unlinkSync } from 'node:fs';
