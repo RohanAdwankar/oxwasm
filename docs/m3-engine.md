@@ -4681,6 +4681,14 @@ Invalidation also clears the call profile, the closure-pruning set and
 the known-entry set for the range, so recycled code profiles and joins
 closures afresh rather than inheriting the old code's history.
 
+The sweep over the new defaults (gate at 3, incremental call targets,
+deferred assembly) was 181 of 182 exact, the one failure being the
+recycle race above; the chunk that held it is rerun under the fix. The
+compiler-scale cases, warm wat cache, against the same harness before
+the gate: rustc-asm 642 s to **158 s**, cargo-build 350-390 s to
+**148 s**, clang-S 203 s to **27 s**, java-hello 98 s. The whole sweep
+took 32 minutes against 58 before batch 8.
+
 What the gated clang profile (40 s) leaves: the emitter 4.7 s self plus
 4.5 s of garbage collection, 3.9 s of module instantiation even with
 lazy compilation, 2.9 s of decode plus analysis, 1.6 s interpreting
