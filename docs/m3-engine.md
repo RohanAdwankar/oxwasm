@@ -4734,6 +4734,11 @@ failure memo and lazy compilation was 182 of 182 exact (the last chunk
 already ran with the gate); rustc-asm, clang-S, python3, gzip, m4 and
 recycle exact under the final gate.
 
+The sweep over the size gate: 182 of 182 exact in 21 minutes on the
+idle machine (58 before batch 8, 32 after the closure gate). Warm
+compiler cases in it: cargo-build 101 s, rustc-asm 98 s, java-hello
+72 s, clang-S 15 s.
+
 What the gated clang profile (40 s) leaves: the emitter 4.7 s self plus
 4.5 s of garbage collection, 3.9 s of module instantiation even with
 lazy compilation, 2.9 s of decode plus analysis, 1.6 s interpreting
