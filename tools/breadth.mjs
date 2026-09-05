@@ -245,6 +245,10 @@ const CASES = [
   ['condwait',  '/tmp/breadth_condwait', []],
   ['gostrings', '/tmp/breadth_gostrings', [], { memMB: 2048 }],
   ['go-version', '/usr/local/go/bin/go', ['version'], { memMB: 2048, env: ['GOROOT=/usr/local/go', 'GOTELEMETRY=off'] }],
+  // OpenJDK 21: the vsyscall page, pushf/popf, timed futex waits, fixed
+  // mappings over holes, and glibc's PIC jump tables all fell out of it
+  ['java-version', '/usr/lib/jvm/java-21-openjdk-amd64/bin/java', ['-Xint', '-XX:+UseSerialGC', '-Xshare:off', '-Xmx256m', '-version'],
+              { memMB: 3072, tree: '/usr/lib/jvm/java-21-openjdk-amd64' }],
   ['xz',      '/usr/bin/xz',      ['-9', '-c', IN], { memMB: 1536 }],
   ['xz-1',    '/usr/bin/xz',      ['-1', '-c', IN]],
   ['gzip',    '/bin/gzip',        ['-9', '-c', IN]],

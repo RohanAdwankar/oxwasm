@@ -468,7 +468,44 @@ export function analyze(mem, entry, { maxInsns = 20000, noJtab = false, entries 
       if (wrReg(p, r)) return p;
       cur = p;
     } return null; };
-  const tableOf = (j) => {
+  // A table descriptor: {tbl, width, rel}. Absolute tables hold 8-byte
+  // targets; the PIC form every -fPIC/PIE binary emits (glibc's mutex
+  // kind switch, any Ubuntu binary's switch) holds int32 offsets relative
+  // to the table itself:
+  //   lea    table(%rip), %rdx
+  //   movslq (%rdx,%rax,4), %rax
+  //   add    %rdx, %rax
+  //   jmp    *%rax
+  // Unrecognised, that switch fell to the chain/deopt form at every case.
+  const tableOf = (j) => { const t = tableOfAbs(j); return t == null ? tableOfPic(j) : { tbl: t, width: 8, rel: false }; };
+  const tableOfPic = (j) => {
+    if (j.src.kind !== 'reg') return null;
+    const add = defAbove(j, j.src.r);
+    if (!add || add.mnem !== 'add' || (add.size||8) !== 8 || add.src.kind !== 'reg' || add.dst.r !== j.src.r) return null;
+    const baseR = add.src.r, sumR = add.dst.r;
+    const ld = defAbove(add, sumR);
+    if (!ld || ld.mnem !== 'movsx' || ld.srcSize !== 4 || ld.src.kind !== 'mem' || ld.src.scale !== 4
+        || ld.src.index < 0 || ld.src.base !== baseR || ld.src.fs || ld.src.disp !== 0n) return null;
+    const lb = defAbove(ld, baseR);
+    if (!lb || lb.mnem !== 'lea' || lb.src.kind !== 'mem' || lb.src.index >= 0 || !(lb.src.ripRel || lb.src.base < 0)) return null;
+    // the lea must still hold at the add (nothing between rewrote the base)
+    if (defAbove(add, baseR) !== lb) return null;
+    // Entry count from the bounds check the compiler always emits just
+    // before the load (`cmp $N, %idx; ja default`): int32 offsets past a
+    // table's end are small numbers that land inside the plausibility
+    // window and would become phantom block leaders splitting real
+    // instructions (perl and awk faulted that way). No guard, no table.
+    const idx = ld.src.index; let cur = ld, n = -1;
+    for (let s = 0; s < 12 && n < 0; s++) {
+      const q = byNext.get(cur.rip.toString()); if (!q || q.mnem === 'udec') break;
+      if (q.mnem === 'cmp' && q.dst?.kind === 'reg' && q.dst.r === idx && q.src?.kind === 'imm') n = Number(q.src.v) + 1;
+      else if (wrReg(q, idx) && q.mnem !== 'movzx' && q.mnem !== 'mov' && q.mnem !== 'sub' && q.mnem !== 'add' && q.mnem !== 'lea') break;
+      cur = q;
+    }
+    if (n < 2 || n > 1024) return null;
+    return { tbl: BigInt.asUintN(64, lb.src.disp + (lb.src.ripRel ? lb.next : 0n)), width: 4, rel: true, count: n };
+  };
+  const tableOfAbs = (j) => {
     if (j.src.kind === 'mem') return BigInt.asUintN(64, j.src.disp);
     const ld = defAbove(j, j.src.r);
     if (!ld || ld.mnem !== 'mov' || (ld.size||8) !== 8 || ld.src.kind !== 'mem'
@@ -484,12 +521,14 @@ export function analyze(mem, entry, { maxInsns = 20000, noJtab = false, entries 
   let dbudget = 4096;             // total discovered targets across the function
   while (jmpinds.length && dbudget > 0) {
     const j = jmpinds.shift();
-    const tbl = tableOf(j);
-    if (tbl == null) continue;
+    const td = tableOf(j);
+    if (td == null) continue;
+    const { tbl, width, rel, count } = td;
     const targets = [];
     const min = lo > 0x100000n ? lo - 0x100000n : 0n, max = hi + 0x100000n;
-    for (let i = 0; i < 1024; i++) {
-      let t; try { t = mem.read((tbl + BigInt(i * 8)) & M, 8n); } catch { break; }
+    for (let i = 0; i < (count ?? 1024); i++) {
+      let t; try { t = mem.read((tbl + BigInt(i * width)) & M, BigInt(width)); } catch { break; }
+      if (rel) t = (tbl + BigInt.asIntN(32, t)) & M;     // int32 offset from the table base
       if (t < min || t > max) break;   // first out-of-range entry = end of table
       targets.push(t);
     }

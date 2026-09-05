@@ -4144,3 +4144,31 @@ do NOT change it: loop yield, unroll, loop layout, inliner, tiny
 un-prune, tail cuts, narrowing, TLAB, compressed oops. Parked with
 the tools it produced: `LOOPUNITS`, `LOOPTHRESH`, `FNALLOW`/`FNVETO`,
 `UNITVETOADDR`, `SHADOWLIB`, `STOPFILE`.
+
+### PIC jump tables, and java translated
+
+The table recogniser knew only absolute tables (`jmp *table(,%idx,8)`
+and a `mov` from one). Every -fPIC/PIE binary - all of Ubuntu's, and
+glibc - emits the relative form instead:
+
+    lea    table(%rip), %rdx
+    movslq (%rdx,%rax,4), %rax
+    add    %rdx, %rax
+    jmp    *%rax
+
+so every such `switch` fell to the chain/deopt form at every case.
+The recogniser now follows that chain of definitions and reads int32
+offsets relative to the table. One rule made it safe: the entry count
+comes from the bounds check the compiler always emits just before the
+load (`cmp $N, %idx; ja default`), and without that guard no table is
+taken - the first cut read entries until one fell outside a ±1 MB
+window, and int32 garbage past a table's end is small enough to land
+inside it; those phantom targets became block leaders that split real
+instructions and perl and awk faulted.
+
+With it, glibc's mutex kind switch is a `br_table` and **`java -Xint
+-version` passes translated** (51 tables structured, 3,927 functions
+compiled, banner printed, exit 0): the loop-rooted interaction parked
+above ran through the chain form of exactly these switches. Suite
+exact; perl, perl-fork, awk, awk-prog, gzip, m4, python3, jq, bc, git
+byte-identical.
