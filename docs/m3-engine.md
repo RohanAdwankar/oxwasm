@@ -4259,3 +4259,10 @@ dispatch layout in a handful of shared libc functions (`block/loop
 overlap`): the switch is a `br_table` there too, inside the relooper
 loop rather than in structured blocks. No translator item is left in
 jump tables.
+
+Gate for the xserver `typeof process` guard, the restore-side
+`_mmapBase`, and the fork copy of the arena: the 164-case breadth
+sweep on head 68dd1b2, cold wat cache, four chunks, 164/164
+byte-identical to native in 39 minutes. Nothing shipped this batch
+changes translation, so the sweep is a regression check, not a
+performance measurement.
