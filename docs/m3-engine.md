@@ -4480,3 +4480,8 @@ to 125 s because the repeat rustc children now get their cached units,
 and in the harness the case after cargo-build sees 61 MB of heap and
 2.5 GB external where it saw 2.7 GB and 12 GB. Six child-spawning
 cases stay byte-identical.
+
+`engine/test.sh` (the differential suite: hardware cases, jump tables,
+dispatch layout, packed ops, flags, rcl/rcr, picguard, threads) is
+green on b642e2e; the full breadth sweep with `--expose-gc` runs at a
+flat ~2.3 GB per chunk where the killed chunks had climbed past 12 GB.
