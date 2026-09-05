@@ -4247,3 +4247,8 @@ units recompiled by the current emitter (5,744 of 7,810 recompiled,
 container is 88.1 → 86.4 MB raw with PIC jump tables). Chromium: File >
 New > OK, five strokes, ink drawn, **19.8 ms median input-to-paint**
 against 21.3 ms for the old page the same night. Suite exact.
+`tools/gui/pagecheck.mjs` is the browser-side check that would have
+caught it: serve the packed page, headless Chromium, File > New > OK,
+two strokes, pass iff ink appeared - 17 s on the shipped page. It runs
+alongside the sweep from now on; the node sweep cannot see a
+browser-only failure.

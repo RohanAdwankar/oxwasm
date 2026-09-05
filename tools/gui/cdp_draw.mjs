@@ -8,7 +8,7 @@ import { spawn } from 'node:child_process';
 
 const [url, strokesS = '5', stepsS = '24'] = process.argv.slice(2);
 const STROKES = +strokesS, STEPS = +stepsS;
-const PORT = 9365;
+const PORT = 9365 + Math.floor(Math.random() * 400);   // a fresh port: a stale headless Chromium from a killed run answered probes with a wedged page
 const chrome = spawn('/opt/pw-browsers/chromium', ['--headless','--disable-gpu','--no-sandbox',
   `--remote-debugging-port=${PORT}`,'--window-size=1100,900','about:blank'],{stdio:'ignore'});
 await new Promise(r=>setTimeout(r,2500));
