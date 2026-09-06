@@ -182,6 +182,10 @@ const CENSUS3 = '/tmp/breadth_census3';
 if (!existsSync(CENSUS3)) {  // the third census: filesystem edge cases, /proc shapes, timers, threads (tools/fixtures/census3.c)
   try { execFileSync('gcc', ['-O1', '-o', CENSUS3, new URL('./fixtures/census3.c', import.meta.url).pathname]); } catch {}
 }
+const PTYSH = '/tmp/breadth_ptysh';
+if (!existsSync(PTYSH)) {    // an interactive bash on a pty, driven like a terminal (tools/fixtures/ptysh.c)
+  try { execFileSync('gcc', ['-O1', '-o', PTYSH, new URL('./fixtures/ptysh.c', import.meta.url).pathname, '-lutil']); } catch {}
+}
 const CENSUS5 = '/tmp/breadth_census5';
 if (!existsSync(CENSUS5)) {  // the fifth census: job control (stop/continue) and the tty line discipline (tools/fixtures/census5.c)
   try { execFileSync('gcc', ['-O1', '-o', CENSUS5, new URL('./fixtures/census5.c', import.meta.url).pathname]); } catch {}
@@ -401,6 +405,9 @@ const CASES = [
   ['census3', CENSUS3, []],
   ['census4', CENSUS4, [], { bins: ['/bin/sh'] }],
   ['census5', CENSUS5, []],
+  // an interactive bash on a pty, driven like a terminal: a background job,
+  // jobs, kill %1, ^C to a foreground cat, ^Z stopping sleep, fg, $?, exit
+  ['bash-pty', PTYSH, [], { bins: ['/bin/bash', '/usr/bin/sleep', '/usr/bin/cat'] }],
   // nasm assembling the recycle fixture's source: a flat binary out (outFile)
   ['nasm',    '/usr/bin/nasm', ['-f', 'bin', '-o', '/tmp/breadth_nasm.bin', new URL('./fixtures/recycle.asm', import.meta.url).pathname],
               { bins: [new URL('./fixtures/recycle.asm', import.meta.url).pathname], outFile: '/tmp/breadth_nasm.bin' }],

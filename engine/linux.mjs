@@ -1230,14 +1230,34 @@ export class LinuxEngine {
     this.wakeAllBlk();
   }
   // a signal to every process of a group in the tree (^C on a terminal)
-  _signalPgrp(pgid, sig) {
+  _isReplacement(e) { return !!(e.parentEng?._execed && e.parentEng._execed.eng === e); }   // a tail-exec'd image's replacement: signalled through the image
+  _signalPgrp(pgid, sig, info = { pid: 0, code: 0x80 }) {   // returns how many processes it reached
     let root = this; while (root.parentEng) root = root.parentEng;
-    const seen = new Set();
+    const seen = new Set(); let n = 0;
     const scan = (e) => { if (seen.has(e)) return; seen.add(e);
-      const main = e.threads[0]; if (main && e._pgrec(main).pgid === pgid) e.raiseSignal(sig, null, { pid: 0, code: 0x80 });
-      for (const x of e.threads) if (x.proc && x.state !== 'dead' && e._pgrec(x).pgid === pgid) e.raiseSignal(sig, x.id, { pid: 0, code: 0x80 });
+      const main = e.threads[0]; if (main && e.exitCode === null && !this._isReplacement(e) && e._pgrec(main).pgid === pgid) { e.raiseSignal(sig, null, info); n++; }
+      for (const x of e.threads) if (x.proc && x.state !== 'dead' && x.state !== 'vfork' && e._pgrec(x).pgid === pgid) { e.raiseSignal(sig, x.id, info); n++; }
+      for (const c of e.children ?? []) if (c.eng && c.exited === null) scan(c.eng); };
+    scan(root); return n;
+  }
+  _signalAll(sig, info) {                       // kill(-1): every process in the tree but the caller
+    let root = this; while (root.parentEng) root = root.parentEng;
+    const seen = new Set(), me = this.threads[this.ti];
+    const scan = (e) => { if (seen.has(e)) return; seen.add(e);
+      if (e !== this && e.exitCode === null && !this._isReplacement(e)) e.raiseSignal(sig, null, info);
+      for (const x of e.threads) if (x.proc && x !== me && x.state !== 'dead' && x.state !== 'vfork') e.raiseSignal(sig, x.id, info);
       for (const c of e.children ?? []) if (c.eng && c.exited === null) scan(c.eng); };
     scan(root);
+  }
+  _findProc(pid) {                              // a live process anywhere in the tree: {eng} or {eng, thread} for a window child
+    let root = this; while (root.parentEng) root = root.parentEng;
+    const seen = new Set();
+    const scan = (e) => { if (seen.has(e)) return null; seen.add(e);
+      if ((e.pid ?? 1) === pid && e.exitCode === null && !this._isReplacement(e)) return { eng: e };
+      for (const x of e.threads) if (x.proc?.pid === pid && x.state !== 'dead') return { eng: e, thread: x };
+      for (const c of e.children ?? []) if (c.eng && c.exited === null) { const r = scan(c.eng); if (r) return r; }
+      return null; };
+    return scan(root);
   }
   _allPtys() { let root = this; while (root.parentEng) root = root.parentEng; const out = new Set(), seen = new Set();
     const scan = (e) => { if (seen.has(e)) return; seen.add(e); for (const p of e.ptys?.values() ?? []) out.add(p); for (const c of e.children ?? []) if (c.eng) scan(c.eng); }; scan(root); return out; }
@@ -2466,12 +2486,15 @@ export class LinuxEngine {
         if (sig === 0) { ret(0n); break; }
         if (sig < 1 || sig > 64) { ret(-22n); break; }
         if (nr === 62) {
-          const pid = Number(BigInt.asIntN(32, a1));
-          const kid = (this.children ?? []).find(c => c.pid === pid && c.exited === null);
-          if (kid) { kid.eng.raiseSignal(sig, null, { pid: 1, code: 0 }); ret(0n); break; }
-          const self = this.threads[this.ti].proc?.pid ?? this.pid ?? 1;
-          if (pid > 1 && pid !== self) { ret(-3n); break; }         // ESRCH: no such process here
-          this.raiseSignal(sig, null, { pid: 1, code: 0 });         // SI_USER, process-directed
+          // kill(pid): a process anywhere in the tree by pid; 0 the caller's
+          // group; -1 everyone but the caller; -pgid a group (a shell's
+          // `kill %1` is kill(-pgid) - it used to reach the shell itself)
+          const pid = Number(BigInt.asIntN(32, a1)), self = this.threads[this.ti].proc?.pid ?? this.pid ?? 1, info = { pid: self, code: 0 };
+          if (pid === 0 || pid < -1) { const n = this._signalPgrp(pid === 0 ? this._pgrec(this.threads[this.ti]).pgid : -pid, sig, info); ret(n ? 0n : -3n); break; }
+          if (pid === -1) { this._signalAll(sig, info); ret(0n); break; }
+          if (pid === self) { this.raiseSignal(sig, null, info); ret(0n); break; }
+          const tgt = this._findProc(pid); if (!tgt) { ret(-3n); break; }   // ESRCH
+          tgt.eng.raiseSignal(sig, tgt.thread ? tgt.thread.id : null, info);
         } else {
           const tid = Number(nr === 200 ? a1 : a2);
           if (!this.threads.some(t => t.id === tid) && tid > 1) { ret(-3n); break; }
@@ -4076,10 +4099,21 @@ export class LinuxEngine {
     // pump raising SIGCHLD when the replacement exits) must vanish — waking
     // that image made the re-stepped execve return EINTR and the dead shell
     // ran on to exit 126.
-    if (this._execed) return;
+    if (this._execed) {
+      // A tail-exec'd process is its replacement: a signal to the old image
+      // goes to the replacement engine, and the image mirrors the stop /
+      // continue state so its own parent's wait4 sees the job stop.
+      const r = this._execed;
+      if (r.eng && r.exited === null && r.eng.exitCode === null) {
+        r.eng.raiseSignal(sig, null, info);
+        if (r.eng.stopped && !this.stopped) { this.stopped = r.eng.stopped; this.stopEv = r.eng.stopped; }
+        else if (!r.eng.stopped && this.stopped) { this.stopped = null; this.contEv = true; }
+      }
+      return;
+    }
     const bit = 1n << BigInt(sig - 1);
     const act = this.sigact?.get(sig);
-    if (globalThis.__sigtrace) console.error(`<raise0 sig=${sig} tid=${tid} act=${act ? act.handler?.toString(16) : 'none'} ignored=${!act && this._sigDefaultIgnored(sig)} label=${this._label ?? 'main'}>`);
+    if (globalThis.__sigtrace) console.error(`<raise0 sig=${sig} tid=${tid} act=${act ? act.handler?.toString(16) : 'none'} ignored=${!act && this._sigDefaultIgnored(sig)} ign=[${[...(this.sigign ?? [])].join(',')}] label=${this._label ?? 'main'}>`);
     // Job control. SIGCONT resumes a stopped process whatever its disposition;
     // SIGSTOP always stops; SIGTSTP/SIGTTIN/SIGTTOU stop when neither caught
     // nor ignored. A stopped child engine is skipped by its parent's pump
@@ -4151,7 +4185,7 @@ export class LinuxEngine {
   _sigDefaultIgnored(sig) {
     if (this.sigign?.has(sig)) return true;                                     // SIG_IGN
     if (sig === 17 || sig === 18 || sig === 23 || sig === 28) return true;      // CHLD CONT URG WINCH
-    if (sig === 19 || sig === 20 || sig === 21 || sig === 22) return true;      // stop signals: not modelled
+    if ((sig === 19 || sig === 20 || sig === 21 || sig === 22) && !this.parentEng) return true;   // stop signals: the root has nobody to continue it; a child stops (raiseSignal)
     return false;
   }
   // a pending signal became deliverable with no handler installed
@@ -4817,7 +4851,7 @@ export class LinuxEngine {
     if (this._execed) {                // main process tail-exec'd: pump the replacement
       this.pumpChildren();
       const c = this._execed;
-      if (c.exited !== null) this.exitCode = c.exited;
+      if (c.exited !== null) { this.exitCode = c.exited; if (c.eng?.termSig) this.termSig = c.eng.termSig; }   // a signal death is the process's death (a job killed by SIGTERM is "Terminated", not "Exit 143")
       else this.block(this.nowMs() + 2);
       return 0;
     }
