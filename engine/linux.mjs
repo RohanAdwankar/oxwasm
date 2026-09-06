@@ -891,6 +891,7 @@ export class LinuxEngine {
       const before = this.cpu.rip;
       this._cleanSync = false;
       const insn = this.cpu.step(); this.stats.interpreted++;
+      if (globalThis.__ihist !== undefined && (this.stats.interpreted & 63) === 0) { const h = globalThis.__ihist, k = this.cpu.rip; h.set(k, (h.get(k) || 0) + 1); }   // IHIST: every 64th interpreted step, by rip
       branched = BRANCHY.has(insn.mnem) || this.cpu.rip !== this.cpu.ripNext && this.cpu.rip !== before + BigInt(insn.len);
       if (this.onProgress && this.stats.interpreted % 2e7 === 0) this.onProgress('callout');
       if (this.exitCode !== null) throw EXIT;
@@ -4100,6 +4101,7 @@ export class LinuxEngine {
           }
           e.rip = before; throw e; }
         this.stats.interpreted++;
+        if (globalThis.__ihist !== undefined && (this.stats.interpreted & 63) === 0) { const h = globalThis.__ihist, k = this.cpu.rip; h.set(k, (h.get(k) || 0) + 1); }
         branched = BRANCHY.has(insn.mnem) || this.cpu.rip !== before + BigInt(insn.len);
         if (this.onProgress && this.stats.interpreted % 2e7 === 0) this.onProgress('run');
         if (this.blocked) { this.cpu.rip = before;            // re-execute the syscall on resume
