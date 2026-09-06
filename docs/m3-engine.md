@@ -5531,3 +5531,27 @@ Gate: suite green, sweep 210 of 210 exact in 33 minutes; python-mp
 slower than the previous sweep, but an interleaved A/B of java-hello
 on the pre-fix and post-fix engine gave 106.8 s against 107.9 s - the
 box is slower this hour, the fixes are not.
+
+### Batch 23: what node splitting costs a compiler run
+
+The rustc-asm case profiled: 189 s, of which the garbage collector
+is 44 s (the translator's text churn: 790 MB of wat over 5,500
+units), emit 19 s, analysis 10.5 s, the instruction walk 10.4 s, V8
+compiling units 13 s - and 15 s in the node-splitting pass from
+batch 20: `walk` (the nested SCC descent) 8.4 s, `layoutOrder`,
+`findIrreducible`, `go`. Three things were wrong with it at compiler
+scale. It ran on every function: the layout pass now answers
+reducibility for free (a retreating edge u->h is a back edge iff h
+dominates u, iff the entry is not in the "reaches u without passing
+h" set the loop compaction already computes), and the split runs only
+on the witness - 1,367 of rustc's 11,000 analysed functions, so this
+alone changed nothing. It chose headers by walking the component once
+per candidate entry, quadratic on the tangled components LLVM's jump
+threading leaves (dozens of entries): more than 12 entries is now
+hopeless outright, and each candidate's walk stops at the cap. And a
+function that ran past the cap kept its partial copies in the CFG
+(emitted, never structured): they are discarded. `walk` 8.3 s -> 1.0
+s; rustc's split attempts read capped N quartiles [62, 562, 1006,
+1618, 4895] against successful N [3, 81, 217, 546, 3665] and
+duplicated blocks [1, 2, 9, 33, 512] - the cap is refusing the right
+things. m4's four hot functions still structure, output exact.
