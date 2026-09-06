@@ -14,8 +14,7 @@ import { LinuxEngine } from '../engine/linux.mjs';
 import { setFlagsFromString } from 'node:v8';
 if (process.env.WASM_LAZY !== '0') setFlagsFromString('--wasm-lazy-compilation');   // V8 compiles each wasm function at its first call: most translated functions of a compiler run are never entered (clang -S 45 s -> 39 s), m4 steady state neutral on a quiet machine; WASM_LAZY=0 restores eager
 import { makeAssembler } from './assemble.mjs';
-import { readFileSync, readdirSync, lstatSync, realpathSync, statSync, writeFileSync,
-         existsSync, mkdirSync, unlinkSync } from 'node:fs';
+import { readFileSync, readdirSync, lstatSync, realpathSync, statSync, writeFileSync, existsSync, mkdirSync, unlinkSync, copyFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -343,6 +342,11 @@ const CASES = [
               { memMB: 3072, tree: '/usr/lib/jvm/java-21-openjdk-amd64' }],
   ['java-hello', '/usr/lib/jvm/java-21-openjdk-amd64/bin/java', ['-Xint', '-XX:+UseSerialGC', '-Xshare:off', '-Xmx256m', '-cp', '/tmp/breadth_jhello', 'Hello'],
               { memMB: 3072, tree: ['/usr/lib/jvm/java-21-openjdk-amd64', '/tmp/breadth_jhello'] }],
+  // javac compiling Hello.java on the -Xint JVM: ld.so's longjmp error path on
+  // every failed dlsym, the JVM's generated interpreter as code (execAnon),
+  // rep scans in the subtype check; the class file must match native javac's
+  ['javac',   '/usr/lib/jvm/java-21-openjdk-amd64/bin/javac', ['-J-Xint', '-J-XX:+UseSerialGC', '-J-Xshare:off', '-J-Xmx512m', '-d', '/tmp/breadth_javac', '/tmp/breadth_javac/Hello.java'],
+              { memMB: 3072, tree: ['/usr/lib/jvm/java-21-openjdk-amd64', '/tmp/breadth_javac'], execAnon: true, outFile: '/tmp/breadth_javac/Hello.class' }],
   ['madv',    '/tmp/breadth_madv', []],
   ['dlfail',  DLFAIL, []],
   ['repscan', REPSCAN, []],
@@ -688,6 +692,7 @@ const engine = (bin, args, stdin, opts = {}) => {
   if (process.env.BREADTH_STRACE) eng.strace = [];
   if (process.env.ASYNC_ASM !== '0') { eng.assembleWatDeferred = assembleWatDeferred; eng.pumpAsm = () => asm.pump(); }   // deferred assembly, default since the 182-case sweep under it was green; ASYNC_ASM=0 assembles synchronously (A/B)
   if (opts.childMemMB) eng.childMemMB = opts.childMemMB;   // execve'd children (default 256 MB; a rustc child needs more)
+  if (opts.execAnon) eng.execAnon = true;   // anonymous PROT_EXEC mappings count as code (a JIT's code cache: the JVM's template interpreter)
   if (process.env.AOTFAIL) eng.onAotFail = (a, m) => {   // AOTFAIL=1: every refused translation with its reason; an overlap also shows the bytes and the image
     let extra = '';
     const ov = /overlapping decode: ([0-9a-f]+) inside ([0-9a-f]+)/.exec(String(m));

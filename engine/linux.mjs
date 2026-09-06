@@ -424,7 +424,7 @@ export class LinuxEngine {
     if (this._failMemo) for (const k of this._failMemo.keys()) if (inR(BigInt(k))) this._failMemo.delete(k);
     if (this._sizeDefer) for (const k of this._sizeDefer.keys()) if (inR(k)) this._sizeDefer.delete(k);
     if (this._sizeMemo) for (const k of this._sizeMemo.keys()) if (inR(BigInt(k))) this._sizeMemo.delete(k);
-    if (EXEC_ANON) { const n = this.execRanges.length; this.execRanges = this.execRanges.filter(([a, b]) => !(a >= lo && b <= hi)); if (this.execRanges.length !== n) this._ieCache = undefined; }
+    if (this.execAnon ?? EXEC_ANON) { const n = this.execRanges.length; this.execRanges = this.execRanges.filter(([a, b]) => !(a >= lo && b <= hi)); if (this.execRanges.length !== n) this._ieCache = undefined; }
     if (this._tinyMemo) for (const k of this._tinyMemo.keys()) if (inR(BigInt(k))) this._tinyMemo.delete(k);
     if (this._inflight) for (const u of this._inflight) if (u.funcs.some(inR)) {
       u.cancelled = true;
@@ -1806,7 +1806,7 @@ export class LinuxEngine {
           const shared = !!(flags & 0x1n) && !!(a3 & 0x2n) && h.bytes !== undefined && !!h.writable;
           (this.maps ??= []).push({ at, len, path: h.path ?? '?', fileOff: fo, h, shared });
           this.execRanges.push([at, at + len]);   // library text: profiling must see it (prot untracked)
-        } else if (EXEC_ANON && (a3 & 4n)) {
+        } else if ((this.execAnon ?? EXEC_ANON) && (a3 & 4n)) {
           // Anonymous PROT_EXEC memory is a JIT's code cache (the JVM's
           // template interpreter lives in one). Without this the profiler
           // never sees it and javac interpreted 1.9M steps/s forever.
@@ -3787,6 +3787,7 @@ export class LinuxEngine {
       xserver: o.xserver, mtimes: o.mtimes, tty: o.tty, ttyRows: o.ttyRows, ttyCols: o.ttyCols, stdin: o.stdin });
     if (this.strace) ceng.strace = [];                       // a traced parent traces its children
     if (this.childMemMB !== undefined) ceng.childMemMB = this.childMemMB;
+    if (this.execAnon !== undefined) ceng.execAnon = this.execAnon;
     if (this.assembleWatDeferred) { ceng.assembleWatDeferred = this.assembleWatDeferred; ceng.pumpAsm = this.pumpAsm; }
     if (this.onChildEngine) { ceng.onChildEngine = this.onChildEngine; this.onChildEngine(ceng, o.argv); }
     // record locks the child took inside its window are owned by its proc
