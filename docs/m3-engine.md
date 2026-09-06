@@ -5558,3 +5558,16 @@ things. m4's four hot functions still structure, output exact.
 Gate: suite green, sweep 210 of 210 exact in 32.3 minutes; rustc-asm
 166 s -> 144 s on the same (slow-hour) box, total engine time 1,911 ->
 1,873 s.
+
+**The scavenger.** The largest single line in the rustc-asm profile
+was never the translator's own code: the garbage collector, 44 s of
+181, all of it scavenges of the short-lived strings and instruction
+objects the translator makes (790 MB of wat text, an object with
+BigInt fields per analysed instruction). Node's default semi-space is
+16 MB. `--max-semi-space-size=64` reads 17 s of GC and 154 s of wall,
+128 MB reads 11 s and 151 s; `v8.setFlagsFromString` after startup
+measured no change (43.6 s), the flag has to be on the command line.
+`tools/v8flags.mjs` re-executes a node host once with the flag and its
+own execArgv (`--expose-gc`, `--cpu-prof`) kept; breadth, the bench
+runner and runbin call it at their top, OXWASM_NO_REEXEC=1 opts out.
+The browser page is V8's own heuristics and is untouched by this.

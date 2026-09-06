@@ -1,6 +1,8 @@
 // One timed run of one binary under the engine, for bench/realab.mjs.
 // Prints a single RESULT line: milliseconds, exit code, and a hash of stdout
 // so the A/B can prove the two configurations ran the same program.
+import { ensureHeapFlags } from '../tools/v8flags.mjs';
+ensureHeapFlags();
 import { LinuxEngine } from '../engine/linux.mjs';
 import { setFlagsFromString } from 'node:v8';
 if (process.env.WASM_LAZY !== '0') setFlagsFromString('--wasm-lazy-compilation');   // V8 compiles each wasm function at its first call: most translated functions of a compiler run are never entered (clang -S 45 s -> 39 s), m4 steady state neutral on a quiet machine; WASM_LAZY=0 restores eager

@@ -1,4 +1,6 @@
 // generic: run a provisioned binary under the engine, print exit/stdout/stderr
+import { ensureHeapFlags } from '../tools/v8flags.mjs';
+ensureHeapFlags();
 import { LinuxEngine } from '../engine/linux.mjs';
 import { setFlagsFromString } from 'node:v8';
 if (process.env.WASM_LAZY !== '0') setFlagsFromString('--wasm-lazy-compilation');   // V8 compiles each wasm function at its first call: most translated functions of a compiler run are never entered (clang -S 45 s -> 39 s), m4 steady state neutral on a quiet machine; WASM_LAZY=0 restores eager
