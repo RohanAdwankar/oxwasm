@@ -159,6 +159,7 @@ export class LinuxEngine {
     this._ftCount = 0; this._ftSeen = new Set(); this._entries = null;
     this.regview = new BigInt64Array(this.wmem.buffer, 0, 16);
     this.fsview = new BigInt64Array(this.wmem.buffer, 128, 1);   // fs base for AOT TLS accesses
+    this.flagview = new BigInt64Array(this.wmem.buffer, 136, 1);  // EFLAGS a unit hands over at an escape (bit 63 = valid)
     this.xmmview = new BigInt64Array(this.wmem.buffer, 256, 32); // 16 xmm regs (2 words each) for AOT SIMD
     this.ram = new Uint8Array(this.wmem.buffer, this.RAMOFF, Number(total));
     for (const s of main.loads)
@@ -697,6 +698,12 @@ export class LinuxEngine {
   syncIn()  { this._cleanSync = true;
               for (let r = 0; r < 16; r++) this.cpu.regs[r] = BigInt.asUintN(64, this.regview[r]);
               this.cpu.fsBase = BigInt.asUintN(64, this.fsview[0]);
+              // flags a unit materialized at its escape (pushf, x87, cpuid, a
+              // zero-count rep scan ...): without this the interpreter carried
+              // on with whatever flags it last computed itself
+              const fl = this.flagview[0];
+              if (fl < 0n) { const f = this.cpu.f; f.cf = Number(fl & 1n); f.pf = Number((fl >> 2n) & 1n); f.af = Number((fl >> 4n) & 1n);
+                f.zf = Number((fl >> 6n) & 1n); f.sf = Number((fl >> 7n) & 1n); f.of = Number((fl >> 11n) & 1n); this.flagview[0] = 0n; }
               const x = this.xmmview;
               for (let r = 0; r < 16; r++) this.cpu.xmm[r] = BigInt.asUintN(64, x[r*2]) | (BigInt.asUintN(64, x[r*2+1]) << 64n); }
 

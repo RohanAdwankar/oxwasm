@@ -156,6 +156,10 @@ const DLFAIL = '/tmp/breadth_dlfail';
 if (!existsSync(DLFAIL)) {   // ld.so's longjmp error path under translation (failed dlsym/dlopen, 300x): javac died on it
   try { execFileSync('gcc', ['-O1', '-o', DLFAIL, new URL('./fixtures/dlfail.c', import.meta.url).pathname, '-ldl']); } catch {}
 }
+const REPSCAN = '/tmp/breadth_repscan';
+if (!existsSync(REPSCAN)) {   // rep scas/cmps flags (rcx=0 keeps them; pushf after a scan reads them) - the JVM's subtype check
+  try { execFileSync('gcc', ['-O1', '-o', REPSCAN, new URL('./fixtures/repscan.c', import.meta.url).pathname]); } catch {}
+}
 const SOCKPAIR = '/tmp/breadth_sockpair';
 if (!existsSync(SOCKPAIR)) {   // socketpair(AF_UNIX): both directions, EOF after the peer closes, a child on the other end
   try { execFileSync('gcc', ['-O1', '-o', SOCKPAIR, new URL('./fixtures/sockpair.c', import.meta.url).pathname]); } catch {}
@@ -341,6 +345,7 @@ const CASES = [
               { memMB: 3072, tree: ['/usr/lib/jvm/java-21-openjdk-amd64', '/tmp/breadth_jhello'] }],
   ['madv',    '/tmp/breadth_madv', []],
   ['dlfail',  DLFAIL, []],
+  ['repscan', REPSCAN, []],
   // nasm assembling the recycle fixture's source: a flat binary out (outFile)
   ['nasm',    '/usr/bin/nasm', ['-f', 'bin', '-o', '/tmp/breadth_nasm.bin', new URL('./fixtures/recycle.asm', import.meta.url).pathname],
               { bins: [new URL('./fixtures/recycle.asm', import.meta.url).pathname], outFile: '/tmp/breadth_nasm.bin' }],
