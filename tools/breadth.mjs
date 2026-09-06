@@ -339,7 +339,7 @@ const CASES = [
   // OpenJDK 21: the vsyscall page, pushf/popf, timed futex waits, fixed
   // mappings over holes, and glibc's PIC jump tables all fell out of it
   ['java-version', '/usr/lib/jvm/java-21-openjdk-amd64/bin/java', ['-Xint', '-XX:+UseSerialGC', '-Xshare:off', '-Xmx256m', '-version'],
-              { memMB: 3072, tree: '/usr/lib/jvm/java-21-openjdk-amd64' }],
+              { memMB: 3072, tree: '/usr/lib/jvm/java-21-openjdk-amd64', execAnon: true }],   // the JVM's generated interpreter as code; java-hello stays without it
   ['java-hello', '/usr/lib/jvm/java-21-openjdk-amd64/bin/java', ['-Xint', '-XX:+UseSerialGC', '-Xshare:off', '-Xmx256m', '-cp', '/tmp/breadth_jhello', 'Hello'],
               { memMB: 3072, tree: ['/usr/lib/jvm/java-21-openjdk-amd64', '/tmp/breadth_jhello'] }],
   // javac compiling Hello.java on the -Xint JVM: ld.so's longjmp error path on

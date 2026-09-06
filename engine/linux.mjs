@@ -1828,7 +1828,19 @@ export class LinuxEngine {
         this._mmapGive(lo, align(a2, PAGE));                 // the arena reuses it
         this._invalidateCode(lo, hi);
         ret(0n); break; }
-      case 10: ret(0n); break;                               // mprotect (no page prot here)
+      case 10: {                                             // mprotect(addr, len, prot): no page protection here, but
+        // in exec-anon mode it is the JIT's W^X signal: a range made
+        // executable becomes code the profiler may tier up (V8 maps code
+        // pages RW and flips them RX, so the mmap never said PROT_EXEC), and
+        // a range made writable-without-exec is about to be rewritten, so
+        // its translations go. That makes W^X JITs sound under execAnon;
+        // RWX code caches that rewrite in place stay the reason it is opt-in.
+        if (this.execAnon ?? EXEC_ANON) {
+          const lo = a1, hi = a1 + align(a2, PAGE);
+          if (a3 & 4n) { if (!this.execRanges.some(([a, b]) => a <= lo && hi <= b)) { this.execRanges.push([lo, hi]); this._ieCache = undefined; } }
+          else if ((a3 & 2n) && this.execRanges.some(([a, b]) => a < hi && b > lo)) this._invalidateCode(lo, hi);
+        }
+        ret(0n); break; }
       case 273: ret(0n); break;                              // set_robust_list
       case 334: ret(-38n); break;                            // rseq -> ENOSYS (glibc copes)
       case 302: {                                            // prlimit64(pid, res, new, old)

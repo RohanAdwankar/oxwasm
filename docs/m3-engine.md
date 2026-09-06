@@ -4876,7 +4876,18 @@ chaining across an abandoned frame, flags not handed to the interpreter
 at escapes, and zero-count rep scans - each with a two-second fixture
 (dlfail, repscan) that reproduces what took javac six minutes to reach.
 The sweep over all of it: 186 of 186 exact in 28 minutes (javac 385 s,
-cargo-build 107 s, rustc-asm 108 s). the emitter 4.7 s self plus
+cargo-build 107 s, rustc-asm 108 s).
+
+**mprotect as the W^X signal.** Under execAnon, mprotect now drives the
+exec ranges: a range made PROT_EXEC becomes code (V8 maps its code pages
+RW and flips them RX, so the mmap never said exec and node's JIT output
+had stayed invisible), and a range made writable-without-exec is about
+to be rewritten, so its translations are dropped. That makes W^X JITs
+sound under the lever; node-jit 33 s to 28 s exact, java-version 27 s
+to 16 s. In-place RWX rewriting (HotSpot with C1/C2 on, LuaJIT) has no
+such signal, which is why execAnon stays opt-in; the breadth cases that
+want it (javac, java-version) set it, java-hello runs without it so both
+paths are covered. the emitter 4.7 s self plus
 4.5 s of garbage collection, 3.9 s of module instantiation even with
 lazy compilation, 2.9 s of decode plus analysis, 1.6 s interpreting
 2.5M steps, and the guest's own translated execution. No single bucket
