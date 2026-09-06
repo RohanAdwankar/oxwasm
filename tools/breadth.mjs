@@ -830,6 +830,7 @@ for (const [name, bin, args, opts] of CASES) {
     if (eng.unknown.length) console.log(`         ENOSYS syscalls: ${eng.unknown.join(' ')}`);
     if (eng.ioctls.length) console.log(`         ENOTTY ioctls: ${eng.ioctls.join(' ')}`);
     if (eng.strace) console.log(`         last syscalls:\n           ${eng.strace.slice(-60).join('\n           ')}`);
+    if (eng.strace && process.env.BREADTH_STRACE_FILE) writeFileSync(process.env.BREADTH_STRACE_FILE, eng.strace.join('\n'));   // the whole trace of a failing case
     if (!eng.err && eng.out.length && nat.out.length) {
       let i = 0; while (i < eng.out.length && i < nat.out.length && eng.out[i] === nat.out[i]) i++;
       console.log(`         first difference at byte ${i}`);

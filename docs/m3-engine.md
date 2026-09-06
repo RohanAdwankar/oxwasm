@@ -5049,3 +5049,14 @@ faulted. One cause: the chown family (chown/fchown/fchownat) shared a
 case label with the new chmod handler and read a uid as a path - tar's
 fchown after every extracted file killed the child. The sweep is the
 check that matters; the small runs cover what the batch touched.
+
+The sweep on the fixed engine then failed java-version, which the
+earlier sweep had passed, and the trace showed why: the HotSpot launcher
+stats "." and opens ".." while locating itself. With nothing under /tmp
+and no chdir, the engine's cwd was unset, and norm() left a relative
+name relative - "." normalised to an empty path that the new cwd rule
+called a directory, and ".." to a path that did not exist, so the
+launcher gave up with exit 1. Relative names at the root are now
+absolute ("/name"; "." and ".." are "/"), which is what every other
+lookup already assumed. `BREADTH_STRACE_FILE=path` writes a failing
+case's whole trace, which is how the two lines were found.
