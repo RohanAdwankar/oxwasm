@@ -4837,7 +4837,34 @@ path miscomputes; a unit bisect (`UNITVETO` ranges, 3,200 units) is
 running. Opt-in because code written into such memory can change
 without an munmap (a JIT's code cache), and the engine invalidates
 translations only on munmap/mremap; the -Xint interpreter is generated
-once. the emitter 4.7 s self plus
+once.
+
+**Two flag bugs under the wrong instanceof.** A fixture for the rep
+string operations the JVM's subtype check is built on (`repscan.c`:
+`repne scasq`, `repne scasb`, `repe cmpsb`, with hits at the first and
+last element, misses, and rcx=0) disagreed with hardware in two ways,
+both in translated code:
+
+- *rcx=0.* Hardware leaves the flags untouched; the translator modeled a
+  rep-prefixed cmps/scas as a definite flag writer, so the compare
+  before it was dead by the liveness analysis and never materialized,
+  and a consumer after a zero-count scan read stale lazy operands. A
+  rep cmps/scas is now also a consumer of the incoming flags: the
+  producer materializes, and when its (kind,size) matches the scan's
+  the untouched locals are exactly right; otherwise rcx=0 escapes to
+  the interpreter.
+- *Escapes.* pushf, x87, cpuid and the other instructions a unit refuses
+  end the block and hand the frame to the interpreter - which carried on
+  with whatever flags it had last computed itself: the lazily kept
+  flags were never handed over. `repne scasq; pushfq` read ZF=0/CF=1
+  for an equal compare. An escape is now a soft flag consumer too: the
+  unit stores EFLAGS (computed from the lazy state for the sub/add/logic
+  kinds, bit 63 as the valid marker) in regfile slot 136, and syncIn
+  applies and clears it. A soft consumer never poisons a function: an
+  unknown producer just hands nothing over, as before.
+
+Both fixture variants (pushf and setcc readback) are byte-identical to
+hardware now; repscan is a breadth case; differentials green. the emitter 4.7 s self plus
 4.5 s of garbage collection, 3.9 s of module instantiation even with
 lazy compilation, 2.9 s of decode plus analysis, 1.6 s interpreting
 2.5M steps, and the guest's own translated execution. No single bucket

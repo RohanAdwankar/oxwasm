@@ -39,6 +39,7 @@ export const FTHBYTES = FTSLOTS * 16;
 // registered entries, capped to keep the load factor (here 61%) low enough
 // that linear probing stays short
 export const FTMAP_MAX = 20000;
+export const EFLAGS_SLOT = 136;   // regfile slot: EFLAGS handed to the interpreter at an escape (bit 63 = valid; syncIn applies and clears it)
 export const FNPROF_BASE = 0x20000, FNPROF_SLOTS = 1 << 14;   // OXWASM_FNPROF counters: 16384 x i64, in the dead space below FTHASH
 export const fnprofSlot = (a) => FNPROF_BASE + ((Number((BigInt(a) >> 4n) & 0x3fffn)) * 8);
 // OXWASM_BLKPROF=hexfn[,hexfn]: a per-BLOCK entry counter for the named
@@ -1860,15 +1861,35 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     if (ok && k) blkFlagIn[b] = k;
   }
   const matProducers = new Set();                   // producer keys that must materialize
+  // Soft consumers read the flags too, but an unknown producer must not
+  // poison the function - they just get no flags:
+  //  - an escape to the interpreter (udec terminator: pushf, x87, cpuid ...)
+  //    hands the interpreter the lazily kept flags, or nothing if unknown
+  //    (before this, cpu.f stayed stale across every escape: `repne scasq;
+  //    pushfq` read the flags of whatever ran last in the interpreter);
+  //  - a rep-prefixed cmps/scas leaves the flags UNTOUCHED when rcx is 0,
+  //    so it is a consumer of the incoming flags as well as a producer.
+  // softFlags: 'b:idx' -> {kind,size} of the flags reaching the consumer, or null.
+  const softFlags = new Map();
   for (let b = 0; b < N; b++) {
-    const insns = blocks[b].insns, consumers = [];
+    const insns = blocks[b].insns, consumers = [], soft = new Set();
     // adc/sbb also CONSUME CF (from the nearest preceding flag producer)
-    for (let j = 0; j < insns.length; j++) if (['cmov','setcc','adc','sbb'].includes(insns[j].mnem)) consumers.push(j);
+    for (let j = 0; j < insns.length; j++) {
+      if (['cmov','setcc','adc','sbb'].includes(insns[j].mnem)) consumers.push(j);
+      else if ((insns[j].mnem === 'cmps' || insns[j].mnem === 'scas') && (insns[j].rep || insns[j].rep2)) { consumers.push(j); soft.add(j); }
+    }
     if (term[b].kind === 'jcc') consumers.push(insns.length - 1);
+    else if (term[b].kind === 'deopt' && !term[b].src) { consumers.push(insns.length - 1); soft.add(insns.length - 1); }
     for (const j of consumers) {
       let p = -1, clob = null;
       for (let kk = j - 1; kk >= 0; kk--) { const insn = insns[kk];
         if (modeled(insn)) { p = kk; break; } if (CLOBBER.has(insn.mnem)) { clob = insn; p = -2; break; } }
+      if (soft.has(j)) {
+        if (p >= 0) { matProducers.add(b+':'+p); softFlags.set(b+':'+j, flagKind(insns[p])); }
+        else if (p === -1 && blkFlagIn[b]) { for (const key of inDefs[b]) if (key !== 'EXT' && key !== 'KILL') matProducers.add(key); softFlags.set(b+':'+j, blkFlagIn[b]); }
+        else softFlags.set(b+':'+j, null);
+        continue;
+      }
       if (p >= 0) matProducers.add(b+':'+p);
       else if (p === -2) throw new Error('AOT: unmodeled flag producer '+clob.mnem+' @ '+clob.rip.toString(16));
       else {                                        // producer is cross-block
@@ -1931,6 +1952,19 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     const producers = new Set();
     for (let idx = 0; idx < blk.insns.length; idx++) if (matProducers.has(i+':'+idx)) producers.add(idx);
     let flagState = blkFlagIn[i] || null, ii = 0;
+    // EFLAGS from the lazy state, stored (bit 63 set as the marker) in the
+    // regfile's flag slot for syncIn to apply; kinds whose CF the lazy model
+    // does not carry (inc/dec/adc/sbb/cf/fcmp) hand nothing over.
+    const eflagsStore = (fs) => {
+      if (!fs || !['sub', 'add', 'logic'].includes(fs.kind)) return '';
+      const S = fs.size, sgn = SIGNl[S], m = MASK[S];
+      const a = '(local.get $fa)', b = '(local.get $fb)', r = '(local.get $fr)';
+      const zf = `(i64.extend_i32_u (i64.eqz ${r}))`, sf = `(i64.extend_i32_u (i64.ne (i64.and ${r} (i64.const ${sgn})) (i64.const 0)))`;
+      let cf = '(i64.const 0)', of = '(i64.const 0)';
+      if (fs.kind === 'sub') { cf = `(i64.extend_i32_u (i64.lt_u ${a} ${b}))`; of = `(i64.extend_i32_u (i64.ne (i64.and (i64.and (i64.xor ${a} ${b}) (i64.xor ${a} ${r})) (i64.const ${sgn})) (i64.const 0)))`; }
+      else if (fs.kind === 'add') { cf = `(i64.extend_i32_u (i64.lt_u ${r} (i64.and ${a} (i64.const ${m}))))`; of = `(i64.extend_i32_u (i64.ne (i64.and (i64.and (i64.xor ${a} ${r}) (i64.xor ${b} ${r})) (i64.const ${sgn})) (i64.const 0)))`; }
+      return `(i64.store (i32.const ${EFLAGS_SLOT}) (i64.or (i64.const -9223372036854775296) (i64.or ${cf} (i64.or (i64.shl ${zf} (i64.const 6)) (i64.or (i64.shl ${sf} (i64.const 7)) (i64.shl ${of} (i64.const 11)))))))`;   // marker | 0x202 | CF | ZF<<6 | SF<<7 | OF<<11
+    };
     const setFlags = (kind, size, aE, bE, rE) => {
       if (!producers.has(ii)) return;              // dead flags: skip
       if (aE) L.push(`(local.set $fa ${aE})`); if (bE) L.push(`(local.set $fb ${bE})`); L.push(`(local.set $fr ${rE})`);
@@ -2468,6 +2502,13 @@ function emitUnitFunction(a0, fnAddr, ctx) {
             `(local.set $r7 (i64.add (local.get $r7) (i64.const ${S})))`,
           ];
           if (insn.rep || insn.rep2) {
+            // rcx == 0: hardware leaves the flags alone. The incoming flags
+            // were materialized for us (soft consumer); when they are the
+            // same (kind,size) the untouched $fa/$fb/$fr ARE the right state,
+            // otherwise escape to the interpreter with them handed over.
+            const inF = softFlags.get(i+':'+ii);
+            if (!(inF && inF.kind === 'sub' && inF.size === S))
+              L.push(`(if (i64.eqz (local.get $r1)) (then ${eflagsStore(inF)} (local.set $rex (i64.const ${hexs(insn.rip)})) ${SA_MARK} (return (call $x_deopt (local.get $rex) (local.get $rsp0)))))`);
             const e = '$ce_'+insn.rip.toString(16), lp = '$cl_'+insn.rip.toString(16);
             // repe (rep): stop when fr != 0; repne (rep2): stop when fr == 0
             const stop = insn.rep2 ? `(i64.eqz (local.get $fr))` : `(i64.ne (local.get $fr) (i64.const 0))`;
@@ -2657,6 +2698,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       // indirect jump (jump table / tail call) or undecodable byte:
       // hand the frame to the engine at the computed target / that rip
       L.push(`(local.set $rex ${t.src ? rd(t.src,8,lnext) : `(i64.const ${hexs(t.at)})`})`);
+      if (!t.src) { const st = eflagsStore(softFlags.get(i+':'+(blk.insns.length-1))); if (st) L.push(st); }   // escape: the interpreter continues with these flags
       L.push(SA_MARK);
       if (t.src) L.push(...tailJmp());
       L.push(`(return (call $x_deopt (local.get $rex) (local.get $rsp0)))`);
