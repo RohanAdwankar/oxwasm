@@ -22,9 +22,11 @@ static volatile int ints; static void onint(int s) { (void)s; ints++; }
 static int drain(int fd, unsigned char *b, int cap) { int n = 0; struct pollfd p = { fd, POLLIN, 0 }; while (n < cap && poll(&p, 1, 200) > 0) { int r = read(fd, b + n, cap - n); if (r <= 0) break; n += r; } return n; }
 // a wait that polls with WNOHANG: a state the kernel never reports shows up as
 // a line rather than a hang (the first version blocked the whole sweep natively)
-static pid_t waitp(pid_t c, int *st, int opts) { for (int i = 0; i < 400; i++) { pid_t r = waitpid(c, st, opts | WNOHANG); if (r != 0) return r; usleep(5000); } return -2; }
+static pid_t waitp(pid_t c, int *st, int opts) { for (int i = 0; i < 2000; i++) { pid_t r = waitpid(c, st, opts | WNOHANG); if (r != 0) return r; usleep(5000); } return -2; }   // up to 10 s: a loaded box schedules a fresh child late
 int main(void) {
   alarm(60);                                                 // a watchdog: no census hangs a sweep
+  for (int sg = 1; sg < 32; sg++) if (sg != SIGKILL && sg != SIGSTOP) signal(sg, SIG_DFL);   // dispositions are inherited across exec: a harness that ignores SIGTSTP must not decide the answers
+  setpgid(0, 0);   // our own group, with a live parent in another group of the session: in an ORPHANED group Linux discards SIGTSTP (a harness run under nohup is one), and the stop never comes
   // --- stop / continue ---
   pid_t c = fork(); if (c == 0) { for (;;) pause(); }
   usleep(20000); int st = 0; R("kill-stop", kill(c, SIGSTOP)); R("waitpid-untraced", waitp(c, &st, WUNTRACED) == c); printf("stopped=%d sig=%d\n", WIFSTOPPED(st), WIFSTOPPED(st) ? WSTOPSIG(st) : -1);

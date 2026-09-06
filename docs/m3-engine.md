@@ -5265,3 +5265,17 @@ session leader exits its pty loses its session and foreground group.
 Both ends of a pty stat as character devices with matching numbers by
 path and by descriptor, which is what ttyname() checks. The census is
 a breadth case.
+
+Two things the sweep taught after the batch landed. The host loop takes
+the earliest deadline across the process tree so a runnable child never
+waits out its parent's tick, and it counted a stopped child as runnable:
+a parent sleeping while its child was stopped re-ran its nanosleep
+without ever napping, and runbin's guard called it a hang. A stopped
+child now sets no deadline. And the fixture itself had two races that
+Linux, not the engine, exposed under the sweep's load: a blocking
+waitpid for a state the kernel never reported stalled the whole sweep
+(the native run, so no wall cap applied), and a SIGTSTP sent on the
+heels of a SIGCONT sometimes did not stop the child at all. The waits
+now poll with WNOHANG under alarm(60), and the SIGTSTP probe gets a
+fresh child - a census must fail loudly, never hang, and must not ask
+the kernel a question with two answers.

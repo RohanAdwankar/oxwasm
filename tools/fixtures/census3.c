@@ -71,9 +71,9 @@ int main(void) {
   // timers and sleeps
   timer_t tm; struct sigevent se = { .sigev_notify = SIGEV_SIGNAL, .sigev_signo = SIGALRM }; signal(SIGALRM, h);
   sigset_t blk, old; sigemptyset(&blk); sigaddset(&blk, SIGALRM); sigprocmask(SIG_BLOCK, &blk, &old);   // blocked before arming: the expiry must wait for sigtimedwait
-  R("timer_create", timer_create(CLOCK_MONOTONIC, &se, &tm)); struct itimerspec its = { { 0, 0 }, { 0, 2000000 } };
+  R("timer_create", timer_create(CLOCK_MONOTONIC, &se, &tm)); struct itimerspec its = { { 0, 0 }, { 0, 300000000 } };   /* 300 ms: still armed at the next call on a loaded engine */
   R("timer_settime", timer_settime(tm, 0, &its, NULL)); struct itimerspec cur; R("timer_gettime", timer_gettime(tm, &cur)); printf("armed=%d\n", cur.it_value.tv_sec == 0 && cur.it_value.tv_nsec > 0);
-  siginfo_t si; struct timespec to = { 1, 0 }; R("sigtimedwait-timer", sigtimedwait(&blk, &si, &to)); printf("si_code=%d overrun=%d\n", si.si_code == SI_TIMER, timer_getoverrun(tm));
+  siginfo_t si; struct timespec to = { 10, 0 }; R("sigtimedwait-timer", sigtimedwait(&blk, &si, &to)); printf("si_code=%d overrun=%d\n", si.si_code == SI_TIMER, timer_getoverrun(tm));
   sigprocmask(SIG_SETMASK, &old, NULL); R("timer_delete", timer_delete(tm)); R("timer_delete-again", timer_delete(tm));
   struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now); now.tv_nsec += 1000000; if (now.tv_nsec >= 1000000000) { now.tv_sec++; now.tv_nsec -= 1000000000; }
   R("clock_nanosleep-abs", clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &now, NULL)); R("clock_nanosleep-badclock", clock_nanosleep(99, 0, &(struct timespec){ 0, 1 }, NULL));
