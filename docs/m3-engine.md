@@ -4887,7 +4887,25 @@ sound under the lever; node-jit 33 s to 28 s exact, java-version 27 s
 to 16 s. In-place RWX rewriting (HotSpot with C1/C2 on, LuaJIT) has no
 such signal, which is why execAnon stays opt-in; the breadth cases that
 want it (javac, java-version) set it, java-hello runs without it so both
-paths are covered. the emitter 4.7 s self plus
+paths are covered.
+
+**The guard itself was javac's 385 s.** A CPU profile of the javac run
+put 61 s in the deopt handler alone, 56 s in the run loop, 33 s in
+dispatch, 22 s in syncIn and only 3 s in translated code: 41M deopts in
+400 s, one per Java bytecode. HotSpot's template interpreter dispatches
+every bytecode with `jmp *(%r10,%rbx,8)` and uses rsp as the Java
+operand stack, so at the jump rsp is routinely above the template's
+entry rsp - exactly what the tail-chain guard above takes for an
+abandoned frame. The guard only matters for a NESTED frame, where a
+translated call site waits on the return; a top-level frame (nesting
+word zero) has its exit rip honoured, so whatever a chain eventually
+returns to is simply where the guest goes next. The guard now lets a
+top-level frame chain regardless of rsp. javac: 400 s to 37.6 s, deopts
+41M to 20k, interpreted steps 356M to 6M, class file still exact; java
+hello 31 s to 20 s; dlfail still passes (its longjmp runs under a
+nested call site). `DEOPTLOG=1` and `IHIST=1` in runbin print the deopt
+landings and the interpreted rips by library - what said "bytecode
+dispatch" in one look. the emitter 4.7 s self plus
 4.5 s of garbage collection, 3.9 s of module instantiation even with
 lazy compilation, 2.9 s of decode plus analysis, 1.6 s interpreting
 2.5M steps, and the guest's own translated execution. No single bucket

@@ -1940,9 +1940,15 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   // _dl_signal_exception ran its post-longjmp code with rsi=1 and trapped;
   // javac hit it on every failed dlsym). Above the frame it deopts instead,
   // and the engine unwinds the stale frames.
+  // A TOP-LEVEL frame (nesting word zero: dispatched from the run loop, no
+  // translated call site waiting on its return) may chain regardless of rsp:
+  // its exit rip is honoured, so whatever the chain eventually returns to is
+  // simply where the guest goes next. HotSpot's template interpreter uses rsp
+  // as the Java operand stack and dispatches every bytecode with rsp above the
+  // template's entry rsp; guarding those cost javac 41M deopts in 400 s.
   const tailJmp = () => { usesFtr = true; return [
     icResolve('(local.get $rex)'),
-    `(if (i32.and ${ftHit} (i64.le_u (local.get $r4) (local.get $rsp0)))`,
+    `(if (i32.and ${ftHit} (i32.or (i64.le_u (local.get $r4) (local.get $rsp0)) (i32.eqz (i32.load (i32.const ${FTNEST})))))`,
     `  (then ${ftBurn} ${ftDec} (return_call_indirect $ft (type $uft) (local.get $fti))))`,
   ]; };
 
