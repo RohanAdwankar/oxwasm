@@ -967,7 +967,17 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   // layoutOrder(count, succOf, entry): reachable blocks in RPO from the
   // entry, then loop-compacted (below). Applied once in address-index space
   // and again after node splitting widens the CFG in RPO-index space.
+  // layoutOrder also answers whether the CFG is reducible: a retreating edge
+  // u->h (pos[h] <= pos[u]) is a back edge iff h dominates u, i.e. iff no
+  // path from the entry reaches u without passing h - and "reaches a
+  // back-edge source without passing h" is exactly the natural-loop set the
+  // compaction below already computes, so the entry being in it is the
+  // irreducibility witness. Node splitting (a fresh SCC walk per round, its
+  // own Tarjan per nesting level) ran on every function before this gate and
+  // cost rustc-asm 15 s of 189; it now runs only where the witness is found.
+  let irreducible = false;
   const layoutOrder = (An, succOf, entryIdx) => {
+  irreducible = false;
   const order = []; const vis = new Uint8Array(An);
   (function dfs(u) { vis[u] = 1;
     for (const v of succOf(u)) if (v >= 0 && !vis[v]) dfs(v);
@@ -997,6 +1007,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     for (const [h, srcs] of loops) {
       const mem = new Set([h]); const st = srcs.filter(u => u !== h); for (const u of st) mem.add(u);
       while (st.length) { const u = st.pop(); for (const p of preds[u]) if (!mem.has(p)) { mem.add(p); st.push(p); } }
+      if (h !== entryIdx && mem.has(entryIdx)) irreducible = true;
       const hp = pos[h]; let last = hp; for (const m of mem) if (pos[m] > last) last = pos[m];
       const range = order.slice(hp, last + 1), inL = range.filter(a => mem.has(a)), outL = range.filter(a => !mem.has(a));
       if (!outL.length) continue;
@@ -1101,8 +1112,8 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   // component holding a jump-table site is left alone: its copies would
   // still branch to the original case blocks. OXWASM_NODESPLIT=0 disables.
   const NODESPLIT = !(typeof process !== 'undefined' && process.env?.OXWASM_NODESPLIT === '0');
-  if (NODESPLIT) {
-    const findIrreducible = () => {
+  if (NODESPLIT && irreducible) {
+    const findIrreducible = (capLeft) => {
       // Tarjan SCCs over a node subset; returns [members[]] (size>1 or self-loop)
       const sccs = (nodes) => {
         const idx = new Int32Array(N).fill(-1), low = new Int32Array(N), on = new Uint8Array(N);
@@ -1124,14 +1135,24 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           const cs = new Set(comp);
           const entries = comp.filter(v => v === 0 || preds[v].some(p => !cs.has(p))).sort((a, b) => a - b);
           if (entries.length > 1) {
+            // Header choice is a walk of the component per candidate entry,
+            // and a tangled component (LLVM's jump threading leaves rustc
+            // functions with dozens of entries) made that quadratic - 8 s of
+            // a rustc run spent choosing headers for splits the cap then
+            // refused. More than 12 entries is hopeless under any cap; each
+            // candidate's walk stops as soon as it passes the cap.
+            if (entries.length > 12) return { hopeless: true };
             let best = null;
             for (const h of (cs.has(0) ? [0] : entries)) {
               const seen = new Set(); const stk = entries.filter(e => e !== h);
+              const limit = best ? best.dup.size : capLeft + 1;
+              let over = false;
               while (stk.length) { const u = stk.pop(); if (seen.has(u) || u === h) continue; seen.add(u);
+                if (seen.size >= limit) { over = true; break; }
                 for (const w of succs[u]) if (w >= 0 && cs.has(w)) stk.push(w); }
-              if (!best || seen.size < best.dup.size) best = { h, dup: seen, cs };
+              if (!over && (!best || seen.size < best.dup.size)) best = { h, dup: seen, cs };
             }
-            return best;
+            return best ?? { hopeless: true };
           }
           const h = entries.length ? entries[0] : comp[0];
           const inner = new Set(cs); inner.delete(h);
@@ -1146,12 +1167,18 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     // needed 0.18-0.41x), at least 48 blocks, at most 512; past it the
     // function keeps the dispatch layout it had before
     let dupTotal = 0, rounds = 0, did = false; const cap = Math.min(512, Math.max(48, N >> 1));
+    // a function that runs past the cap keeps the dispatch layout it would
+    // have had anyway: its partial copies are discarded, not emitted (rustc:
+    // 875 of 1,367 split functions capped, 100k duplicated blocks)
+    const snap = { blocks: blocks.slice(), term: term.slice(), succs: succs.slice(), N };
+    const giveUp = () => { st.capped++; (st.cappedN ??= []).push(snap.N); blocks.length = 0; blocks.push(...snap.blocks); term.length = 0; term.push(...snap.term); succs.length = 0; succs.push(...snap.succs); N = snap.N; did = false; };
     for (;;) {
-      if (rounds++ > 64) { st.capped++; break; }
-      const pick = findIrreducible();
+      if (rounds++ > 64) { giveUp(); break; }
+      const pick = findIrreducible(cap - dupTotal);
       if (!pick) break;
+      if (pick.hopeless) { giveUp(); break; }
       const dup = [...pick.dup].sort((a, b) => a - b);
-      if (dupTotal + dup.length > cap) { st.capped++; break; }
+      if (dupTotal + dup.length > cap) { giveUp(); break; }
       // a jump-table site branches by REPRESENTATIVE index (the resolver
       // maps a computed address to the one member of jtabUnion at that
       // address); a site whose case block was duplicated carries a remap
@@ -1176,7 +1203,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       N = blocks.length; dupTotal += dup.length; st.loops++; st.blocks += dup.length; did = true;
     }
     if (did) {
-      st.fns++;
+      st.fns++; (st.okN ??= []).push([snap.N, dupTotal]);
       const order = layoutOrder(N, (i) => succs[i], 0);
       const inv = new Int32Array(N).fill(-1); order.forEach((o, r) => inv[o] = r);
       const re = (j) => j < 0 ? j : inv[j];
