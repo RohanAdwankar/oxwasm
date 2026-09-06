@@ -843,7 +843,7 @@ const engine = (bin, args, stdin, opts = {}) => {
                             for (const c of e.children ?? []) if (c.eng) walk(c.eng); };
                             walk(eng); return [...m].map(([k, n]) => `${k}x${n}`); })(),
            ms: Number(process.hrtime.bigint() - t0) / 1e6,
-           units: eng.aotFns.size, insns: eng.stats.interpreted, err,
+           units: eng.aotFns.size, insns: eng.stats.interpreted, aotRuns: eng.stats.aotRuns | 0, err,
            yields: `${eng.stats.loopYieldTop | 0}/${eng.stats.loopYieldNested | 0}/${eng.stats.loopHot | 0}` };   // top-level yields / nested (deopt) yields / units rooted on request
 };
 
@@ -868,7 +868,7 @@ for (const [name, bin, args, opts] of CASES) {
   const same = eng.code === nat.code && Buffer.compare(eng.out, nat.out) === 0;
   if (same) { pass++;
     console.log(`  ok   ${name.padEnd(9)} ${String(nat.out.length).padStart(8)}B out, ` +
-                `${eng.units} fns, ${(eng.ms).toFixed(0)}ms yields=${eng.yields}`);
+                `${eng.units} fns, ${(eng.ms).toFixed(0)}ms yields=${eng.yields} interp=${eng.insns} aot=${eng.aotRuns}`);   // interp: interpreted steps - a case whose count is out of proportion to its work is running code it should have compiled (vforkexec read 64M for two 4M-iteration loops)
     if (process.env.BREADTH_STDERR && eng.stderr) console.log(`         guest stderr: ${JSON.stringify(eng.stderr.slice(0, 600))}`);   // BREADTH_STDERR=1: show it on success too (warnings the byte compare cannot see)
     if (process.env.BREADTH_MEM) {   // guest-written entries whose bytes live inside a wasm memory would pin that memory for the rest of the run
       const big = Object.entries(files).filter(([k, v]) => v && v.buffer && v.buffer.byteLength > (64 << 20) && v.byteLength < v.buffer.byteLength).map(([k, v]) => `${k}(${v.byteLength}B in a ${(v.buffer.byteLength / 1e6) | 0}MB buffer)`);
