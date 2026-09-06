@@ -5286,3 +5286,36 @@ discards SIGTSTP sent to a member of an orphaned process group, and a
 harness run under nohup is one, so the fixture now takes its own group
 under its live parent - the engine stops the child either way, which
 is the difference a native comparison exists to show.
+
+### Batch 18: an interactive bash on a pty
+
+With job control in the engine, the consumer that exercises all of it
+at once is a shell on a terminal. `tools/fixtures/ptysh.c` opens a
+pty, forks `bash --norc --noprofile -i` with the slave as its
+controlling terminal (TERM=dumb, PS1='$ '), and types like a person:
+`echo hello`, `sleep 30 &`, `jobs`, `kill %1`, `echo after` (the job's
+death is reported before that prompt), `cat` with a line typed and ^C,
+`sleep 100` with ^Z, `jobs`, `fg` with ^C, `echo $?`, `exit`. It
+prints what the terminal showed after each step, escaped, with job
+pids normalised, and the native transcript is stable run to run. The
+bash-pty breadth case compares it byte for byte.
+
+The first run matched through `jobs` and hung at `kill %1`. Three
+engine gaps, each a real one: kill(2) only knew a direct child by pid,
+so bash's `kill(-pgid)` for `%1` fell through to signalling the shell
+itself (kill now finds any process in the tree by pid, and pid 0, -1
+and -pgid reach the caller's group, everyone, or a group across the
+tree); a tail-exec'd image (a forked job child that blocked before its
+exec and was materialised, then exec'd sleep in place) swallowed every
+signal sent to it, so ^Z to the foreground group stopped the sleep
+engine but the shell's wait4 - which watches the image - never saw a
+stop (the image now forwards signals to its replacement and mirrors
+its stopped / continued state); and the image adopted only the
+replacement's exit code, not its signal, so a job killed by SIGTERM
+was "Exit 143" rather than "Terminated" and bash did not print the
+newline it prints after a job dies of ^C (the signal is carried
+through). Also, stop signals had stayed default-ignored in the
+disposition table from before batch 17 - only the root, which has
+nobody to continue it, keeps that. After those the whole transcript is
+identical, 10.6 s; the engine differentials and the shell- and
+signal-sensitive breadth cases stayed exact.
