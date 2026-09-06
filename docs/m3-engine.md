@@ -5062,3 +5062,64 @@ lookup already assumed. `BREADTH_STRACE_FILE=path` writes a failing
 case's whole trace, which is how the two lines were found.
 The sweep with census2 in it, on the final engine: 195 of 195 exact in
 23.5 minutes.
+
+### Batch 14: the third census, and unmodified CPython over the new sockets
+
+First a check that the socket layer holds up under a real program:
+`tools/fixtures/sock.py` on the unmodified CPython runs a TCP echo
+server on the loopback with the client in another thread (70 KB
+through the pair, select on the client end), an AF_UNIX stream server
+on a path, datagrams between two bound names, and a pipe end passed
+over a socketpair with `socket.send_fds`. Byte-identical on the first
+run; it is the python-sock breadth case. One lesson was the fixture's,
+not the engine's: the server thread printed its own lines, and native
+schedules the two threads' prints in either order, so the server's
+lines are collected and printed after the join.
+
+The third census (`tools/fixtures/census3.c`, 131 lines) covers
+filesystem edge cases, /proc shapes, timers and threads: hard link
+counts, symlink forms, a symlink loop, a 5000-byte name, rmdir of a
+non-empty directory, rename over it, mkdir under a missing parent,
+truncate, O_APPEND with pwrite, O_PATH, dup2 onto itself and onto -1,
+mkfifo via mknod, umask and chdir in a forked child, F_OFD locks, poll
+on a file, a directory and a bad descriptor, epoll edge-triggered and
+oneshot with their error paths, a SIGEV_SIGNAL posix timer taken by
+sigtimedwait, clock_nanosleep TIMER_ABSTIME and its EINVALs,
+sigsuspend, sigwaitinfo, readlink of /proc/self/{cwd,exe,fd/N},
+/proc/self/{cmdline,status,stat,maps,limits,mountinfo}, /proc/meminfo,
+/proc/cpuinfo, /proc/sys/kernel/{osrelease,pid_max}, uname,
+gethostname, sysconf, a pthread's tid, set_tid_address, the sched
+family.
+
+The first engine run hung so hard that runbin's guard never fired:
+`nanosleep({0, -1})` is EINVAL natively and became a sleep whose
+deadline never came (runbin sleeps toward a deadline without counting
+it against the guard). With sleep arguments validated (tv_nsec in
+range, a known clock id, CLOCK_THREAD_CPUTIME_ID refused) the run went
+through and twenty-five lines differed, fixed line by line: ELOOP and
+ENAMETOOLONG (a `PathErr` thrown by path resolution - forty hops
+through symlinks, or a name over 4095 bytes - and turned into the
+errno by the syscall dispatcher, so every path-taking syscall answers
+without its own check), readlink's forms (one handler for readlink and
+readlinkat: the target, /proc/self/exe, cwd, root, fd/N naming the
+descriptor's file or its anonymous kind - `pipe:[ino]`,
+`socket:[ino]`, `anon_inode:[eventfd]` - EINVAL for a non-link and
+ENOENT for nothing at all; it was EINVAL for everything else), mkdir
+ENOENT under a missing parent (it created the directory), truncate(2)
+(ENOSYS; open descriptors follow the new buffer), O_APPEND applied to
+pwrite as well as write (Linux ignores pwrite's offset on an append
+descriptor, and every write lands at the end whatever the position),
+O_PATH descriptors that fstat but do not read or write, dup2/dup3
+EBADF outside the descriptor range and EINVAL for dup3 onto itself,
+poll on a directory readable, epoll: EPOLLET reports a descriptor only
+when something arrived since its last report (a generation key from
+the pipe's byte counters), EPOLLONESHOT disarms after one report until
+MOD re-arms it, DEL of an unregistered descriptor ENOENT, ADD of a
+regular file or directory EPERM, ADD of the epoll descriptor itself
+EINVAL, and the sched family (getparam/setscheduler/getscheduler,
+priority min/max per policy, rr_get_interval) instead of ENOSYS -
+glibc's sched_* wrappers had all been failing. One probe was the
+fixture's own race: it armed a 2 ms timer and only then blocked
+SIGALRM, and on the slower engine the expiry landed on the handler
+before the mask went up; the mask now goes up first, which is how the
+pattern is meant to be written. The census is a breadth case.

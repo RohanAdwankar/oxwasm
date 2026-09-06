@@ -175,6 +175,10 @@ const CENSUS2 = '/tmp/breadth_census2';
 if (!existsSync(CENSUS2)) {  // the second census: processes, signals, sockets, memory (tools/fixtures/census2.c)
   try { execFileSync('gcc', ['-O1', '-o', CENSUS2, new URL('./fixtures/census2.c', import.meta.url).pathname]); } catch {}
 }
+const CENSUS3 = '/tmp/breadth_census3';
+if (!existsSync(CENSUS3)) {  // the third census: filesystem edge cases, /proc shapes, timers, threads (tools/fixtures/census3.c)
+  try { execFileSync('gcc', ['-O1', '-o', CENSUS3, new URL('./fixtures/census3.c', import.meta.url).pathname]); } catch {}
+}
 const SOCKPAIR = '/tmp/breadth_sockpair';
 if (!existsSync(SOCKPAIR)) {   // socketpair(AF_UNIX): both directions, EOF after the peer closes, a child on the other end
   try { execFileSync('gcc', ['-O1', '-o', SOCKPAIR, new URL('./fixtures/sockpair.c', import.meta.url).pathname]); } catch {}
@@ -383,6 +387,7 @@ const CASES = [
   ['repscan', REPSCAN, []],
   ['census',  CENSUS, []],
   ['census2', CENSUS2, []],
+  ['census3', CENSUS3, []],
   // nasm assembling the recycle fixture's source: a flat binary out (outFile)
   ['nasm',    '/usr/bin/nasm', ['-f', 'bin', '-o', '/tmp/breadth_nasm.bin', new URL('./fixtures/recycle.asm', import.meta.url).pathname],
               { bins: [new URL('./fixtures/recycle.asm', import.meta.url).pathname], outFile: '/tmp/breadth_nasm.bin' }],
@@ -552,6 +557,12 @@ const CASES = [
   // bash: trap + kill -USR1 $$ (distinct pid, handler delivery), functions, arrays, arithmetic
   ['bash-trap', '/bin/bash', ['-c', 'trap "echo got USR1" USR1; kill -USR1 $$; echo after; f(){ echo "f:$1"; }; f x; a=(1 2 3); echo ${#a[@]} $((7*6))']],
   // python multiprocessing: fork children that never exec, blocking on pipes
+  // python sockets, unmodified CPython: a TCP echo server on the loopback with
+  // a client in another thread (70 KB through the pair, select), an AF_UNIX
+  // stream server on a path, datagrams between two bound names, a pipe end
+  // passed over a socketpair with SCM_RIGHTS
+  ['python-sock', '/usr/bin/python3', ['-S', new URL('./fixtures/sock.py', import.meta.url).pathname],
+                { tree: '/usr/lib/python3.11', bins: [new URL('./fixtures/sock.py', import.meta.url).pathname], memMB: 1024 }],
   ['python-mp', '/usr/bin/python3', ['-S', new URL('./fixtures/mp.py', import.meta.url).pathname],
                 { tree: '/usr/lib/python3.11', bins: [new URL('./fixtures/mp.py', import.meta.url).pathname], memMB: 1024 }],
   // python: ITIMER_REAL interrupts time.sleep, PEP 475 retries it
