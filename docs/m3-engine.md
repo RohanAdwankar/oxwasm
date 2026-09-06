@@ -5319,3 +5319,4 @@ disposition table from before batch 17 - only the root, which has
 nobody to continue it, keeps that. After those the whole transcript is
 identical, 10.6 s; the engine differentials and the shell- and
 signal-sensitive breadth cases stayed exact.
+The sweep with bash-pty in it: 208 of 208 exact in 27.7 minutes.
