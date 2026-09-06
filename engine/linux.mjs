@@ -44,6 +44,7 @@ const CLOSURE_MIN = Number((typeof process !== 'undefined' && process.env?.OXWAS
 // is emitted (2,000 insns -> 31 calls, 13,000 -> 203). OXWASM_SIZEGATE=0 off.
 const SIZEGATE = !(typeof process !== 'undefined' && process.env?.OXWASM_SIZEGATE === '0');
 const SIZEGATE_SHIFT = Number((typeof process !== 'undefined' && process.env?.OXWASM_SIZEGATE_SHIFT) || 6);
+const EXEC_ANON = typeof process !== 'undefined' && process.env?.OXWASM_EXEC_ANON === '1';   // anonymous PROT_EXEC mmaps count as code for profiling/translation (JIT code caches)
 const UNPRUNE = new Set(((typeof process !== 'undefined' && process.env?.OXWASM_UNPRUNE) || '').split(',').filter(Boolean).map(h => BigInt('0x' + h).toString()));
 
 export class LinuxEngine {
@@ -422,6 +423,7 @@ export class LinuxEngine {
     if (this._failMemo) for (const k of this._failMemo.keys()) if (inR(BigInt(k))) this._failMemo.delete(k);
     if (this._sizeDefer) for (const k of this._sizeDefer.keys()) if (inR(k)) this._sizeDefer.delete(k);
     if (this._sizeMemo) for (const k of this._sizeMemo.keys()) if (inR(BigInt(k))) this._sizeMemo.delete(k);
+    if (EXEC_ANON) { const n = this.execRanges.length; this.execRanges = this.execRanges.filter(([a, b]) => !(a >= lo && b <= hi)); if (this.execRanges.length !== n) this._ieCache = undefined; }
     if (this._tinyMemo) for (const k of this._tinyMemo.keys()) if (inR(BigInt(k))) this._tinyMemo.delete(k);
     if (this._inflight) for (const u of this._inflight) if (u.funcs.some(inR)) {
       u.cancelled = true;
@@ -1797,6 +1799,13 @@ export class LinuxEngine {
           const shared = !!(flags & 0x1n) && !!(a3 & 0x2n) && h.bytes !== undefined && !!h.writable;
           (this.maps ??= []).push({ at, len, path: h.path ?? '?', fileOff: fo, h, shared });
           this.execRanges.push([at, at + len]);   // library text: profiling must see it (prot untracked)
+        } else if (EXEC_ANON && (a3 & 4n)) {
+          // Anonymous PROT_EXEC memory is a JIT's code cache (the JVM's
+          // template interpreter lives in one). Without this the profiler
+          // never sees it and javac interpreted 1.9M steps/s forever.
+          // Opt-in: code written there can change without an munmap, and
+          // the engine invalidates translations only on munmap/mremap.
+          this.execRanges.push([at, at + len]);
         }
         ret(at); break; }
       case 11: {                                             // munmap
