@@ -4924,7 +4924,18 @@ Two more probes. ffprobe over a lavfi test source is a breadth case
 space manager and JIT) dies at startup with an aspacem assertion: it
 expects to own the process address space from its 0x58000000 load
 address up, and the flat window's layout is not that - parked with go
-build as an address-space shape the window does not offer. the emitter 4.7 s self plus
+build as an address-space shape the window does not offer.
+
+### Batch 11: archive tools, and directory order
+
+curl over a file URL, `unzip -l` and `zip -r` of a small tree are breadth
+cases. zip's archive differed from native's in entry order alone: zip
+prepends what readdir hands it, and the engine had listed directories in
+provisioning order, which came from `fs.readdirSync` - libuv sorts that.
+Provisioning now walks with `fs.opendirSync` (the host's getdents order),
+so a guest directory lists in the same raw order as the host's, and zip,
+tar, find and `ls -U` see what native sees. runbin gained
+`STDOUTFILE=path` (raw guest stdout) for this kind of byte comparison. the emitter 4.7 s self plus
 4.5 s of garbage collection, 3.9 s of module instantiation even with
 lazy compilation, 2.9 s of decode plus analysis, 1.6 s interpreting
 2.5M steps, and the guest's own translated execution. No single bucket
