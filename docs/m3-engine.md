@@ -5338,3 +5338,5 @@ NONE` on a pty (TERM=vt100, 24x80: open a file, `jo`, a line, Esc,
 without it vim printed E557 and fell back to its builtin terminals,
 which a real deployment would see too, so the case provisions
 /usr/share/terminfo. Both are breadth cases (script-pty, vim-pty).
+The sweep with script-pty and vim-pty in it: 210 of 210 exact in 25.9
+minutes.
