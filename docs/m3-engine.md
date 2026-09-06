@@ -5060,3 +5060,5 @@ launcher gave up with exit 1. Relative names at the root are now
 absolute ("/name"; "." and ".." are "/"), which is what every other
 lookup already assumed. `BREADTH_STRACE_FILE=path` writes a failing
 case's whole trace, which is how the two lines were found.
+The sweep with census2 in it, on the final engine: 195 of 195 exact in
+23.5 minutes.
