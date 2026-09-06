@@ -5507,3 +5507,22 @@ multiprocessing pool - all paid it after their first vfork. A flag now
 records whether a save happened; vforkexec 46 s -> 4 s under runbin.
 The DBGRIP=hex (dispatch decision at a rip) and DBGBUDGET=1 (who sets
 the budget, with a stack) levers in runbin found it.
+
+**The livelock the budget bug had been hiding.** With parents
+dispatching compiled code again, the first sweep stalled on python-mp
+(35 minutes with no output; 161 s before). A CPU profile taken from
+outside through the inspector port (`scratchpad/insprof.mjs`; the
+in-loop levers cannot fire when the engine never leaves a slice)
+showed one `dispatchAot` that never returned, and a pause-and-evaluate
+client (`inspeval.mjs`, `globalThis.__eng` from runbin) read the
+state: the Pool's three handler threads spinning through poll, wait4
+and clock_gettime (2.2M calls), both workers materialised as child
+engines blocked on their pipes. Children are pumped between run()
+slices, a slice ends on a step budget, and compiled code burns no
+steps - so the parent never blocked as a whole and the workers never
+ran. Interpreted, the same parent ended its slice every 5e7 steps.
+The engine now cuts a slice older than 50 ms at the next compiled
+syscall, callout hop or 4096 nested interpreter steps whenever a live
+child engine exists (`_kidsDue`): an immediate-deadline block unwinds
+to the host, which pumps the children and resumes at the next
+instruction. python-mp 161 s -> 79 s under runbin.

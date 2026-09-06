@@ -933,7 +933,7 @@ export class LinuxEngine {
       // an immediately-due blocked deadline and re-pumps on the next task.
       this._itc = (this._itc | 0) + 1;            // persistent across nested interpUntil calls
       if ((this._itc & 0x3FFFF) === 0 && this.pumpAsm && this._inflight && this._inflight.size) this.pumpAsm();   // see run(): deferred units register here too
-      if ((this._itc & 0xFFF) === 0 && this.sliceDeadline != null && performance.now() > this.sliceDeadline) {
+      if ((this._itc & 0xFFF) === 0 && ((this.sliceDeadline != null && performance.now() > this.sliceDeadline) || this._kidsDue())) {
         this.syncOut();
         this.blocked = { deadline: this.nowMs() };
         throw new BlockUnwind(this.cpu.rip);
@@ -985,6 +985,8 @@ export class LinuxEngine {
         // to the top loop, which resumes at the new rip with the state just
         // published.
         if (this._sigRedirected) { this._sigRedirected = false; throw new DeoptUnwind(this.cpu.rip); }
+        // rip is already the post-syscall address: the unwind resumes there
+        if (this._kidsDue()) { this.blocked = { deadline: this.nowMs() }; throw new BlockUnwind(this.cpu.rip); }
       },
       callout: (target) => {
         target = BigInt.asUintN(64, target);
@@ -994,7 +996,7 @@ export class LinuxEngine {
         // slices). At callout entry the caller has spilled the whole regfile
         // and the return address is on the guest stack — resuming interp AT
         // the target reproduces the call exactly.
-        if (this.sliceDeadline != null && performance.now() > this.sliceDeadline) {
+        if ((this.sliceDeadline != null && performance.now() > this.sliceDeadline) || this._kidsDue()) {
           this.blocked = { deadline: this.nowMs() };
           throw new BlockUnwind(target);
         }
@@ -4899,8 +4901,24 @@ export class LinuxEngine {
     return out;
   }
 
+  // Slice preemption for a parent whose children are separate engines: the
+  // host pumps them only between run() slices, and a slice ends on a step
+  // budget that compiled code never burns. A parent spinning through
+  // non-blocking syscalls in compiled code (python's Pool: three threads in
+  // poll/wait4/clock_gettime, 2.2M calls) never blocked as a whole, so its
+  // workers never ran - a livelock the vfork budget bug had been hiding by
+  // keeping every such parent interpreted. With live child engines, a slice
+  // older than 50 ms is cut at the next syscall (or callout hop, or 4096
+  // nested interpreter steps): an immediate-deadline block unwinds to the
+  // host, which pumps the children and resumes at the next instruction.
+  _kidsDue() {
+    return this.children !== undefined && this.children.length !== 0 && this._sliceT0 !== undefined &&
+      performance.now() - this._sliceT0 > 50 &&
+      this.children.some(c => c.exited === null && c.eng !== undefined && c.eng !== null && c.eng.exitCode === null && !c.eng.stopped);
+  }
   _run1(maxSteps = 5e9) {
     let steps = 0;
+    this._sliceT0 = performance.now();
     // true top level (never nested): clear the wasm-frame budget word so
     // taxes leaked by unwound chains can't accumulate across slices
     (this._ftdv ??= new DataView(this.wmem.buffer)).setUint32(FTMAP + 8, 0, true);
