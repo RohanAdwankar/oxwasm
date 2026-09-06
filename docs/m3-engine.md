@@ -4874,7 +4874,9 @@ covered). Batch 10 therefore lands four engine fixes that had nothing
 to do with Java in particular: a longjmp through nested frames, tail
 chaining across an abandoned frame, flags not handed to the interpreter
 at escapes, and zero-count rep scans - each with a two-second fixture
-(dlfail, repscan) that reproduces what took javac six minutes to reach. the emitter 4.7 s self plus
+(dlfail, repscan) that reproduces what took javac six minutes to reach.
+The sweep over all of it: 186 of 186 exact in 28 minutes (javac 385 s,
+cargo-build 107 s, rustc-asm 108 s). the emitter 4.7 s self plus
 4.5 s of garbage collection, 3.9 s of module instantiation even with
 lazy compilation, 2.9 s of decode plus analysis, 1.6 s interpreting
 2.5M steps, and the guest's own translated execution. No single bucket
