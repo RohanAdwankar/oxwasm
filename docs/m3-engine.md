@@ -5594,3 +5594,26 @@ the run before - the box, not the change: java-hello, which the
 translator changes do not touch, moved 100 -> 102 s and cargo-build
 120 -> 153 s in the same run; the profile, where structure() left the
 top twenty, is the evidence).
+
+### Batch 25: the shipped page on the batch 20-24 engine
+
+The node sweep cannot see a browser-only failure, and batches 20-24
+changed the emitter (node splitting, jump-table remaps), the tiering
+(deferred units pumped mid-stretch, the vfork budget, child-aware
+slices) and the hosts. The shipped GIMP page re-shelled on the current
+engine modules (`tools/gui/reshell.mjs`, 10 modules, its own units)
+in headless Chromium: File > New > OK in 14 s, three strokes, ink 0 ->
+2,583 pixels, warm stroke 20.1 ms median input-to-paint (19.8 ms when
+the page shipped). The units recompiled by the current emitter
+(`repackunits.mjs`, every container entry re-run through
+compileUnitWat from the snapshot memory) are the fuller check, below.
+Recompiled: 5,753 of 7,810 units re-emitted (1,897 keep their old
+bytes - trampolines and units whose analysis the current emitter
+refuses - and 160 would lose exports), container 86.4 -> 87.3 MB raw.
+Re-shelled with them, `pagecheck.mjs`: File > New > OK, strokes drew,
+20.5 ms median input-to-paint; shipped into demo/gimp (index.html and
+app.units.gz), where the check reads 19.2 ms. The page now carries the
+engine of batches 20-24 - for the browser the vfork budget fix matters
+most: GIMP launches every plug-in by fork+exec, and until it the main
+process came back from the first one never again dispatching compiled
+code from the interpreter.
