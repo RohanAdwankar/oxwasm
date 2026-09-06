@@ -5340,3 +5340,70 @@ which a real deployment would see too, so the case provisions
 /usr/share/terminfo. Both are breadth cases (script-pty, vim-pty).
 The sweep with script-pty and vim-pty in it: 210 of 210 exact in 25.9
 minutes.
+
+### Batch 20: node splitting - m4's hottest functions leave the dispatch layout
+
+Back to translated-code quality (#26), starting from where m4 spends
+its time. The profile of the big m4 run puts next_token (0x40fe70) at
+16% self time, then 0x410bf0 (8.5%), next_char (0x409e80, 6.8%),
+0x411248 (5.2%) and 0x417160. Four of those six were emitted in the
+br_table dispatch layout: `structure()` reported "block/loop overlap"
+for each, and dumping their CFGs showed why. gcc's tail duplication
+leaves the tokenizer's loop with two entry blocks (54 and 81 in RPO,
+entered from before the loop and from inside it), 0x410bf0's expand
+loop with seven, 0x411248's with four. These are genuinely irreducible
+loops - no block order can nest them - which is what task #62 had
+found and priced without fixing.
+
+**Node splitting** fixes them at the CFG level, before the unroller:
+for a strongly connected component with several entries, pick the
+header whose alternative is cheapest, copy the members reachable from
+the OTHER entries without passing that header, and point the entering
+edges at the copies. Copies are the same block objects (same
+instructions, same address; the unroller already relies on that), their
+internal edges stay inside the copy, every other edge goes to the
+original, so the copied path enters the loop only through the header.
+Nested loops are found by removing the header and repeating inside;
+the pass iterates to a fixpoint (a copy can hold an irreducible
+sub-loop of its own) under a per-function cap of half the function's
+blocks (at least 48, at most 512), then the layout is recomputed - RPO
+plus the loop compaction, now a function shared with the first layout.
+A jump-table site whose case block was duplicated carries a per-site
+remap from the resolver's representative index to its copy, applied to
+its br_table (structured) or `$pc` (dispatch): 0x410bf0 is entered by
+the same switch twice, once before the loop and once inside it, at two
+different case blocks, and without the remap it stayed in dispatch. A
+representative the layout drops (an original left unreachable once
+every entering edge went to a copy) is replaced by a reachable copy
+and the remaps are re-keyed. OXWASM_NODESPLIT=0 disables; the
+dispatch layout remains the fallback past the cap.
+
+All four hot m4 functions take the structured layout now (next_token
+181 -> 213 blocks, 0x410bf0 347 -> 407, 0x411248 117 -> 140, 0x417160
+518 -> 732); the m4 unit's dispatch count went from 98 functions to
+47. m4 steady state 7.18x -> 6.78x on the vsnative harness (engine
+9,822 ms against native 1,449, from 10,248 against 1,427 before the
+batch; the session-to-session noise on the engine number is about
++/-10%, and the interleaved off/on pair read 7.35x -> 6.95x); the
+translation cost is 2,726 duplicated blocks on the small run, 5.2 ->
+5.6 s of wall. disptest now compiles its irreducible
+function in both layouts (splitting off forces dispatch, on must
+structure it) and checks both bit-exact: 800/800.
+
+**Hot-site un-prune, measured and left off.** With the layout fixed,
+next_token's remaining cost is its per-character call to next_char
+through the $ftr chain - the callee tiered up first, in its own unit,
+so every later caller's closure pruned it. Keeping it in by hand
+(OXWASM_UNPRUNE=409e80) took m4 from 6.95x to 6.47x. The general rule
+(a callee called from a cycle of the unit's root stays in the closure
+when it is at most 640 instructions, under a per-unit budget) is in
+the translator as OXWASM_UNPRUNE_HOT=N, but its default is 0: it kept
+567 callees (67k instructions) per m4 run at a 1024 budget, +2 s of
+analysis and emit for 4.5% of steady state (9582 -> 9146 ms) - a net
+loss below a minute of runtime. The version that pays needs a call
+counter on the chained-call path so only callees that are actually
+called hot are re-homed (a re-tier), which the current profile cannot
+tell (it stops counting at the first tier-up).
+Gate: full suite green (disptest in both layouts, jtabtest 112/112),
+sweep 210 of 210 exact in 31.2 minutes (25.9 before; the compiler
+cases pay the duplicated blocks' emit).

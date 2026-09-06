@@ -10,6 +10,7 @@ import { writeFileSync, unlinkSync } from 'node:fs';
 let an = 0;
 globalThis.__jtabStats = { structured: 0 }; globalThis.__layoutOf = new Map();
 let watBytes = 0, watUnits = 0;
+if (process.env.CFGDUMP) globalThis.__cfgDump = process.env.CFGDUMP;   // CFGDUMP=hex: when this function falls back to dispatch, write its N/succs to CFGDUMP_TO
 const assembleWat = (wat) => { watBytes += wat.length; watUnits++; if (process.env.WATDUMP === 'all') writeFileSync('/tmp/scratch' + watUnits + '.wat', wat); else if (process.env.WATDUMP && wat.includes('$f_' + process.env.WATDUMP)) writeFileSync(process.env.WATDUMP_TO || ('/tmp/scratch' + process.env.WATDUMP + '.wat'), wat);                       // AOT=1: tier live, like breadth
   return asm(wat); };
 const asm = makeAssembler({ debugNames: true, tag: 'rb' });   // pre-forked: 4 ms a unit instead of 133 from a 3 GB process
@@ -92,7 +93,7 @@ globalThis.__jtabStats ??= { structured: 0 };
 if (process.env.LAYOUTOF) for (const a of process.env.LAYOUTOF.split(',')) console.log(`--- layout ${a}: ${globalThis.__layoutOf.get(a)}`);
 if (globalThis.__inlStats?.rej) console.log(`--- inline rejections (${globalThis.__inlStats.rej.length}):\n` + [...new Set(globalThis.__inlStats.rej)].slice(0, 40).join('\n'));
 console.log(`--- narrow: ${JSON.stringify(globalThis.__narrowStats || {})}`);
-console.log(`--- layouts: ${JSON.stringify(globalThis.__inlStats || {})} jtab=${JSON.stringify(globalThis.__jtabStats)} unroll=${JSON.stringify(globalThis.__unrollStats || {})} deopts=${eng.stats.deopts|0} layout=${JSON.stringify(globalThis.__layoutStats||{})}`);
+console.log(`--- layouts: ${JSON.stringify(globalThis.__inlStats || {})} jtab=${JSON.stringify(globalThis.__jtabStats)} unroll=${JSON.stringify(globalThis.__unrollStats || {})} deopts=${eng.stats.deopts|0} layout=${JSON.stringify(globalThis.__layoutStats||{})} split=${JSON.stringify(globalThis.__splitStats||{})} hotUnprune=${JSON.stringify(globalThis.__hotUnpruneStats||{})}`);
 console.log(`--- wat: units=${watUnits} bytes=${(watBytes/1e6).toFixed(2)}MB loopHot=${eng.stats.loopHot|0} yieldTop=${eng.stats.loopYieldTop|0} yieldNested=${eng.stats.loopYieldNested|0} aotFns=${eng.aotFns.size}`);
 if (process.env.OXWASM_FNPROF === '1') {   // per-function entry counts (see FNPROF in aot_wat.mjs); top 40, collisions flagged
   const { fnprofSlot } = await import('../engine/aot_wat.mjs');
@@ -149,3 +150,4 @@ if (process.env.FILE) { const f = eng.files[process.env.FILE]; console.log('--- 
 if (eng.stderr&&eng.stderr.length) console.log('--- stderr ---\n' + eng.stderr.join('').slice(0, process.env.STDERRMAX ? +process.env.STDERRMAX : 4000));
 if (process.env.STRACE) console.log('--- strace tail ---\n' + eng.strace.slice(process.env.STRACE === 'full' ? 0 : -40).join('\n'));
 if (process.env.STRACE) { armChildren(eng); for (const ce of seenEng) console.log(`--- child ${ce._label} exit=${ce.exitCode} blocked=${JSON.stringify(ce.blocked)} threads=${ce.threads.map(t=>t.id+':'+t.state).join(' ')} strace tail ---\n` + (ce.strace||[]).slice(-30).join('\n')); }
+if (globalThis.__cfgDumped) { const d = globalThis.__cfgDumped; writeFileSync(process.env.CFGDUMP_TO || (process.cwd() + '/cfg.json'), JSON.stringify(d)); console.log(`--- cfgdump: N=${d.N} ${d.err}`); }

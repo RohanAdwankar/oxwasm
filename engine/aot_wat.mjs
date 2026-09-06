@@ -961,14 +961,19 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   };
   // reverse postorder from the ENTRY block — which is NOT necessarily the
   // lowest address: a unit rooted at a loop head can decode blocks below it.
-  const An = a0.blocks.length; const order = []; const vis = new Uint8Array(An);
+  const An = a0.blocks.length;
   const entryIdx = a0.bidx.get(fnAddr.toString());
   if (entryIdx === undefined) throw new Error('AOT: entry not a block leader');
+  // layoutOrder(count, succOf, entry): reachable blocks in RPO from the
+  // entry, then loop-compacted (below). Applied once in address-index space
+  // and again after node splitting widens the CFG in RPO-index space.
+  const layoutOrder = (An, succOf, entryIdx) => {
+  const order = []; const vis = new Uint8Array(An);
   (function dfs(u) { vis[u] = 1;
-    for (const v of succAddrIdx(u)) if (v >= 0 && !vis[v]) dfs(v);
+    for (const v of succOf(u)) if (v >= 0 && !vis[v]) dfs(v);
     order.push(u);
   })(entryIdx);
-  order.reverse();                                  // RPO in address-index space
+  order.reverse();                                  // RPO
   // Loop-aware layout. Plain RPO can interleave a block that is NOT part of
   // a loop between the loop's blocks (an exit path laid out before a later
   // body block). structure() then sees a forward branch into the loop's
@@ -985,9 +990,9 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   if (!(typeof process !== 'undefined' && process.env?.OXWASM_LOOPLAYOUT === '0')) {
     const pos = new Array(An).fill(-1); order.forEach((a, r) => pos[a] = r);
     const preds = Array.from({ length: An }, () => []);
-    for (const u of order) for (const v of succAddrIdx(u)) if (v >= 0) preds[v].push(u);
+    for (const u of order) for (const v of succOf(u)) if (v >= 0) preds[v].push(u);
     const heads = new Map();                        // header addrIdx -> back-edge sources
-    for (const u of order) for (const v of succAddrIdx(u)) if (v >= 0 && pos[v] <= pos[u]) (heads.get(v) ?? heads.set(v, []).get(v)).push(u);
+    for (const u of order) for (const v of succOf(u)) if (v >= 0 && pos[v] <= pos[u]) (heads.get(v) ?? heads.set(v, []).get(v)).push(u);
     const loops = [...heads].sort((a, b) => pos[a[0]] - pos[b[0]]);
     for (const [h, srcs] of loops) {
       const mem = new Set([h]); const st = srcs.filter(u => u !== h); for (const u of st) mem.add(u);
@@ -1000,6 +1005,9 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       (globalThis.__layoutStats ??= { compacted: 0, moved: 0 }).compacted++; globalThis.__layoutStats.moved += outL.length;
     }
   }
+  return order;
+  };
+  const order = layoutOrder(An, succAddrIdx, entryIdx);
   const rpoOf = new Array(An).fill(-1);
   order.forEach((addrIdx, r) => rpoOf[addrIdx] = r);
   const blocks = order.map(ai => a0.blocks[ai]);    // blocks laid out in RPO
@@ -1072,6 +1080,127 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     else if (last.mnem === 'udec')   { hasDeopt = true; term.push({kind:'deopt', src:null, at:last.rip}); succs.push([]); }
     else { const t = idxOf(next); if (t < 0) hasDeopt = true;
       term.push({kind:'fall', t, ta: next}); succs.push([t]); }
+  }
+  // ---- node splitting: make every loop single-entry -----------------------
+  // gcc's tail duplication leaves m4's tokenizer (next_token, 16% of the
+  // profile) and three more of its six hottest functions with loops that
+  // have two to seven entry blocks - genuinely irreducible, so structure()
+  // could only ever hand them to the br_table dispatch layout (a dispatcher
+  // round-trip per edge, 4 of 6 hot functions). Classic node splitting
+  // repairs that at the CFG level: for a strongly connected component with
+  // several entries pick the header h whose alternative is cheapest, copy
+  // the members reachable from the OTHER entries without passing h, and
+  // point the entering edges at the copies. Copies are the same block
+  // objects (same instructions, same address; the unroller relies on the
+  // same fact), their internal edges stay inside the copy and every other
+  // edge goes to the original - so the copied path now enters the loop only
+  // through h. Nested loops are found by removing the header and repeating
+  // inside; the whole thing iterates to a fixpoint (a copy can itself hold
+  // an irreducible sub-loop) under a duplication cap, after which the
+  // layout is recomputed (RPO + loop compaction) over the widened CFG. A
+  // component holding a jump-table site is left alone: its copies would
+  // still branch to the original case blocks. OXWASM_NODESPLIT=0 disables.
+  const NODESPLIT = !(typeof process !== 'undefined' && process.env?.OXWASM_NODESPLIT === '0');
+  if (NODESPLIT) {
+    const findIrreducible = () => {
+      // Tarjan SCCs over a node subset; returns [members[]] (size>1 or self-loop)
+      const sccs = (nodes) => {
+        const idx = new Int32Array(N).fill(-1), low = new Int32Array(N), on = new Uint8Array(N);
+        const st = [], out = []; let c = 0;
+        const go = (v) => { idx[v] = low[v] = c++; st.push(v); on[v] = 1;
+          for (const w of succs[v]) { if (w < 0 || !nodes.has(w)) continue;
+            if (idx[w] < 0) { go(w); if (low[w] < low[v]) low[v] = low[w]; }
+            else if (on[w] && idx[w] < low[v]) low[v] = idx[w]; }
+          if (low[v] === idx[v]) { const comp = []; let w;
+            do { w = st.pop(); on[w] = 0; comp.push(w); } while (w !== v);
+            if (comp.length > 1 || succs[v].includes(v)) out.push(comp); } };
+        for (const v of nodes) if (idx[v] < 0) go(v);
+        return out;
+      };
+      const preds = Array.from({ length: N }, () => []);
+      for (let u = 0; u < N; u++) for (const v of succs[u]) if (v >= 0) preds[v].push(u);
+      const walk = (nodes) => {
+        for (const comp of sccs(nodes)) {
+          const cs = new Set(comp);
+          const entries = comp.filter(v => v === 0 || preds[v].some(p => !cs.has(p))).sort((a, b) => a - b);
+          if (entries.length > 1) {
+            let best = null;
+            for (const h of (cs.has(0) ? [0] : entries)) {
+              const seen = new Set(); const stk = entries.filter(e => e !== h);
+              while (stk.length) { const u = stk.pop(); if (seen.has(u) || u === h) continue; seen.add(u);
+                for (const w of succs[u]) if (w >= 0 && cs.has(w)) stk.push(w); }
+              if (!best || seen.size < best.dup.size) best = { h, dup: seen, cs };
+            }
+            return best;
+          }
+          const h = entries.length ? entries[0] : comp[0];
+          const inner = new Set(cs); inner.delete(h);
+          if (inner.size) { const r = walk(inner); if (r) return r; }
+        }
+        return null;
+      };
+      return walk(new Set(Array.from({ length: N }, (_, i) => i)));
+    };
+    const st = (globalThis.__splitStats ??= { fns: 0, loops: 0, blocks: 0, capped: 0, jtab: 0 });
+    // duplication cap per function: half its size (the hot m4 functions
+    // needed 0.18-0.41x), at least 48 blocks, at most 512; past it the
+    // function keeps the dispatch layout it had before
+    let dupTotal = 0, rounds = 0, did = false; const cap = Math.min(512, Math.max(48, N >> 1));
+    for (;;) {
+      if (rounds++ > 64) { st.capped++; break; }
+      const pick = findIrreducible();
+      if (!pick) break;
+      const dup = [...pick.dup].sort((a, b) => a - b);
+      if (dupTotal + dup.length > cap) { st.capped++; break; }
+      // a jump-table site branches by REPRESENTATIVE index (the resolver
+      // maps a computed address to the one member of jtabUnion at that
+      // address); a site whose case block was duplicated carries a remap
+      // from that representative to the copy it must branch to instead, and
+      // the emitter applies it to the site's br_table (structured) or $pc
+      // (dispatch). m4's expand loop is entered by the same switch twice - once
+      // from before the loop, once from inside it - at two different blocks.
+      const cmap = new Map(); dup.forEach((q, k) => cmap.set(q, N + k));
+      const re = (j) => (j >= 0 && cmap.has(j)) ? cmap.get(j) : j;
+      const reTerm = (t, f) => { const u = { ...t };
+        if (typeof u.t === 'number') u.t = f(u.t);
+        if (typeof u.f === 'number') u.f = f(u.f);
+        if (u.kind === 'jtab') { const m = new Map();
+          for (const r of jtabUnion) { const cur = t.remap?.get(r) ?? r, nv = f(cur); if (nv !== r) m.set(r, nv); }
+          u.remap = m.size ? m : undefined; }
+        return u; };
+      for (const q of dup) { blocks.push(blocks[q]); term.push(reTerm(term[q], re)); succs.push(succs[q].map(re)); }
+      // entering edges: from outside the component into a duplicated block
+      for (let u = 0; u < N; u++) { if (pick.cs.has(u)) continue;
+        if (!succs[u].some(j => j >= 0 && cmap.has(j))) continue;
+        term[u] = reTerm(term[u], re); succs[u] = succs[u].map(re); }
+      N = blocks.length; dupTotal += dup.length; st.loops++; st.blocks += dup.length; did = true;
+    }
+    if (did) {
+      st.fns++;
+      const order = layoutOrder(N, (i) => succs[i], 0);
+      const inv = new Int32Array(N).fill(-1); order.forEach((o, r) => inv[o] = r);
+      const re = (j) => j < 0 ? j : inv[j];
+      // a representative that the layout dropped (its original became
+      // unreachable once every entering edge went to a copy) is replaced by
+      // a reachable copy of the same block, and every site's remap re-keyed
+      const rep = new Map();
+      if (hasJtab) for (const r of jtabUnion) { let v = inv[r];
+        if (v < 0) for (let j = 0; j < N && v < 0; j++) if (blocks[j] === blocks[r] && inv[j] >= 0) v = inv[j];
+        if (v >= 0) rep.set(r, v); }
+      const nb = order.map(o => blocks[o]);
+      const nt = order.map(o => { const u = { ...term[o] };
+        if (typeof u.t === 'number') u.t = re(u.t);
+        if (typeof u.f === 'number') u.f = re(u.f);
+        if (u.kind === 'jtab') { const m = new Map();
+          for (const [r, k] of rep) { const cur = term[o].remap?.get(r) ?? r, v = inv[cur]; if (v >= 0 && v !== k) m.set(k, v); }
+          u.remap = m.size ? m : undefined; }
+        return u; });
+      const ns = order.map(o => succs[o].map(re));
+      blocks.length = 0; blocks.push(...nb); term.length = 0; term.push(...nt); succs.length = 0; succs.push(...ns);
+      for (const [id, ix] of bidx) { if (inv[ix] >= 0) bidx.set(id, inv[ix]); else bidx.delete(id); }
+      if (hasJtab) { jtabUnion.clear(); for (const [, v] of rep) jtabUnion.add(v); }
+      N = blocks.length;
+    }
   }
   // ---- loop unrolling, at the CFG level -------------------------------------
   // The loop yield's burn (a read-modify-write of the budget word at every
@@ -1181,6 +1310,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   if (typeof process !== 'undefined' && process.env?.OXWASM_FORCEDISP === '1') mode = 'dispatch';   // A/B: price the dispatch layout
   else try { ({ open, closeAfter } = structure(N, succs)); }
   catch (e) {
+    if (globalThis.__cfgDump && globalThis.__cfgDump === fnAddr.toString(16)) globalThis.__cfgDumped = { N, succs: succs.map(s => [...s]), starts: blocks.map(b => b.start.toString(16)), err: e.message };
     if (!/overlap|irreducible|unclosed|converge/.test(e.message) || globalThis.__disableDispatch) throw e;
     if (hasJtab && globalThis.__jtabStats) { const fb = (globalThis.__jtabStats.fallback ??= {}); const k = e.message.slice(0, 60); fb[k] = (fb[k] || 0) + 1; }
     globalThis.__lastStructErr = e.message.slice(0, 120);
@@ -2681,7 +2811,9 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       // still deopts, so resolution is exact by construction.
       L.push(`(local.set $rex ${rd(t.src,8,lnext)})`);
       L.push(`(local.set $pc (call $jtr_${fnAddr.toString(16)} (local.get $rex)))`);
+      const jmap = (r) => t.remap?.get(r) ?? r;          // node splitting: this site's copy of a case block
       if (DISP) {
+        if (t.remap) for (const [r, v] of t.remap) L.push(`(if (i32.eq (local.get $pc) (i32.const ${r})) (then (local.set $pc (i32.const ${v}))))`);
         L.push(`(br_if $L_disp (i32.ge_s (local.get $pc) (i32.const 0)))`);
         L.push(SA_MARK);
         L.push(...tailJmp());
@@ -2693,7 +2825,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
         // just past the deopt tail; everything else (an unknown address,
         // $pc = -1, or a block that is not a table target) takes the
         // default and deopts at the computed address.
-        const vec = []; for (let r = 0; r < N; r++) vec.push(jtabUnion.has(r) ? (r === i + 1 ? `$jt_next_${i}` : (r <= i ? '$loop_' + r : '$blk_' + r)) : `$jt_dflt_${i}`);
+        const vec = []; for (let r = 0; r < N; r++) { const x = jmap(r); vec.push(jtabUnion.has(r) ? (x === i + 1 ? `$jt_next_${i}` : (x <= i ? '$loop_' + x : '$blk_' + x)) : `$jt_dflt_${i}`); }
         L.push(`(block $jt_next_${i} (block $jt_dflt_${i} (br_table ${vec.join(' ')} $jt_dflt_${i} (local.get $pc)))`);
         L.push(SA_MARK);
         L.push(...tailJmp());
@@ -3080,6 +3212,32 @@ export function compileUnitWat(mem, entry, opts = {}) {
     catch { ok = false; }
     tinyMemo.set(k, ok); return ok;
   };
+  // Hot-site un-prune: a callee called from a CYCLE of a function already
+  // in this closure is on that function's hot path. Pruned (already compiled
+  // elsewhere), every such call pays the $ftr chain - hash probe,
+  // call_indirect, budget save/restore - and next_char in m4 was paid per
+  // character from six tokenizer loops that way: un-pruning it by hand
+  // (OXWASM_UNPRUNE=409e80) took m4 from 6.95x to 6.47x native. The engine's
+  // call profile cannot rank it (see inlineCallees: a threshold detector
+  // that stops at the first tier-up), the caller's own CFG can. Such a
+  // callee stays in the closure when its body is at most HOTSIZE
+  // instructions (bigger ones amortise the chain) and this unit has HOTUN
+  // instructions of such duplication left; direct wasm calls result, and
+  // the inliner gets a candidate. OXWASM_UNPRUNE_HOT=0 turns it off.
+  // Default OFF: on m4 it bought 4.5% of steady state (9582 -> 9146 ms) for
+  // +2 s of translation per run (567 callees, 67k instructions analysed and
+  // emitted again at a 1024 budget) - a net loss below a minute of runtime.
+  // The version that pays needs a call counter on the chained-call path so
+  // only callees that are ACTUALLY called hot get re-homed (a re-tier).
+  const HOTUN = opts.hotUnprune ?? Number((typeof process !== 'undefined' && process.env?.OXWASM_UNPRUNE_HOT) ?? 0);
+  const HOTSIZE = Number((typeof process !== 'undefined' && process.env?.OXWASM_UNPRUNE_HOTSIZE) ?? 640);
+  const hotSites = new Set(); let hotSpent = 0;
+  const noteHotSites = (an) => {
+    if (!(HOTUN > 0)) return;
+    let cyc; try { cyc = cyclicBlocks(an); } catch { return; }
+    for (const bi of cyc) for (const insn of an.blocks[bi].insns)
+      if (insn.mnem === 'call') hotSites.add(((insn.next + insn.rel) & an.M).toString());
+  };
   const funcs = new Map();                       // addrStr -> analysis
   const poisoned = new Set();                    // addrStr -> engine-only (callout)
   const pending = [entry];
@@ -3103,7 +3261,11 @@ export function compileUnitWat(mem, entry, opts = {}) {
     // the duplication is a few lines per site. OXWASM_UNPRUNE_TINY=0 turns
     // it off; the per-address verdict is memoised across units in opts.tinyMemo.
     if (opts.veto && k !== entry.toString() && opts.veto(k)) continue;   // bisect aid: an explicit veto beats the tiny exception
-    if (skip && k !== entry.toString() && skip(k) && !isTiny(a)) continue;
+    let hotOnly = false;                       // admitted by the hot-site rule alone: sized after analysis
+    if (skip && k !== entry.toString() && skip(k) && !isTiny(a)) {
+      if (!(HOTUN > 0 && hotSites.has(k) && hotSpent < HOTUN)) continue;
+      hotOnly = true;
+    }
     // A callee whose analysis or emit failed in an earlier unit fails the
     // same way in this one (the bytes have not changed; the engine clears the
     // memo when they do): poison it without analysing again. rustc-asm
@@ -3165,7 +3327,14 @@ export function compileUnitWat(mem, entry, opts = {}) {
       if (opts.sizeGate) { let n = 0; for (const b of an.blocks) n += b.insns.length;
         const need = opts.sizeGate(k, n, k === entry.toString());
         if (need) { if (k === entry.toString()) throw Object.assign(new Error('size gate: ' + n + ' insns, ' + need + ' calls needed'), { deferred: need }); if (opts.sizeMemo) opts.sizeMemo.set(k, n); continue; } }
+      if (hotOnly) { let n = 0; for (const b of an.blocks) n += b.insns.length;
+        const st = (globalThis.__hotUnpruneStats ??= { kept: 0, insns: 0, refused: 0 });
+        if (n > HOTSIZE || hotSpent + n > HOTUN) { st.refused++; continue; }   // stays pruned: its sites chain through $ftr
+        hotSpent += n; st.kept++; st.insns += n; }
       funcs.set(k, an);
+      // the ROOT's cycles only: noting every member's cycles cascaded (m4:
+      // 862 callees, 116k instructions kept over one run, +2 s of startup)
+      if (k === entry.toString()) noteHotSites(an);
       for (const c of an.calls) if (!funcs.has(c) && !poisoned.has(c)) pending.push(BigInt(c));
     } catch (e) { poisoned.add(k); if (k === entry.toString()) throw e; if (opts.failMemo && !e.deferred) opts.failMemo.set(k, e.message); }
   }
