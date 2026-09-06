@@ -5127,3 +5127,11 @@ The sweep with census3 and python-sock in it: 198 of 198 exact in 23.4
 minutes. (A first attempt stalled in chunk 1 while two other guests of
 mine ran beside it; alone, the chunk is 54 of 54 in 4.5 minutes - one
 big guest at a time remains the rule.)
+
+**Sockets across processes.** The http-loop case puts python's
+http.server (ThreadingHTTPServer: listen, poll, accept, a thread per
+request) in the background of a bash script and has curl retry until it
+connects, then fetch a 404, then kill and wait - three programs, the
+listener's name found through the registry the process tree shares.
+Byte-identical, 32 s. Its first attempt "hung" only because it ran
+beside the sweep; alone it finished before a 120 s snapshot was due.
