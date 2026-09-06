@@ -33,18 +33,28 @@ const elf = new Uint8Array(readFileSync(join(dir, 'irr')));
 const entry = BigInt('0x' + execFileSync('nm', [join(dir, 'irr')]).toString().split('\n').find(l => / T irr$/.test(l)).trim().split(/\s+/)[0]);
 
 const mk = () => new LinuxEngine(elf, { argv: ['irr'], files: {}, memMB: 256 });
-const eng0 = mk();
-const unit = compileUnitWat(eng0.mem, entry, { guestBase: eng0.base, ramBase: eng0.RAMOFF });
-if (!unit.wat.includes('$L_disp')) { console.log('SETUP FAIL: irr did not compile in dispatch mode'); process.exit(1); }
-writeFileSync(join(dir, 'irr.wat'), unit.wat);
-execFileSync('wat2wasm', ['--enable-tail-call', join(dir, 'irr.wat'), '-o', join(dir, 'irr.wasm')]);
-const mod = new WebAssembly.Module(readFileSync(join(dir, 'irr.wasm')));
+// Two layouts of the same irreducible function: node splitting OFF forces
+// the br_table dispatch fallback (the layout this test was written for);
+// node splitting ON (the default) must repair the CFG into the structured
+// layout - both bit-exact against the interpreter.
+const build = (split) => {
+  process.env.OXWASM_NODESPLIT = split ? '1' : '0';
+  const eng0 = mk();
+  const unit = compileUnitWat(eng0.mem, entry, { guestBase: eng0.base, ramBase: eng0.RAMOFF });
+  const disp = unit.wat.includes('$L_disp');
+  if (disp === split) { console.log(`SETUP FAIL: irr compiled in ${disp ? 'dispatch' : 'structured'} mode with node splitting ${split ? 'on' : 'off'}`); process.exit(1); }
+  const w = join(dir, `irr${split ? '_split' : ''}.wat`);
+  writeFileSync(w, unit.wat);
+  execFileSync('wat2wasm', ['--enable-tail-call', w, '-o', w.replace(/\.wat$/, '.wasm')]);
+  return new WebAssembly.Module(readFileSync(w.replace(/\.wat$/, '.wasm')));
+};
 const entryName = 'f_' + entry.toString(16);
 const SENT = 0xdeadbee0n;
 
 const seeds = [1n, 2n, 3n, 7n, 0xffffffffn, 0x123456789abcdefn, 0x8000000000000000n,
   0xdeadbeefcafebaben, (1n<<64n)-1n, 0x9e3779b97f4a7c15n];
 let pass = 0, fail = 0;
+for (const [mod, label] of [[build(false), 'dispatch-mode'], [build(true), 'node-split structured']])
 for (let n = 1n; n <= 40n; n++) for (const seed of seeds) {
   // oracle: interpreter
   const e = mk(); const cpu = e.cpu;
@@ -62,10 +72,10 @@ for (let n = 1n; n <= 40n; n++) for (const seed of seeds) {
   e2.regview[4] = BigInt.asIntN(64, rsp); e2.regview[7] = BigInt.asIntN(64, n); e2.regview[6] = BigInt.asIntN(64, seed);
   new DataView(e2.wmem.buffer).setBigUint64(e2.RAMOFF + Number(rsp - e2.base), SENT, true);
   const exit = BigInt.asUintN(64, inst.exports[entryName]());
-  if (exit !== SENT) { fail++; console.log(`FAIL exit n=${n} seed=${seed.toString(16)} exit=${exit.toString(16)}`); continue; }
+  if (exit !== SENT) { fail++; console.log(`FAIL ${label} exit n=${n} seed=${seed.toString(16)} exit=${exit.toString(16)}`); continue; }
   const aot = BigInt.asUintN(64, e2.regview[0]);
   if (aot === oracle) pass++;
-  else { fail++; console.log(`MISMATCH n=${n} seed=${seed.toString(16)}: oracle=${oracle.toString(16)} aot=${aot.toString(16)}`); }
+  else { fail++; console.log(`MISMATCH ${label} n=${n} seed=${seed.toString(16)}: oracle=${oracle.toString(16)} aot=${aot.toString(16)}`); }
 }
-console.log(`\n${pass}/${pass + fail} dispatch-mode (irreducible CFG) results bit-exact (AOT vs interpreter)`);
+console.log(`\n${pass}/${pass + fail} irreducible-CFG results bit-exact, dispatch and node-split layouts (AOT vs interpreter)`);
 if (fail) process.exit(1);
