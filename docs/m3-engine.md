@@ -5407,3 +5407,19 @@ tell (it stops counting at the first tier-up).
 Gate: full suite green (disptest in both layouts, jtabtest 112/112),
 sweep 210 of 210 exact in 31.2 minutes (25.9 before; the compiler
 cases pay the duplicated blocks' emit).
+
+The same A/B on the other call-dense case: perl's 30M-iteration loop
+went 7.26x -> 6.24x (engine 5,645 -> 5,245 ms, native 777 vs 840 ms
+across the pair) - its runloop is a switch inside a loop that the
+switch also re-enters, the shape the jump-table remap exists for.
+vim -es (`%s` over 400 k lines): 4.42x -> 3.58x (engine 1,504 ->
+1,178 ms, native 341/329 ms). Three call-dense binaries, three
+double-digit steady-state gains from one structural fix - the
+dispatch layout had been the widest remaining tax on gcc-shaped hot
+loops.
+
+| binary | before | after |
+|---|---:|---:|
+| m4 | 7.18x | 6.78x |
+| perl | 7.26x | 6.24x |
+| vim -es | 4.42x | 3.58x |
