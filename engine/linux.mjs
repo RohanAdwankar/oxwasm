@@ -1250,7 +1250,7 @@ export class LinuxEngine {
   norm(p) {
     // relative paths resolve against the process cwd (tar -C, configure
     // scripts, anything that chdir()s and then opens a bare name)
-    if (p.charCodeAt(0) !== 47 && this.cwd && this.cwd !== '/') p = this.cwd + '/' + p;
+    if (p.charCodeAt(0) !== 47) p = (this.cwd && this.cwd !== '/' ? this.cwd : '') + '/' + p;   // a relative name at the root is "/name", and "." and ".." there are "/" (the JVM opens ".." while locating itself)
     p = p.replace(/\/{2,}/g, '/');
     if (!p.includes('.')) return p.length > 1 ? p.replace(/\/+$/, '') : p;   // fast path
     const abs = p.charCodeAt(0) === 47;
