@@ -18,10 +18,9 @@ export function decode(fetch, rip) {
     if (p === 0xF2) { rep2 = 1; continue; }    // repne / scalar-double
     if (p === 0xF0) { lock = 1; continue; }    // lock: single-hart, plain semantics
     if ((p & 0xF0) === 0x40) { rex = p; continue; }
-    if (p === 0x2E || p === 0x3E) { continue; } // cs/ds overrides: meaningless in 64-bit (padding/notrack)
-    if (p === 0x26 ||
-        p === 0x36 || p === 0x65)
-      throw new Error(`unsupported prefix ${p.toString(16)}`);
+    if (p === 0x2E || p === 0x3E || p === 0x26 || p === 0x36) { continue; }   // cs/ds/es/ss overrides: null in 64-bit (padding, notrack; HotSpot's C2 output carries ss:)
+    if (p === 0x65)
+      throw new Error(`unsupported prefix ${p.toString(16)}`);   // gs: a real segment base this engine does not model
     break;
   }
   const W = rex & 8 ? 1 : 0, R = rex & 4 ? 1 : 0, X = rex & 2 ? 1 : 0, B = rex & 1 ? 1 : 0;
