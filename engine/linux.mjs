@@ -1435,6 +1435,7 @@ export class LinuxEngine {
     p = this.resolve(this.norm(p));
     if (p === '/' ) return true;
     if (SYNTH_DIRS.has(p) || /^\/proc\/\d+(\/(fd|task))?$/.test(p)) return true;
+    { const cwd = this.norm('.'); if (p === cwd || (cwd + '/').startsWith(p + '/')) return true; }   // the cwd and its ancestors exist (patch makes its temp file in ./)
     const pre = p.endsWith('/') ? p : p + '/';
     const m = this._fsMeta();
     if (this._dirset === undefined || this._dirsetV !== m.v) {
@@ -2493,7 +2494,7 @@ export class LinuxEngine {
             ret(BigInt(fd)); break;
           }
           if (flags & 0x40) {                                 // O_CREAT: writable guest files, in a directory that exists
-            { const np = this.norm(p), par = np.slice(0, np.lastIndexOf('/')) || '/'; if (!this.isDir(par)) { ret(-2n); break; } }   // ENOENT
+            { const np = this.norm(p), i = np.lastIndexOf('/'); if (i > 0 && !this.isDir(np.slice(0, i))) { ret(-2n); break; } }   // ENOENT (a bare name lives in the cwd)
             f = new Uint8Array(0);
             this.files[this.norm(p)] = f; this.fsBump();
             if (this.mtimes) this.mtimes[this.norm(p)] = Math.floor(this.nowMs() / 1000);
