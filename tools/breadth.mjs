@@ -175,6 +175,7 @@ const CENSUS2 = '/tmp/breadth_census2';
 if (!existsSync(CENSUS2)) {  // the second census: processes, signals, sockets, memory (tools/fixtures/census2.c)
   try { execFileSync('gcc', ['-O1', '-o', CENSUS2, new URL('./fixtures/census2.c', import.meta.url).pathname]); } catch {}
 }
+if (!existsSync('/tmp/bh/hello.txt')) { try { mkdirSync('/tmp/bh', { recursive: true }); writeFileSync('/tmp/bh/hello.txt', 'hello over http\n'); } catch {} }   // http-loop's document root
 const CENSUS3 = '/tmp/breadth_census3';
 if (!existsSync(CENSUS3)) {  // the third census: filesystem edge cases, /proc shapes, timers, threads (tools/fixtures/census3.c)
   try { execFileSync('gcc', ['-O1', '-o', CENSUS3, new URL('./fixtures/census3.c', import.meta.url).pathname]); } catch {}
@@ -563,6 +564,12 @@ const CASES = [
   // passed over a socketpair with SCM_RIGHTS
   ['python-sock', '/usr/bin/python3', ['-S', new URL('./fixtures/sock.py', import.meta.url).pathname],
                 { tree: '/usr/lib/python3.11', bins: [new URL('./fixtures/sock.py', import.meta.url).pathname], memMB: 1024 }],
+  // an HTTP server and its client in separate processes: python's http.server
+  // (ThreadingHTTPServer: listen, poll, accept, a thread per request) in the
+  // background, curl retried until it connects (the socket registry is shared
+  // across the fork/exec tree), a 404, then kill and wait
+  ['http-loop', '/bin/bash', ['-c', 'cd /tmp/bh && python3 -S -m http.server 8765 --bind 127.0.0.1 >/dev/null 2>&1 & for i in $(seq 1 300); do curl -sf http://127.0.0.1:8765/hello.txt && break; sleep 0.2; done; curl -s -o /dev/null -w "%{http_code}\\n" http://127.0.0.1:8765/missing; kill %1; wait; echo rc=$?'],
+                { tree: '/usr/lib/python3.11', bins: ['/tmp/bh/hello.txt', '/usr/bin/python3', '/usr/bin/curl', '/usr/bin/sleep', '/usr/bin/seq', '/usr/bin/kill'], memMB: 1024, childMemMB: 1024 }],
   ['python-mp', '/usr/bin/python3', ['-S', new URL('./fixtures/mp.py', import.meta.url).pathname],
                 { tree: '/usr/lib/python3.11', bins: [new URL('./fixtures/mp.py', import.meta.url).pathname], memMB: 1024 }],
   // python: ITIMER_REAL interrupts time.sleep, PEP 475 retries it
