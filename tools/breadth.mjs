@@ -182,6 +182,10 @@ const CENSUS3 = '/tmp/breadth_census3';
 if (!existsSync(CENSUS3)) {  // the third census: filesystem edge cases, /proc shapes, timers, threads (tools/fixtures/census3.c)
   try { execFileSync('gcc', ['-O1', '-o', CENSUS3, new URL('./fixtures/census3.c', import.meta.url).pathname]); } catch {}
 }
+const PTYVIM = '/tmp/breadth_ptyvim';
+if (!existsSync(PTYVIM)) {   // vim on a pty (tools/fixtures/ptyvim.c)
+  try { execFileSync('gcc', ['-O1', '-o', PTYVIM, new URL('./fixtures/ptyvim.c', import.meta.url).pathname, '-lutil']); } catch {}
+}
 const PTYSH = '/tmp/breadth_ptysh';
 if (!existsSync(PTYSH)) {    // an interactive bash on a pty, driven like a terminal (tools/fixtures/ptysh.c)
   try { execFileSync('gcc', ['-O1', '-o', PTYSH, new URL('./fixtures/ptysh.c', import.meta.url).pathname, '-lutil']); } catch {}
@@ -408,6 +412,10 @@ const CASES = [
   // an interactive bash on a pty, driven like a terminal: a background job,
   // jobs, kill %1, ^C to a foreground cat, ^Z stopping sleep, fg, $?, exit
   ['bash-pty', PTYSH, [], { bins: ['/bin/bash', '/usr/bin/sleep', '/usr/bin/cat'] }],
+  // script(1): a pty, a forked shell, SIGCHLD through a signalfd, the transcript on stdout
+  ['script-pty', '/usr/bin/script', ['-q', '-c', 'echo hi; printf "a\\tb\\n"', '/dev/null'], { bins: ['/bin/sh', '/usr/bin/echo', '/usr/bin/printf'] }],
+  // vim on a pty (TERM=vt100, 24x80): open a file, insert a line, :wq; the terminal bytes and the file
+  ['vim-pty', PTYVIM, [], { bins: ['/usr/bin/vim'], tree: '/usr/share/terminfo', memMB: 1024 }],
   // nasm assembling the recycle fixture's source: a flat binary out (outFile)
   ['nasm',    '/usr/bin/nasm', ['-f', 'bin', '-o', '/tmp/breadth_nasm.bin', new URL('./fixtures/recycle.asm', import.meta.url).pathname],
               { bins: [new URL('./fixtures/recycle.asm', import.meta.url).pathname], outFile: '/tmp/breadth_nasm.bin' }],

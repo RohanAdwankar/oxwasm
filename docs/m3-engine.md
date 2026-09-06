@@ -5320,3 +5320,21 @@ nobody to continue it, keeps that. After those the whole transcript is
 identical, 10.6 s; the engine differentials and the shell- and
 signal-sensitive breadth cases stayed exact.
 The sweep with bash-pty in it: 208 of 208 exact in 27.7 minutes.
+
+### Batch 19: script(1) and vim on a pty
+
+Two more terminal programs, now that a session on a pty works. `script
+-q -c 'echo hi; printf "a\tb\n"' /dev/null` produced the right bytes
+on the first run and then never exited: script takes SIGCHLD through
+a signalfd, with the signal blocked and its disposition SIG_DFL, and
+the engine discarded a default-ignored signal at generation - so the
+child's exit never reached the signalfd and script polled forever.
+Linux queues any blocked signal whatever its disposition ("blocked
+signals are never ignored, since the handler may change by the time it
+is unblocked"), and so does the engine now: the discard applies only
+when the thread the signal lands on does not block it. `vim -u NONE -i
+NONE` on a pty (TERM=vt100, 24x80: open a file, `jo`, a line, Esc,
+`:wq`) matched byte for byte once the terminfo tree was provisioned -
+without it vim printed E557 and fell back to its builtin terminals,
+which a real deployment would see too, so the case provisions
+/usr/share/terminfo. Both are breadth cases (script-pty, vim-pty).

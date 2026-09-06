@@ -4122,7 +4122,6 @@ export class LinuxEngine {
     if (sig === 18 && this.stopped) { this.stopped = null; this.contEv = true; }
     if ((sig === 19 || (sig >= 20 && sig <= 22 && !act && !this.sigign?.has(sig))) && this.parentEng) {
       this.stopped = sig; this.stopEv = sig; return; }
-    if (!act && this._sigDefaultIgnored(sig)) return;                          // SIG_IGN / default-ignore: discarded
     let t = null;
     const live = (x) => x.state !== 'dead';
     if (tid != null) t = this.threads.find(x => x.id === tid && live(x)) ?? this.threads.find(live);
@@ -4134,6 +4133,11 @@ export class LinuxEngine {
     }
     if (!t) return;                                                             // nobody left to signal
     this._ts(t);
+    // SIG_IGN / default-ignore: discarded - unless every thread blocks it, in
+    // which case it stays pending like Linux's ("blocked signals are never
+    // ignored"): script(1) takes SIGCHLD through a signalfd with the signal
+    // blocked and SIG_DFL, and a discarded SIGCHLD left it polling forever
+    if (!act && this._sigDefaultIgnored(sig) && !(t.sigmask & bit)) return;
     if (globalThis.__sigtrace) console.error(`<raise sig=${sig} -> tid=${t.id} st=${t.state} cur=${this.threads[this.ti].id} mask=${t.sigmask.toString(16)}>`);
     // no handler and deliverable now: the default action (terminate) applies
     // at once. Blocked, it stays pending — for sigprocmask to unblock later,
