@@ -1271,15 +1271,21 @@ function emitUnitFunction(a0, fnAddr, ctx) {
         if ('f' in u && typeof u.f === 'number') u.f = sh(u.f);
         return u; };
       const nb = [], nt = [], ns = [];
-      for (let q = 0; q < N; q++) {
-        if (q === e) for (let c = 1; c < k; c++) for (let r = h; r < e; r++) {
+      const copies = () => { for (let c = 1; c < k; c++) for (let r = h; r < e; r++) {
           nb.push(blocks[r]); nt.push(remapTerm(r, term[r], c)); ns.push(succs[r].map(j => mapEdge(r, j, c)));
-        }
+        } };
+      for (let q = 0; q < N; q++) {
+        if (q === e) copies();
         const inRange = q >= h && q < e;
         nb.push(blocks[q]);
         nt.push(inRange ? remapTerm(q, term[q], 0) : shiftTerm(term[q]));
         ns.push(succs[q].map(j => inRange ? mapEdge(q, j, 0) : (j < 0 ? j : sh(j))));
       }
+      // a loop that is the LAST range (a unit rooted at its head with the
+      // exit block laid out before it: e === N) never met q === e - its
+      // edges were remapped onto copies that were never appended, and the
+      // emitter indexed past N (found by pumptest's loop-head unit)
+      if (e === N) copies();
       blocks.length = 0; blocks.push(...nb); term.length = 0; term.push(...nt); succs.length = 0; succs.push(...ns);
       for (const [id, ix] of bidx) bidx.set(id, sh(ix));
       N = blocks.length;

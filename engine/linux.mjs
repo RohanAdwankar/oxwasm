@@ -648,7 +648,9 @@ export class LinuxEngine {
         this.aotFns.set(k, null);
         for (const a of unit.funcs) (this._pendingFns ??= new Set()).add(a.toString());
         (this._inflight ??= new Set()).add(unit);
+        if (globalThis.__asmTrace) console.error(`<asm submit ${k.toString(16)} funcs=${unit.funcs.length} t=${Math.round(performance.now())}>`);
         this.assembleWatDeferred(unit.wat, (bytes, err) => {
+          if (globalThis.__asmTrace) console.error(`<asm back ${k.toString(16)} err=${!!err} cancelled=${!!unit.cancelled} t=${Math.round(performance.now())}>`);
           for (const a of unit.funcs) this._pendingFns.delete(a.toString());
           this._inflight.delete(unit);
           if (unit.cancelled) return;                    // its code was recycled while it assembled
@@ -659,7 +661,7 @@ export class LinuxEngine {
             this.aotFns.delete(k);                       // the placeholder; finishAotUnit registers the real export
             this.finishAotUnit(unit, inst);
             if (!this.aotFns.has(k)) throw new Error('entry missing from unit');
-          } catch (e) { this.aotFns.delete(k); this.aotFailed.add(k); if (this.onAotFail) this.onAotFail(entry, e.message); }
+          } catch (e) { if (globalThis.__asmTrace) console.error(e.stack); this.aotFns.delete(k); this.aotFailed.add(k); if (this.onAotFail) this.onAotFail(entry, e.message); }
         });
         return;
       }
@@ -688,6 +690,7 @@ export class LinuxEngine {
       if (!this.aotFns.has(k)) throw new Error('entry missing from unit');
       this.stats.tiers.aot = (this.stats.tiers.aot || 0) + 1;
     } catch (e) { if (e.deferred) { this.stats.sizeDeferred = (this.stats.sizeDeferred || 0) + 1; return; }   // size gate: not a failure, re-tiers at the count it named
+      if (globalThis.__asmTrace) console.error(e.stack);
       this.aotFailed.add(k);
       if (this.onAotFail) this.onAotFail(entry, e.message);
     } finally { if (t0c) this.tierMs += performance.now() - t0c; }
@@ -929,6 +932,7 @@ export class LinuxEngine {
       // (state published, resume re-enters interp at this rip); the host sees
       // an immediately-due blocked deadline and re-pumps on the next task.
       this._itc = (this._itc | 0) + 1;            // persistent across nested interpUntil calls
+      if ((this._itc & 0x3FFFF) === 0 && this.pumpAsm && this._inflight && this._inflight.size) this.pumpAsm();   // see run(): deferred units register here too
       if ((this._itc & 0xFFF) === 0 && this.sliceDeadline != null && performance.now() > this.sliceDeadline) {
         this.syncOut();
         this.blocked = { deadline: this.nowMs() };
@@ -4941,6 +4945,14 @@ export class LinuxEngine {
                             branched = true;
                             if (this.park()) continue; break; }
         if ((steps & 0xFFF) === 0 && this.sliceDeadline != null && performance.now() > this.sliceDeadline) break;
+        // Deferred units register from pumpAsm(), which ran only at run()
+        // entry and at the next tier-up: once every hot root was submitted,
+        // a long interpreted stretch never pumped again, and perl's op
+        // dispatcher ran its whole loop interpreted with its own compiled
+        // unit sitting in the broker's fifo (38 s against 11 s synchronous;
+        // the unit came back at t=9 s and registered at t=38 s, the end).
+        // Pump every 2^18 steps while anything is in flight.
+        if ((steps & 0x3FFFF) === 0 && this.pumpAsm && this._inflight && this._inflight.size) this.pumpAsm();
         if ((insn.mnem === 'jcc' || insn.mnem === 'jmp') && this.cpu.rip < before && this.inExec(this.cpu.rip)) {   // jmp: rotated-loop back-edge
           const hk = this.cpu.rip;
           const n = (this.profile.get(hk) || 0) + 1;

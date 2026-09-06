@@ -5423,3 +5423,40 @@ loops.
 | m4 | 7.18x | 6.78x |
 | perl | 7.26x | 6.24x |
 | vim -es | 4.42x | 3.58x |
+
+### Batch 21: deferred units that never registered, and a lost unroll copy
+
+Profiling perl under runbin (the diagnostic harness) instead of the
+bench runner gave a run of 287 s where the bench measured 9 s - same
+engine, same binary, same script. The bench runner assembles
+synchronously; runbin, breadth and every default host assemble
+through the deferred broker, and under the broker perl's op
+dispatcher ran its whole loop interpreted. The trace (ASMTRACE=1,
+new lever) showed why: its unit was submitted at t=9 s, came back
+moments later, and registered at t=38 s - the end of the run.
+`pumpAsm()`, which collects finished units from the broker's fifo,
+ran only at `run()` entry and at the start of the next tier-up. Once
+every hot root had been submitted nothing tiered up any more, the host
+slice (5e7 steps) did not end, and the finished units sat in the fifo
+while the interpreter did the work their translations were for. The
+interpreter loops now pump every 2^18 steps while anything is in
+flight (top-level `_run1` and the callout `interpUntil`, both guarded
+on `_inflight.size` so a quiet engine pays a field read). perl small:
+38 s -> 11 s under deferred assembly, the same as synchronous.
+
+The regression test (`engine/diff/pumptest.mjs`, in the suite) holds
+every unit until pumped, runs a 3M-iteration call loop in one host
+slice and checks that the loop went compiled (interpreted steps under
+4 per iteration; 18M before the fix). Writing it found a second bug:
+the loop-head unit of its loop failed to emit with "Cannot read
+properties of undefined (reading 'push')" - the unroller appends its
+copies when the block walk reaches the range's end index e, and a
+unit rooted at a loop head whose exit block lays out BEFORE the loop
+has e === N, so the copies were never appended while every edge had
+already been remapped onto them. Pre-existing (reproduced on the
+pre-batch-20 translator); the copies are appended after the walk in
+that case.
+Gate: suite green (pumptest in it), sweep 210 of 210 exact in 30.1
+minutes (31.2 before the pump; the cases that stall interpreted with a
+unit in the fifo are the long-lived-frame ones, and most breadth cases
+are short).
