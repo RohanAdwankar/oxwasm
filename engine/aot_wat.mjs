@@ -149,7 +149,11 @@ export function compileFunctionWatDispatch(mem, entry, { guestBase, ramBase, max
   const insnAt = new Map(); const work = [entry]; const seen = new Set(); let count = 0;
   while (work.length) {
     const rip = work.pop(); const key = rip.toString();
-    if (seen.has(key)) continue; seen.add(key);
+    // the visited set is keyed by Number: a guest address fits 2^53, and a
+    // Set of numbers inserts at ~165 ns against ~600 ns for strings or
+    // BigInts (rustc-asm walks 9.5M instructions)
+    const kn = Number(rip);
+    if (seen.has(kn)) continue; seen.add(kn);
     if (count++ > maxInsns) throw new Error('function too large');
     const insn = decode((i) => Number(mem.read(rip + BigInt(i), 1n)), rip);
     insn.rip = rip; insn.next = rip + BigInt(insn.len); insnAt.set(key, insn);
@@ -389,7 +393,11 @@ export function analyze(mem, entry, { maxInsns = 20000, noJtab = false, entries 
   };
   const drain = () => { while (work.length) {
     const rip = work.pop(); const key = rip.toString();
-    if (seen.has(key)) continue; seen.add(key);
+    // the visited set is keyed by Number: a guest address fits 2^53, and a
+    // Set of numbers inserts at ~165 ns against ~600 ns for strings or
+    // BigInts (rustc-asm walks 9.5M instructions)
+    const kn = Number(rip);
+    if (seen.has(kn)) continue; seen.add(kn);
     if (count++ > maxInsns) throw new Error('function too large');
     let insn;
     try { insn = decode(fetcher(rip), rip); }
@@ -561,7 +569,7 @@ export function analyze(mem, entry, { maxInsns = 20000, noJtab = false, entries 
     }
     if (targets.length < 2) continue;
     jtabs.set(j.rip.toString(), targets);
-    for (const t of targets) if (!seen.has(t.toString()) && dbudget > 0) { dbudget--; work.push(t); }
+    for (const t of targets) if (!seen.has(Number(t)) && dbudget > 0) { dbudget--; work.push(t); }
     drain();                      // newly decoded handlers may end in more jmpinds
   }
   const addrs = [...insnAt.keys()].map(BigInt).sort((a,b)=>a<b?-1:1);
@@ -864,16 +872,26 @@ function structure(N, succs) {
   // END is its branch target (immovable); a loop scope's BEGIN is its header
   // (immovable). So widen only the movable side: grow a loop's end, or grow a
   // block's begin. If neither is movable, the CFG needs the dispatch fallback.
+  // Every pass visits the scopes sorted by begin, so a scope only meets the
+  // later-beginning scopes that start inside it: the all-pairs form was
+  // quadratic in the scope count and 6 s of a rustc run. The rules are
+  // monotone (begins only move back, ends only forward), so the fixpoint
+  // and the overlap it cannot fix are the same whatever the visiting order;
+  // a begin moved back mid-pass is re-sorted by the next pass.
   let changed = true, guard = 0;
   while (changed) { changed = false;
     if (guard++ > 10000) throw new Error('AOT: scope nesting did not converge');
-    for (const s of scopes) for (const t of scopes) {
-      if (!(s.b < t.b && t.b < s.e && s.e < t.e)) continue;
-      // Prefer growing a BLOCK's begin backward (always valid, and it never
-      // engulfs a loop-exit target the way growing a loop's end would).
-      if (t.type === 'block')      { t.b = s.b; changed = true; }    // grow later block's begin back
-      else if (s.type === 'loop')  { s.e = t.e; changed = true; }    // grow earlier loop's end fwd
-      else throw new Error(`AOT: block/loop overlap needs dispatch fallback: ${s.type}[${s.b},${s.e}) vs ${t.type}[${t.b},${t.e})`);
+    const order = scopes.slice().sort((x, y) => (x.b - y.b) || (y.e - x.e));
+    for (let i = 0; i < order.length; i++) { const s = order[i];
+      for (let j = i + 1; j < order.length; j++) { const t = order[j];
+        if (t.b >= s.e) break;
+        if (!(s.b < t.b && s.e < t.e)) continue;
+        // Prefer growing a BLOCK's begin backward (always valid, and it never
+        // engulfs a loop-exit target the way growing a loop's end would).
+        if (t.type === 'block')      { t.b = s.b; changed = true; }    // grow later block's begin back
+        else if (s.type === 'loop')  { s.e = t.e; changed = true; }    // grow earlier loop's end fwd
+        else throw new Error(`AOT: block/loop overlap needs dispatch fallback: ${s.type}[${s.b},${s.e}) vs ${t.type}[${t.b},${t.e})`);
+      }
     }
   }
   // opening order at a position: larger range (outer) first

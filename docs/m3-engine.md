@@ -5574,3 +5574,23 @@ The browser page is V8's own heuristics and is untouched by this.
 Gate: sweep 210 of 210 exact in 28.9 minutes (32.3 before the flag,
 same box); rustc-asm 144 s -> 121 s, cargo-build 145 s -> 120 s,
 total engine time 1,873 -> 1,667 s.
+
+**Two more translator lines.** `structure()` fixed improper scope
+overlaps with an all-pairs loop repeated to a fixpoint - quadratic in
+the scope count, 6 s of the rustc run. Each pass now visits the scopes
+sorted by begin and a scope meets only the later-beginning scopes that
+start inside it; the rules are monotone (begins move back, ends move
+forward, never the reverse), so the fixpoint is the same in any
+visiting order and so is the overlap no rule can fix (a block ending
+inside a loop entered from before its header: once true, it stays true
+as intervals only widen). It left the profile's top twenty (under 1.3
+s). The instruction walk's visited set was keyed by the address as a
+string: a Set of strings or BigInts inserts at ~600 ns, a Set of
+numbers at ~165 ns, and a guest address fits 2^53 - keyed by Number
+now (the instruction map's string keys, which everything downstream
+uses, are unchanged).
+Gate: suite green, sweep 210 of 210 exact (31.7 minutes against 28.9
+the run before - the box, not the change: java-hello, which the
+translator changes do not touch, moved 100 -> 102 s and cargo-build
+120 -> 153 s in the same run; the profile, where structure() left the
+top twenty, is the evidence).
