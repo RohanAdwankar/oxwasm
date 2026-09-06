@@ -1397,7 +1397,15 @@ export class LinuxEngine {
     if (po === pn) return 0n;
     const m = this._fsMeta();
     const exists = (q) => this.files[q] !== undefined || m.links.has(q) || this.isDir(q);
-    if (flags & 2) return -22n;
+    if (flags & 2) {                                          // RENAME_EXCHANGE: both must exist; swap files or links (directories: EINVAL)
+      if (!exists(po) || !exists(pn)) return -2n;
+      if (this.isDir(po) || this.isDir(pn)) return -22n;
+      const fo = this.files[po], fn = this.files[pn], lo = m.links.get(po), ln = m.links.get(pn);
+      delete this.files[po]; delete this.files[pn]; m.links.delete(po); m.links.delete(pn);
+      if (fo !== undefined) this.files[pn] = fo; if (fn !== undefined) this.files[po] = fn;
+      if (lo !== undefined) m.links.set(pn, lo); if (ln !== undefined) m.links.set(po, ln);
+      this.fsBump(); return 0n;
+    }
     if ((flags & 1) && exists(pn)) return -17n;
     const mv = (a, b) => { if (this.mtimes && this.mtimes[a] !== undefined) { this.mtimes[b] = this.mtimes[a]; delete this.mtimes[a]; } };
     if (this.files[po] !== undefined) {
@@ -1519,7 +1527,9 @@ export class LinuxEngine {
   // answer and tar archived data files with the execute bit set - native
   // headers say 0644 - while a blanket 0644 would break shells probing
   // PATH entries with access(X_OK).
-  fileMode(bytes) {
+  fileMode(bytes, path) {
+    const m = path !== undefined && path !== null ? this._fsMeta().modes?.get(path) : undefined;
+    if (m !== undefined) return 0o100000 | m;
     return bytes && bytes.length >= 2 &&
       ((bytes[0] === 0x7f && bytes[1] === 0x45 && bytes[2] === 0x4c && bytes[3] === 0x46) ||
        (bytes[0] === 0x23 && bytes[1] === 0x21)) ? 0o100755 : 0o100644;
@@ -1724,11 +1734,56 @@ export class LinuxEngine {
         const nw = Number(a2); this.fds.set(nw, handle);
         if (nr === 292 && (Number(cpu.regs[2]) & 0x80000)) this.cloexec.add(nw); else this.cloexec.delete(nw);
         ret(BigInt(nw)); break; }
+      case 285: {                                             // fallocate(fd, mode, off, len): grow the file (KEEP_SIZE and punch modes: no size change)
+        const h = this.fds.get(Number(a1)); if (!h || h.bytes === undefined) { ret(-9n); break; }
+        const mode = Number(a2), end = Number(a3) + Number(cpu.regs[10]);
+        if (!(mode & 0x3) && end > h.bytes.length) this._growFile(h, end);
+        ret(0n); break; }
+      case 40: {                                              // sendfile(out_fd, in_fd, *off, count)
+        const ho = this._sinkOf(Number(a1)), hi = this.fds.get(Number(a2)); if (!hi) { ret(-9n); break; } if (!ho || (hi.bytes === undefined && !hi.pipe)) { ret(-22n); break; }
+        const off = a3 ? Number(this.mem.read(a3, 8n)) : undefined;
+        const data = this._readBytes(hi, Number(cpu.regs[10]), off); if (data === undefined) { ret(-22n); break; } if (data === null) { ret(-11n); break; }
+        const n = this._writeBytes(ho, data);
+        if (a3) this.mem.write(a3, 8n, BigInt(off + n));
+        ret(BigInt(n)); break; }
+      case 326: {                                             // copy_file_range(fd_in, *off_in, fd_out, *off_out, len, flags)
+        const hi = this.fds.get(Number(a1)), ho = this.fds.get(Number(a3)); if (!hi || !ho) { ret(-9n); break; }
+        if (hi.bytes === undefined || ho.bytes === undefined) { ret(-22n); break; }
+        const oi = a2 ? Number(this.mem.read(a2, 8n)) : undefined, oo = cpu.regs[10] ? Number(this.mem.read(cpu.regs[10], 8n)) : undefined;
+        const data = this._readBytes(hi, Number(cpu.regs[8]), oi); const n = this._writeBytes(ho, data, oo);
+        if (a2) this.mem.write(a2, 8n, BigInt(oi + n)); if (cpu.regs[10]) this.mem.write(cpu.regs[10], 8n, BigInt(oo + n));
+        ret(BigInt(n)); break; }
+      case 275: {                                             // splice(fd_in, *off_in, fd_out, *off_out, len, flags): one side is a pipe
+        const hi = this.fds.get(Number(a1)), ho = this._sinkOf(Number(a3)); if (!hi) { ret(-9n); break; }
+        if (!ho || (!hi.pipe && !ho.pipe) || (hi.bytes === undefined && !hi.pipe)) { ret(-22n); break; }
+        const oi = a2 ? Number(this.mem.read(a2, 8n)) : undefined, oo = cpu.regs[10] ? Number(this.mem.read(cpu.regs[10], 8n)) : undefined;
+        const data = this._readBytes(hi, Number(cpu.regs[8]), oi); if (data === undefined) { ret(-22n); break; }
+        if (data === null) { if (hi.nonblock || (Number(cpu.regs[9]) & 2)) { ret(-11n); break; } this.block(null); break; }
+        const n = this._writeBytes(ho, data, oo); if (n === undefined) { ret(-22n); break; }
+        if (a2) this.mem.write(a2, 8n, BigInt(oi + n)); if (cpu.regs[10]) this.mem.write(cpu.regs[10], 8n, BigInt(oo + n));
+        ret(BigInt(n)); break; }
+      case 319: {                                             // memfd_create(name, flags): an anonymous regular file
+        const fd = this.allocFd(); this.fds.set(fd, { bytes: new Uint8Array(0), pos: 0, writable: true, memfd: this.readPath(a1) });
+        if (Number(a2) & 1) this.cloexec.add(fd);             // MFD_CLOEXEC
+        ret(BigInt(fd)); break; }
+      case 253: case 294: {                                   // inotify_init / inotify_init1(flags)
+        const fl = nr === 294 ? Number(a1) : 0, fd = this.allocFd();
+        this.fds.set(fd, { ino: { watches: new Map(), next: 1, queue: [] }, nonblock: !!(fl & 0x800) });
+        if (fl & 0x80000) this.cloexec.add(fd); (this._inotifyFds ??= new Set()).add(fd);
+        ret(BigInt(fd)); break; }
+      case 254: {                                             // inotify_add_watch(fd, path, mask)
+        const h = this.fds.get(Number(a1)); if (!h?.ino) { ret(-22n); break; }
+        const wp = this.norm(this.readPath(a2)); if (!this.isDir(wp) && this.files[wp] === undefined) { ret(-2n); break; }
+        for (const [wd, w] of h.ino.watches) if (w.path === wp) { w.mask = Number(a3); ret(BigInt(wd)); break; }
+        const wd = h.ino.next++; h.ino.watches.set(wd, { path: wp, mask: Number(a3) }); ret(BigInt(wd)); break; }
+      case 255: {                                             // inotify_rm_watch(fd, wd)
+        const h = this.fds.get(Number(a1)); if (!h?.ino || !h.ino.watches.delete(Number(a2))) { ret(-22n); break; } ret(0n); break; }
       case 22: case 293: {                                   // pipe / pipe2
         const buf = { chunks: [], pos: 0, off: 0, size: 0 };
         const rfd = this.allocFd(); this.fds.set(rfd, null); const wfd = this.allocFd(); this.fds.delete(rfd);
-        this.fds.set(rfd, { pipe: buf, mode: 'r' });
-        this.fds.set(wfd, { pipe: buf, mode: 'w' });
+        const nb = nr === 293 && !!(Number(a2) & 0x800);        // pipe2(O_NONBLOCK): both ends (a read on an empty one blocked forever)
+        this.fds.set(rfd, { pipe: buf, mode: 'r', nonblock: nb });
+        this.fds.set(wfd, { pipe: buf, mode: 'w', nonblock: nb });
         if (nr === 293 && (Number(a2) & 0x80000)) { this.cloexec.add(rfd); this.cloexec.add(wfd); }
         this.jsnap(a1, 8);
         const v = new DataView(this.wmem.buffer), o = this.RAMOFF + Number(a1 - this.base);
@@ -1869,6 +1924,9 @@ export class LinuxEngine {
         // (absolute only: busybox re-execs itself by this name and aborted
         // on a relative argv0; '/prog' resolves to the image in lookup())
         const buf = cpu.regs[2], sz = cpu.regs[10] ?? cpu.regs[8];
+        { const lp = this.norm(this.atPath(a1, a2)); const lm = this._fsMeta().links;
+          if (lm.has(lp)) { const t = new TextEncoder().encode(lm.get(lp)); this.ram.set(t.subarray(0, Number(sz)), Number(buf - this.base)); ret(BigInt(Math.min(t.length, Number(sz)))); break; }
+          if (!lp.startsWith('/proc/') && (this.files[lp] !== undefined || this.isDir(lp))) { ret(-22n); break; } }   // not a symlink: EINVAL
         const p = new TextEncoder().encode(this.argv0?.startsWith('/') ? this.argv0 : '/prog');
         this.ram.set(p.subarray(0, Number(sz)), Number(buf - this.base));
         ret(BigInt(Math.min(p.length, Number(sz)))); break; }
@@ -2183,10 +2241,29 @@ export class LinuxEngine {
       case 201: ret(BigInt(Math.floor(Date.now() / 1000))); break;   // time
       case 309: {                                             // getcpu(cpu*, node*, tcache): one CPU, one node
         if (a1) this.mem.write(a1, 4n, 0n); if (a2) this.mem.write(a2, 4n, 0n); ret(0n); break; }
-      case 188: case 189: case 190: ret(-95n); break;           // setxattr family: ENOTSUP
-      case 191: case 192: case 193: ret(-61n); break;           // getxattr family: ENODATA
-      case 194: case 195: case 196: ret(0n); break;             // listxattr family: empty list
-      case 197: case 198: case 199: ret(-61n); break;           // removexattr family: ENODATA
+      case 188: case 189: case 190:                           // setxattr / lsetxattr / fsetxattr(path|fd, name, value, size, flags)
+      case 191: case 192: case 193:                           // getxattr / lgetxattr / fgetxattr
+      case 194: case 195: case 196:                           // listxattr / llistxattr / flistxattr
+      case 197: case 198: case 199: {                         // removexattr / lremovexattr / fremovexattr
+        // Extended attributes in the user namespace live per path in fsMeta;
+        // the other namespaces answer as a filesystem without them would.
+        const byFd = nr === 190 || nr === 193 || nr === 196 || nr === 199;
+        const xp = byFd ? this.fds.get(Number(a1))?.path : this.norm(this.readPath(a1));
+        if (xp === undefined || xp === null) { ret(-9n); break; }
+        if (!byFd && this.files[xp] === undefined && !this.isDir(xp) && !this._fsMeta().links.has(xp)) { ret(-2n); break; }
+        const xa = (this._fsMeta().xattrs ??= new Map()); const kind = nr <= 190 ? 'set' : nr <= 193 ? 'get' : nr <= 196 ? 'list' : 'remove';
+        if (kind === 'list') { const names = [...(xa.get(xp)?.keys() ?? [])]; const blob = new TextEncoder().encode(names.map(n => n + '\0').join(''));
+          if (Number(a3) === 0) { ret(BigInt(blob.length)); break; } if (blob.length > Number(a3)) { ret(-34n); break; }
+          this.ram.set(blob, Number(a2 - this.base)); ret(BigInt(blob.length)); break; }
+        const name = this.readPath(a2);
+        if (!name.startsWith('user.')) { ret(kind === 'set' ? -95n : -61n); break; }   // ENOTSUP / ENODATA
+        const attrs = xa.get(xp) ?? new Map();
+        if (kind === 'set') { const fl = Number(cpu.regs[8]); if ((fl & 1) && attrs.has(name)) { ret(-17n); break; } if ((fl & 2) && !attrs.has(name)) { ret(-61n); break; }
+          attrs.set(name, this.ram.slice(Number(a3 - this.base), Number(a3 - this.base) + Number(cpu.regs[10]))); xa.set(xp, attrs); ret(0n); break; }
+        if (kind === 'remove') { if (!attrs.delete(name)) { ret(-61n); break; } ret(0n); break; }
+        const v = attrs.get(name); if (v === undefined) { ret(-61n); break; }
+        const cap = Number(cpu.regs[10]); if (cap === 0) { ret(BigInt(v.length)); break; } if (v.length > cap) { ret(-34n); break; }
+        this.ram.set(v, Number(a3 - this.base)); ret(BigInt(v.length)); break; }
       case 229: {                                             // clock_getres(clk, res*): 1ns
         if (a2) { this.jsnap(a2, 16); this.mem.write(a2, 8n, 0n); this.mem.write(a2 + 8n, 8n, 1n); }
         ret(0n); break; }
@@ -2243,7 +2320,10 @@ export class LinuxEngine {
       case 113: case 114:                                     // setreuid / setregid
       case 117: case 119:                                     // setresuid / setresgid
       case 92: case 93: case 260:                             // chown / fchown / fchownat
-      case 90: case 91: case 268: ret(0n); break;             // chmod / fchmod / fchmodat
+      case 90: case 91: case 268: {                           // chmod / fchmod / fchmodat: the permission bits are remembered per path
+        let p, mode; if (nr === 91) { const h = this.fds.get(Number(a1)); p = h?.path; mode = Number(a2); } else { p = this.norm(nr === 90 ? this.readPath(a1) : this.atPath(a1, a2)); mode = Number(nr === 90 ? a2 : a3); }
+        if (p) (this._fsMeta().modes ??= new Map()).set(p, mode & 0o7777);
+        ret(0n); break; }
       case 452: {                                             // fchmodat2(dirfd, path, mode, flags): modes are not modelled
         const p = this.norm(this.atPath(a1, a2));
         const exists = this.files[p] !== undefined || this.isDir(p) || this._fsMeta().links.has(p) || !!this._fifoAt(p);
@@ -2346,6 +2426,7 @@ export class LinuxEngine {
             f = new Uint8Array(0);
             this.files[this.norm(p)] = f; this.fsBump();
             if (this.mtimes) this.mtimes[this.norm(p)] = Math.floor(this.nowMs() / 1000);
+            this._inotify(this.norm(p), 0x100);                 // IN_CREATE
           } else { ret(-2n); break; }                         // ENOENT
         } else if (flags & 0x200) {                           // O_TRUNC
           f = new Uint8Array(0);
@@ -2378,6 +2459,17 @@ export class LinuxEngine {
         }
         if (h.pipe) {                                         // drain the shared pipe buffer
           const r = this._pipeDrain(h, a2, Number(a3)); if (r !== null) ret(r); break;
+        }
+        if (h.ino) {                                          // inotify: struct inotify_event records
+          const q = h.ino.queue; if (!q.length) { if (h.nonblock) { ret(-11n); break; } this.block(null); break; }
+          const cap = Number(a3); let n = 0;
+          while (q.length) { const e = q[0], nb = new TextEncoder().encode(e.name), len = nb.length ? ((nb.length + 1 + 15) & ~15) : 0;
+            if (n + 16 + len > cap) break; q.shift();
+            const o = this.RAMOFF + Number(a2 - this.base) + n; this.jsnap(a2 + BigInt(n), 16 + len);
+            const dv = new DataView(this.wmem.buffer); dv.setInt32(o, e.wd, true); dv.setUint32(o + 4, e.mask, true); dv.setUint32(o + 8, 0, true); dv.setUint32(o + 12, len, true);
+            new Uint8Array(this.wmem.buffer, o + 16, len).fill(0); if (len) new Uint8Array(this.wmem.buffer, o + 16, len).set(nb); n += 16 + len; }
+          if (n === 0 && q.length) { ret(-22n); break; }      // buffer smaller than one event
+          ret(BigInt(n)); break;
         }
         if (h.tfd) {                                          // timerfd: 8-byte expiration count
           this._tfdTick(h.tfd);
@@ -2469,7 +2561,7 @@ export class LinuxEngine {
             this.writeStat(cpu.regs[2], '/dev/pts/0', 0, 0o020620, 0x8800n, 1001n); ret(0n); break;
           } else {
             const f = this.lookup(p);
-            if (f !== undefined) { size = f.length; mode = this.fileMode(f); }
+            if (f !== undefined) { size = f.length; mode = this.fileMode(f, p); }
             else if (this.isDir(p)) { size = 4096; mode = 0o040755; }
             else if (this._fifoAt(p)) { size = 0; mode = 0o010644; }
             else { ret(-2n); break; }                         // ENOENT
@@ -2481,7 +2573,7 @@ export class LinuxEngine {
             this.writeStat(a2, '/dev/pts/0', 0, 0o020620, 0x8800n, 1001n); ret(0n); break; }
           if (h?.gen) { size = 0; mode = 0o020666; }                        // /dev/zero, /dev/urandom
           else if (h?.tfd || h?.sfd) { size = 0; mode = 0o0100600; }       // anon inode
-          else if (h?.bytes) { size = h.bytes.length; mode = this.fileMode(h.bytes); statPath = h.path ?? null; }  // regular file
+          else if (h?.bytes) { size = h.bytes.length; mode = this.fileMode(h.bytes, h.path); statPath = h.path ?? null; }  // regular file
           else if (h?.pipe) { size = 0; mode = h.fifo ? 0o010644 : 0o010600; statPath = h.fifo ? h.path : null; }   // FIFO / pipe
           else if (h?.sock) { size = 0; mode = 0o140777; }                 // socket
           else if (h?.isdir) { size = 4096; mode = 0o040755; statPath = h.path; }
@@ -2526,9 +2618,10 @@ export class LinuxEngine {
         if (f === undefined && !this.isDir(p)) {
           if (this._fifoAt(p)) { this.writeStat(a2, p, 0, 0o010644); ret(0n); break; }
           ret(-2n); break; }                                  // ENOENT
-        this.writeStat(a2, p, f ? f.length : 4096, f ? this.fileMode(f) : 0o040755);
+        this.writeStat(a2, p, f ? f.length : 4096, f ? this.fileMode(f, p) : 0o040755);
         ret(0n); break; }
       case 17: {                                              // pread64(fd, buf, count, off)
+        { const hh = this.fds.get(Number(a1)); if (hh?.bytes !== undefined) for (const m of this.maps ?? []) if (m.shared && m.h === hh) this._writeBackMap(m); }   // a MAP_SHARED view of this file (memfd): absorb its pages first
         const h = this.fds.get(Number(a1));
         if (!h) { ret(-9n); break; }
         const fo = Number(cpu.regs[10]);
@@ -2690,6 +2783,7 @@ export class LinuxEngine {
         const timeoutMs = Number(BigInt.asIntN(32, cpu.regs[10] & 0xFFFFFFFFn));
         const readyR = (t) => !t ? false
           : t.sock ? !!(t.sock.conn && t.sock.conn.readable())
+          : t.ino ? t.ino.queue.length > 0
           : t.pipe ? (t.pipe.chunks.length > 0 || !!t.pipe.weof)
           : t.ev ? t.ev.count > 0n
           : t.tfd ? this._tfdReady(t.tfd)
@@ -2872,6 +2966,7 @@ export class LinuxEngine {
         dv.setBigUint64(o, 1000n, true);                      // uptime
         dv.setBigUint64(o + 32, BigInt(512 << 20), true);     // totalram: 512MB keeps app cache heuristics small
         dv.setBigUint64(o + 40, BigInt(256 << 20), true);     // freeram
+        dv.setUint16(o + 80, 1 + (this.children?.length ?? 0), true);   // procs: this process and its children
         dv.setUint16(o + 72, 8, true);                        // procs
         dv.setUint32(o + 100, 1, true);                       // mem_unit
         ret(0n); break; }
@@ -2928,7 +3023,7 @@ export class LinuxEngine {
         // set (F_SETFD tracked them unconditionally) until the JS Set hit
         // its 2^24 ceiling and took the engine down with it
         if (!h && Number(a1) > 2) { ret(-9n); break; }
-        if (cmd === 3) { ret(BigInt(2 | (h?.sock?.nonblock ? 0x800 : 0))); break; }   // F_GETFL: O_RDWR
+        if (cmd === 3) { ret(BigInt(2 | ((h?.sock?.nonblock || h?.nonblock) ? 0x800 : 0))); break; }   // F_GETFL: O_RDWR (+O_NONBLOCK on a nonblocking socket or pipe)
         if (cmd === 4) { if (h?.sock) h.sock.nonblock = !!(Number(a3) & 0x800); if (h?.pipe) h.nonblock = !!(Number(a3) & 0x800); ret(0n); break; }  // F_SETFL
         if (cmd === 1) { ret(BigInt(this.cloexec.has(Number(a1)) ? 1 : 0)); break; }   // F_GETFD
         if (cmd === 2) { if (Number(a3) & 1) this.cloexec.add(Number(a1)); else this.cloexec.delete(Number(a1)); ret(0n); break; }  // F_SETFD
@@ -2996,6 +3091,7 @@ export class LinuxEngine {
         if (this.isDir(p) || this.files[p] !== undefined) { ret(-17n); break; } // EEXIST
         this._fsMeta().dirs.add(p); this.fsBump();
         if (this.mtimes) this.mtimes[p] = Math.floor(Date.now() / 1000);
+        this._inotify(p, 0x100 | 0x40000000);                   // IN_CREATE | IN_ISDIR
         ret(0n); break; }
       case 132: case 235: case 280: {                         // utime / utimes / utimensat
         // touch: utimensat must report ENOENT for a missing path (that is the
@@ -3028,7 +3124,8 @@ export class LinuxEngine {
         if (nr === 263 && (Number(a3) & 0x200)) {             // AT_REMOVEDIR (rm -r)
           ret(BigInt(this.rmdirPath(p))); break; }
         const lm = this._fsMeta().links;
-        if (lm.has(p)) { lm.delete(p); this.fsBump(); ret(0n); break; }   // the link, not its target
+        if (lm.has(p)) { lm.delete(p); this.fsBump(); this._inotify(p, 0x200); ret(0n); break; }   // the link, not its target
+        if (this.files[p] !== undefined) this._inotify(p, 0x200);   // IN_DELETE (the removal itself follows)
         if (this._fsMeta().fifos?.delete(p)) { this.fsBump(); ret(0n); break; }
         if (this.files[p] === undefined) { ret(this.isDir(p) ? -21n : -2n); break; }  // EISDIR
         const g = this._fsMeta().hard?.get(p); if (g) { g.delete(p); this._fsMeta().hard.delete(p); }
@@ -3220,6 +3317,7 @@ export class LinuxEngine {
         const unmask = this._waitMaskIn(cpu, tmask); if (unmask === 'sig') break;
         const readyR = (h) => !h ? false
           : h.sock ? !!(h.sock.conn && h.sock.conn.readable())
+          : h.ino ? h.ino.queue.length > 0
           : h.pipe ? (h.pipe.chunks.length > 0 || !!h.pipe.weof)
           : h.ev ? h.ev.count > 0n
           : h.tfd ? this._tfdReady(h.tfd)
@@ -3273,6 +3371,7 @@ export class LinuxEngine {
         const unmask = this._waitMaskIn(cpu, tmask); if (unmask === 'sig') break;
         const readyR = (h) => !h ? false
           : h.sock ? !!(h.sock.conn && h.sock.conn.readable())
+          : h.ino ? h.ino.queue.length > 0
           : h.pipe ? (h.pipe.chunks.length > 0 || !!h.pipe.weof)
           : h.ev ? h.ev.count > 0n
           : h.tfd ? this._tfdReady(h.tfd)
@@ -3942,6 +4041,48 @@ export class LinuxEngine {
   // a real pipe (EAGAIN when non-blocking) - the plug-in wire protocol reads
   // before data arrives. Returns the count, -11n, or null after arranging
   // the block (the syscall re-executes once woken).
+  // Byte-level transfer for the fd-to-fd syscalls (sendfile, splice,
+  // copy_file_range): a regular file at its position or an explicit offset,
+  // or a pipe end. _readBytes answers null when a pipe read would block.
+  _readBytes(h, want, off) {
+    if (h.bytes !== undefined) { const p = off ?? h.pos; const n = Math.max(0, Math.min(want, h.bytes.length - p)); const out = h.bytes.slice(p, p + n); if (off === undefined) h.pos = p + n; return out; }
+    if (h.pipe) {
+      const parts = []; let got = 0;
+      while (got < want && h.pipe.chunks.length) { const c = h.pipe.chunks[0], avail = c.length - h.pipe.off, take = Math.min(avail, want - got);
+        parts.push(c.subarray(h.pipe.off, h.pipe.off + take)); got += take; h.pipe.off += take;
+        if (h.pipe.off >= c.length) { h.pipe.chunks.shift(); h.pipe.off = 0; } }
+      if (got > 0) { h.pipe.size = Math.max(0, (h.pipe.size ?? 0) - got); this.wakeAllBlk(); }
+      else if (!h.pipe.weof && this._pipeWriterAlive(h.pipe)) return null;
+      const out = new Uint8Array(got); let o = 0; for (const q of parts) { out.set(q, o); o += q.length; } return out;
+    }
+    return undefined;
+  }
+  _writeBytes(h, bytes, off) {
+    if (h.bytes !== undefined) { const p = off ?? h.pos, end = p + bytes.length; if (end > h.bytes.length) this._growFile(h, end); h.bytes.set(bytes, p); if (h.path) this._mapsAbsorb(h.path, p, bytes); if (off === undefined) h.pos = end; return bytes.length; }
+    if (h.pipe) { const pb = h.peer ?? h.pipe; pb.chunks.push(bytes.slice()); pb.size = (pb.size ?? 0) + bytes.length; this.wakeAllBlk(); return bytes.length; }
+    if (h.sink) {                                             // stdout / stderr, on the root engine like writeChunk
+      let root = this; while (root.parentEng) root = root.parentEng;
+      const str = new TextDecoder().decode(bytes);
+      if (h.sink === 'err') { (root.stderr ||= []).push(str); (root.stderrBytes ||= []).push(bytes.slice()); }
+      else { root.stdout.push(str); root.stdoutBytes.push(bytes.slice()); }
+      return bytes.length;
+    }
+    return undefined;
+  }
+  // the fd-to-fd syscalls resolve their destination like write(2) does (fds 1
+  // and 2 without a handle are the default sinks) and must know BEFORE reading
+  // whether the sink is one they can feed - busybox's cat sendfiles to stdout
+  // and falls back to read/write on EINVAL, which found the input consumed
+  _sinkOf(fd) { const h = this.fds.get(fd) ?? (fd === 1 ? { sink: 'out' } : fd === 2 ? { sink: 'err' } : undefined); return h && (h.bytes !== undefined || h.pipe || h.sink) ? h : null; }
+  // inotify: an event for `path` (a file created, deleted or moved) reaches
+  // every watch on its parent directory whose mask wants it
+  _inotify(path, mask) {
+    if (!this._inotifyFds || this._inotifyFds.size === 0) return;
+    const i = path.lastIndexOf('/'), dir = i > 0 ? path.slice(0, i) : '/', name = path.slice(i + 1);
+    for (const fd of this._inotifyFds) { const h = this.fds.get(fd); if (!h?.ino) { this._inotifyFds.delete(fd); continue; }
+      for (const [wd, w] of h.ino.watches) if (w.path === dir && (w.mask & mask)) h.ino.queue.push({ wd, mask, name }); }
+    this.wakeAllBlk();
+  }
   _pipeDrain(h, addr, want) {
     let dst = Number(addr - this.base), got = 0;
     while (got < want && h.pipe.chunks.length) {
