@@ -4935,7 +4935,8 @@ provisioning order, which came from `fs.readdirSync` - libuv sorts that.
 Provisioning now walks with `fs.opendirSync` (the host's getdents order),
 so a guest directory lists in the same raw order as the host's, and zip,
 tar, find and `ls -U` see what native sees. runbin gained
-`STDOUTFILE=path` (raw guest stdout) for this kind of byte comparison. the emitter 4.7 s self plus
+`STDOUTFILE=path` (raw guest stdout) for this kind of byte comparison.
+The sweep with java-jit in it: 188 of 188 exact in 24 minutes. the emitter 4.7 s self plus
 4.5 s of garbage collection, 3.9 s of module instantiation even with
 lazy compilation, 2.9 s of decode plus analysis, 1.6 s interpreting
 2.5M steps, and the guest's own translated execution. No single bucket
