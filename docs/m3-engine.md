@@ -5475,3 +5475,13 @@ callee side was V8's own entry cost for functions with many locals
 1.34 with 40 i64, 1.33 with 40 i64 + 9 v128, 1.36 with 60 + 16 - the
 local count is free under TurboFan (SSA drops the zero-init), so
 pruning declarations (3 of 51 are unused anyway) is not a lever.
+
+**vim -es, same method (3x input, 66 MB).** No hot spot to attack: the
+top compiled units are 3.7%, 3.6%, 3.1%, 2.6% of samples (a libc
+routine, then vim's 0x511610, 0x4e6337, 0x6e7f5e), the rest a long
+tail. vim's 3.58x is spread over its regexp engine and buffer code,
+which makes it a whole-translator quality question rather than a
+per-function one; the two structural levers that applied broadly
+(node splitting, the pump) are in. Parked; the next lever for the
+call-dense band is the callee's own entry/exit (reloads and spills
+around a direct in-unit call), priced next.
