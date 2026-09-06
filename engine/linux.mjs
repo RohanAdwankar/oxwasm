@@ -33,6 +33,7 @@ const SYNTH_DIRS = new Set(['/proc', '/proc/self', '/proc/self/fd', '/proc/self/
                             '/tmp', '/var', '/var/tmp', '/dev/shm', '/run', '/root', '/home', '/etc', '/usr', '/usr/lib',
                             '/usr/bin', '/usr/share', '/bin', '/lib', '/opt', '/mnt', '/srv']);
 class DeoptUnwind { constructor(rip) { this.rip = rip; } }
+class PathErr { constructor(errno) { this.errno = errno; } }   // ENAMETOOLONG / ELOOP from readPath / resolve, answered by the syscall dispatcher
 // A blocking syscall (poll/select/read with nothing ready, nanosleep) suspends
 // the guest the same way a deopt escapes compiled code: every register is
 // already in the regfile / cpu and the syscall insn's rip is recorded, so ALL
@@ -1230,7 +1231,8 @@ export class LinuxEngine {
   readCStrMem(addr, len) { this.guardRange(addr, len);
     return new TextDecoder().decode(this.ram.subarray(Number(addr - this.base), Number(addr - this.base) + len)); }
   readPath(addr) { let p = '', a = addr;
-    for (;;) { const c = Number(this.mem.read(a, 1n)); if (!c) break; p += String.fromCharCode(c); a++; }
+    for (;;) { const c = Number(this.mem.read(a, 1n)); if (!c) break; p += String.fromCharCode(c); a++; if (p.length > 4096) throw new PathErr(36); }   // ENAMETOOLONG
+    if (p.length > 4095) throw new PathErr(36);
     return p; }
   // trailing slashes are not part of a name: mkdir("/tmp/a/") and
   // stat("/tmp/a") must agree, and a dir recorded WITH one listed itself
@@ -1283,9 +1285,35 @@ export class LinuxEngine {
       }
       if (!hit) return p;
     }
-    return p;                                    // link loop: leave it dangling
+    throw new PathErr(40);                       // ELOOP: forty hops and still a link
   }
   lookup(p) { p = this.resolve(this.norm(p)); return this.files[p] ?? this._synth(p); }
+  // readlink's answer for a normalised path: the link's target, a /proc/self
+  // form (exe, cwd, root, fd/N naming the descriptor's file or its anonymous
+  // kind), or the errno: -22 for something that is not a link, -2 for nothing
+  _readlinkTarget(lp) {
+    const lm = this._fsMeta().links; if (lm.has(lp)) return lm.get(lp);
+    const m = /^\/proc\/(?:self|\d+)\/(.*)$/.exec(lp);
+    if (m) {
+      if (m[1] === 'exe') return this.argv0?.startsWith('/') ? this.argv0 : '/prog';
+      if (m[1] === 'cwd') return this.norm('.');
+      if (m[1] === 'root') return '/';
+      const fm = /^fd\/(\d+)$/.exec(m[1]);
+      if (fm) { const fd = Number(fm[1]), h = this.fds.get(fd);
+        if (!h) return fd <= 2 ? (this.tty ? '/dev/pts/0' : fd === 0 ? '/dev/null' : `pipe:[${100 + fd}]`) : -2;
+        if (h.istty || (this.tty && fd <= 2)) return '/dev/pts/0';
+        const ino = () => (h._ino ??= (this._anonIno = (this._anonIno ?? 5000) + 1));
+        if (h.pipe && !h.fifo) return `pipe:[${ino()}]`;
+        if (h.sk || h.sock || h.lsock || h.dsock) return `socket:[${ino()}]`;
+        if (h.ev) return 'anon_inode:[eventfd]'; if (h.tfd) return 'anon_inode:[timerfd]'; if (h.sfd) return 'anon_inode:[signalfd]';
+        if (h.ep) return 'anon_inode:[eventpoll]'; if (h.ino) return 'anon_inode:inotify'; if (h.pidfd) return 'anon_inode:[pidfd]';
+        if (h.devnull) return '/dev/null'; if (h.sink) return this.tty ? '/dev/pts/0' : `pipe:[${100 + fd}]`;
+        return h.path ?? `anon_inode:[${ino()}]`; }
+      return this.lookup(lp) !== undefined || this.isDir(lp) ? -22 : -2;
+    }
+    if (this.files[lp] !== undefined || this.isDir(lp) || this._fifoAt(lp) || this._sockAt(lp) || this._synth(lp) !== undefined) return -22;
+    return -2;
+  }
   // ---- synthetic /proc and /dev ------------------------------------------------
   // Generated on every lookup (cheap, always current). Only the files real
   // programs read: glibc's pthread_getattr_np walks /proc/self/maps for the
@@ -1656,7 +1684,7 @@ export class LinuxEngine {
       this.guardRange(addr, len);                          // payload may be .rodata
       const bytes = this.ram.slice(Number(addr - this.base), Number(addr - this.base) + len);
       const h = defSink(fd);
-      if (h?.isdir || h?.lsock || h?.pidfd) return -9;      // EBADF: nothing to write to
+      if (h?.isdir || h?.lsock || h?.pidfd || h?.opath) return -9;   // EBADF: nothing to write to
       if (h?.sock?.conn) { h.sock.conn.write(bytes); this.wakeAllBlk(); return; }
       if (h?.sock) return -107;                              // ENOTCONN: a stream socket nobody connected
       if (h?.wpipe) {                                        // a pty end
@@ -1698,6 +1726,7 @@ export class LinuxEngine {
       if (h?.devnull || h?.gen) return;                      // /dev/null, /dev/zero, /dev/urandom: discard, count as written
       if (h && h.bytes !== undefined && h.writable) {        // regular file opened for writing
         if (h.path) (this.dirtyFiles ??= new Set()).add(h.path);
+        if (h.append) h.pos = h.bytes.length;                // O_APPEND: every write lands at the end
         const end = h.pos + bytes.length;
         if (end > h.bytes.length) this._growFile(h, end);
         h.bytes.set(bytes, h.pos);
@@ -1713,7 +1742,7 @@ export class LinuxEngine {
       else { root.stdout.push(str); root.stdoutBytes.push(bytes); }
     };
     if (this._sigEntry(cpu, nr)) return;                  // signal delivery: interrupted / pending
-    switch (nr) {
+    try { switch (nr) {
       case 1: {                                              // write(fd, buf, len)
         const r = writeChunk(Number(a1), a2, Number(a3));
         if (r === -4096) break;                              // pipe full: blocked, re-executes
@@ -1739,7 +1768,11 @@ export class LinuxEngine {
         if (!h && !this.fds.has(old)) { ret(-9n); break; }   // EBADF
         const handle = h ?? this.fds.get(old);
         if (nr === 32) { const fd = this.allocFd(); this.fds.set(fd, handle); this.cloexec.delete(fd); ret(BigInt(fd)); break; }
-        const nw = Number(a2); this.fds.set(nw, handle);
+        const nw = Number(BigInt.asIntN(32, a2));
+        if (nw < 0 || nw >= 1048576) { ret(-9n); break; }     // EBADF: outside the descriptor range
+        if (nr === 292 && nw === old) { ret(-22n); break; }   // dup3: EINVAL on the same descriptor
+        if (nw === old) { ret(BigInt(nw)); break; }           // dup2 onto itself: nothing changes
+        this.fds.set(nw, handle);
         if (nr === 292 && (Number(cpu.regs[2]) & 0x80000)) this.cloexec.add(nw); else this.cloexec.delete(nw);
         ret(BigInt(nw)); break; }
       case 285: {                                             // fallocate(fd, mode, off, len): grow the file (KEEP_SIZE and punch modes: no size change)
@@ -1927,18 +1960,12 @@ export class LinuxEngine {
         v.setBigUint64(off, cur, true);
         v.setBigUint64(off + 8, max, true);
         ret(0n); break; }
-      case 267: {                                            // readlinkat: /proc/self/exe -> argv0
-        // the real path, as readlink (89) already answers: Go's os.Executable
-        // re-execs the binary by this name for its telemetry child
-        // (absolute only: busybox re-execs itself by this name and aborted
-        // on a relative argv0; '/prog' resolves to the image in lookup())
-        const buf = cpu.regs[2], sz = cpu.regs[10] ?? cpu.regs[8];
-        { const lp = this.norm(this.atPath(a1, a2)); const lm = this._fsMeta().links;
-          if (lm.has(lp)) { const t = new TextEncoder().encode(lm.get(lp)); this.ram.set(t.subarray(0, Number(sz)), Number(buf - this.base)); ret(BigInt(Math.min(t.length, Number(sz)))); break; }
-          if (!lp.startsWith('/proc/') && (this.files[lp] !== undefined || this.isDir(lp))) { ret(-22n); break; } }   // not a symlink: EINVAL
-        const p = new TextEncoder().encode(this.argv0?.startsWith('/') ? this.argv0 : '/prog');
-        this.ram.set(p.subarray(0, Number(sz)), Number(buf - this.base));
-        ret(BigInt(Math.min(p.length, Number(sz)))); break; }
+      case 89: case 267: {                                    // readlink(path, buf, sz) / readlinkat(dirfd, path, buf, sz)
+        const lp = this.norm(nr === 89 ? this.readPath(a1) : this.atPath(a1, a2)), buf = nr === 89 ? a2 : a3, sz = Number(nr === 89 ? a3 : cpu.regs[10]);
+        const t = this._readlinkTarget(lp);
+        if (typeof t === 'number') { ret(BigInt(t)); break; }
+        const b = new TextEncoder().encode(t), n = Math.min(b.length, sz);
+        this.jsnap(buf, n); this.ram.set(b.subarray(0, n), Number(buf - this.base)); ret(BigInt(n)); break; }
       case 318: {                                            // getrandom(buf, len, flags)
         const buf = a1, len = Number(a2), off = Number(buf - this.base);
         // len 0 touches nothing and answers 0 whatever the pointer: Rust std
@@ -2345,8 +2372,11 @@ export class LinuxEngine {
         const req = nr === 35 ? a1 : cpu.regs[2];            // rdx for clock_nanosleep
         const abs = nr === 230 && (Number(a2) & 1);          // TIMER_ABSTIME
         if (req === 0n) { ret(0n); break; }
+        if (nr === 230 && (Number(a1) > 9 || Number(a1) === 3)) { ret(-22n); break; }   // EINVAL: unknown clock, or CLOCK_THREAD_CPUTIME_ID
         const o = this.RAMOFF + Number(req - this.base);
         const v = new DataView(this.wmem.buffer);
+        { const sec = v.getBigInt64(o, true), nsec = v.getBigInt64(o + 8, true);
+          if (sec < 0n || nsec < 0n || nsec >= 1000000000n) { ret(-22n); break; } }   // EINVAL (a negative nsec became an endless sleep)
         const tms = Number(v.getBigUint64(o, true)) * 1000 + Number(v.getBigUint64(o + 8, true)) / 1e6;
         const now = this.nowMs();
         const deadline = this._deadline ??
@@ -2500,19 +2530,20 @@ export class LinuxEngine {
             if (this.mtimes) this.mtimes[this.norm(p)] = Math.floor(this.nowMs() / 1000);
             this._inotify(this.norm(p), 0x100);                 // IN_CREATE
           } else { ret(-2n); break; }                         // ENOENT
-        } else if ((flags & 0xc0) === 0xc0) { ret(-17n); break; }   // O_CREAT|O_EXCL on an existing file: EEXIST
-        else if (flags & 0x200) {                             // O_TRUNC
+        } else if ((flags & 0xc0) === 0xc0 && !(flags & 0x200000)) { ret(-17n); break; }   // O_CREAT|O_EXCL on an existing file: EEXIST
+        else if ((flags & 0x200) && !(flags & 0x200000)) {    // O_TRUNC (O_PATH ignores it)
           f = new Uint8Array(0);
           this.files[this.norm(p)] = f;
         }
         const fd = this.allocFd();
-        const wr = (flags & 3) !== 0;                         // O_WRONLY / O_RDWR
+        const wr = (flags & 3) !== 0 && !(flags & 0x200000);   // O_WRONLY / O_RDWR (an O_PATH descriptor does no I/O)
         this.fds.set(fd, { bytes: f, pos: (flags & 0x400) ? f.length : 0,
-                           path: this.resolve(this.norm(p)), writable: wr });
+                           path: this.resolve(this.norm(p)), writable: wr, append: !!(flags & 0x400), opath: !!(flags & 0x200000) });
         ret(BigInt(fd)); break; }
       case 0: {                                               // read(fd, buf, len)
         const fd = Number(a1), h = this.fds.get(fd);
         if (!h) { ret(fd === 0 ? 0n : -9n); break; }          // stdin -> EOF
+        if (h.opath) { ret(-9n); break; }                     // EBADF: O_PATH
         if (h.sock) {                                         // stream socket (X connection)
           const c = h.sock.conn;
           if (!c) { ret(-107n); break; }                      // ENOTCONN
@@ -2724,7 +2755,7 @@ export class LinuxEngine {
         if (len <= 0) { ret(0n); break; }
         this.guardRange(a2, len);
         const bytes = this.ram.slice(Number(a2 - this.base), Number(a2 - this.base) + len);
-        const off = Number(cpu.regs[10]);
+        const off = h.append ? h.bytes.length : Number(cpu.regs[10]);   // O_APPEND ignores the offset (Linux's documented bug)
         const end = off + len;
         if (end > h.bytes.length) this._growFile(h, end);
 
@@ -2757,29 +2788,6 @@ export class LinuxEngine {
         this.ram.fill(0, Number(a1 - this.base), Number(a1 - this.base) + 390);
         put(0, 'Linux'); put(65, 'oxwasm'); put(130, '6.1.0'); put(195, '#1 oxwasm');
         put(260, 'x86_64'); ret(0n); break; }
-      case 89: {                                              // readlink(path, buf, sz)
-        const p = this.readPath(a1);
-        if (p === '/proc/self/exe') { const b = new TextEncoder().encode(this.argv0?.startsWith('/') ? this.argv0 : '/prog');
-          this.jsnap(a2, Math.min(b.length, Number(a3)));
-          this.ram.set(b.subarray(0, Number(a3)), Number(a2 - this.base));
-          ret(BigInt(Math.min(b.length, Number(a3)))); break; }
-        if (this.tty) {                                       // ttyname(): /proc/self/fd/N
-          const m = /^\/proc\/(?:self|\d+)\/fd\/(\d+)$/.exec(this.norm(p));
-          if (m) { const h2 = this.fds.get(Number(m[1]));
-            if (Number(m[1]) <= 2 || h2?.istty) {
-              const b2 = new TextEncoder().encode('/dev/pts/0');
-              const n2 = Math.min(b2.length, Number(a3));
-              this.jsnap(a2, n2);
-              this.ram.set(b2.subarray(0, n2), Number(a2 - this.base));
-              ret(BigInt(n2)); break; } }
-        }
-        const t = this._fsMeta().links.get(this.norm(p));
-        if (t !== undefined) { const b = new TextEncoder().encode(t);
-          const n = Math.min(b.length, Number(a3));
-          this.jsnap(a2, n);
-          this.ram.set(b.subarray(0, n), Number(a2 - this.base));
-          ret(BigInt(n)); break; }
-        ret(-22n); break; }                                   // EINVAL: not a symlink
       case 133: case 259: {                                   // mknod(path, mode, dev) / mknodat(dirfd, path, mode, dev)
         const p = this.norm(nr === 133 ? this.readPath(a1) : this.atPath(a1, a2));
         const mode = Number(nr === 133 ? a2 : a3);
@@ -2854,13 +2862,16 @@ export class LinuxEngine {
         const h = this.fds.get(Number(a1));
         if (!h?.ep) { ret(-9n); break; }                      // EBADF
         const op = Number(a2), tfd = Number(a3);
-        if (op === 2) { h.ep.interest.delete(tfd); ret(0n); break; }   // DEL
+        if (tfd === Number(a1)) { ret(-22n); break; }         // EINVAL: an epoll fd cannot watch itself
+        const th = this.fds.get(tfd); if (!th && tfd > 2) { ret(-9n); break; }   // EBADF
+        if (op === 2) { ret(h.ep.interest.delete(tfd) ? 0n : -2n); break; }   // DEL: ENOENT when not registered
+        if (th && (th.bytes !== undefined || th.isdir)) { ret(-1n); break; }   // EPERM: regular files and directories do not poll
         // epoll_event is packed on x86-64: u32 events + u64 data = 12 bytes
         const v = new DataView(this.wmem.buffer), o = this.RAMOFF + Number(cpu.regs[10] - this.base);
         const events = v.getUint32(o, true), data = v.getBigUint64(o + 4, true);
         if (op === 1 && h.ep.interest.has(tfd)) { ret(-17n); break; }  // ADD -> EEXIST
         if (op === 3 && !h.ep.interest.has(tfd)) { ret(-2n); break; }  // MOD -> ENOENT
-        h.ep.interest.set(tfd, { events, data }); ret(0n); break; }
+        h.ep.interest.set(tfd, { events, data, rep: undefined, off: false }); ret(0n); break; }
       case 232: case 281: {                                   // epoll_wait / epoll_pwait
         const h = this.fds.get(Number(a1));
         if (!h?.ep) { ret(-9n); break; }
@@ -2884,10 +2895,14 @@ export class LinuxEngine {
           if (n >= maxev) break;
           const t = this.fds.get(tfd);
           if (!t) continue;                                   // closed while registered: dropped, like real epoll
+          if (it.off) continue;                               // EPOLLONESHOT reported once; MOD re-arms
           let re = 0;
           if ((it.events & 1) && readyR(t)) re |= 1;          // EPOLLIN
           if (it.events & 4) re |= 4;                         // EPOLLOUT: always writable
-          if (re) { v.setUint32(base + n * 12, re, true); v.setBigUint64(base + n * 12 + 4, it.data, true); n++; }
+          if (re && (it.events & 0x80000000)) {               // EPOLLET: only when something arrived since the last report
+            const key = t.pipe ? `${t.pipe.wtot ?? 0}:${t.pipe.rtot ?? 0}:${!!t.pipe.weof}` : t.ev ? String(t.ev.count) : t.dsock ? t.dsock.queue.length : t.lsock ? t.lsock.backlog.length : t.ino ? t.ino.queue.length : t.tfd ? t.tfd.fired : Math.random();
+            if (key === it.rep) re = 0; else it.rep = key; }
+          if (re) { v.setUint32(base + n * 12, re, true); v.setBigUint64(base + n * 12 + 4, it.data, true); n++; if (it.events & 0x40000000) it.off = true; }
         }
         const now = this.nowMs();
         if (n > 0 || timeoutMs === 0 || (this._deadline != null && now >= this._deadline)) {
@@ -3178,6 +3193,7 @@ export class LinuxEngine {
       case 83: case 258: {                                    // mkdir / mkdirat
         const p = this.norm(nr === 83 ? this.readPath(a1) : this.atPath(a1, a2));
         if (this.isDir(p) || this.files[p] !== undefined) { ret(-17n); break; } // EEXIST
+        { const i = p.lastIndexOf('/'); if (i > 0 && !this.isDir(p.slice(0, i))) { ret(this.files[p.slice(0, i)] !== undefined ? -20n : -2n); break; } }   // ENOTDIR / ENOENT
         this._fsMeta().dirs.add(p); this.fsBump();
         if (this.mtimes) this.mtimes[p] = Math.floor(Date.now() / 1000);
         this._inotify(p, 0x100 | 0x40000000);                   // IN_CREATE | IN_ISDIR
@@ -3220,6 +3236,13 @@ export class LinuxEngine {
         if (this.files[p] === undefined) { ret(this.isDir(p) ? -21n : -2n); break; }  // EISDIR
         const g = this._fsMeta().hard?.get(p); if (g) { g.delete(p); this._fsMeta().hard.delete(p); }
         delete this.files[p]; this.fsBump(); ret(0n); break; }
+      case 76: {                                              // truncate(path, len)
+        const p = this.resolve(this.norm(this.readPath(a1))), f = this.files[p];
+        if (f === undefined) { ret(this.isDir(p) ? -21n : -2n); break; }   // EISDIR / ENOENT
+        const len = Number(BigInt.asIntN(64, a2)); if (len < 0) { ret(-22n); break; }
+        const nb = new Uint8Array(len); nb.set(f.subarray(0, Math.min(len, f.length))); this.files[p] = nb;
+        for (const [, h] of this.fds) if (h?.bytes === f) h.bytes = nb;   // open descriptors follow the new buffer
+        this.fsBump(); (this.dirtyFiles ??= new Set()).add(p); ret(0n); break; }
       case 77: {                                              // ftruncate(fd, len)
         const h = this.fds.get(Number(a1));
         if (!h || h.bytes === undefined) { ret(-9n); break; }
@@ -3502,6 +3525,11 @@ export class LinuxEngine {
         this.jsnap(cpu.regs[10], 4); this.jsnap(cpu.regs[8], 4);
         v.setUint32(vo, val, true); v.setUint32(lo, 4, true);
         ret(0n); break; }
+      case 143: { this.jsnap(a2, 4); this.mem.write(a2, 4n, 0n); ret(0n); break; }   // sched_getparam: priority 0
+      case 144: case 145: ret(0n); break;                    // sched_setscheduler / sched_getscheduler: SCHED_OTHER
+      case 146: ret(Number(a1) === 1 || Number(a1) === 2 ? 99n : 0n); break;   // sched_get_priority_max: FIFO/RR 99, else 0
+      case 147: ret(Number(a1) === 1 || Number(a1) === 2 ? 1n : 0n); break;    // sched_get_priority_min
+      case 148: { this.jsnap(a2, 16); this.mem.write(a2, 8n, 0n); this.mem.write(a2 + 8n, 8n, 4000000n); ret(0n); break; }   // sched_rr_get_interval: 4 ms
       case 434: {                                             // pidfd_open(pid, flags): a handle that polls readable once the child has exited
         const fd = this.allocFd(); this.fds.set(fd, { pidfd: Number(a1) }); this.cloexec.add(fd); ret(BigInt(fd)); break; }
 
@@ -3523,6 +3551,7 @@ export class LinuxEngine {
         const tmask = nr === 271 && cpu.regs[10] ? this.mem.read(cpu.regs[10], 8n) : null;
         const unmask = this._waitMaskIn(cpu, tmask); if (unmask === 'sig') break;
         const readyR = (h) => !h ? false
+          : h.isdir ? true
           : h.lsock ? h.lsock.backlog.length > 0
           : h.dsock ? h.dsock.queue.length > 0
           : h.pidfd ? this._pidDone(h.pidfd)
@@ -3580,6 +3609,7 @@ export class LinuxEngine {
         if (nr === 270 && cpu.regs[9]) { const ssp = this.mem.read(cpu.regs[9], 8n); if (ssp) tmask = this.mem.read(ssp, 8n); }
         const unmask = this._waitMaskIn(cpu, tmask); if (unmask === 'sig') break;
         const readyR = (h) => !h ? false
+          : h.isdir ? true
           : h.lsock ? h.lsock.backlog.length > 0
           : h.dsock ? h.dsock.queue.length > 0
           : h.pidfd ? this._pidDone(h.pidfd)
@@ -3611,7 +3641,7 @@ export class LinuxEngine {
       default:
         ret(-38n);                                           // ENOSYS
         (this.unknown ||= new Set()).add(nr);
-    }
+    } } catch (e) { if (e instanceof PathErr) ret(-BigInt(e.errno)); else throw e; }
     if (this._sigAny) this._sigExit(cpu);                   // signal delivery on return to user
   }
 
