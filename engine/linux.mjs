@@ -2198,7 +2198,7 @@ export class LinuxEngine {
           // still hold the syscall number when the rewound insn re-steps
           this.block(null); break;
         }
-        (this.children ??= []).push({ pid: t.proc.pid, eng: ceng, exited: null });
+        (this.children ??= []).push({ pid: t.proc.pid, eng: ceng, exited: null, pp: t.proc.parent.proc ?? null });   // pp: the process that forked it (null = the main one)
         ceng.pid = t.proc.pid; ceng.ppid = this.pid ?? 1;
         t.state = 'dead'; this._killProcSiblings(t);
         this._pipeEofSweep(skipped);
@@ -2209,7 +2209,8 @@ export class LinuxEngine {
       case 61: {                                             // wait4(pid, status*, options, rusage)
         const pid = Number(BigInt.asIntN(32, a1)), opts = Number(a3);
         const kids = this.children ?? [];
-        const mine = kids.filter(c => pid <= 0 || c.pid === pid);
+        const me = this.threads[this.ti].proc ?? null;         // which process asks: a window child, or the main one
+        const mine = kids.filter(c => (c.pp ?? null) === me && (pid <= 0 || c.pid === pid));   // only its own children (a subshell must not reap its parent's)
         if (!mine.length) { ret(-10n); break; }              // ECHILD
         const done = mine.find(c => c.exited !== null || (c.eng && c.eng.exitCode !== null));
         if (!done) { if (opts & 1) ret(0n); else this.block(null); break; }   // WNOHANG / block
@@ -2253,7 +2254,8 @@ export class LinuxEngine {
       case 247: {                                            // waitid(idtype, id, infop*, options, rusage)
         const idtype = Number(a1), id = Number(BigInt.asIntN(32, a2)), opts = Number(cpu.regs[10]);
         const kids = this.children ?? [];
-        const mine = kids.filter(c => idtype === 0 || (idtype === 1 && c.pid === id) || idtype === 2);   // P_ALL / P_PID / P_PGID (one group here)
+        const me = this.threads[this.ti].proc ?? null;
+        const mine = kids.filter(c => (c.pp ?? null) === me && (idtype === 0 || (idtype === 1 && c.pid === id) || idtype === 2));   // P_ALL / P_PID / P_PGID (one group here)
         if (!mine.length) { ret(-10n); break; }              // ECHILD
         const done = (opts & 4) ? mine.find(c => c.exited !== null || (c.eng && c.eng.exitCode !== null)) : null;   // WEXITED
         if (!done) { if (opts & 1) { if (a3) { this.jsnap(a3, 128); for (let o = 0n; o < 128n; o += 8n) this.mem.write(a3 + o, 8n, 0n); } ret(0n); } else this.block(null); break; }   // WNOHANG: si_pid 0
@@ -2306,7 +2308,7 @@ export class LinuxEngine {
           this._rlockExit(t.proc);
           this._vforkRollback(t);
           t.proc.parent.state = 'run'; this._vforkThaw(t.proc.parent);
-          (this.children ??= []).push({ pid: t.proc.pid, eng: null, exited: Number(a1 & 0xffn) });
+          (this.children ??= []).push({ pid: t.proc.pid, eng: null, exited: Number(a1 & 0xffn), pp: t.proc.parent.proc ?? null });
           // SIGCHLD to the PARENT thread (the current thread is the dying child)
           this.raiseSignal(17, t.proc.parent.id, { pid: t.proc.pid, code: 1, status: Number(a1 & 0xffn) });
           this.block(null); ret(0n); break;
@@ -3857,7 +3859,7 @@ export class LinuxEngine {
       this._pipeEofSweep([...t.proc.fds.values()]);
       this._vforkRollback(t);
       t.proc.parent.state = 'run'; this._vforkThaw(t.proc.parent);
-      (this.children ??= []).push({ pid: t.proc.pid, eng: null, exited: 128 + sig, sig });
+      (this.children ??= []).push({ pid: t.proc.pid, eng: null, exited: 128 + sig, sig, pp: t.proc.parent.proc ?? null });
       this.raiseSignal(17, t.proc.parent.id, { pid: t.proc.pid, code: 2, status: sig });   // CLD_KILLED
       this.cpu.halted = true;                                // this thread's step ends here
       this.block(null);                                      // park: the scheduler moves on
@@ -4198,8 +4200,16 @@ export class LinuxEngine {
     this._vforkRollback(t);
     const parent = t.proc.parent;
     parent.state = 'run'; this._vforkThaw(parent);
-    (this.children ??= []).push({ pid: t.proc.pid, eng: ceng, exited: null });
+    (this.children ??= []).push({ pid: t.proc.pid, eng: ceng, exited: null, pp: parent.proc ?? null });
     ceng.pid = t.proc.pid; ceng.ppid = this.pid ?? 1;
+    // children the window forked before it was materialised are ITS children:
+    // a bash subshell (`cd d && cmd &`) forks cmd and blocks in wait4, which
+    // is what materialises it - and with the record left behind here it saw
+    // ECHILD, exited, and its parent's `kill %1` found no such job
+    if (this.children.some(c => c.pp === t.proc)) {
+      const mine = this.children.filter(c => c.pp === t.proc); this.children = this.children.filter(c => c.pp !== t.proc);
+      ceng.children = mine; for (const c of mine) { c.pp = null; if (c.eng) c.eng.parentEng = ceng; }
+    }
     this.blocked = null;
     this._deadline = null;
     this.switchTo(this.threads.indexOf(parent));

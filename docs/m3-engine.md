@@ -5143,3 +5143,19 @@ pair with backpressure), a server that closes first, a refused port,
 a UDP exchange, a unix-domain server. Byte-identical on the first run
 (35 s); the node-net breadth case. libuv is the consumer the
 edge-triggered epoll was built for, and it drove it without a gap.
+
+**A subshell's children go with it.** Both socket cases had a line on
+stderr that breadth does not compare: `kill: %1: no such job`. bash runs
+`cd d && cmd &` as a subshell that forks cmd and waits for it, and a
+forked child that blocks is what the engine materialises into its own
+engine (the vfork window ends). The record of cmd, the subshell's
+child, stayed in the parent's children list: the materialised subshell
+found no children, got ECHILD from its wait, and exited, so its parent
+reaped the job before `kill %1` ran (`CHILDTRACE=1` in runbin names
+the site that creates each child record, which is how the stray record
+was found). Records now carry the process that forked them, wait4 and
+waitid answer only for the caller's own children (a subshell used to
+be able to reap its parent's), and a window's children move into its
+engine when it is materialised. Three-line repros of the shape
+(`cd /tmp && sleep 30 & ...; jobs -l; kill %1`) now match native
+exactly, stderr included.
