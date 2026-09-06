@@ -4906,7 +4906,18 @@ hello 31 s to 20 s; dlfail still passes (its longjmp runs under a
 nested call site). `DEOPTLOG=1` and `IHIST=1` in runbin print the deopt
 landings and the interpreted rips by library - what said "bytecode
 dispatch" in one look. The sweep over the relaxed guard: 186 of 186
-exact in 21.5 minutes; javac 29.6 s warm. the emitter 4.7 s self plus
+exact in 21.5 minutes; javac 29.6 s warm.
+
+**The JIT-on JVM says what execAnon cannot be.** `java Hello` with C1/C2
+enabled runs correctly with execAnon off (92 s; its compiled nmethods
+carry `ss:`-prefixed padding, which the decoder refused - es/ss are null
+prefixes in 64-bit mode like cs/ds and are accepted now; gs stays
+refused as a real segment base). With execAnon ON it faults at a
+different wild address on every run: HotSpot patches call sites and
+inline caches in place in its RWX code cache, and a translation of the
+old bytes keeps running. No mprotect, no munmap - no signal. That is
+the case that keeps execAnon opt-in; `java-jit` is a breadth case
+without it. the emitter 4.7 s self plus
 4.5 s of garbage collection, 3.9 s of module instantiation even with
 lazy compilation, 2.9 s of decode plus analysis, 1.6 s interpreting
 2.5M steps, and the guest's own translated execution. No single bucket

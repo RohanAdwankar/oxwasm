@@ -345,6 +345,11 @@ const CASES = [
   // javac compiling Hello.java on the -Xint JVM: ld.so's longjmp error path on
   // every failed dlsym, the JVM's generated interpreter as code (execAnon),
   // rep scans in the subtype check; the class file must match native javac's
+  // the JVM with C1/C2 ON (no -Xint): compiled nmethods with ss:-prefixed
+  // padding run in the interpreter, libjvm translated; NOT execAnon - HotSpot
+  // patches call sites and inline caches in place, which no signal reports
+  ['java-jit', '/usr/lib/jvm/java-21-openjdk-amd64/bin/java', ['-XX:+UseSerialGC', '-Xshare:off', '-Xmx256m', '-cp', '/tmp/breadth_jhello', 'Hello'],
+              { memMB: 3072, tree: ['/usr/lib/jvm/java-21-openjdk-amd64', '/tmp/breadth_jhello'] }],
   ['javac',   '/usr/lib/jvm/java-21-openjdk-amd64/bin/javac', ['-J-Xint', '-J-XX:+UseSerialGC', '-J-Xshare:off', '-J-Xmx512m', '-d', '/tmp/breadth_javac', '/tmp/breadth_javac/Hello.java'],
               { memMB: 3072, tree: ['/usr/lib/jvm/java-21-openjdk-amd64', '/tmp/breadth_javac'], execAnon: true, outFile: '/tmp/breadth_javac/Hello.class' }],
   ['madv',    '/tmp/breadth_madv', []],
