@@ -5159,3 +5159,5 @@ be able to reap its parent's), and a window's children move into its
 engine when it is materialised. Three-line repros of the shape
 (`cd /tmp && sleep 30 & ...; jobs -l; kill %1`) now match native
 exactly, stderr included.
+The sweep with node-net, http-loop and git-http in it: 202 of 202
+exact in 25 minutes.
