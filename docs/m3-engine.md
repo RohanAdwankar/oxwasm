@@ -4755,6 +4755,27 @@ reports what is live, not the allocation rate, so attributing the
 the per-instruction emit strings, the analysis objects, and the
 narrowing pass's regex results. Not pursued further today.
 
+### Batch 10 probes: javac, go build
+
+`go build hello.go` (go 1.24) fails after 234 s with the Go runtime's
+own "out of memory: cannot allocate 4194304-byte block (0 in use)"; its
+`go version` case passes. The mmap trace explains it: the runtime asks
+for its 64 MB heap arenas at hinted addresses (0xc000000000,
+0x1c000000000, ... in 1 TB steps) with PROT_NONE, and reserves two
+512 MB regions for its page-allocator summaries the same way. The
+engine's guest is a flat 3 GB window, so a reservation costs the same
+address space as a mapping; 109 successful mmaps summed to 7.5 GB with
+unmaps in between, and the arena requests at the end got ENOMEM. The
+go parent also interpreted 408M steps in those 234 s with 10k compiled
+runs, a tiering gap of its own. Address-space reservations that a
+48-bit process takes for free are a structural limit of the flat
+window; `memMB` up to ~4090 (the wasm32 ceiling) is the only lever.
+
+`javac Hello.java` (OpenJDK 21, -Xint) dies in translated code with a
+wasm "memory access out of bounds" in libjvm; `java Hello` with the
+same flags passes. Interpreter-only and 4 GB runs are in progress to
+tell a translation fault from an access past the guest window.
+
 What the gated clang profile (40 s) leaves: the emitter 4.7 s self plus
 4.5 s of garbage collection, 3.9 s of module instantiation even with
 lazy compilation, 2.9 s of decode plus analysis, 1.6 s interpreting
