@@ -85,7 +85,7 @@ const writeFd = (h, str) => {
   const p3 = eng.newPty(), mm = eng.ptmxHandle(p3), ss = eng.ptsHandle(p3);
   writeFd(mm, 'ls\n');
   check('master writes reach the slave', drain(ss.pipe) === 'ls\n', '(slave saw nothing)');
-  check('ECHO returns typed bytes to the master', drain(mm.pipe) === 'ls\n', '(no echo)');
+  check('ECHO returns typed bytes to the master', drain(mm.pipe) === 'ls\r\n', '(no echo, or the newline not through ONLCR)');   // an echoed newline goes through output processing: "\r\n" under OPOST|ONLCR, as Linux does
   p3.termios.lflag &= ~8;                                     // ECHO off
   writeFd(mm, 'x\n');
   check('ECHO off suppresses the echo', drain(mm.pipe) === '' && drain(ss.pipe) === 'x\n', '(echoed anyway)');

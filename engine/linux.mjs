@@ -1186,16 +1186,27 @@ export class LinuxEngine {
   // echo the erase byte itself.
   ttyInput(pty, bytes) {
     const T = pty.termios;
-    const echo = (b) => { if (T.lflag & 8) pty.s2m.chunks.push(b instanceof Uint8Array ? b : new Uint8Array(b)); };
-    if (!(T.lflag & 2)) {                                   // raw: straight through
-      pty.m2s.chunks.push(bytes);
-      echo(bytes.slice());
-      return;
+    const push = (buf, b) => { const u = b instanceof Uint8Array ? b : new Uint8Array(b); buf.chunks.push(u); buf.size = (buf.size ?? 0) + u.length; };
+    // echo goes through output processing like any write to the slave: an
+    // echoed newline is "\r\n" under OPOST|ONLCR, a control character is ^X
+    const echo = (b) => { if (!(T.lflag & 8)) return; const out = [];
+      for (const x of b) { if (x === 10 && (T.oflag & 1) && (T.oflag & 4)) out.push(13, 10); else out.push(x); } push(pty.s2m, out); };
+    const ctl = (x) => { if (T.lflag & 8) push(pty.s2m, [94, x === 127 ? 63 : x + 64]); };   // ECHOCTL: ^C, ^\, ^Z
+    const sigc = (sig) => { if (!(T.lflag & 1)) return false; if (!(T.lflag & 0x80)) pty.m2s.chunks.length = 0, pty.m2s.size = 0, (pty.line ??= []).length = 0;   // ISIG: the queue is flushed unless NOFLSH
+      if (pty.pgrp !== undefined) this._signalPgrp(pty.pgrp, sig); return true; };
+    if (!(T.lflag & 2)) {                                   // raw: straight through (ISIG may still be on)
+      const keep = [];
+      for (const b of bytes) { if (b === T.cc[0] && sigc(2)) { ctl(b); continue; } if (b === T.cc[1] && sigc(3)) { ctl(b); continue; } if (b === T.cc[10] && sigc(20)) { ctl(b); continue; } keep.push(b); }
+      if (keep.length) { push(pty.m2s, keep); echo(keep); }
+      this.wakeAllBlk(); return;
     }
     const line = (pty.line ??= []);
     for (let b of bytes) {
       if (b === 13 && (T.iflag & 0x100)) b = 10;            // ICRNL
       else if (b === 10 && (T.iflag & 0x40)) b = 13;        // INLCR
+      if (b === T.cc[0] && sigc(2)) { ctl(b); continue; }    // VINTR -> SIGINT to the foreground group
+      if (b === T.cc[1] && sigc(3)) { ctl(b); continue; }    // VQUIT -> SIGQUIT
+      if (b === T.cc[10] && sigc(20)) { ctl(b); continue; }  // VSUSP -> SIGTSTP
       if (b === T.cc[2]) {                                   // VERASE
         if (line.length) { line.pop(); echo([8, 32, 8]); }
         continue;
@@ -1204,19 +1215,49 @@ export class LinuxEngine {
         while (line.length) { line.pop(); echo([8, 32, 8]); }
         continue;
       }
-      if (b === T.cc[4] && !line.length) {                    // VEOF on an empty line
-        pty.m2s.weof = true;
+      if (b === T.cc[4]) {                                   // VEOF: a partial line becomes readable as it is; an empty one is one EOF
+        if (line.length) { push(pty.m2s, new Uint8Array(line)); line.length = 0; }
+        else pty.m2s.chunks.push(new Uint8Array(0));         // the marker read() answers with 0, once
         continue;
       }
       line.push(b);
       echo([b]);
       if (b === 10) {                                        // Enter: the line is now readable
-        pty.m2s.chunks.push(new Uint8Array(line));
+        push(pty.m2s, new Uint8Array(line));
         line.length = 0;
       }
     }
+    this.wakeAllBlk();
+  }
+  // a signal to every process of a group in the tree (^C on a terminal)
+  _signalPgrp(pgid, sig) {
+    let root = this; while (root.parentEng) root = root.parentEng;
+    const seen = new Set();
+    const scan = (e) => { if (seen.has(e)) return; seen.add(e);
+      const main = e.threads[0]; if (main && e._pgrec(main).pgid === pgid) e.raiseSignal(sig, null, { pid: 0, code: 0x80 });
+      for (const x of e.threads) if (x.proc && x.state !== 'dead' && e._pgrec(x).pgid === pgid) e.raiseSignal(sig, x.id, { pid: 0, code: 0x80 });
+      for (const c of e.children ?? []) if (c.eng && c.exited === null) scan(c.eng); };
+    scan(root);
+  }
+  _allPtys() { let root = this; while (root.parentEng) root = root.parentEng; const out = new Set(), seen = new Set();
+    const scan = (e) => { if (seen.has(e)) return; seen.add(e); for (const p of e.ptys?.values() ?? []) out.add(p); for (const c of e.children ?? []) if (c.eng) scan(c.eng); }; scan(root); return out; }
+  _ptyHangup(e) {                                            // a session leader exited: its terminal has no session or foreground group any more
+    if (e.pid === undefined || e.sid !== e.pid) return;
+    for (const p of this._allPtys()) if (p.sid === e.pid) { p.sid = undefined; p.pgrp = undefined; }
+  }
+  _ptsReady(h) {                                             // a slave in raw mode is readable only with VMIN bytes queued
+    const p = h.pts, T = p.termios;
+    if (p.m2s.weof || p.m2s.chunks.some(c => c.length === 0)) return true;
+    const avail = p.m2s.size ?? 0;
+    return (T.lflag & 2) ? avail > 0 : avail >= Math.max(1, T.cc[6]);
   }
 
+  _ptyStat(p) {                                            // /dev/pts/N of a live pty, or /dev/ptmx: {mode, rdev, ino} for stat
+    const m = /^\/dev\/pts\/(\d+)$/.exec(p);
+    if (m && this._allPtys().size && [...this._allPtys()].some(x => x.n === Number(m[1]))) return { mode: 0o020620, rdev: 0x8800n + BigInt(m[1]), ino: 2000n + BigInt(m[1]) };
+    if (p === '/dev/ptmx') return { mode: 0o020666, rdev: 0x502n, ino: 1999n };
+    return null;
+  }
   ptmxHandle(pty) {
     return { ptm: pty, istty: true, pipe: pty.s2m, wpipe: pty.m2s, path: '/dev/ptmx' };
   }
@@ -1695,8 +1736,8 @@ export class LinuxEngine {
           if ((T.oflag & 1) && (T.oflag & 4) && bytes.includes(10)) {
             const out = [];
             for (const b of bytes) { if (b === 10) out.push(13); out.push(b); }
-            h.wpipe.chunks.push(new Uint8Array(out));
-          } else h.wpipe.chunks.push(bytes);
+            h.wpipe.chunks.push(new Uint8Array(out)); h.wpipe.size = (h.wpipe.size ?? 0) + out.length;
+          } else { h.wpipe.chunks.push(bytes); h.wpipe.size = (h.wpipe.size ?? 0) + bytes.length; }
         } else {
           // keyboard input, through the line discipline
           this.ttyInput(h.ptm, bytes);
@@ -2043,18 +2084,23 @@ export class LinuxEngine {
             if (!h?.ptm || !a3) { ret(-25n); break; }
             this.jsnap(a3, 4);
             v.setUint32(off, h.ptm.n, true); ret(0n); break;
-          case 0x40045431: ret(h?.ptm ? 0n : -25n); break;    // TIOCSPTLCK
+          case 0x40045431: if (!h?.ptm) { ret(-25n); break; } h.ptm.locked = !!v.getUint32(off, true); ret(0n); break;   // TIOCSPTLCK
+          case 0x80045439: if (!h?.ptm || !a3) { ret(-25n); break; } this.jsnap(a3, 4); v.setUint32(off, h.ptm.locked === false ? 0 : 1, true); ret(0n); break;   // TIOCGPTLCK
+          case 0x5411: if (a3) { this.jsnap(a3, 4); v.setUint32(off, 0, true); } ret(0n); break;   // TIOCOUTQ: output drains at once
+          case 0x5429: if (!pty || pty.sid === undefined) { ret(-25n); break; } if (a3) { this.jsnap(a3, 4); v.setUint32(off, pty.sid, true); } ret(0n); break;   // TIOCGSID
+          case 0x5422: { const r = this._pgrec(this.threads[this.ti]); if (r.ctty !== pty || !pty) { ret(-25n); break; } r.ctty = null; if (r.sid === (this.threads[this.ti].proc?.pid ?? this.pid ?? 1)) { pty.sid = undefined; pty.pgrp = undefined; } ret(0n); break; }   // TIOCNOTTY: the leader gives it up
+          case 0x5425: ret(0n); break;                                      // TCSBRKP
           case 0x5441: {                                     // TIOCGPTPEER
             if (!h?.ptm) { ret(-25n); break; }
             const fd = this.allocFd();
             this.fds.set(fd, this.ptsHandle(h.ptm));
             ret(BigInt(fd)); break; }
-          case 0x540E: { const r = this._pgrec(this.threads[this.ti]); if (pty) { pty.sid = r.sid; pty.pgrp = r.pgid; } ret(0n); break; }   // TIOCSCTTY: the caller's session takes the terminal
+          case 0x540E: { const r = this._pgrec(this.threads[this.ti]); if (pty) { pty.sid = r.sid; pty.pgrp = r.pgid; r.ctty = pty; } ret(0n); break; }   // TIOCSCTTY: the caller's session takes the terminal
           case 0x540F: {                                     // TIOCGPGRP: the foreground group, ENOTTY on a pty no session owns
             if (pty && pty.pgrp === undefined) { ret(-25n); break; }
             if (a3) { this.jsnap(a3, 4); v.setUint32(off, pty ? pty.pgrp : this._pgrec(this.threads[this.ti]).pgid, true); } ret(0n); break; }
           case 0x5410: { if (pty) { if (pty.pgrp === undefined) { ret(-25n); break; } pty.pgrp = v.getUint32(off, true); } ret(0n); break; }   // TIOCSPGRP
-          case 0x540B: ret(0n); break;                                      // TCFLSH
+          case 0x540B: { if (pty) { const q = Number(a3); if (q === 0 || q === 2) { pty.m2s.chunks.length = 0; pty.m2s.size = 0; (pty.line ??= []).length = 0; } if (q === 1 || q === 2) { pty.s2m.chunks.length = 0; pty.s2m.size = 0; } } ret(0n); break; }   // TCFLSH: TCIFLUSH / TCOFLUSH / TCIOFLUSH
           case 0x5409: ret(0n); break;                                      // TCSBRK
           default: this._noteIoctl(req, h); ret(-25n); break;
         }
@@ -2204,7 +2250,7 @@ export class LinuxEngine {
         }
         (this.children ??= []).push({ pid: t.proc.pid, eng: ceng, exited: null, pp: t.proc.parent.proc ?? null });   // pp: the process that forked it (null = the main one)
         ceng.pid = t.proc.pid; ceng.ppid = this.pid ?? 1;
-        { const r = this._pgrec(t); ceng.pgid = r.pgid; ceng.sid = r.sid; }
+        { const r = this._pgrec(t); ceng.pgid = r.pgid; ceng.sid = r.sid; ceng.ctty = r.ctty ?? null; }
         t.state = 'dead'; this._killProcSiblings(t);
         this._pipeEofSweep(skipped);
         this._vforkRollback(t);
@@ -2221,7 +2267,12 @@ export class LinuxEngine {
           for (const c of mine) if (c.exited !== null || (c.eng && c.eng.exitCode !== null)) this.children.splice(this.children.indexOf(c), 1);
           ret(-10n); break; }
         const done = mine.find(c => c.exited !== null || (c.eng && c.eng.exitCode !== null));
-        if (!done) { if (opts & 1) ret(0n); else this.block(null); break; }   // WNOHANG / block
+        if (!done) {
+          if (opts & 2) { const st = mine.find(c => c.eng?.stopEv); if (st) { const sig = st.eng.stopEv; st.eng.stopEv = null; st.eng._stopSeen = false;   // WUNTRACED: a stopped child, reported once
+            if (a2) this.mem.write(a2, 4n, BigInt((sig << 8) | 0x7f)); ret(BigInt(st.pid)); break; } }
+          if (opts & 8) { const ct = mine.find(c => c.eng?.contEv); if (ct) { ct.eng.contEv = false; ct.eng._contSeen = false;   // WCONTINUED
+            if (a2) this.mem.write(a2, 4n, 0xffffn); ret(BigInt(ct.pid)); break; } }
+          if (opts & 1) ret(0n); else this.block(null); break; }   // WNOHANG / block
         const code = done.exited ?? done.eng.exitCode;
         const tsig = done.sig ?? done.eng?.termSig;
         if (a2) this.mem.write(a2, 4n, BigInt(tsig ? (tsig & 0x7f) : ((code & 0xff) << 8)));   // WIFSIGNALED / WIFEXITED
@@ -2270,7 +2321,12 @@ export class LinuxEngine {
         const mine = kids.filter(c => (c.pp ?? null) === me && (idtype === 0 || (idtype === 1 && c.pid === id) || idtype === 2));   // P_ALL / P_PID / P_PGID (one group here)
         if (!mine.length) { ret(-10n); break; }              // ECHILD
         const done = (opts & 4) ? mine.find(c => c.exited !== null || (c.eng && c.eng.exitCode !== null)) : null;   // WEXITED
-        if (!done) { if (opts & 1) { if (a3) { this.jsnap(a3, 128); for (let o = 0n; o < 128n; o += 8n) this.mem.write(a3 + o, 8n, 0n); } ret(0n); } else this.block(null); break; }   // WNOHANG: si_pid 0
+        if (!done) {
+          if (opts & 2) { const st = mine.find(c => c.eng?.stopEv); if (st) { const sig = st.eng.stopEv; st.eng.stopEv = null; st.eng._stopSeen = false;   // WSTOPPED
+            if (a3) this._writeSiginfo(a3, 17, { code: 5, pid: st.pid, status: sig }); ret(0n); break; } }
+          if (opts & 8) { const ct = mine.find(c => c.eng?.contEv); if (ct) { ct.eng.contEv = false; ct.eng._contSeen = false;   // WCONTINUED
+            if (a3) this._writeSiginfo(a3, 17, { code: 6, pid: ct.pid, status: 18 }); ret(0n); break; } }
+          if (opts & 1) { if (a3) { this.jsnap(a3, 128); for (let o = 0n; o < 128n; o += 8n) this.mem.write(a3 + o, 8n, 0n); } ret(0n); } else this.block(null); break; }   // WNOHANG: si_pid 0
         const code = done.exited ?? done.eng.exitCode, tsig = done.sig ?? done.eng?.termSig;
         if (a3) this._writeSiginfo(a3, 17, { code: tsig ? 2 : 1, pid: done.pid, status: tsig ? (tsig & 0x7f) : (code & 0xff) });   // CLD_KILLED / CLD_EXITED
         if (!(opts & 0x01000000)) this.children.splice(this.children.indexOf(done), 1);   // WNOWAIT leaves it reapable
@@ -2469,6 +2525,11 @@ export class LinuxEngine {
             const fd = this.allocFd();
             this.fds.set(fd, { bytes: new Uint8Array(0), pos: 0, writable: true, devnull: true });
             ret(BigInt(fd)); break;
+          }
+          if (np === '/dev/tty') {                           // the controlling terminal: a pty this session took, else the host terminal, else ENXIO
+            const r = this._pgrec(this.threads[this.ti]);
+            if (r.ctty) { const fd = this.allocFd(); this.fds.set(fd, this.ptsHandle(r.ctty)); ret(BigInt(fd)); break; }
+            if (!this.tty) { ret(-6n); break; }
           }
           if (np === '/dev/ptmx') {                          // allocate a pty pair
             const fd = this.allocFd();
@@ -2681,6 +2742,8 @@ export class LinuxEngine {
                      this._fsMeta().links.has(this.norm(p))) {
             statPath = this.norm(p);
             size = this._fsMeta().links.get(statPath).length; mode = 0o120777;
+          } else if (this._ptyStat(this.norm(p))) {
+            const ps = this._ptyStat(this.norm(p)); this.writeStat(cpu.regs[2], this.norm(p), 0, ps.mode, ps.rdev, ps.ino); ret(0n); break;
           } else if (this.isTtyPath(p)) {
             this.writeStat(cpu.regs[2], '/dev/pts/0', 0, 0o020620, 0x8800n, 1001n); ret(0n); break;
           } else {
@@ -2697,6 +2760,7 @@ export class LinuxEngine {
           if (this.tty && (Number(a1) <= 2 || h?.istty)) {     // terminal: match stat("/dev/pts/0")
             this.writeStat(a2, '/dev/pts/0', 0, 0o020620, 0x8800n, 1001n); ret(0n); break; }
           if (!h && Number(a1) > 2) { ret(-9n); break; }      // EBADF
+          if (h?.pts || h?.ptm) { const ps = this._ptyStat(h.pts ? '/dev/pts/' + h.pts.n : '/dev/ptmx'); if (ps) { this.writeStat(a2, h.path, 0, ps.mode, ps.rdev, ps.ino); ret(0n); break; } }   // a pty end: the same numbers stat(path) gives
           if (h?.gen) { size = 0; mode = 0o020666; }                        // /dev/zero, /dev/urandom
           else if (h?.tfd || h?.sfd) { size = 0; mode = 0o0100600; }       // anon inode
           else if (h?.bytes) { size = h.bytes.length; mode = this.fileMode(h.bytes, h.path); statPath = h.path ?? null; }  // regular file
@@ -2738,6 +2802,7 @@ export class LinuxEngine {
         if (this.debugPollAfter != null && this.nowMs() > this.debugPollAfter) {
           if (this.nowMs() - (this._dbgStatLast ?? 0) > 5000) { this._dbgStatLast = this.nowMs();
             console.error(`<statwd thr=${this.threads?.[this.ti]?.id} ${nr===6?'lstat':'stat'} ${p}>`); } }
+        if (this._ptyStat(this.norm(p))) { const ps = this._ptyStat(this.norm(p)); this.writeStat(a2, this.norm(p), 0, ps.mode, ps.rdev, ps.ino); ret(0n); break; }
         if (this.isTtyPath(p)) {
           this.writeStat(a2, '/dev/pts/0', 0, 0o020620, 0x8800n, 1001n); ret(0n); break; }
         const f = this.lookup(p);
@@ -2893,6 +2958,7 @@ export class LinuxEngine {
         const maxev = Number(a3);
         const timeoutMs = Number(BigInt.asIntN(32, cpu.regs[10] & 0xFFFFFFFFn));
         const readyR = (t) => !t ? false
+          : t.pts ? this._ptsReady(t)
           : t.lsock ? t.lsock.backlog.length > 0
           : t.dsock ? t.dsock.queue.length > 0
           : t.pidfd ? this._pidDone(t.pidfd)
@@ -3744,6 +3810,7 @@ export class LinuxEngine {
         const readyR = (h) => !h ? false
           : h.isdir ? true
           : h.mq ? h.mq.msgs.length > 0
+          : h.pts ? this._ptsReady(h)
           : h.lsock ? h.lsock.backlog.length > 0
           : h.dsock ? h.dsock.queue.length > 0
           : h.pidfd ? this._pidDone(h.pidfd)
@@ -3803,6 +3870,7 @@ export class LinuxEngine {
         const readyR = (h) => !h ? false
           : h.isdir ? true
           : h.mq ? h.mq.msgs.length > 0
+          : h.pts ? this._ptsReady(h)
           : h.lsock ? h.lsock.backlog.length > 0
           : h.dsock ? h.dsock.queue.length > 0
           : h.pidfd ? this._pidDone(h.pidfd)
@@ -4012,6 +4080,14 @@ export class LinuxEngine {
     const bit = 1n << BigInt(sig - 1);
     const act = this.sigact?.get(sig);
     if (globalThis.__sigtrace) console.error(`<raise0 sig=${sig} tid=${tid} act=${act ? act.handler?.toString(16) : 'none'} ignored=${!act && this._sigDefaultIgnored(sig)} label=${this._label ?? 'main'}>`);
+    // Job control. SIGCONT resumes a stopped process whatever its disposition;
+    // SIGSTOP always stops; SIGTSTP/SIGTTIN/SIGTTOU stop when neither caught
+    // nor ignored. A stopped child engine is skipped by its parent's pump
+    // until continued, and its parent's wait4 sees WIFSTOPPED / WIFCONTINUED.
+    // (Only a child engine can stop: the root has nobody to continue it.)
+    if (sig === 18 && this.stopped) { this.stopped = null; this.contEv = true; }
+    if ((sig === 19 || (sig >= 20 && sig <= 22 && !act && !this.sigign?.has(sig))) && this.parentEng) {
+      this.stopped = sig; this.stopEv = sig; return; }
     if (!act && this._sigDefaultIgnored(sig)) return;                          // SIG_IGN / default-ignore: discarded
     let t = null;
     const live = (x) => x.state !== 'dead';
@@ -4028,7 +4104,7 @@ export class LinuxEngine {
     // no handler and deliverable now: the default action (terminate) applies
     // at once. Blocked, it stays pending — for sigprocmask to unblock later,
     // or for sigtimedwait / signalfd to consume.
-    if (!act && !(t.sigmask & bit)) { this._terminate(sig); return; }
+    if (!act && !(t.sigmask & bit) && !(this.stopped && sig !== 9)) { this._terminate(sig); return; }   // stopped: it waits for the continue
     t.pending |= bit;
     (t.siginfo ??= new Map()).set(sig, info);
     this._sigAny = true;
@@ -4393,7 +4469,7 @@ export class LinuxEngine {
     parent.state = 'run'; this._vforkThaw(parent);
     (this.children ??= []).push({ pid: t.proc.pid, eng: ceng, exited: null, pp: parent.proc ?? null });
     ceng.pid = t.proc.pid; ceng.ppid = this.pid ?? 1;
-    { const r = this._pgrec(t); ceng.pgid = r.pgid; ceng.sid = r.sid; }
+    { const r = this._pgrec(t); ceng.pgid = r.pgid; ceng.sid = r.sid; ceng.ctty = r.ctty ?? null; }
     if (this._shmAt?.length) { this._shmSync(true); ceng._shmAt = this._shmAt.filter(m => m.proc === t.proc || m.proc === null).map(m => ({ ...m, proc: null })); for (const m of ceng._shmAt) m.seg.nattch++; }
     // children the window forked before it was materialised are ITS children:
     // a bash subshell (`cd d && cmd &`) forks cmd and blocks in wait4, which
@@ -4533,6 +4609,11 @@ export class LinuxEngine {
   }
   _pipeDrain(h, addr, want) {
     let dst = Number(addr - this.base), got = 0;
+    if (h.pts) {                                            // a pty slave: an EOF marker answers 0 once; raw mode waits for VMIN bytes
+      if (h.pipe.chunks.length && h.pipe.chunks[0].length === 0) { h.pipe.chunks.shift(); return 0n; }
+      const T = h.pts.termios;
+      if (!(T.lflag & 2) && (h.pipe.size ?? 0) < Math.max(1, T.cc[6]) && !h.pipe.weof) { if (h.nonblock) return -11n; this.block(null); return null; }
+    }
     while (got < want && h.pipe.chunks.length) {
       const c = h.pipe.chunks[0], avail = c.length - h.pipe.off;
       const take = Math.min(avail, want - got);
@@ -4709,12 +4790,15 @@ export class LinuxEngine {
     for (const c of this.children) {
       if (c.exited !== null) continue;
       const e = c.eng;
-      if (e.exitCode === null) {
+      if (e.stopEv && !e._stopSeen) { e._stopSeen = true; this.raiseSignal(17, null, { pid: c.pid, code: 5, status: e.stopEv }); }   // CLD_STOPPED
+      if (e.contEv && !e._contSeen) { e._contSeen = true; this.raiseSignal(17, null, { pid: c.pid, code: 6, status: 18 }); }         // CLD_CONTINUED
+      if (e.exitCode === null && !e.stopped) {
         if (e.blocked) e.wake();
         try { e.run(3e5); } catch (err) { c.exited = 127; c.error = err.message; c.errorStack = err.stack; }   // errorStack: where in the engine a child died (tooling)
       }
       if (c.exited === null && e.exitCode !== null) {
         c.exited = e.exitCode;
+        this._ptyHangup(e);
         this._pipeEofSweep([...e.fds.values()]);
         this.raiseSignal(17, null, { pid: c.pid, code: 1, status: c.exited });   // SIGCHLD, CLD_EXITED
         if (this.onChildExit) this.onChildExit(c);

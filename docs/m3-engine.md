@@ -5221,3 +5221,47 @@ the session-sensitive breadth cases (dash, busybox, bash traps and
 process substitution, timeout, xargs, make, python and perl and ruby
 children) stayed exact.
 The sweep with census4 in it: 204 of 204 exact in 25.7 minutes.
+
+### Batch 17: the fifth census - job control and the line discipline
+
+`tools/fixtures/census5.c` (77 lines native): a child stopped with
+SIGSTOP and seen through waitpid(WUNTRACED), continued and seen through
+WCONTINUED, stopped again with SIGTSTP, sent SIGTERM while stopped (it
+must wait for the continue, then die of it), a child that ignores
+SIGTSTP and does not stop; a pty opened the posix way (grantpt,
+unlockpt, TIOCGPTLCK, TIOCGPTN, ptsname, ttyname), the default termios
+flags and control characters, canonical editing with the exact bytes
+the master sees echoed (erase as "\b \b", kill, a newline as "\r\n", CR
+turned into NL and echoed as "\r\n"), a partial line invisible to
+FIONREAD and poll, ^D mid-line delivering the partial line and ^D at
+line start as one EOF after which the line keeps working, ONLCR on the
+slave's output, TIOCOUTQ, TCFLSH, tcdrain, tcsendbreak, raw mode with
+VMIN=2 (poll not ready after one byte, read waits for two, no echo, no
+ONLCR), /dev/tty with no controlling terminal (ENXIO), ^C typed on the
+master reaching a child that took the pty as its controlling terminal
+(and its "^C" echo), TIOCNOTTY, and the pty after its session leader
+exited (TIOCGPGRP and TIOCGSID both ENOTTY).
+
+Stop signals had been "not modelled" (discarded) since the first
+signal work, and the whole first section hung at the first waitpid.
+A child engine can now stop: SIGSTOP always, SIGTSTP/SIGTTIN/SIGTTOU
+when neither caught nor ignored; its parent's pump skips it, raises
+SIGCHLD with CLD_STOPPED, and wait4/waitid report WIFSTOPPED once per
+stop and WIFCONTINUED once per SIGCONT (which resumes it whatever its
+disposition). A fatal signal that arrives while stopped stays pending
+and is acted on after the continue, as on Linux. The line discipline
+gained what the census listed: echo goes through output processing (an
+echoed newline is "\r\n" under OPOST|ONLCR - the engine's own pty test
+had encoded the old plain "\n" and was corrected against the native
+bytes), ISIG turns VINTR/VQUIT/VSUSP into SIGINT/SIGQUIT/SIGTSTP for the
+pty's foreground group across the process tree with the "^C" echo,
+VEOF mid-line flushes the partial line and at line start queues a
+one-shot EOF marker (it was a sticky end-of-file), raw mode gates reads
+and readiness on VMIN, TCFLSH really flushes, and the queue sizes are
+kept so FIONREAD answers. Each session records its controlling
+terminal: /dev/tty opens it (a slave handle on that pty), or the host
+terminal in terminal mode, or ENXIO; TIOCNOTTY gives it up; and when a
+session leader exits its pty loses its session and foreground group.
+Both ends of a pty stat as character devices with matching numbers by
+path and by descriptor, which is what ttyname() checks. The census is
+a breadth case.
