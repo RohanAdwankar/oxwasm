@@ -336,6 +336,9 @@ const CASES = [
   ['java-hello', '/usr/lib/jvm/java-21-openjdk-amd64/bin/java', ['-Xint', '-XX:+UseSerialGC', '-Xshare:off', '-Xmx256m', '-cp', '/tmp/breadth_jhello', 'Hello'],
               { memMB: 3072, tree: ['/usr/lib/jvm/java-21-openjdk-amd64', '/tmp/breadth_jhello'] }],
   ['madv',    '/tmp/breadth_madv', []],
+  // nasm assembling the recycle fixture's source: a flat binary out (outFile)
+  ['nasm',    '/usr/bin/nasm', ['-f', 'bin', '-o', '/tmp/breadth_nasm.bin', new URL('./fixtures/recycle.asm', import.meta.url).pathname],
+              { bins: [new URL('./fixtures/recycle.asm', import.meta.url).pathname], outFile: '/tmp/breadth_nasm.bin' }],
   ['sockpair', '/tmp/breadth_sockpair', []],
   ['renamedir', '/tmp/breadth_renamedir', []],
   ['pselect',  '/tmp/breadth_pselect', []],   // the wait's temporary mask, EINTR after the handler, the deadline dropped with it
