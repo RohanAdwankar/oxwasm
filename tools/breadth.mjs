@@ -331,6 +331,8 @@ const CASES = [
   // the brk fix, where it now exits 1 like native instead of faulting.
   // ffmpeg: MMX/SSE DSP surface (emms after every SIMD call), worker threads,
   // 40 shared libraries; a synthetic source hashed by the md5 muxer
+  ['ffprobe', '/usr/bin/ffprobe', ['-hide_banner', '-v', 'error', '-f', 'lavfi', '-i', 'testsrc=duration=0.3:size=64x64:rate=10', '-show_streams', '-show_format'],
+              { memMB: 2048, tree: '/usr/lib/x86_64-linux-gnu/pulseaudio' }],
   ['ffmpeg',  '/usr/bin/ffmpeg',  ['-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', 'testsrc=duration=0.3:size=64x64:rate=10', '-f', 'md5', '-'],
               { memMB: 2048, tree: '/usr/lib/x86_64-linux-gnu/pulseaudio' }],
   ['condwait',  '/tmp/breadth_condwait', []],
