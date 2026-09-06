@@ -4824,7 +4824,7 @@ export class LinuxEngine {
     let out = this._run1(maxSteps);
     for (let round = 0; round < 64; round++) {
       if (this.exitCode !== null || !this.blocked) break;
-      const live = (this.children ?? []).filter(c => c.exited === null && c.eng.exitCode === null);
+      const live = (this.children ?? []).filter(c => c.exited === null && c.eng.exitCode === null && !c.eng.stopped);   // a stopped child is not runnable
       if (!live.length) break;
       const before = live.map(c => c.eng.stats.interpreted + c.eng.stats.aotRuns);
       this.pumpChildren();
@@ -4841,7 +4841,7 @@ export class LinuxEngine {
     // asleep. Never park indefinitely while a child lives.
     if (this.blocked && this.children?.some(c => c.exited === null)) {
       let dl = this.blocked.deadline;
-      for (const c of this.children) if (c.exited === null && c.eng && c.eng.exitCode === null) {
+      for (const c of this.children) if (c.exited === null && c.eng && c.eng.exitCode === null && !c.eng.stopped) {   // a stopped child sets no deadline (it looked runnable and spun the host)
         const cd = c.eng.blocked ? c.eng.blocked.deadline : this.nowMs();
         if (cd != null && (dl == null || cd < dl)) dl = cd;
       }

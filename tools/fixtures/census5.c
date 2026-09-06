@@ -20,15 +20,19 @@
 static void hex(const char *tag, const unsigned char *b, int n) { printf("%s=", tag); for (int i = 0; i < n; i++) printf("%02x", b[i]); printf("\n"); }
 static volatile int ints; static void onint(int s) { (void)s; ints++; }
 static int drain(int fd, unsigned char *b, int cap) { int n = 0; struct pollfd p = { fd, POLLIN, 0 }; while (n < cap && poll(&p, 1, 200) > 0) { int r = read(fd, b + n, cap - n); if (r <= 0) break; n += r; } return n; }
+// a wait that polls with WNOHANG: a state the kernel never reports shows up as
+// a line rather than a hang (the first version blocked the whole sweep natively)
+static pid_t waitp(pid_t c, int *st, int opts) { for (int i = 0; i < 400; i++) { pid_t r = waitpid(c, st, opts | WNOHANG); if (r != 0) return r; usleep(5000); } return -2; }
 int main(void) {
+  alarm(60);                                                 // a watchdog: no census hangs a sweep
   // --- stop / continue ---
   pid_t c = fork(); if (c == 0) { for (;;) pause(); }
-  usleep(20000); int st = 0; R("kill-stop", kill(c, SIGSTOP)); R("waitpid-untraced", waitpid(c, &st, WUNTRACED) == c); printf("stopped=%d sig=%d\n", WIFSTOPPED(st), WIFSTOPPED(st) ? WSTOPSIG(st) : -1);
-  R("waitpid-nohang-while-stopped", waitpid(c, &st, WNOHANG | WUNTRACED)); R("kill-cont", kill(c, SIGCONT)); R("waitpid-continued", waitpid(c, &st, WCONTINUED) == c); printf("continued=%d\n", WIFCONTINUED(st));
-  R("kill-tstp", kill(c, SIGTSTP)); R("waitpid-untraced2", waitpid(c, &st, WUNTRACED) == c); printf("stopped=%d sig=%d\n", WIFSTOPPED(st), WIFSTOPPED(st) ? WSTOPSIG(st) : -1);
-  R("kill-term-stopped", kill(c, SIGTERM)); R("waitpid-nohang-still-stopped", waitpid(c, &st, WNOHANG)); R("kill-cont2", kill(c, SIGCONT)); R("waitpid-exited", waitpid(c, &st, 0) == c); printf("signaled=%d sig=%d\n", WIFSIGNALED(st), WTERMSIG(st));
+  usleep(20000); int st = 0; R("kill-stop", kill(c, SIGSTOP)); R("waitpid-untraced", waitp(c, &st, WUNTRACED) == c); printf("stopped=%d sig=%d\n", WIFSTOPPED(st), WIFSTOPPED(st) ? WSTOPSIG(st) : -1);
+  R("waitpid-nohang-while-stopped", waitpid(c, &st, WNOHANG | WUNTRACED)); R("kill-cont", kill(c, SIGCONT)); R("waitpid-continued", waitp(c, &st, WCONTINUED) == c); printf("continued=%d\n", WIFCONTINUED(st));
+  usleep(20000); R("kill-tstp", kill(c, SIGTSTP)); R("waitpid-untraced2", waitp(c, &st, WUNTRACED) == c); printf("stopped=%d sig=%d\n", WIFSTOPPED(st), WIFSTOPPED(st) ? WSTOPSIG(st) : -1);
+  R("kill-term-stopped", kill(c, SIGTERM)); usleep(20000); R("waitpid-nohang-still-stopped", waitpid(c, &st, WNOHANG)); R("kill-cont2", kill(c, SIGCONT)); R("waitpid-exited", waitp(c, &st, 0) == c); printf("signaled=%d sig=%d\n", WIFSIGNALED(st), WTERMSIG(st));
   c = fork(); if (c == 0) { signal(SIGTSTP, SIG_IGN); for (;;) pause(); } usleep(20000);
-  R("kill-tstp-ignored", kill(c, SIGTSTP)); usleep(20000); R("waitpid-nohang-not-stopped", waitpid(c, &st, WNOHANG | WUNTRACED)); kill(c, SIGKILL); waitpid(c, &st, 0); printf("killed=%d\n", WTERMSIG(st));
+  R("kill-tstp-ignored", kill(c, SIGTSTP)); usleep(20000); R("waitpid-nohang-not-stopped", waitpid(c, &st, WNOHANG | WUNTRACED)); kill(c, SIGKILL); waitp(c, &st, 0); printf("killed=%d\n", WTERMSIG(st));
   // --- a pty the posix way ---
   int m = posix_openpt(O_RDWR | O_NOCTTY); R("posix_openpt", m); R("grantpt", grantpt(m)); R("unlockpt", unlockpt(m)); int lock = 1; R("TIOCGPTLCK", ioctl(m, TIOCGPTLCK, &lock)); printf("locked=%d\n", lock);
   unsigned n = 99; R("TIOCGPTN", ioctl(m, TIOCGPTN, &n)); const char *sn = ptsname(m); printf("ptsname-shape=%d\n", sn && strncmp(sn, "/dev/pts/", 9) == 0 && atoi(sn + 9) == (int)n);
