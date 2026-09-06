@@ -5460,3 +5460,18 @@ Gate: suite green (pumptest in it), sweep 210 of 210 exact in 30.1
 minutes (31.2 before the pump; the cases that stall interpreted with a
 unit in the fifo are the long-lived-frame ones, and most breadth cases
 are short).
+
+**perl under the structured layout, profiled properly.** With deferred
+units registering, runbin's perl profile is the bench's: the 30M-op
+loop is ~5.2 s of a 12.4 s run, the runloop's loop-head unit
+(`f_531718`, Perl_runops_standard's `call *0x10(%rax)` loop, 4 blocks)
+is 10.5% of all samples on its own and the pp_ callees (0x569780
+pp_modulo 5.2%, 0x53f0a0 4.7%, pp_multiply/add/padsv 2-4% each) the
+rest. The runloop unit is as tight as the protocol allows: probe,
+call_indirect, the accounting words, four reloads. One suspect for the
+callee side was V8's own entry cost for functions with many locals
+(pp_modulo declares 51, nine of them v128): a kernel calling a leaf
+30M times through call_indirect reads 1.33 ns/call with 1 local,
+1.34 with 40 i64, 1.33 with 40 i64 + 9 v128, 1.36 with 60 + 16 - the
+local count is free under TurboFan (SSA drops the zero-init), so
+pruning declarations (3 of 51 are unused anyway) is not a lever.
