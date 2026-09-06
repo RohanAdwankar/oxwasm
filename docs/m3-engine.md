@@ -4905,7 +4905,8 @@ top-level frame chain regardless of rsp. javac: 400 s to 37.6 s, deopts
 hello 31 s to 20 s; dlfail still passes (its longjmp runs under a
 nested call site). `DEOPTLOG=1` and `IHIST=1` in runbin print the deopt
 landings and the interpreted rips by library - what said "bytecode
-dispatch" in one look. the emitter 4.7 s self plus
+dispatch" in one look. The sweep over the relaxed guard: 186 of 186
+exact in 21.5 minutes; javac 29.6 s warm. the emitter 4.7 s self plus
 4.5 s of garbage collection, 3.9 s of module instantiation even with
 lazy compilation, 2.9 s of decode plus analysis, 1.6 s interpreting
 2.5M steps, and the guest's own translated execution. No single bucket
