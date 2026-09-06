@@ -152,6 +152,10 @@ const MADV = '/tmp/breadth_madv';
 if (!existsSync(MADV)) {   // madvise(MADV_DONTNEED) reads back zeros (jemalloc's startup probe); mlock succeeds
   try { execFileSync('gcc', ['-O1', '-o', MADV, new URL('./fixtures/madv.c', import.meta.url).pathname]); } catch {}
 }
+const DLFAIL = '/tmp/breadth_dlfail';
+if (!existsSync(DLFAIL)) {   // ld.so's longjmp error path under translation (failed dlsym/dlopen, 300x): javac died on it
+  try { execFileSync('gcc', ['-O1', '-o', DLFAIL, new URL('./fixtures/dlfail.c', import.meta.url).pathname, '-ldl']); } catch {}
+}
 const SOCKPAIR = '/tmp/breadth_sockpair';
 if (!existsSync(SOCKPAIR)) {   // socketpair(AF_UNIX): both directions, EOF after the peer closes, a child on the other end
   try { execFileSync('gcc', ['-O1', '-o', SOCKPAIR, new URL('./fixtures/sockpair.c', import.meta.url).pathname]); } catch {}
@@ -336,6 +340,7 @@ const CASES = [
   ['java-hello', '/usr/lib/jvm/java-21-openjdk-amd64/bin/java', ['-Xint', '-XX:+UseSerialGC', '-Xshare:off', '-Xmx256m', '-cp', '/tmp/breadth_jhello', 'Hello'],
               { memMB: 3072, tree: ['/usr/lib/jvm/java-21-openjdk-amd64', '/tmp/breadth_jhello'] }],
   ['madv',    '/tmp/breadth_madv', []],
+  ['dlfail',  DLFAIL, []],
   // nasm assembling the recycle fixture's source: a flat binary out (outFile)
   ['nasm',    '/usr/bin/nasm', ['-f', 'bin', '-o', '/tmp/breadth_nasm.bin', new URL('./fixtures/recycle.asm', import.meta.url).pathname],
               { bins: [new URL('./fixtures/recycle.asm', import.meta.url).pathname], outFile: '/tmp/breadth_nasm.bin' }],

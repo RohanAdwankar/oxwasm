@@ -4785,7 +4785,42 @@ after a short `GUARD`-bounded run, then the function's bytes decide
 between a translation fault and a vector over-read at the top of the
 guest window.
 
-What the gated clang profile (40 s) leaves: the emitter 4.7 s self plus
+**javac root cause: a longjmp through translated frames.** A 300-line
+fixture (`tools/fixtures/dlfail.c`: dlsym of a missing symbol and
+dlopen of a missing library, 300 times each) reproduces the javac trap
+in two seconds and bisects to one function: veto ld.so's `__longjmp`
+from translation and it passes. The failing path: `_dl_catch_exception`
+sets up a jmp_buf, the lookup fails, `_dl_signal_exception` calls
+`__longjmp`, which restores a caller's rsp and ends in `jmp *%rdx`.
+Two engine mechanisms each assumed the guest frame under them was still
+there:
+
+- *Nested frames.* A callout runs the callee to completion by
+  interpreting until the guest returns to the call's return address at
+  the frame's exit rsp; the deopt handler runs a landing nested inside
+  the deopting frame. After a longjmp the guest never returns there.
+  The nested interpreter kept going inside the abandoned frame, one
+  level deeper per dlsym miss, until the JS stack overflowed ("Maximum
+  call stack size exceeded" with everything else vetoed). Both sites
+  now watch for rsp rising above the frame's exit level and unwind the
+  wasm frames to the top loop, which resumes at the landing from the
+  published register file.
+- *Tail-jump chaining.* Once `__longjmp` itself tiered up, its
+  `jmp *%rdx` chained through the dispatch table as a wasm tail call
+  into the landing's compiled continuation - splicing that continuation
+  into the longjmp's own frame. When the continuation returned, the
+  wasm return resumed `_dl_signal_exception`, the function the guest
+  had abandoned, which ran its post-call code with rsi=1 and trapped
+  out of bounds. Tail jumps now chain only while rsp is at or below the
+  frame's entry rsp; above it they deopt, and the unwind above takes
+  over. (`rdsspq`, `incsspq` and the rest of glibc's CET shadow-stack
+  code decode as nops and take the no-shadow-stack path, as on
+  hardware without CET.)
+
+Found with a trace of callout entries, frame completions and unwinds
+(`FRAMETRACE=1` in runbin) plus `wasm-objdump` on the unit to map V8's
+trap offset to the instruction (`mov 0x8(%rsi),%rcx` after the call).
+dlfail is a breadth case; recycle still exact; differentials green. the emitter 4.7 s self plus
 4.5 s of garbage collection, 3.9 s of module instantiation even with
 lazy compilation, 2.9 s of decode plus analysis, 1.6 s interpreting
 2.5M steps, and the guest's own translated execution. No single bucket

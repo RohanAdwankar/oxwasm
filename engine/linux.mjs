@@ -392,6 +392,19 @@ export class LinuxEngine {
   // off-thread paths (async assemble, async compile): a placeholder null is
   // already in aotFns for the entry, so `get` — not `has` — is what decides
   // whether an address still needs registering.
+  // Finish a callout's guest frame by interpreting until the guest returns to
+  // retAddr with rsp back at rspExit. If the guest stack rises ABOVE rspExit
+  // first, the guest has left this frame without returning - a longjmp past
+  // it (ld.so signals a failed symbol lookup that way, on every dlsym miss;
+  // the nested interpreter used to keep going inside the frame, one level
+  // deeper per miss, until the JS stack overflowed or a stale frame faulted).
+  // Unwind the wasm frames to the top loop, which resumes at the landing.
+  _finishFrame(retAddr, rspExit) {
+    this.interpUntil(() => (this.cpu.rip === retAddr && this.cpu.regs[4] === rspExit) || this.cpu.regs[4] > rspExit);
+    this.syncOut();
+    if (globalThis.__frameTrace && this.cpu.regs[4] <= rspExit) console.error(`<finish retAddr=${retAddr.toString(16)} rsp=${this.cpu.regs[4].toString(16)} rspExit=${rspExit.toString(16)}>`);
+    if (this.cpu.regs[4] > rspExit) { this.stats.frameGone = (this.stats.frameGone || 0) + 1; if (globalThis.__frameTrace) console.error(`<framegone callout rip=${this.cpu.rip.toString(16)} rsp=${this.cpu.regs[4].toString(16)} rspExit=${rspExit.toString(16)}>`); throw new DeoptUnwind(this.cpu.rip); }
+  }
   // Code in [lo, hi) is gone (munmap, mremap away): drop every artifact keyed
   // in the range - compiled units, failures, the loop tier, both profiles, the
   // closure-pruning and known-entry sets (a fresh mapping here must be able
@@ -715,7 +728,7 @@ export class LinuxEngine {
       this.syncIn(); this.stats.aotRuns++;
       if (this.onProgress && this.stats.aotRuns % 4e6 === 0) this.onProgress('aot');
       return BigInt.asUintN(64, exit); }
-    catch (e) { if (e instanceof DeoptUnwind) { this.syncIn();
+    catch (e) { if (e instanceof DeoptUnwind) { this.syncIn(); if (globalThis.__frameTrace) console.error(`<dispatch-catch entry=${entry.toString(16)} erip=${e.rip.toString(16)} rsp=${this.cpu.regs[4].toString(16)} iu=${this._iuDepth | 0}>`);
         // A deopt back to the exact rip we dispatched made zero progress, and
         // the caller's loop will re-dispatch the same function — with a deopt
         // GUARD at the entry insn (e.g. a 128-bit `div` whose back-edge
@@ -973,6 +986,7 @@ export class LinuxEngine {
         // memory before the call, and the guest return address is on the guest
         // stack. rsp lives in the regfile at slot 4.
         const rsp0 = BigInt.asUintN(64, this.regview[4]);
+        if (globalThis.__frameTrace) console.error(`<callout target=${target.toString(16)} rsp=${rsp0.toString(16)} compiled=${this.aotFns.has(target)} iu=${this._iuDepth | 0}>`);
         if (rsp0 < 0x10000n && this.onBadRsp) this.onBadRsp(target, rsp0);
         const retAddr = this.mem.read(rsp0, 8n);
         const rspExit = BigInt.asUintN(64, rsp0 + 8n);
@@ -1003,8 +1017,7 @@ export class LinuxEngine {
             if (exit === retAddr && BigInt.asUintN(64, this.regview[4]) === rspExit)
               return BigInt.asIntN(64, exit);
             this.syncIn(); this.cpu.rip = exit;
-            this.interpUntil(() => this.cpu.rip === retAddr && this.cpu.regs[4] === rspExit);
-            this.syncOut();
+            this._finishFrame(retAddr, rspExit);
             return BigInt.asIntN(64, retAddr);
           }
           catch (e) {
@@ -1014,8 +1027,9 @@ export class LinuxEngine {
             // regfile; finish the frame by interpreting, contained here so the
             // caller's wasm frame survives.
             this.syncIn(); this.cpu.rip = e.rip;
-            this.interpUntil(() => this.cpu.rip === retAddr && this.cpu.regs[4] === rspExit);
-            this.syncOut();
+            if (globalThis.__frameTrace) console.error(`<callout-catch target=${target.toString(16)} erip=${e.rip.toString(16)} retAddr=${retAddr.toString(16)} rspExit=${rspExit.toString(16)} rsp=${this.cpu.regs[4].toString(16)}>`);
+            this._finishFrame(retAddr, rspExit);
+            if (globalThis.__frameTrace) console.error(`<callout-ret(catch) target=${target.toString(16)} retAddr=${retAddr.toString(16)}>`);
             return BigInt.asIntN(64, retAddr);
           }
         }
@@ -1027,8 +1041,8 @@ export class LinuxEngine {
         // interpreted forever at ~5M steps per cycle.
         if (this.assembleWat) this.profileTarget(target);
         this.syncIn(); this.cpu.rip = target;
-        this.interpUntil(() => this.cpu.rip === retAddr && this.cpu.regs[4] === rspExit);
-        this.syncOut();
+        this._finishFrame(retAddr, rspExit);
+        if (globalThis.__frameTrace) console.error(`<callout-ret(interp) target=${target.toString(16)} retAddr=${retAddr.toString(16)} rsp=${this.cpu.regs[4].toString(16)}>`);
         return BigInt.asIntN(64, retAddr);
       },
       // The unit spilled the whole regfile before `(return (call $x_deopt ...))`
@@ -1051,6 +1065,17 @@ export class LinuxEngine {
         // guard) passes its own rip — a landing-unit rooted exactly there
         // would re-deopt at the same t forever; only the interpreter can
         // execute that instruction.
+        // The guest stack above this frame's entry rsp means the guest has
+        // abandoned the frame: a longjmp (ld.so's _dl_signal_exception out
+        // of _dl_catch_exception, on every failed dlsym) landed in a caller
+        // whose wasm frame is below us. Running the landing nested here
+        // would keep a stale frame chain alive; unwind to the top loop
+        // instead, which resumes at t from the published state.
+        if (_rsp0 !== undefined && BigInt.asUintN(64, this.regview[4]) > BigInt.asUintN(64, _rsp0)) {
+          this.stats.frameGone = (this.stats.frameGone || 0) + 1;
+          if (globalThis.__frameTrace) console.error(`<framegone deopt rip=${t.toString(16)} rsp=${BigInt.asUintN(64, this.regview[4]).toString(16)} rsp0=${BigInt.asUintN(64, _rsp0).toString(16)} depth=${this._deoD | 0}>`);
+          throw new DeoptUnwind(t);
+        }
         const fdv = (this._ftdv ??= new DataView(this.wmem.buffer));
         const fd = fdv.getUint32(FTMAP + 8, true);
         if (f && !this.chainSlow && t !== this._deoChainT && (this._deoD | 0) < 200 &&
