@@ -4936,7 +4936,34 @@ Provisioning now walks with `fs.opendirSync` (the host's getdents order),
 so a guest directory lists in the same raw order as the host's, and zip,
 tar, find and `ls -U` see what native sees. runbin gained
 `STDOUTFILE=path` (raw guest stdout) for this kind of byte comparison.
-The sweep with java-jit in it: 188 of 188 exact in 24 minutes. the emitter 4.7 s self plus
+The sweep with java-jit in it: 188 of 188 exact in 24 minutes.
+
+### Batch 12: a syscall census
+
+`tools/fixtures/census.c` calls what the ordinary breadth binaries never
+do and prints each result as `name=ret/errno`, so native and engine
+compare byte for byte: fallocate, statx, user xattrs, utimensat,
+renameat2 with NOREPLACE and EXCHANGE, flock, sendfile, copy_file_range,
+pipe2 flags, splice both ways, eventfd, epoll over it, timerfd,
+signalfd, memfd_create with a MAP_SHARED view, inotify (create events
+on a watched directory), sysinfo, uname, prlimit64, sched_getaffinity,
+getcpu, sched_yield, gettid, tgkill(0), clock_getres, nanosleep,
+symlinkat/readlinkat, fchmodat, unlinkat, getrandom. First run: 71
+native lines against a hang - `pipe2(O_NONBLOCK)` ignored its flags and
+a read on the empty pipe blocked forever. Then, line by line: fallocate,
+sendfile, copy_file_range and splice (ENOSYS before; byte-level
+transfer helpers over files, pipes and the default stdout/stderr sinks),
+memfd_create (an anonymous regular file; a pread through it absorbs its
+MAP_SHARED pages first, so the mapped write is visible), inotify
+(init/add/rm, IN_CREATE/IN_DELETE from open, mkdir, unlink and rmdir,
+readable through poll/epoll), user.* xattrs per path, RENAME_EXCHANGE
+(ENOENT when a side is missing, a swap when both exist), chmod family
+remembered per path and reported by stat, sysinfo's process count,
+readlinkat's EINVAL on a non-link. One regression on the way: sendfile
+consumed its input before discovering stdout was a sink it could not
+feed, and busybox's `cat` (which sendfiles to stdout and falls back on
+EINVAL) printed nothing - the shell differential caught it; the sinks
+are resolved before any read now. The census is a breadth case. the emitter 4.7 s self plus
 4.5 s of garbage collection, 3.9 s of module instantiation even with
 lazy compilation, 2.9 s of decode plus analysis, 1.6 s interpreting
 2.5M steps, and the guest's own translated execution. No single bucket

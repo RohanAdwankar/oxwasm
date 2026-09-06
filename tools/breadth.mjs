@@ -163,6 +163,10 @@ const DLFAIL = '/tmp/breadth_dlfail';
 if (!existsSync(DLFAIL)) {   // ld.so's longjmp error path under translation (failed dlsym/dlopen, 300x): javac died on it
   try { execFileSync('gcc', ['-O1', '-o', DLFAIL, new URL('./fixtures/dlfail.c', import.meta.url).pathname, '-ldl']); } catch {}
 }
+const CENSUS = '/tmp/breadth_census';
+if (!existsSync(CENSUS)) {   // a census of less-common syscalls, each line name=ret/errno (tools/fixtures/census.c)
+  try { execFileSync('gcc', ['-O1', '-o', CENSUS, new URL('./fixtures/census.c', import.meta.url).pathname]); } catch {}
+}
 const REPSCAN = '/tmp/breadth_repscan';
 if (!existsSync(REPSCAN)) {   // rep scas/cmps flags (rcx=0 keeps them; pushf after a scan reads them) - the JVM's subtype check
   try { execFileSync('gcc', ['-O1', '-o', REPSCAN, new URL('./fixtures/repscan.c', import.meta.url).pathname]); } catch {}
@@ -373,6 +377,7 @@ const CASES = [
   ['madv',    '/tmp/breadth_madv', []],
   ['dlfail',  DLFAIL, []],
   ['repscan', REPSCAN, []],
+  ['census',  CENSUS, []],
   // nasm assembling the recycle fixture's source: a flat binary out (outFile)
   ['nasm',    '/usr/bin/nasm', ['-f', 'bin', '-o', '/tmp/breadth_nasm.bin', new URL('./fixtures/recycle.asm', import.meta.url).pathname],
               { bins: [new URL('./fixtures/recycle.asm', import.meta.url).pathname], outFile: '/tmp/breadth_nasm.bin' }],
