@@ -1673,10 +1673,17 @@ export class LinuxEngine {
     // interpreted so every store goes through the journal.
     if (n.proc) { this._mainFds ??= this.fds; this.fds = n.proc.fds;
       this.mem.jrnl = n.proc.jrnl;
-      if (this._vforkBudget === undefined) { this._vforkBudget = this.aotBudget; this.aotBudget = 0; } }
+      // The saved budget is normally UNDEFINED (no budget: dispatch freely),
+      // so "saved !== undefined" was never true and the parent came back
+      // from every vfork window with aotBudget still 0 - vetoing every
+      // top-level AOT dispatch for the rest of its life. The vforkexec
+      // fixture ran its second hot loop interpreted (30 s for a 2 s case),
+      // and every parent of a vfork (gcc's driver, shells, make) paid the
+      // same. A separate flag says whether a save happened.
+      if (!this._vforkSaved) { this._vforkSaved = true; this._vforkBudget = this.aotBudget; this.aotBudget = 0; } }
     else { if (this._mainFds) { this.fds = this._mainFds; this._mainFds = null; }
-      if (this.mem.jrnl && this._vforkBudget !== undefined) { this.mem.jrnl = null;
-        this.aotBudget = this._vforkBudget; this._vforkBudget = undefined; } }
+      if (this.mem.jrnl && this._vforkSaved) { this.mem.jrnl = null;
+        this.aotBudget = this._vforkBudget; this._vforkBudget = undefined; this._vforkSaved = false; } }
   }
   reapTimers() { const now = this.nowMs();
     if (this.itimer?.at != null) this._checkAlarm();
@@ -4598,7 +4605,7 @@ export class LinuxEngine {
     }
     t.proc.jrnl = null;
     if (this.mem.jrnl === jr) this.mem.jrnl = null;
-    if (this._vforkBudget !== undefined) { this.aotBudget = this._vforkBudget; this._vforkBudget = undefined; }
+    if (this._vforkSaved) { this.aotBudget = this._vforkBudget; this._vforkBudget = undefined; this._vforkSaved = false; }
   }
 
   // read(2)/recv(2) on a pipe or socketpair end: copy out what is buffered;
@@ -4908,6 +4915,7 @@ export class LinuxEngine {
         if (this._sigAny && this._sigPoll()) branched = true;     // asynchronous delivery at an insn boundary
         const key = this.cpu.rip;
         let f = branched ? this.aotFns.get(key) : undefined;
+        if (globalThis.__dbgRip !== undefined && key === globalThis.__dbgRip && ((this._dbgN = (this._dbgN | 0) + 1) & 0xFFFFF) === 1) console.error(`<dbgrip ${key.toString(16)} branched=${branched} f=${typeof f} has=${this.aotFns.has(key)} budget=${this.aotBudget} n=${this._dbgN}>`);
         if (f && this.aotBudget !== undefined && --this.aotBudget < 0) f = null;
         if (f) { if (this.ripTrace !== undefined) { this.ripTrace[this.ripTraceI++ & 1023] = -key; }   // negative = AOT entry
                  this.cpu.rip = this.dispatchMaybeShadow(f);

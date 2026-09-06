@@ -10,6 +10,7 @@ import { writeFileSync, unlinkSync } from 'node:fs';
 let an = 0;
 globalThis.__jtabStats = { structured: 0 }; globalThis.__layoutOf = new Map();
 let watBytes = 0, watUnits = 0;
+if (process.env.DBGRIP) globalThis.__dbgRip = BigInt("0x" + process.env.DBGRIP);   // DBGRIP=hex: log the top-level dispatch decision at this rip
 if (process.env.ASMTRACE) globalThis.__asmTrace = true;   // ASMTRACE=1: deferred-assembly submit/return per unit, and the stack of a unit that fails
 if (process.env.CFGDUMP) globalThis.__cfgDump = process.env.CFGDUMP;   // CFGDUMP=hex: when this function falls back to dispatch, write its N/succs to CFGDUMP_TO
 const assembleWat = (wat) => { watBytes += wat.length; watUnits++; if (process.env.WATDUMP === 'all') writeFileSync('/tmp/scratch' + watUnits + '.wat', wat); else if (process.env.WATDUMP && wat.includes('$f_' + process.env.WATDUMP)) writeFileSync(process.env.WATDUMP_TO || ('/tmp/scratch' + process.env.WATDUMP + '.wat'), wat);                       // AOT=1: tier live, like breadth
@@ -30,6 +31,7 @@ const walk = (d) => { let e; try { e = rawDir(d); } catch { return; } for (const
 for (const d of (process.env.TREE || '').split(':').filter(Boolean)) walk(d);   // TREE=dir:dir - provision whole directories
 const eng = new LinuxEngine(new Uint8Array(readFileSync(bin)),
   { argv: [bin, ...args], env: ['PATH=/usr/bin', 'HOME=/root', 'LANG=C', ...(process.env.EXTRAENV || '').split(' ').filter(Boolean)], files, mtimes, memMB: process.env.MEM ? +process.env.MEM : 512, assembleWat: process.env.AOT ? assembleWat : undefined, ...(process.env.LOOPUNITS === '0' ? { aotLoopThreshold: Infinity } : process.env.LOOPTHRESH ? { aotLoopThreshold: +process.env.LOOPTHRESH } : {}) });   // LOOPTHRESH=N: loop-head roots tier up after N back edges   // LOOPUNITS=0: no loop-head roots (bisects veto whole functions)
+if (process.env.DBGBUDGET) { let ab = undefined; Object.defineProperty(eng, "aotBudget", { get() { return ab; }, set(v) { if (v === 0 || (typeof v === "number" && v < 0 && !(ab < 0))) console.error(`<aotBudget=${v} from ${new Error().stack.split("\n").slice(2, 5).map(x => x.trim()).join(" <- ")}>`); ab = v; }, configurable: true }); }   // DBGBUDGET=1: who sets the AOT dispatch budget
 if (process.env.CHILDTRACE) eng.children = new Proxy([], { set(t, k, v) { if (v && typeof v === 'object' && 'pid' in v) console.error(`<childrec pid=${v.pid} exited=${v.exited} eng=${!!v.eng} pp=${v.pp ? v.pp.pid : null} at ${new Error().stack.split('\n').slice(2, 5).map(x => x.trim().replace(/^at /, '')).join(' <- ')}>`); t[k] = v; return true; } });   // CHILDTRACE=1: who pushed each child record (a lost background job)
 if (process.env.KIDS) eng.onChildEngine = (ce, argv) => { ce._label = (argv || [])[0]; seenEng.add(ce); if (eng.strace) ce.strace = new (eng.strace.constructor)(); };   // children trace like the parent (STRACENR/STRACEERR filters included)   // KIDS=1: record every child engine at creation (the run-loop sweep misses ones reaped within a slice)
 if (process.env.AOT && process.env.ASYNC_ASM !== '0') { eng.assembleWatDeferred = (w, cb) => asm.submit(w, cb); eng.pumpAsm = () => asm.pump(); }   // units assemble while the guest keeps running (default); ASYNC_ASM=0: synchronous assembly
@@ -123,7 +125,7 @@ if (process.env.OXWASM_BLKPROF) {   // per-block entry counts of the named funct
 if (process.env.DUMP) {   // DUMP=hexrip,...: tiering state of given entries + the hottest uncompiled call targets
   console.log(`--- tiering: loopHot=${eng.stats.loopHot|0} yieldTop=${eng.stats.loopYieldTop|0} yieldNested=${eng.stats.loopYieldNested|0} aotFns=${eng.aotFns.size} aotFailed=${eng.aotFailed?.size} ftCount=${eng._ftCount} ftFull=${eng._ftFull} tiers=${JSON.stringify(eng.stats.tiers)}`);
   for (const h of process.env.DUMP.split(',').filter(Boolean)) { const a = BigInt('0x' + h);
-    console.log(`  ${h}: aotFns=${eng.aotFns.has(a)} failed=${eng.aotFailed?.has(a)} calls=${eng.aotCalls?.get(a)} trampoline=${eng.isTrampoline(a)}`); }
+    console.log(`  ${h}: aotFns=${eng.aotFns.has(a)}/${typeof eng.aotFns.get(a)} failed=${eng.aotFailed?.has(a)} calls=${eng.aotCalls?.get(a)} trampoline=${eng.isTrampoline(a)}`); }
   console.log('  syscalls: ' + Object.entries(eng.stats.syscalls).sort((x, y) => y[1] - x[1]).slice(0, 10).map(([n, c]) => n + 'x' + c).join(' '));
   const hot = [...(eng.aotCalls ?? [])].filter(([a]) => !eng.aotFns.has(a)).sort((x, y) => y[1] - x[1]).slice(0, 12);
   const hotAll = [...(eng.aotCalls ?? [])].sort((x, y) => y[1] - x[1]).slice(0, 24);
