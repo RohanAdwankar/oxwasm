@@ -509,6 +509,11 @@ const CASES = [
   // The 3e6-iteration TurboFan stress lives in scratch tooling; this sized-
   // down loop keeps the sweep's wall clock sane while still forcing codegen.
   ['node-jit','/opt/node22/bin/node', ['-e', 'let s=0; for (let i=0;i<3e5;i++) s+=i%7; console.log(s, /a(b+)c/.exec("xabbbcy")[1])'], { memMB: 2048 }],
+  // node's net and dgram over the loopback (libuv: nonblocking connect, epoll
+  // edge-triggered, 2 MB through an echo server with backpressure, EOF from a
+  // server that closes first, a refused port, UDP, a unix-domain server)
+  ['node-net','/opt/node22/bin/node', ['--jitless', new URL('./fixtures/net.js', import.meta.url).pathname],
+              { memMB: 2048, bins: [new URL('./fixtures/net.js', import.meta.url).pathname] }],
   // a real repo, read paths: object walk + index + worktree stat. The
   // fixture at /tmp/breadth_repo is committed with pinned dates so the
   // hash is stable; safe.directory silences ownership checks that would
