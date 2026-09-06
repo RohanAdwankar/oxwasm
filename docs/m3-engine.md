@@ -5555,3 +5555,6 @@ s; rustc's split attempts read capped N quartiles [62, 562, 1006,
 1618, 4895] against successful N [3, 81, 217, 546, 3665] and
 duplicated blocks [1, 2, 9, 33, 512] - the cap is refusing the right
 things. m4's four hot functions still structure, output exact.
+Gate: suite green, sweep 210 of 210 exact in 32.3 minutes; rustc-asm
+166 s -> 144 s on the same (slow-hour) box, total engine time 1,911 ->
+1,873 s.
