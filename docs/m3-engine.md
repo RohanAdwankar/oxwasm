@@ -5220,3 +5220,4 @@ answer. The census is a breadth case; the engine differentials and
 the session-sensitive breadth cases (dash, busybox, bash traps and
 process substitution, timeout, xargs, make, python and perl and ruby
 children) stayed exact.
+The sweep with census4 in it: 204 of 204 exact in 25.7 minutes.
