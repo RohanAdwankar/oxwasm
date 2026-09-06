@@ -5526,3 +5526,8 @@ syscall, callout hop or 4096 nested interpreter steps whenever a live
 child engine exists (`_kidsDue`): an immediate-deadline block unwinds
 to the host, which pumps the children and resumes at the next
 instruction. python-mp 161 s -> 79 s under runbin.
+Gate: suite green, sweep 210 of 210 exact in 33 minutes; python-mp
+161 s -> 41 s in the sweep. The compiler and JVM cases read ~30%
+slower than the previous sweep, but an interleaved A/B of java-hello
+on the pre-fix and post-fix engine gave 106.8 s against 107.9 s - the
+box is slower this hour, the fixes are not.
