@@ -1713,7 +1713,7 @@ export class LinuxEngine {
         // A pipe holds 64KB: a writer that finds it full BLOCKS until a reader
         // drains it (EAGAIN if non-blocking). Without a bound, a compiled
         // `yes` pushed gigabytes of chunks before `head` ever ran.
-        if ((pb.size ?? 0) >= PIPE_CAP) {
+        if ((pb.size ?? 0) >= (pb.cap ?? PIPE_CAP)) {
           if (h.nonblock) return -11;
           this.block(null); return -4096;                    // re-executed once woken
         }
@@ -1742,6 +1742,7 @@ export class LinuxEngine {
       else { root.stdout.push(str); root.stdoutBytes.push(bytes); }
     };
     if (this._sigEntry(cpu, nr)) return;                  // signal delivery: interrupted / pending
+    if (this._shmAt?.length) this._shmSync(false);        // System V shared memory: local writes out, others' in
     try { switch (nr) {
       case 1: {                                              // write(fd, buf, len)
         const r = writeChunk(Number(a1), a2, Number(a3));
@@ -1797,6 +1798,7 @@ export class LinuxEngine {
       case 275: {                                             // splice(fd_in, *off_in, fd_out, *off_out, len, flags): one side is a pipe
         const hi = this.fds.get(Number(a1)), ho = this._sinkOf(Number(a3)); if (!hi) { ret(-9n); break; }
         if (!ho || (!hi.pipe && !ho.pipe) || (hi.bytes === undefined && !hi.pipe)) { ret(-22n); break; }
+        if (Number(cpu.regs[8]) === 0) { ret(0n); break; }    // nothing asked: nothing moved, never a wait
         const oi = a2 ? Number(this.mem.read(a2, 8n)) : undefined, oo = cpu.regs[10] ? Number(this.mem.read(cpu.regs[10], 8n)) : undefined;
         const data = this._readBytes(hi, Number(cpu.regs[8]), oi); if (data === undefined) { ret(-22n); break; }
         if (data === null) { if (hi.nonblock || (Number(cpu.regs[9]) & 2)) { ret(-11n); break; } this.block(null); break; }
@@ -1940,7 +1942,7 @@ export class LinuxEngine {
         }
         ret(0n); break; }
       case 273: ret(0n); break;                              // set_robust_list
-      case 334: ret(-38n); break;                            // rseq -> ENOSYS (glibc copes)
+      case 334: ret(a1 === 0n || Number(a2) < 32 || (Number(a2) & 31) ? -22n : -38n); break;   // rseq: EINVAL on bad arguments, else ENOSYS (glibc copes)
       case 302: {                                            // prlimit64(pid, res, new, old)
         const oldp = cpu.regs[10];                           // r10 = old_limit (rdx is new_limit!)
         if (oldp) { const v = new DataView(this.wmem.buffer);
@@ -2047,9 +2049,11 @@ export class LinuxEngine {
             const fd = this.allocFd();
             this.fds.set(fd, this.ptsHandle(h.ptm));
             ret(BigInt(fd)); break; }
-          case 0x540E: ret(0n); break;                       // TIOCSCTTY
-          case 0x540F: if (a3) { this.jsnap(a3, 4); v.setUint32(off, 1, true); } ret(0n); break;   // TIOCGPGRP
-          case 0x5410: ret(0n); break;                                      // TIOCSPGRP
+          case 0x540E: { const r = this._pgrec(this.threads[this.ti]); if (pty) { pty.sid = r.sid; pty.pgrp = r.pgid; } ret(0n); break; }   // TIOCSCTTY: the caller's session takes the terminal
+          case 0x540F: {                                     // TIOCGPGRP: the foreground group, ENOTTY on a pty no session owns
+            if (pty && pty.pgrp === undefined) { ret(-25n); break; }
+            if (a3) { this.jsnap(a3, 4); v.setUint32(off, pty ? pty.pgrp : this._pgrec(this.threads[this.ti]).pgid, true); } ret(0n); break; }
+          case 0x5410: { if (pty) { if (pty.pgrp === undefined) { ret(-25n); break; } pty.pgrp = v.getUint32(off, true); } ret(0n); break; }   // TIOCSPGRP
           case 0x540B: ret(0n); break;                                      // TCFLSH
           case 0x5409: ret(0n); break;                                      // TCSBRK
           default: this._noteIoctl(req, h); ret(-25n); break;
@@ -2200,6 +2204,7 @@ export class LinuxEngine {
         }
         (this.children ??= []).push({ pid: t.proc.pid, eng: ceng, exited: null, pp: t.proc.parent.proc ?? null });   // pp: the process that forked it (null = the main one)
         ceng.pid = t.proc.pid; ceng.ppid = this.pid ?? 1;
+        { const r = this._pgrec(t); ceng.pgid = r.pgid; ceng.sid = r.sid; }
         t.state = 'dead'; this._killProcSiblings(t);
         this._pipeEofSweep(skipped);
         this._vforkRollback(t);
@@ -2212,6 +2217,9 @@ export class LinuxEngine {
         const me = this.threads[this.ti].proc ?? null;         // which process asks: a window child, or the main one
         const mine = kids.filter(c => (c.pp ?? null) === me && (pid <= 0 || c.pid === pid));   // only its own children (a subshell must not reap its parent's)
         if (!mine.length) { ret(-10n); break; }              // ECHILD
+        if ((this.threads[this.ti].proc ?? this).nocldwait) {   // SA_NOCLDWAIT: children are reaped as they exit
+          for (const c of mine) if (c.exited !== null || (c.eng && c.eng.exitCode !== null)) this.children.splice(this.children.indexOf(c), 1);
+          ret(-10n); break; }
         const done = mine.find(c => c.exited !== null || (c.eng && c.eng.exitCode !== null));
         if (!done) { if (opts & 1) ret(0n); else this.block(null); break; }   // WNOHANG / block
         const code = done.exited ?? done.eng.exitCode;
@@ -2231,6 +2239,10 @@ export class LinuxEngine {
         if (op === 15) { let nm = ''; for (let i = 0; i < 15; i++) { const c = Number(this.mem.read(a2 + BigInt(i), 1n)); if (!c) break; nm += String.fromCharCode(c); } t.comm = nm; }   // PR_SET_NAME
         else if (op === 16) { const nm = t.comm ?? this.argv?.[0]?.split('/').pop()?.slice(0, 15) ?? ''; this.jsnap(a2, 16); for (let i = 0; i < 16; i++) this.mem.write(a2 + BigInt(i), 1n, BigInt(i < nm.length ? nm.charCodeAt(i) : 0)); }   // PR_GET_NAME
         else if (op === 3) { ret(1n); break; }                // PR_GET_DUMPABLE
+        else if (op === 30) { ret(50000n); break; }           // PR_GET_TIMERSLACK
+        else if (op === 23) { ret(1n); break; }               // PR_CAPBSET_READ
+        else if (op === 40 || op === 37 || op === 2) { if (a2) { this.jsnap(a2, 8); this.mem.write(a2, 8n, 0n); } ret(0n); break; }   // PR_GET_TID_ADDRESS / GET_CHILD_SUBREAPER / GET_PDEATHSIG
+        else if (![1, 4, 7, 8, 21, 22, 29, 36, 38, 39, 41, 42, 0x59616d61, 0x53564d41].includes(op)) { ret(-22n); break; }   // EINVAL: an option Linux does not know either
         ret(0n); break; }
       case 135: {                                            // personality(persona): query with 0xffffffff, else set
         const cur = this._personality ?? 0; if (Number(a1 & 0xffffffffn) !== 0xffffffff) this._personality = Number(a1 & 0xffffffffn); ret(BigInt(cur)); break; }
@@ -2294,6 +2306,7 @@ export class LinuxEngine {
         ret(8n); break; }
       case 60: case 231: {                                   // exit / exit_group
         const t = this.threads[this.ti];
+        if (this._shmAt?.length) this._shmExit(t);            // shared-memory attaches reach the segment before the image goes
         if (t.proc && nr === 60 && this.threads.some(x => x !== t && x.state !== 'dead' && x.proc === t.proc)) {
           t.state = 'dead';                                  // one thread of a window child: the process lives on
           if (t.ctid) { this.mem.write(t.ctid, 4n, 0n); this.futexWake(t.ctid, 1 << 30); }
@@ -2932,6 +2945,7 @@ export class LinuxEngine {
         if (a2) {
           const act = { handler: this.mem.read(a2, 8n), flags: this.mem.read(a2 + 8n, 8n),
                         restorer: this.mem.read(a2 + 16n, 8n), mask: this.mem.read(a2 + 24n, 8n) };
+          if (sig === 17) (tcur.proc ?? this).nocldwait = !!(act.flags & 2n);   // SA_NOCLDWAIT survives a SIG_DFL disposition (which stores nothing)
           if (act.handler === 0n || act.handler === 1n) acts.delete(sig); else acts.set(sig, act);
           if (act.handler === 1n) ign.add(sig); else ign.delete(sig);
         }
@@ -3075,7 +3089,26 @@ export class LinuxEngine {
         dv.setUint16(o + 72, 8, true);                        // procs
         dv.setUint32(o + 100, 1, true);                       // mem_unit
         ret(0n); break; }
-      case 332: ret(-38n); break;                             // statx -> ENOSYS (glibc falls back)
+      case 332: {                                             // statx(dirfd, path, flags, mask, buf): the fstatat answer in the statx layout
+        const flags = Number(a3), buf = cpu.regs[8];
+        if (flags & ~0x7900) { ret(-22n); break; }             // EINVAL: bits statx does not take
+        const saved = [cpu.regs[0], cpu.regs[7], cpu.regs[6], cpu.regs[2], cpu.regs[10], cpu.regs[8]];
+        cpu.regs[0] = 262n; cpu.regs[2] = buf; cpu.regs[10] = BigInt(flags & 0x1100);   // newfstatat(dirfd, path, buf, flags) into the statx buffer as scratch
+        this.syscall(cpu);
+        const r = BigInt.asIntN(64, cpu.regs[0]);
+        [, cpu.regs[7], cpu.regs[6], cpu.regs[2], cpu.regs[10], cpu.regs[8]] = saved;
+        if (r < 0n || this.blocked) { ret(r); break; }
+        const st = this.ram.slice(Number(buf - this.base), Number(buf - this.base) + 144), sv = new DataView(st.buffer, st.byteOffset, 144);
+        this.jsnap(buf, 256); const o = this.RAMOFF + Number(buf - this.base); new Uint8Array(this.wmem.buffer, o, 256).fill(0);
+        const v = new DataView(this.wmem.buffer);
+        v.setUint32(o, 0x7ff, true); v.setUint32(o + 4, sv.getUint32(56, true), true);                    // stx_mask (the basic fields), blksize
+        v.setUint32(o + 16, Number(sv.getBigUint64(16, true)), true); v.setUint32(o + 20, sv.getUint32(28, true), true); v.setUint32(o + 24, sv.getUint32(32, true), true);   // nlink uid gid
+        v.setUint16(o + 28, sv.getUint32(24, true) & 0xffff, true);                                         // mode
+        v.setBigUint64(o + 32, sv.getBigUint64(8, true), true); v.setBigUint64(o + 40, sv.getBigUint64(48, true), true); v.setBigUint64(o + 48, sv.getBigUint64(64, true), true);   // ino size blocks
+        for (const [so, to] of [[72, 64], [104, 96], [88, 112]]) { v.setBigInt64(o + to, sv.getBigInt64(so, true), true); v.setUint32(o + to + 8, Number(sv.getBigUint64(so + 8, true)), true); }   // atime ctime mtime
+        const rdev = sv.getBigUint64(40, true), dev = sv.getBigUint64(0, true);
+        v.setUint32(o + 128, Number((rdev >> 8n) & 0xfffn), true); v.setUint32(o + 132, Number(rdev & 0xffn), true); v.setUint32(o + 136, Number((dev >> 8n) & 0xfffn), true); v.setUint32(o + 140, Number(dev & 0xffn), true);
+        ret(0n); break; }
       case 217: {                                             // getdents64(fd, dirp, count)
         const h = this.fds.get(Number(a1));
         if (!h?.isdir) { ret(-20n); break; }                  // ENOTDIR
@@ -3129,6 +3162,8 @@ export class LinuxEngine {
         // its 2^24 ceiling and took the engine down with it
         if (!h && Number(a1) > 2) { ret(-9n); break; }
         if (cmd === 3) { ret(BigInt(2 | ((h?.sock?.nonblock || h?.nonblock) ? 0x800 : 0))); break; }   // F_GETFL: O_RDWR (+O_NONBLOCK on a nonblocking socket or pipe)
+        if (cmd === 1032) { ret(h?.pipe ? BigInt(h.pipe.cap ?? PIPE_CAP) : -9n); break; }   // F_GETPIPE_SZ
+        if (cmd === 1031) { if (!h?.pipe) { ret(-9n); break; } let sz = 4096; while (sz < Number(a3)) sz <<= 1; if (sz > (1 << 20)) { ret(-1n); break; } h.pipe.cap = sz; ret(BigInt(sz)); break; }   // F_SETPIPE_SZ: pages, a power of two, capped
         if (cmd === 4) { if (h?.sock) h.sock.nonblock = !!(Number(a3) & 0x800); if (h?.pipe || h?.dsock || h?.lsock) h.nonblock = !!(Number(a3) & 0x800); ret(0n); break; }  // F_SETFL
         if (cmd === 1) { ret(BigInt(this.cloexec.has(Number(a1)) ? 1 : 0)); break; }   // F_GETFD
         if (cmd === 2) { if (Number(a3) & 1) this.cloexec.add(Number(a1)); else this.cloexec.delete(Number(a1)); ret(0n); break; }  // F_SETFD
@@ -3186,11 +3221,18 @@ export class LinuxEngine {
       // Job control: a shell loops on getpgrp() != tcgetpgrp(fd) until they
       // agree, so these must match what TIOCGPGRP reports. Leaving getpgrp
       // unimplemented made dash spin forever — 1.28M ioctls in one run.
-      case 111: ret(1n); break;                               // getpgrp
-      case 121: ret(1n); break;                               // getpgid
-      case 109: ret(0n); break;                               // setpgid
-      case 112: ret(1n); break;                               // setsid
-      case 124: ret(1n); break;                               // getsid
+      case 111: ret(BigInt(this._pgrec(this.threads[this.ti]).pgid)); break;   // getpgrp
+      case 121: case 124: {                                   // getpgid(pid) / getsid(pid): self, or a child
+        const r = this._pgrecOf(Number(BigInt.asIntN(32, a1))); if (!r) { ret(-3n); break; }   // ESRCH
+        ret(BigInt(nr === 121 ? r.pgid : r.sid)); break; }
+      case 109: {                                             // setpgid(pid, pgid)
+        const self = this.threads[this.ti].proc?.pid ?? this.pid ?? 1, pid = Number(BigInt.asIntN(32, a1)) || self;
+        const r = this._pgrecOf(pid); if (!r) { ret(-3n); break; }
+        r.pgid = Number(BigInt.asIntN(32, a2)) || pid; ret(0n); break; }
+      case 112: {                                             // setsid: a new session, unless the caller already leads a group
+        const t = this.threads[this.ti], r = this._pgrec(t), pid = t.proc?.pid ?? this.pid ?? 1;
+        if (r.pgid === pid) { ret(-1n); break; }              // EPERM
+        r.sid = r.pgid = pid; r.ctty = null; ret(BigInt(pid)); break; }
       case 186: ret(BigInt(this.threads[this.ti].id)); break;  // gettid
       case 83: case 258: {                                    // mkdir / mkdirat
         const p = this.norm(nr === 83 ? this.readPath(a1) : this.atPath(a1, a2));
@@ -3532,6 +3574,153 @@ export class LinuxEngine {
       case 146: ret(Number(a1) === 1 || Number(a1) === 2 ? 99n : 0n); break;   // sched_get_priority_max: FIFO/RR 99, else 0
       case 147: ret(Number(a1) === 1 || Number(a1) === 2 ? 1n : 0n); break;    // sched_get_priority_min
       case 148: { this.jsnap(a2, 16); this.mem.write(a2, 8n, 0n); this.mem.write(a2 + 8n, 8n, 4000000n); ret(0n); break; }   // sched_rr_get_interval: 4 ms
+
+      // ---- System V IPC: shared memory, semaphore sets, message queues ----
+      // One registry for the process tree (in the fs metadata every engine
+      // shares). A shared-memory attach is a range of this engine's RAM with a
+      // copy of the segment; local writes reach the segment and other
+      // processes' writes reach the copy at syscall boundaries (_shmSync).
+      case 29: {                                             // shmget(key, size, flg)
+        const ipc = this._ipc(), key = Number(BigInt.asIntN(32, a1)), size = Number(a2), flg = Number(a3);
+        let seg = key ? [...ipc.shm.values()].find(x => x.key === key) : null;
+        if (seg) { if ((flg & 0xc00) === 0xc00) { ret(-17n); break; } if (size > seg.size) { ret(-22n); break; } ret(BigInt(seg.id)); break; }   // IPC_CREAT|IPC_EXCL: EEXIST
+        if (key && !(flg & 0x200)) { ret(-2n); break; }       // no IPC_CREAT: ENOENT
+        if (size <= 0) { ret(-22n); break; }
+        seg = { id: ipc.next++, key, size, bytes: new Uint8Array(size), v: 0, nattch: 0, mode: flg & 0o777, cpid: this.pid ?? 1 };
+        ipc.shm.set(seg.id, seg); ret(BigInt(seg.id)); break; }
+      case 30: {                                             // shmat(id, addr, flg)
+        const seg = this._ipc().shm.get(Number(a1)); if (!seg) { ret(-22n); break; }
+        const len = align(BigInt(seg.size), PAGE), at = this._mmapTake(len), o = Number(at - this.base);
+        if (o < 0 || o + Number(len) > this.ram.length) { ret(-12n); break; }
+        this._shmSync(true);                                  // our other attaches of this segment reach it first
+        this.ram.fill(0, o, o + Number(len)); this.ram.set(seg.bytes, o);
+        (this._shmAt ??= []).push({ seg, at, len: seg.size, v: seg.v, proc: this.threads[this.ti].proc ?? null }); seg.nattch++;
+        for (const t of this.threads) t.cpu.icache?.clear();
+        ret(at); break; }
+      case 67: {                                             // shmdt(addr)
+        const i = (this._shmAt ?? []).findIndex(m => m.at === a1); if (i < 0) { ret(-22n); break; }
+        this._shmSync(true); const m = this._shmAt.splice(i, 1)[0]; m.seg.nattch--;
+        this._unmapRange(m.at, m.at + align(BigInt(m.len), PAGE)); ret(0n); break; }
+      case 31: {                                             // shmctl(id, cmd, buf)
+        const ipc = this._ipc(), seg = ipc.shm.get(Number(a1)), cmd = Number(a2) & 0xff; if (!seg) { ret(-22n); break; }
+        if (cmd === 0) { ipc.shm.delete(seg.id); ret(0n); break; }   // IPC_RMID: the id is gone, attaches live on
+        if (cmd === 2) {                                      // IPC_STAT: shmid_ds
+          this._ipcPerm(a3, seg); this.mem.write(a3 + 48n, 8n, BigInt(seg.size)); this.mem.write(a3 + 80n, 4n, BigInt(seg.cpid)); this.mem.write(a3 + 84n, 4n, 0n); this.mem.write(a3 + 88n, 8n, BigInt(seg.nattch)); ret(0n); break; }
+        if (cmd === 1) { ret(0n); break; }                    // IPC_SET
+        ret(-22n); break; }
+      case 64: {                                             // semget(key, nsems, flg)
+        const ipc = this._ipc(), key = Number(BigInt.asIntN(32, a1)), n = Number(a2), flg = Number(a3);
+        let set = key ? [...ipc.sem.values()].find(x => x.key === key) : null;
+        if (set) { if ((flg & 0xc00) === 0xc00) { ret(-17n); break; } if (n > set.vals.length) { ret(-22n); break; } ret(BigInt(set.id)); break; }
+        if (key && !(flg & 0x200)) { ret(-2n); break; }
+        if (n <= 0 || n > 32000) { ret(-22n); break; }
+        set = { id: ipc.next++, key, vals: new Int32Array(n), mode: flg & 0o777 }; ipc.sem.set(set.id, set); ret(BigInt(set.id)); break; }
+      case 65: case 220: {                                   // semop(id, sops*, n) / semtimedop(..., timeout*)
+        const set = this._ipc().sem.get(Number(a1)); if (!set) { ret(-22n); break; }
+        const n = Number(a3), ops = [];
+        for (let i = 0; i < n; i++) { const o = a2 + BigInt(i * 6); ops.push({ num: Number(this.mem.read(o, 2n)), op: Number(BigInt.asIntN(16, this.mem.read(o + 2n, 2n))), flg: Number(this.mem.read(o + 4n, 2n)) }); }
+        if (ops.some(x => x.num >= set.vals.length)) { ret(-27n); break; }   // EFBIG
+        const would = ops.find(x => (x.op < 0 && set.vals[x.num] + x.op < 0) || (x.op === 0 && set.vals[x.num] !== 0));
+        if (would) { if (would.flg & 0x800) { ret(-11n); break; } this.block(null); break; }   // IPC_NOWAIT: EAGAIN; else wait for a change
+        for (const x of ops) set.vals[x.num] += x.op;
+        this._wakeTree(); ret(0n); break; }
+      case 66: {                                             // semctl(id, num, cmd, arg)
+        const ipc = this._ipc(), set = ipc.sem.get(Number(a1)), num = Number(a2), cmd = Number(a3) & 0xff, arg = cpu.regs[10];
+        if (!set) { ret(-22n); break; }
+        switch (cmd) {
+          case 0: ipc.sem.delete(set.id); this._wakeTree(); ret(0n); break;       // IPC_RMID
+          case 1: ret(0n); break;                                                  // IPC_SET
+          case 2: this._ipcPerm(arg, set); this.mem.write(arg + 88n, 8n, BigInt(set.vals.length)); ret(0n); break;   // IPC_STAT: semid_ds
+          case 11: case 14: case 15: ret(0n); break;                                // GETPID / GETNCNT / GETZCNT
+          case 12: ret(num < set.vals.length ? BigInt(set.vals[num]) : -22n); break;   // GETVAL
+          case 13: for (let i = 0; i < set.vals.length; i++) this.mem.write(arg + BigInt(i * 2), 2n, BigInt(set.vals[i] & 0xffff)); ret(0n); break;   // GETALL
+          case 16: if (num >= set.vals.length) { ret(-22n); break; } set.vals[num] = Number(BigInt.asIntN(32, arg & 0xffffffffn)); this._wakeTree(); ret(0n); break;   // SETVAL
+          case 17: for (let i = 0; i < set.vals.length; i++) set.vals[i] = Number(this.mem.read(arg + BigInt(i * 2), 2n)); this._wakeTree(); ret(0n); break;   // SETALL
+          default: ret(-22n);
+        } break; }
+      case 68: {                                             // msgget(key, flg)
+        const ipc = this._ipc(), key = Number(BigInt.asIntN(32, a1)), flg = Number(a2);
+        let q = key ? [...ipc.msg.values()].find(x => x.key === key) : null;
+        if (q) { if ((flg & 0xc00) === 0xc00) { ret(-17n); break; } ret(BigInt(q.id)); break; }
+        if (key && !(flg & 0x200)) { ret(-2n); break; }
+        q = { id: ipc.next++, key, msgs: [], bytes: 0, mode: flg & 0o777 }; ipc.msg.set(q.id, q); ret(BigInt(q.id)); break; }
+      case 69: {                                             // msgsnd(id, msgp, sz, flg)
+        const q = this._ipc().msg.get(Number(a1)); if (!q) { ret(-22n); break; }
+        const sz = Number(a3), type = BigInt.asIntN(64, this.mem.read(a2, 8n));
+        if (sz > 8192 || type <= 0n) { ret(-22n); break; }
+        if (q.bytes + sz > 16384) { if (Number(cpu.regs[10]) & 0x800) { ret(-11n); break; } this.block(null); break; }
+        const o = Number(a2 - this.base) + 8; q.msgs.push({ type, bytes: this.ram.slice(o, o + sz) }); q.bytes += sz;
+        this._wakeTree(); ret(0n); break; }
+      case 70: {                                             // msgrcv(id, msgp, sz, type, flg)
+        const q = this._ipc().msg.get(Number(a1)); if (!q) { ret(-22n); break; }
+        const sz = Number(a3), type = BigInt.asIntN(64, cpu.regs[10]), flg = Number(cpu.regs[8]);
+        let i = -1;
+        if (type === 0n) i = q.msgs.length ? 0 : -1;
+        else if (type > 0n) i = q.msgs.findIndex(m => m.type === type);
+        else { let best = -1; for (let k = 0; k < q.msgs.length; k++) if (q.msgs[k].type <= -type && (best < 0 || q.msgs[k].type < q.msgs[best].type)) best = k; i = best; }
+        if (i < 0) { if (flg & 0x800) { ret(-42n); break; } this.block(null); break; }   // ENOMSG
+        const m = q.msgs[i];
+        if (m.bytes.length > sz && !(flg & 0x1000)) { ret(-7n); break; }   // E2BIG unless MSG_NOERROR
+        q.msgs.splice(i, 1); q.bytes -= m.bytes.length; const n = Math.min(sz, m.bytes.length);
+        this.jsnap(a2, 8 + n); this.mem.write(a2, 8n, m.type); this.ram.set(m.bytes.subarray(0, n), Number(a2 - this.base) + 8);
+        this._wakeTree(); ret(BigInt(n)); break; }
+      case 71: {                                             // msgctl(id, cmd, buf)
+        const ipc = this._ipc(), q = ipc.msg.get(Number(a1)), cmd = Number(a2) & 0xff; if (!q) { ret(-22n); break; }
+        if (cmd === 0) { ipc.msg.delete(q.id); this._wakeTree(); ret(0n); break; }
+        if (cmd === 2) { this._ipcPerm(a3, q); this.mem.write(a3 + 72n, 8n, BigInt(q.bytes)); this.mem.write(a3 + 80n, 8n, BigInt(q.msgs.length)); this.mem.write(a3 + 88n, 8n, 16384n); ret(0n); break; }   // msqid_ds
+        if (cmd === 1) { ret(0n); break; }
+        ret(-22n); break; }
+      // ---- POSIX message queues: a named priority queue behind a descriptor ----
+      case 240: {                                            // mq_open(name, oflag, mode, attr*)
+        const name = this.readPath(a1).replace(/^\/+/, ''), fl = Number(a2), reg = (this._fsMeta().mqs ??= new Map());
+        let q = reg.get(name);
+        if (q && (fl & 0xc0) === 0xc0) { ret(-17n); break; }
+        if (!q) { if (!(fl & 0x40)) { ret(-2n); break; }
+          let maxmsg = 10, msgsize = 8192;
+          if (cpu.regs[10]) { maxmsg = Number(this.mem.read(cpu.regs[10] + 8n, 8n)); msgsize = Number(this.mem.read(cpu.regs[10] + 16n, 8n)); if (maxmsg <= 0 || msgsize <= 0) { ret(-22n); break; } }
+          q = { name, maxmsg, msgsize, msgs: [] }; reg.set(name, q); }
+        const fd = this.allocFd(); this.fds.set(fd, { mq: q, nonblock: !!(fl & 0x800), path: '/dev/mqueue/' + name }); this.cloexec.add(fd); ret(BigInt(fd)); break; }
+      case 241: { const name = this.readPath(a1).replace(/^\/+/, ''); ret(this._fsMeta().mqs?.delete(name) ? 0n : -2n); break; }   // mq_unlink
+      case 242: {                                            // mq_timedsend(mqd, msg*, len, prio, timeout*)
+        const h = this.fds.get(Number(a1)); if (!h?.mq) { ret(-9n); break; }
+        const q = h.mq, len = Number(a3), prio = Number(cpu.regs[10]);
+        if (len > q.msgsize) { ret(-90n); break; }             // EMSGSIZE
+        if (q.msgs.length >= q.maxmsg) { if (h.nonblock) { ret(-11n); break; } if (this._mqTimeout(cpu.regs[8])) { ret(-110n); break; } this.block(null); break; }
+        const o = Number(a2 - this.base), m = { prio, bytes: this.ram.slice(o, o + len) };
+        let i = q.msgs.findIndex(x => x.prio < prio); if (i < 0) i = q.msgs.length; q.msgs.splice(i, 0, m);
+        this._deadline = null; this._wakeTree(); ret(0n); break; }
+      case 243: {                                            // mq_timedreceive(mqd, msg*, len, prio*, timeout*)
+        const h = this.fds.get(Number(a1)); if (!h?.mq) { ret(-9n); break; }
+        const q = h.mq, len = Number(a3);
+        if (len < q.msgsize) { ret(-90n); break; }
+        if (!q.msgs.length) { if (h.nonblock) { ret(-11n); break; } if (this._mqTimeout(cpu.regs[8])) { ret(-110n); break; } this.block(null); break; }
+        const m = q.msgs.shift(); this.jsnap(a2, m.bytes.length); this.ram.set(m.bytes, Number(a2 - this.base));
+        if (cpu.regs[10]) { this.jsnap(cpu.regs[10], 4); this.mem.write(cpu.regs[10], 4n, BigInt(m.prio)); }
+        this._deadline = null; this._wakeTree(); ret(BigInt(m.bytes.length)); break; }
+      case 245: {                                            // mq_getsetattr(mqd, new*, old*)
+        const h = this.fds.get(Number(a1)); if (!h?.mq) { ret(-9n); break; }
+        if (a3) { this.jsnap(a3, 32); this.mem.write(a3, 8n, h.nonblock ? 0x800n : 0n); this.mem.write(a3 + 8n, 8n, BigInt(h.mq.maxmsg)); this.mem.write(a3 + 16n, 8n, BigInt(h.mq.msgsize)); this.mem.write(a3 + 24n, 8n, BigInt(h.mq.msgs.length)); }
+        if (a2) h.nonblock = !!(Number(this.mem.read(a2, 8n)) & 0x800);
+        ret(0n); break; }
+      // ---- pipes: tee and vmsplice ----
+      case 276: {                                            // tee(fd_in, fd_out, len, flags): copy without consuming
+        const hi = this.fds.get(Number(a1)), ho = this.fds.get(Number(a2)); if (!hi || !ho) { ret(-9n); break; }
+        if (!hi.pipe || !ho.pipe) { ret(-22n); break; }
+        const want = Number(a3), avail = []; let got = 0, off = hi.pipe.off; if (!want) { ret(0n); break; }
+        for (const c of hi.pipe.chunks) { if (got >= want) break; const take = Math.min(c.length - off, want - got); avail.push(c.subarray(off, off + take)); got += take; off = 0; }
+        if (!got) { if (hi.pipe.weof) { ret(0n); break; } if (hi.nonblock || (Number(cpu.regs[10]) & 2)) { ret(-11n); break; } this.block(null); break; }
+        const out = new Uint8Array(got); { let o = 0; for (const b of avail) { out.set(b, o); o += b.length; } }
+        const n = this._writeBytes(ho, out); if (n === undefined) { ret(-22n); break; } ret(BigInt(n)); break; }
+      case 278: {                                            // vmsplice(fd, iov*, n, flags): user pages into a pipe
+        const h = this.fds.get(Number(a1)); if (!h) { ret(-9n); break; } if (!h.pipe) { ret(-9n); break; }
+        const v = new DataView(this.wmem.buffer), parts = []; let total = 0;
+        for (let i = 0; i < Number(a3); i++) { const o = this.RAMOFF + Number(a2 - this.base) + i * 16; const p = v.getBigUint64(o, true), l = Number(v.getBigUint64(o + 8, true)); parts.push(this.ram.slice(Number(p - this.base), Number(p - this.base) + l)); total += l; }
+        const all = new Uint8Array(total); { let o = 0; for (const b of parts) { all.set(b, o); o += b.length; } }
+        const n = this._writeBytes(h, all); if (n === undefined) { ret(-22n); break; } ret(BigInt(n)); break; }
+      // ---- hardening probes: the answers Linux gives, so feature tests take the same branch ----
+      case 317: { const op = Number(a1); ret(op === 1 || op === 2 ? 0n : -22n); break; }   // seccomp: a filter "installs", GET_ACTION_AVAIL ok, the rest EINVAL
+      case 324: ret(Number(a1) === 0 ? 0x1ffn : 0n); break;   // membarrier: QUERY answers the command mask
+      case 272: { const f = Number(a1); ret(f === 0 || !(f & ~0x40600) ? 0n : (f & 0x7e020000) ? -1n : -22n); break; }   // unshare: FILES/FS/SYSVSEM fine, namespaces EPERM, else EINVAL
       case 434: {                                             // pidfd_open(pid, flags): a handle that polls readable once the child has exited
         const fd = this.allocFd(); this.fds.set(fd, { pidfd: Number(a1) }); this.cloexec.add(fd); ret(BigInt(fd)); break; }
 
@@ -3554,6 +3743,7 @@ export class LinuxEngine {
         const unmask = this._waitMaskIn(cpu, tmask); if (unmask === 'sig') break;
         const readyR = (h) => !h ? false
           : h.isdir ? true
+          : h.mq ? h.mq.msgs.length > 0
           : h.lsock ? h.lsock.backlog.length > 0
           : h.dsock ? h.dsock.queue.length > 0
           : h.pidfd ? this._pidDone(h.pidfd)
@@ -3612,6 +3802,7 @@ export class LinuxEngine {
         const unmask = this._waitMaskIn(cpu, tmask); if (unmask === 'sig') break;
         const readyR = (h) => !h ? false
           : h.isdir ? true
+          : h.mq ? h.mq.msgs.length > 0
           : h.lsock ? h.lsock.backlog.length > 0
           : h.dsock ? h.dsock.queue.length > 0
           : h.pidfd ? this._pidDone(h.pidfd)
@@ -4202,6 +4393,8 @@ export class LinuxEngine {
     parent.state = 'run'; this._vforkThaw(parent);
     (this.children ??= []).push({ pid: t.proc.pid, eng: ceng, exited: null, pp: parent.proc ?? null });
     ceng.pid = t.proc.pid; ceng.ppid = this.pid ?? 1;
+    { const r = this._pgrec(t); ceng.pgid = r.pgid; ceng.sid = r.sid; }
+    if (this._shmAt?.length) { this._shmSync(true); ceng._shmAt = this._shmAt.filter(m => m.proc === t.proc || m.proc === null).map(m => ({ ...m, proc: null })); for (const m of ceng._shmAt) m.seg.nattch++; }
     // children the window forked before it was materialised are ITS children:
     // a bash subshell (`cd d && cmd &`) forks cmd and blocks in wait4, which
     // is what materialises it - and with the record left behind here it saw
@@ -4354,6 +4547,45 @@ export class LinuxEngine {
       this.block(null); return null;
     }
     return BigInt(got);
+  }
+  // --- System V IPC and process groups ---------------------------------------
+  _ipc() { const m = this._fsMeta(); return m.ipc ??= { shm: new Map(), sem: new Map(), msg: new Map(), next: 1 }; }
+  _ipcPerm(addr, o) {                           // struct ipc_perm (48 bytes): key uid gid cuid cgid mode seq
+    this.jsnap(addr, 112); for (let i = 0n; i < 112n; i += 8n) this.mem.write(addr + i, 8n, 0n);
+    this.mem.write(addr, 4n, BigInt.asUintN(32, BigInt(o.key ?? 0))); this.mem.write(addr + 20n, 2n, BigInt(o.mode ?? 0o600));
+  }
+  _shmSync(force) {                             // an attach's bytes and its segment agree at syscall boundaries
+    for (const m of this._shmAt ?? []) {
+      const seg = m.seg, o = Number(m.at - this.base), ram = this.ram.subarray(o, o + m.len);
+      if (m.v !== seg.v) { ram.set(seg.bytes); m.v = seg.v; continue; }   // someone else wrote: take theirs
+      if (!force && m.len > (1 << 20)) continue;                          // a large segment is only compared at attach, detach, exit and fork
+      let diff = false; for (let i = 0; i < m.len; i++) if (ram[i] !== seg.bytes[i]) { diff = true; break; }
+      if (diff) { seg.bytes.set(ram); seg.v++; m.v = seg.v; }
+    }
+  }
+  _shmExit(t) {                                 // a process is leaving: push its attaches, drop them
+    this._shmSync(true);
+    const mine = t.proc ? this._shmAt.filter(m => m.proc === t.proc) : this._shmAt.slice();
+    for (const m of mine) { m.seg.nattch--; this._shmAt.splice(this._shmAt.indexOf(m), 1); if (t.proc) this._unmapRange(m.at, m.at + align(BigInt(m.len), PAGE)); }
+  }
+  _mqTimeout(tp) {                              // an absolute CLOCK_REALTIME timeout for the mq calls: true once it has passed
+    if (!tp) return false;
+    const abs = Number(this.mem.read(tp, 8n)) * 1000 + Number(this.mem.read(tp + 8n, 8n)) / 1e6, now = this.nowMs();
+    this._deadline ??= abs - Date.now() + now;
+    if (now >= this._deadline) { this._deadline = null; return true; }
+    return false;
+  }
+  _pgrec(t) {                                   // the {pgid, sid} record of the calling process (a window child, or this engine)
+    const o = t.proc ?? this;
+    if (o.pgid === undefined) { const p = t.proc ? this._pgrec(t.proc.parent) : null; o.pgid = p ? p.pgid : (this.pid ?? 1); o.sid = p ? p.sid : o.pgid; }
+    return o;
+  }
+  _pgrecOf(pid) {                               // by pid: the caller, a window child, or a child engine
+    const self = this.threads[this.ti];
+    if (pid === 0 || pid === (self.proc?.pid ?? this.pid ?? 1)) return this._pgrec(self);
+    const w = this.threads.find(x => x.proc?.pid === pid && x.state !== 'dead'); if (w) return this._pgrec(w);
+    const c = (this.children ?? []).find(c => c.pid === pid && c.eng); if (c) { const e = c.eng; if (e.pgid === undefined) { const r = this._pgrec(self); e.pgid = r.pgid; e.sid = r.sid; } return e; }
+    return null;
   }
   _pipePeek(h, addr, want, nb) {                // MSG_PEEK: copy without consuming
     let dst = Number(addr - this.base), got = 0, off = h.pipe.off;
