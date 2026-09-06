@@ -3,7 +3,7 @@ import { LinuxEngine } from '../engine/linux.mjs';
 import { setFlagsFromString } from 'node:v8';
 if (process.env.WASM_LAZY !== '0') setFlagsFromString('--wasm-lazy-compilation');   // V8 compiles each wasm function at its first call: most translated functions of a compiler run are never entered (clang -S 45 s -> 39 s), m4 steady state neutral on a quiet machine; WASM_LAZY=0 restores eager
 import { makeAssembler } from '../tools/assemble.mjs';
-import { readFileSync, readdirSync, lstatSync, realpathSync, existsSync } from 'node:fs';
+import { readFileSync, readdirSync, lstatSync, realpathSync, existsSync, opendirSync } from 'node:fs';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { writeFileSync, unlinkSync } from 'node:fs';
@@ -23,7 +23,8 @@ for (const d of ['/lib/x86_64-linux-gnu', '/usr/lib/x86_64-linux-gnu', '/lib64']
 }
 add('/etc/ld.so.cache'); add(bin);
 for (const b of (process.env.BINS||'').split(',').filter(Boolean)) add(b);
-const walk = (d) => { let e; try { e = readdirSync(d); } catch { return; } for (const f of e) { const hp = join(d, f); let st; try { st = lstatSync(hp); } catch { continue; } if (st.isDirectory()) walk(hp); else { try { add(hp, realpathSync(hp)); } catch {} } } };
+const rawDir = (d) => { const dir = opendirSync(d), out = []; let e; while ((e = dir.readSync()) !== null) out.push(e.name); dir.closeSync(); return out; };   // host getdents order, not readdirSync's sorted one
+const walk = (d) => { let e; try { e = rawDir(d); } catch { return; } for (const f of e) { const hp = join(d, f); let st; try { st = lstatSync(hp); } catch { continue; } if (st.isDirectory()) walk(hp); else { try { add(hp, realpathSync(hp)); } catch {} } } };
 for (const d of (process.env.TREE || '').split(':').filter(Boolean)) walk(d);   // TREE=dir:dir - provision whole directories
 const eng = new LinuxEngine(new Uint8Array(readFileSync(bin)),
   { argv: [bin, ...args], env: ['PATH=/usr/bin', 'HOME=/root', 'LANG=C', ...(process.env.EXTRAENV || '').split(' ').filter(Boolean)], files, mtimes, memMB: process.env.MEM ? +process.env.MEM : 512, assembleWat: process.env.AOT ? assembleWat : undefined, ...(process.env.LOOPUNITS === '0' ? { aotLoopThreshold: Infinity } : process.env.LOOPTHRESH ? { aotLoopThreshold: +process.env.LOOPTHRESH } : {}) });   // LOOPTHRESH=N: loop-head roots tier up after N back edges   // LOOPUNITS=0: no loop-head roots (bisects veto whole functions)

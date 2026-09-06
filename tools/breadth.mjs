@@ -14,7 +14,7 @@ import { LinuxEngine } from '../engine/linux.mjs';
 import { setFlagsFromString } from 'node:v8';
 if (process.env.WASM_LAZY !== '0') setFlagsFromString('--wasm-lazy-compilation');   // V8 compiles each wasm function at its first call: most translated functions of a compiler run are never entered (clang -S 45 s -> 39 s), m4 steady state neutral on a quiet machine; WASM_LAZY=0 restores eager
 import { makeAssembler } from './assemble.mjs';
-import { readFileSync, readdirSync, lstatSync, realpathSync, statSync, writeFileSync, existsSync, mkdirSync, unlinkSync, copyFileSync } from 'node:fs';
+import { readFileSync, readdirSync, lstatSync, realpathSync, statSync, writeFileSync, existsSync, mkdirSync, unlinkSync, copyFileSync, opendirSync } from 'node:fs';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -58,6 +58,14 @@ add(IN, IN);
 // fixed rwx page, munmap it, map different code at the same address - an
 // engine that keeps address-keyed translations across munmap prints the
 // stale answer. Built from the committed asm when nasm is present.
+// an archive fixture: a small tree zipped natively once; zip re-archives it
+// (DOS timestamps from the provisioned mtimes), unzip lists it
+const ZIPDIR = '/tmp/breadth_zipdir', ZIPF = '/tmp/breadth_z.zip';
+if (!existsSync(ZIPF)) {
+  try { mkdirSync(ZIPDIR + '/sub', { recursive: true }); writeFileSync(ZIPDIR + '/a.txt', 'alpha\n');
+        writeFileSync(ZIPDIR + '/sub/big.txt', 'x'.repeat(20000)); copyFileSync(new URL('./fixtures/dlfail.c', import.meta.url).pathname, ZIPDIR + '/sub/dlfail.c');
+        execFileSync('zip', ['-q', '-r', '-X', ZIPF, 'breadth_zipdir'], { cwd: '/tmp' }); } catch {}
+}
 const RECYCLE = '/tmp/breadth_recycle';
 if (!existsSync(RECYCLE)) {
   try { execFileSync('nasm', ['-f', 'bin', '-o', RECYCLE,
@@ -297,8 +305,13 @@ const assembleWatDeferred = (wat, cb) => {
 // its stdlib CPython never reaches main, and the case would measure its own
 // startup failure). Walked once per distinct tree.
 const walked = new Set();
+// Directory entries in the HOST's getdents order (fs.opendirSync; readdirSync
+// sorts): the engine lists a directory in provisioning order, and zip, tar,
+// find and `ls -U` archive or print in readdir order - zip's output differed
+// from native's only in entry order until this matched.
+const rawDir = (d) => { const dir = opendirSync(d), out = []; let e; while ((e = dir.readSync()) !== null) out.push(e.name); dir.closeSync(); return out; };
 const walk = (d) => { if (walked.has(d)) return; walked.add(d);
-  let e; try { e = readdirSync(d); mtimes[d] = Math.floor(statSync(d).mtimeMs / 1000); } catch { return; }   // dirs carry mtimes too (ls -l)
+  let e; try { e = rawDir(d); mtimes[d] = Math.floor(statSync(d).mtimeMs / 1000); } catch { return; }   // dirs carry mtimes too (ls -l)
   for (const f of e) { const hp = join(d, f);
     let st; try { st = lstatSync(hp); } catch { continue; }
     if (st.isDirectory()) walk(hp); else { try { add(hp, realpathSync(hp)); } catch {} } } };
@@ -331,6 +344,9 @@ const CASES = [
   // the brk fix, where it now exits 1 like native instead of faulting.
   // ffmpeg: MMX/SSE DSP surface (emms after every SIMD call), worker threads,
   // 40 shared libraries; a synthetic source hashed by the md5 muxer
+  ['unzip-l',  '/usr/bin/unzip', ['-l', ZIPF], { bins: [ZIPF] }],
+  ['zip-dir',  '/usr/bin/zip',   ['-q', '-r', '-X', '-', ZIPDIR], { tree: ZIPDIR }],
+  ['curl-file', '/usr/bin/curl', ['-s', 'file://' + ZIPDIR + '/sub/dlfail.c'], { tree: ZIPDIR }],
   ['ffprobe', '/usr/bin/ffprobe', ['-hide_banner', '-v', 'error', '-f', 'lavfi', '-i', 'testsrc=duration=0.3:size=64x64:rate=10', '-show_streams', '-show_format'],
               { memMB: 2048, tree: '/usr/lib/x86_64-linux-gnu/pulseaudio' }],
   ['ffmpeg',  '/usr/bin/ffmpeg',  ['-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', 'testsrc=duration=0.3:size=64x64:rate=10', '-f', 'md5', '-'],
