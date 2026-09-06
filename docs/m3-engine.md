@@ -4820,7 +4820,24 @@ there:
 Found with a trace of callout entries, frame completions and unwinds
 (`FRAMETRACE=1` in runbin) plus `wasm-objdump` on the unit to map V8's
 trap offset to the instruction (`mov 0x8(%rsi),%rcx` after the call).
-dlfail is a breadth case; recycle still exact; differentials green. the emitter 4.7 s self plus
+dlfail is a breadth case; recycle still exact; differentials green.
+
+With the longjmp fixed, javac no longer traps - it ran 15 minutes
+without finishing. A state sample said why: 594M interpreted steps at
+343 s, 1.9M steps/s, translated runs barely growing. The JVM's template
+interpreter is generated at startup into anonymous PROT_EXEC memory,
+and `execRanges` (what the profiler counts as code) only ever held
+file-backed text: the JVM's own interpreter, which runs every bytecode
+under -Xint, could never tier up. `OXWASM_EXEC_ANON=1` (opt-in) counts
+anonymous PROT_EXEC mappings as code and drops them at munmap. java
+hello: 77 s to 31 s, output exact. javac then reaches a Java-level
+failure in 42 s - an `instanceof` in `Context.put` came out wrong
+(AssertionError "T extends Context.Factory") - so some translated JVM
+path miscomputes; a unit bisect (`UNITVETO` ranges, 3,200 units) is
+running. Opt-in because code written into such memory can change
+without an munmap (a JIT's code cache), and the engine invalidates
+translations only on munmap/mremap; the -Xint interpreter is generated
+once. the emitter 4.7 s self plus
 4.5 s of garbage collection, 3.9 s of module instantiation even with
 lazy compilation, 2.9 s of decode plus analysis, 1.6 s interpreting
 2.5M steps, and the guest's own translated execution. No single bucket
