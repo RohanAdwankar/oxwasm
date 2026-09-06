@@ -29,7 +29,9 @@ int main(void) {
   pid_t c = fork(); if (c == 0) { for (;;) pause(); }
   usleep(20000); int st = 0; R("kill-stop", kill(c, SIGSTOP)); R("waitpid-untraced", waitp(c, &st, WUNTRACED) == c); printf("stopped=%d sig=%d\n", WIFSTOPPED(st), WIFSTOPPED(st) ? WSTOPSIG(st) : -1);
   R("waitpid-nohang-while-stopped", waitpid(c, &st, WNOHANG | WUNTRACED)); R("kill-cont", kill(c, SIGCONT)); R("waitpid-continued", waitp(c, &st, WCONTINUED) == c); printf("continued=%d\n", WIFCONTINUED(st));
-  usleep(20000); R("kill-tstp", kill(c, SIGTSTP)); R("waitpid-untraced2", waitp(c, &st, WUNTRACED) == c); printf("stopped=%d sig=%d\n", WIFSTOPPED(st), WIFSTOPPED(st) ? WSTOPSIG(st) : -1);
+  kill(c, SIGKILL); waitp(c, &st, 0);                        // a fresh child for SIGTSTP: a stop sent on the heels of a continue is racy on Linux itself
+  c = fork(); if (c == 0) { for (;;) pause(); } usleep(20000);
+  R("kill-tstp", kill(c, SIGTSTP)); R("waitpid-untraced2", waitp(c, &st, WUNTRACED) == c); printf("stopped=%d sig=%d\n", WIFSTOPPED(st), WIFSTOPPED(st) ? WSTOPSIG(st) : -1);
   R("kill-term-stopped", kill(c, SIGTERM)); usleep(20000); R("waitpid-nohang-still-stopped", waitpid(c, &st, WNOHANG)); R("kill-cont2", kill(c, SIGCONT)); R("waitpid-exited", waitp(c, &st, 0) == c); printf("signaled=%d sig=%d\n", WIFSIGNALED(st), WTERMSIG(st));
   c = fork(); if (c == 0) { signal(SIGTSTP, SIG_IGN); for (;;) pause(); } usleep(20000);
   R("kill-tstp-ignored", kill(c, SIGTSTP)); usleep(20000); R("waitpid-nohang-not-stopped", waitpid(c, &st, WNOHANG | WUNTRACED)); kill(c, SIGKILL); waitp(c, &st, 0); printf("killed=%d\n", WTERMSIG(st));
