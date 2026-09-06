@@ -39,6 +39,7 @@ node addflagtest.mjs
 node adctest.mjs
 node picguardtest.mjs
 node recycletest.mjs
+node pumptest.mjs
 node enginetest.mjs
 node atomictest.mjs
 node fcmptest.mjs
