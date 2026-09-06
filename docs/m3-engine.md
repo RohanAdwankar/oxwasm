@@ -5135,3 +5135,11 @@ connects, then fetch a 404, then kill and wait - three programs, the
 listener's name found through the registry the process tree shares.
 Byte-identical, 32 s. Its first attempt "hung" only because it ran
 beside the sweep; alone it finished before a 120 s snapshot was due.
+
+**Node over the local sockets.** `tools/fixtures/net.js` on the
+unmodified node: a TCP echo server and client in one process (libuv's
+nonblocking connect, epoll edge-triggered readiness, 2 MB through the
+pair with backpressure), a server that closes first, a refused port,
+a UDP exchange, a unix-domain server. Byte-identical on the first run
+(35 s); the node-net breadth case. libuv is the consumer the
+edge-triggered epoll was built for, and it drove it without a gap.
