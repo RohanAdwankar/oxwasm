@@ -4773,8 +4773,17 @@ window; `memMB` up to ~4090 (the wasm32 ceiling) is the only lever.
 
 `javac Hello.java` (OpenJDK 21, -Xint) dies in translated code with a
 wasm "memory access out of bounds" in libjvm; `java Hello` with the
-same flags passes. Interpreter-only and 4 GB runs are in progress to
-tell a translation fault from an access past the guest window.
+same flags passes. The trap comes 386 s into the run, in a chain of
+frames at 0x1406xxx (a library loaded low, before libjvm at 0x3168e000;
+one frame is a 45 KB function, the shape of libc's vector memcpy or
+strlen family). The probes so far are inconclusive by cost: javac
+interpreter-only did not finish in 18 minutes; with the trapping
+function vetoed from translation it neither trapped nor finished in 15;
+the 4 GB run was host-OOM-killed while another 3 GB guest ran. Next:
+`LIBOF=hex,hex` in runbin (new) names the mapping of each trap frame
+after a short `GUARD`-bounded run, then the function's bytes decide
+between a translation fault and a vector over-read at the top of the
+guest window.
 
 What the gated clang profile (40 s) leaves: the emitter 4.7 s self plus
 4.5 s of garbage collection, 3.9 s of module instantiation even with
