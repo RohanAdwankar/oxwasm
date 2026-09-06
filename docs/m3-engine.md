@@ -5571,3 +5571,6 @@ measured no change (43.6 s), the flag has to be on the command line.
 own execArgv (`--expose-gc`, `--cpu-prof`) kept; breadth, the bench
 runner and runbin call it at their top, OXWASM_NO_REEXEC=1 opts out.
 The browser page is V8's own heuristics and is untouched by this.
+Gate: sweep 210 of 210 exact in 28.9 minutes (32.3 before the flag,
+same box); rustc-asm 144 s -> 121 s, cargo-build 145 s -> 120 s,
+total engine time 1,873 -> 1,667 s.
