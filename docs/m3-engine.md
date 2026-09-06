@@ -5279,3 +5279,10 @@ heels of a SIGCONT sometimes did not stop the child at all. The waits
 now poll with WNOHANG under alarm(60), and the SIGTSTP probe gets a
 fresh child - a census must fail loudly, never hang, and must not ask
 the kernel a question with two answers.
+The sweep with census5 in it, chunks 1-3 from the first run and 4-5
+rerun on the final engine and fixtures: 206 of 206 exact. The one
+native failure along the way was the orphaned-group rule: Linux
+discards SIGTSTP sent to a member of an orphaned process group, and a
+harness run under nohup is one, so the fixture now takes its own group
+under its live parent - the engine stops the child either way, which
+is the difference a native comparison exists to show.
