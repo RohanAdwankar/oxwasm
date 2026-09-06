@@ -141,6 +141,7 @@ if (process.env.IHIST) {   // IHIST=1: top interpreted rips (every 64th step sam
   console.log('  by lib: ' + [...byLib.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8).map(([l, n]) => `${l} ${(100 * n / tot).toFixed(1)}%`).join(', '));
 }
 if (process.env.LIBOF) for (const h of process.env.LIBOF.split(',')) { const a = BigInt('0x' + h); const m = (eng.maps ?? []).find(m => a >= m.at && a < m.at + m.len); console.log(`--- libof ${h}: ${m ? `${m.path} map ${m.at.toString(16)}+${m.len.toString(16)} fileOff ${(m.fileOff ?? 0n).toString(16)} -> file offset ${(a - m.at + BigInt(m.fileOff ?? 0)).toString(16)}` : libOf(a)}`); }   // LIBOF=hex,hex: which mapping holds these guest addresses (wasm trap frames name f_<hex>)
+if (process.env.STDOUTFILE) writeFileSync(process.env.STDOUTFILE, eng.stdoutBytes && eng.stdoutBytes.length ? Buffer.concat(eng.stdoutBytes.map(b => Buffer.from(b))) : Buffer.from((eng.stdout || []).join(''), 'binary'));   // STDOUTFILE=path: the guest's raw stdout bytes
 if (process.env.FILE) { const f = eng.files[process.env.FILE]; console.log('--- file ' + process.env.FILE + ' ---\n' + (f ? Buffer.from(f).toString() : '(missing)')); }
 if (eng.stderr&&eng.stderr.length) console.log('--- stderr ---\n' + eng.stderr.join('').slice(0, process.env.STDERRMAX ? +process.env.STDERRMAX : 4000));
 if (process.env.STRACE) console.log('--- strace tail ---\n' + eng.strace.slice(process.env.STRACE === 'full' ? 0 : -40).join('\n'));
