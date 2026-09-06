@@ -27,7 +27,11 @@ const PIPE_CAP = 65536;                       // Linux default pipe capacity
 const SLEEPY = new Set([34, 35, 230, 130, 128, 7, 271, 23, 270, 232, 281, 61, 202]);
 const NORESTART = new Set([23, 270, 7, 271, 232, 281, 35, 230, 34, 130]);   // EINTR after a handler even under SA_RESTART (signal(7))
 const SYNTH_DIRS = new Set(['/proc', '/proc/self', '/proc/self/fd', '/proc/self/task', '/proc/sys', '/proc/sys/kernel',
-                            '/proc/sys/kernel/random', '/proc/sys/vm', '/proc/sys/fs', '/dev', '/dev/pts', '/dev/fd']);
+                            '/proc/sys/kernel/random', '/proc/sys/vm', '/proc/sys/fs', '/dev', '/dev/pts', '/dev/fd',
+                            // the FHS baseline every Linux has: O_CREAT needs its parent to exist, and a guest
+                            // whose provisioning put nothing under /tmp or /dev/shm still has them
+                            '/tmp', '/var', '/var/tmp', '/dev/shm', '/run', '/root', '/home', '/etc', '/usr', '/usr/lib',
+                            '/usr/bin', '/usr/share', '/bin', '/lib', '/opt', '/mnt', '/srv']);
 class DeoptUnwind { constructor(rip) { this.rip = rip; } }
 // A blocking syscall (poll/select/read with nothing ready, nanosleep) suspends
 // the guest the same way a deopt escapes compiled code: every register is
@@ -1646,12 +1650,14 @@ export class LinuxEngine {
       : (v) => { cpu.regs[0] = BigInt.asUintN(64, v); };
     // resolve a write target: stdout / stderr sink, or a pipe buffer
     const defSink = (fd) => this.fds.get(fd) ?? (fd === 1 ? { sink: 'out' } : fd === 2 ? { sink: 'err' } : undefined);
-    const writeChunk = (fd, addr, len) => {
+    const writeChunk = (fd, addr, len, nosig = false) => {   // nosig: MSG_NOSIGNAL (EPIPE without the signal)
       if (len <= 0) return;
       this.guardRange(addr, len);                          // payload may be .rodata
       const bytes = this.ram.slice(Number(addr - this.base), Number(addr - this.base) + len);
       const h = defSink(fd);
+      if (h?.isdir || h?.lsock || h?.pidfd) return -9;      // EBADF: nothing to write to
       if (h?.sock?.conn) { h.sock.conn.write(bytes); this.wakeAllBlk(); return; }
+      if (h?.sock) return -107;                              // ENOTCONN: a stream socket nobody connected
       if (h?.wpipe) {                                        // a pty end
         const T = (h.ptm ?? h.pts).termios;
         if (h.pts) {
@@ -1673,7 +1679,8 @@ export class LinuxEngine {
         // no read end open anywhere in the process tree: SIGPIPE, and EPIPE
         // if the writer survives it (handler installed or SIG_IGN) — this is
         // what ends `yes | head -1` instead of letting yes fill a dead pipe
-        if (!this._pipeReaderAlive(pb)) { this.raiseSignal(13, null, { pid: 0, code: 0 }); return -32; }
+        if (!this._pipeReaderAlive(pb)) { if (!nosig) this.raiseSignal(13, null, { pid: 0, code: 0 }); return -32; }
+        if (h.sk?.shutW) { if (!nosig) this.raiseSignal(13, null, { pid: 0, code: 0 }); return -32; }
         // A pipe holds 64KB: a writer that finds it full BLOCKS until a reader
         // drains it (EAGAIN if non-blocking). Without a bound, a compiled
         // `yes` pushed gigabytes of chunks before `head` ever ran.
@@ -1681,7 +1688,7 @@ export class LinuxEngine {
           if (h.nonblock) return -11;
           this.block(null); return -4096;                    // re-executed once woken
         }
-        pb.chunks.push(bytes); pb.size = (pb.size ?? 0) + bytes.length; this.wakeAllBlk(); return;
+        pb.chunks.push(bytes); pb.size = (pb.size ?? 0) + bytes.length; pb.wtot = (pb.wtot ?? 0) + bytes.length; this.wakeAllBlk(); return;
       }
       if (h?.ev) {                                           // eventfd: add to the counter
         let v = 0n; for (let i = 7; i >= 0; i--) v = (v << 8n) | BigInt(bytes[i] ?? 0);
@@ -1797,8 +1804,9 @@ export class LinuxEngine {
         const b1 = { chunks: [], pos: 0, off: 0, size: 0 }, b2 = { chunks: [], pos: 0, off: 0, size: 0 };
         const nb = !!(Number(a2) & 0x800);
         const f1 = this.allocFd(); this.fds.set(f1, null); const f2 = this.allocFd(); this.fds.delete(f1);
-        this.fds.set(f1, { pipe: b1, peer: b2, mode: 'rw', nonblock: nb });
-        this.fds.set(f2, { pipe: b2, peer: b1, mode: 'rw', nonblock: nb });
+        const ty = Number(a2) & 0xff;
+        this.fds.set(f1, { pipe: b1, peer: b2, mode: 'rw', nonblock: nb, sk: { fam: 1, type: ty, name: null, peername: null } });
+        this.fds.set(f2, { pipe: b2, peer: b1, mode: 'rw', nonblock: nb, sk: { fam: 1, type: ty, name: null, peername: null } });
         if (Number(a2) & 0x80000) { this.cloexec.add(f1); this.cloexec.add(f2); }
         const sv = cpu.regs[10];
         this.jsnap(sv, 8); this.mem.write(sv, 4n, BigInt(f1)); this.mem.write(sv + 4n, 4n, BigInt(f2));
@@ -1959,7 +1967,7 @@ export class LinuxEngine {
           ret(0n); break; }
         if (req === 0x541B) {                                 // FIONREAD: bytes readable now
           if (!h) { ret(-9n); break; }
-          const avail = h.pipe ? (h.pipe.size ?? 0) : h.bytes !== undefined ? Math.max(0, h.bytes.length - h.pos) : 0;
+          const avail = h.pipe ? (h.pipe.size ?? 0) : h.dsock ? (h.dsock.queue[0]?.bytes.length ?? 0) : h.bytes !== undefined ? Math.max(0, h.bytes.length - h.pos) : 0;
           this.jsnap(a3, 4); this.mem.write(a3, 4n, BigInt(avail)); ret(0n); break; }
         if (!pty && !(this.tty && (Number(a1) <= 2 || h?.istty))) {   // ENOTTY
           this._noteIoctl(req, h); ret(-25n); break; }
@@ -2189,7 +2197,65 @@ export class LinuxEngine {
         ret(0n); break;                                      // the FS is in memory: durable already. vim's write path fsyncs and, on ENOSYS, reports the write failed and unlinks it
       case 24: ret(0n); break;                               // sched_yield (quantum rotation covers fairness)
       case 273: ret(0n); break;                              // set_robust_list
-      case 157: ret(0n); break;                              // prctl (PR_SET_NAME etc.)
+      case 157: {                                            // prctl(option, ...)
+        const op = Number(a1), t = this.threads[this.ti];
+        if (op === 15) { let nm = ''; for (let i = 0; i < 15; i++) { const c = Number(this.mem.read(a2 + BigInt(i), 1n)); if (!c) break; nm += String.fromCharCode(c); } t.comm = nm; }   // PR_SET_NAME
+        else if (op === 16) { const nm = t.comm ?? this.argv?.[0]?.split('/').pop()?.slice(0, 15) ?? ''; this.jsnap(a2, 16); for (let i = 0; i < 16; i++) this.mem.write(a2 + BigInt(i), 1n, BigInt(i < nm.length ? nm.charCodeAt(i) : 0)); }   // PR_GET_NAME
+        else if (op === 3) { ret(1n); break; }                // PR_GET_DUMPABLE
+        ret(0n); break; }
+      case 135: {                                            // personality(persona): query with 0xffffffff, else set
+        const cur = this._personality ?? 0; if (Number(a1 & 0xffffffffn) !== 0xffffffff) this._personality = Number(a1 & 0xffffffffn); ret(BigInt(cur)); break; }
+      case 115: ret(0n); break;                              // getgroups: no supplementary groups
+      case 140: ret(20n); break;                             // getpriority: nice 0 (the kernel's 20 - nice form)
+      case 141: ret(0n); break;                              // setpriority
+      case 100: {                                            // times(tms*): clock ticks (100 Hz) of wall time as user time
+        const ticks = BigInt(Math.floor(this.nowMs() / 10));
+        if (a1) { this.jsnap(a1, 32); this.mem.write(a1, 8n, ticks); this.mem.write(a1 + 8n, 8n, 0n); this.mem.write(a1 + 16n, 8n, 0n); this.mem.write(a1 + 24n, 8n, 0n); }
+        ret(ticks); break; }
+      case 129: case 297: {                                  // rt_sigqueueinfo(pid, sig, info*) / rt_tgsigqueueinfo(tgid, tid, sig, info*): a signal with a value
+        const sig = Number(nr === 129 ? a2 : a3), ip = nr === 129 ? a3 : cpu.regs[10];
+        if (sig < 1 || sig > 64) { ret(-22n); break; }
+        const code = Number(BigInt.asIntN(32, this.mem.read(ip + 8n, 4n))), sival = this.mem.read(ip + 24n, 8n);
+        const pid = Number(BigInt.asIntN(32, a1));
+        const kid = (this.children ?? []).find(c => c.pid === pid && c.exited === null);
+        if (kid) { kid.eng.raiseSignal(sig, null, { pid: 1, code, sival }); ret(0n); break; }
+        const self = this.threads[this.ti].proc?.pid ?? this.pid ?? 1;
+        if (pid > 1 && pid !== self) { ret(-3n); break; }    // ESRCH
+        this.raiseSignal(sig, null, { pid: 1, code, sival }); ret(0n); break; }
+      case 247: {                                            // waitid(idtype, id, infop*, options, rusage)
+        const idtype = Number(a1), id = Number(BigInt.asIntN(32, a2)), opts = Number(cpu.regs[10]);
+        const kids = this.children ?? [];
+        const mine = kids.filter(c => idtype === 0 || (idtype === 1 && c.pid === id) || idtype === 2);   // P_ALL / P_PID / P_PGID (one group here)
+        if (!mine.length) { ret(-10n); break; }              // ECHILD
+        const done = (opts & 4) ? mine.find(c => c.exited !== null || (c.eng && c.eng.exitCode !== null)) : null;   // WEXITED
+        if (!done) { if (opts & 1) { if (a3) { this.jsnap(a3, 128); for (let o = 0n; o < 128n; o += 8n) this.mem.write(a3 + o, 8n, 0n); } ret(0n); } else this.block(null); break; }   // WNOHANG: si_pid 0
+        const code = done.exited ?? done.eng.exitCode, tsig = done.sig ?? done.eng?.termSig;
+        if (a3) this._writeSiginfo(a3, 17, { code: tsig ? 2 : 1, pid: done.pid, status: tsig ? (tsig & 0x7f) : (code & 0xff) });   // CLD_KILLED / CLD_EXITED
+        if (!(opts & 0x01000000)) this.children.splice(this.children.indexOf(done), 1);   // WNOWAIT leaves it reapable
+        ret(0n); break; }
+      case 295: case 296: case 327: case 328: {              // preadv / pwritev (and the v2 forms): readv/writev at an offset that does not move the position
+        const h = this.fds.get(Number(a1)); if (!h) { ret(-9n); break; }
+        if (h.bytes === undefined) { ret(-29n); break; }     // ESPIPE
+        const v = new DataView(this.wmem.buffer);
+        let pos = Number(BigInt.asIntN(64, cpu.regs[10])); const cur = pos < 0; if (cur) pos = h.pos;
+        let done = 0;
+        for (let i = 0; i < Number(a3); i++) {
+          const o = this.RAMOFF + Number(a2 - this.base) + i * 16;
+          const bp = v.getBigUint64(o, true), l = Number(v.getBigUint64(o + 8, true)); if (!l) continue;
+          if (nr === 296 || nr === 328) {
+            if (!h.writable) { ret(-9n); break; }
+            this.guardRange(bp, l); const bytes = this.ram.slice(Number(bp - this.base), Number(bp - this.base) + l);
+            if (h.path) (this.dirtyFiles ??= new Set()).add(h.path);
+            if (pos + done + l > h.bytes.length) this._growFile(h, pos + done + l);
+            h.bytes.set(bytes, pos + done); this._mapsAbsorb(h.path, pos + done, bytes); done += l;
+          } else {
+            if (h.path && this.maps?.length) this._mapsFlushPath(h.path);
+            const n = Math.max(0, Math.min(l, h.bytes.length - pos - done)); if (n <= 0) break;
+            this.jsnap(bp, n); this.ram.set(h.bytes.subarray(pos + done, pos + done + n), Number(bp - this.base)); done += n; if (n < l) break;
+          }
+        }
+        if (cur) h.pos = pos + done;
+        ret(BigInt(done)); break; }
       case 204: {                                            // sched_getaffinity: one CPU
         const n = Math.min(Number(a2), 8);
         const o = this.RAMOFF + Number(a3 - this.base);
@@ -2320,6 +2386,7 @@ export class LinuxEngine {
       case 113: case 114:                                     // setreuid / setregid
       case 117: case 119:                                     // setresuid / setresgid
       case 92: case 93: case 260:                             // chown / fchown / fchownat
+        ret(0n); break;
       case 90: case 91: case 268: {                           // chmod / fchmod / fchmodat: the permission bits are remembered per path
         let p, mode; if (nr === 91) { const h = this.fds.get(Number(a1)); p = h?.path; mode = Number(a2); } else { p = this.norm(nr === 90 ? this.readPath(a1) : this.atPath(a1, a2)); mode = Number(nr === 90 ? a2 : a3); }
         if (p) (this._fsMeta().modes ??= new Map()).set(p, mode & 0o7777);
@@ -2339,6 +2406,9 @@ export class LinuxEngine {
         }
         ret(0n); break; }
       case 257: case 2: {                                     // openat(dirfd,path,flags) / open(path,flags)
+        if (nr === 257) {                                     // a relative path needs a directory fd
+          const dfd = Number(BigInt.asIntN(32, a1));
+          if (dfd !== -100 && this.readPath(a2).charCodeAt(0) !== 47) { const dh = this.fds.get(dfd); if (!dh) { ret(-9n); break; } if (!dh.isdir) { ret(-20n); break; } } }   // EBADF / ENOTDIR
         const p = nr === 257 ? this.atPath(a1, a2) : this.readPath(a1);
         const flags = Number(nr === 257 ? a3 : a2);
         // the controlling terminal: a shell opens it to test for job control
@@ -2422,13 +2492,15 @@ export class LinuxEngine {
             this.fds.set(fd, { isdir: true, path: this.resolve(this.norm(p)), pos: 0 });
             ret(BigInt(fd)); break;
           }
-          if (flags & 0x40) {                                 // O_CREAT: writable guest files
+          if (flags & 0x40) {                                 // O_CREAT: writable guest files, in a directory that exists
+            { const np = this.norm(p), par = np.slice(0, np.lastIndexOf('/')) || '/'; if (!this.isDir(par)) { ret(-2n); break; } }   // ENOENT
             f = new Uint8Array(0);
             this.files[this.norm(p)] = f; this.fsBump();
             if (this.mtimes) this.mtimes[this.norm(p)] = Math.floor(this.nowMs() / 1000);
             this._inotify(this.norm(p), 0x100);                 // IN_CREATE
           } else { ret(-2n); break; }                         // ENOENT
-        } else if (flags & 0x200) {                           // O_TRUNC
+        } else if ((flags & 0xc0) === 0xc0) { ret(-17n); break; }   // O_CREAT|O_EXCL on an existing file: EEXIST
+        else if (flags & 0x200) {                             // O_TRUNC
           f = new Uint8Array(0);
           this.files[this.norm(p)] = f;
         }
@@ -2492,6 +2564,7 @@ export class LinuxEngine {
           if (h.gen === 'zero') dst.fill(0); else for (let i = 0; i < n; i += 65536) crypto.getRandomValues(dst.subarray(i, Math.min(n, i + 65536)));
           h.pos += n; ret(BigInt(n)); break;
         }
+        if (h.isdir) { ret(-21n); break; }                    // EISDIR: a directory reads through getdents64 only
         if (h.path && this.maps?.length) this._mapsFlushPath(h.path);   // coherence: mapped stores reach the read
         // A read at or past EOF returns 0 and must NOT move the position.
         // Without the max(0,...), a read whose offset is beyond the current
@@ -2504,8 +2577,10 @@ export class LinuxEngine {
         this.ram.set(h.bytes.subarray(h.pos, h.pos + n), Number(a2 - this.base));
         h.pos += n; ret(BigInt(n)); break; }
       case 3: { const cfd = Number(a1), ch = this.fds.get(cfd);
+        if (!ch && cfd > 2) { ret(-9n); break; }              // EBADF (0-2 are the implicit terminal handles)
         this.fds.delete(cfd); this.cloexec.delete(cfd);
         if (ch?.pipe && (ch.mode === 'w' || ch.peer)) this._pipeEofSweep([ch]);
+        if (ch?.sk?.name && !this._handleAlive(ch)) this._sockUnreg(ch);
         if (ch && this._fsMeta().flocks?.size) this._flockRelease(ch);
         if (ch && this._fsMeta().rlocks?.size) this._rlockClose(ch);
         ret(0n); break; }                                     // close
@@ -2515,6 +2590,7 @@ export class LinuxEngine {
           if (fl & 4) { this.cloexec.add(fd); continue; }     // CLOSE_RANGE_CLOEXEC
           const ch = this.fds.get(fd); this.fds.delete(fd); this.cloexec.delete(fd);
           if (ch?.pipe && (ch.mode === 'w' || ch.peer)) this._pipeEofSweep([ch]);
+          if (ch?.sk?.name && !this._handleAlive(ch)) this._sockUnreg(ch);
           if (ch && this._fsMeta().flocks?.size) this._flockRelease(ch);
           if (ch && this._fsMeta().rlocks?.size) this._rlockClose(ch);
         }
@@ -2538,8 +2614,9 @@ export class LinuxEngine {
         if (!h.bytes) { ret(-29n); break; }                   // pipe/sink/socket: ESPIPE
         const w = Number(a3);                                 // rdx = whence
         const off = BigInt.asIntN(64, a2);
-        h.pos = w === 0 ? Number(off) : w === 1 ? h.pos + Number(off) : h.bytes.length + Number(off);
-        ret(BigInt(h.pos)); break; }
+        const np = w === 0 ? Number(off) : w === 1 ? h.pos + Number(off) : h.bytes.length + Number(off);
+        if (np < 0 || w > 4) { ret(-22n); break; }           // EINVAL (SEEK_DATA/SEEK_HOLE fold into the end/current forms above)
+        h.pos = np; ret(BigInt(h.pos)); break; }
       case 5: case 262: {                                     // fstat / newfstatat
         const isAt = nr === 262;
         let size = null, mode = 0o020620, statPath = null;    // default: char dev (tty)
@@ -2564,6 +2641,7 @@ export class LinuxEngine {
             if (f !== undefined) { size = f.length; mode = this.fileMode(f, p); }
             else if (this.isDir(p)) { size = 4096; mode = 0o040755; }
             else if (this._fifoAt(p)) { size = 0; mode = 0o010644; }
+            else if (this._sockAt(p)) { size = 0; mode = 0o140755; }
             else { ret(-2n); break; }                         // ENOENT
             statPath = p;
           }
@@ -2571,6 +2649,7 @@ export class LinuxEngine {
           const h = this.fds.get(Number(a1));
           if (this.tty && (Number(a1) <= 2 || h?.istty)) {     // terminal: match stat("/dev/pts/0")
             this.writeStat(a2, '/dev/pts/0', 0, 0o020620, 0x8800n, 1001n); ret(0n); break; }
+          if (!h && Number(a1) > 2) { ret(-9n); break; }      // EBADF
           if (h?.gen) { size = 0; mode = 0o020666; }                        // /dev/zero, /dev/urandom
           else if (h?.tfd || h?.sfd) { size = 0; mode = 0o0100600; }       // anon inode
           else if (h?.bytes) { size = h.bytes.length; mode = this.fileMode(h.bytes, h.path); statPath = h.path ?? null; }  // regular file
@@ -2617,6 +2696,7 @@ export class LinuxEngine {
         const f = this.lookup(p);
         if (f === undefined && !this.isDir(p)) {
           if (this._fifoAt(p)) { this.writeStat(a2, p, 0, 0o010644); ret(0n); break; }
+          if (this._sockAt(p)) { this.writeStat(a2, p, 0, 0o140755); ret(0n); break; }
           ret(-2n); break; }                                  // ENOENT
         this.writeStat(a2, p, f ? f.length : 4096, f ? this.fileMode(f, p) : 0o040755);
         ret(0n); break; }
@@ -2663,8 +2743,12 @@ export class LinuxEngine {
         g.add(newp); for (const q of g) m.hard.set(q, g);
         if (this.mtimes) this.mtimes[newp] = this.mtimes[oldp] ?? Math.floor(this.nowMs() / 1000);
         this.fsBump(); ret(0n); break; }
-      case 21: { const p = this.readPath(a1); ret(this.lookup(p) !== undefined || this.isDir(p) || !!this._fifoAt(p) ? 0n : -2n); break; }   // access
-      case 269: case 439: { const p = this.atPath(a1, a2); ret(this.lookup(p) !== undefined || this.isDir(p) || !!this._fifoAt(p) ? 0n : -2n); break; }  // faccessat / faccessat2
+      case 21: case 269: case 439: {                          // access / faccessat / faccessat2: existence, and X_OK against the file's mode bits
+        const p = nr === 21 ? this.readPath(a1) : this.atPath(a1, a2), mode = Number(nr === 21 ? a2 : a3);
+        const f = this.lookup(p);
+        if (f === undefined && !this.isDir(p) && !this._fifoAt(p) && !this._sockAt(p)) { ret(-2n); break; }
+        if ((mode & 1) && f !== undefined && !(this.fileMode(f, this.norm(p)) & 0o111)) { ret(-13n); break; }   // EACCES
+        ret(0n); break; }
       case 63: {                                              // uname
         const put = (o, s) => { const b = new TextEncoder().encode(s + '\0');
           this.ram.set(b, Number(a1 - this.base) + o); };
@@ -2782,6 +2866,9 @@ export class LinuxEngine {
         const maxev = Number(a3);
         const timeoutMs = Number(BigInt.asIntN(32, cpu.regs[10] & 0xFFFFFFFFn));
         const readyR = (t) => !t ? false
+          : t.lsock ? t.lsock.backlog.length > 0
+          : t.dsock ? t.dsock.queue.length > 0
+          : t.pidfd ? this._pidDone(t.pidfd)
           : t.sock ? !!(t.sock.conn && t.sock.conn.readable())
           : t.ino ? t.ino.queue.length > 0
           : t.pipe ? (t.pipe.chunks.length > 0 || !!t.pipe.weof)
@@ -3024,7 +3111,7 @@ export class LinuxEngine {
         // its 2^24 ceiling and took the engine down with it
         if (!h && Number(a1) > 2) { ret(-9n); break; }
         if (cmd === 3) { ret(BigInt(2 | ((h?.sock?.nonblock || h?.nonblock) ? 0x800 : 0))); break; }   // F_GETFL: O_RDWR (+O_NONBLOCK on a nonblocking socket or pipe)
-        if (cmd === 4) { if (h?.sock) h.sock.nonblock = !!(Number(a3) & 0x800); if (h?.pipe) h.nonblock = !!(Number(a3) & 0x800); ret(0n); break; }  // F_SETFL
+        if (cmd === 4) { if (h?.sock) h.sock.nonblock = !!(Number(a3) & 0x800); if (h?.pipe || h?.dsock || h?.lsock) h.nonblock = !!(Number(a3) & 0x800); ret(0n); break; }  // F_SETFL
         if (cmd === 1) { ret(BigInt(this.cloexec.has(Number(a1)) ? 1 : 0)); break; }   // F_GETFD
         if (cmd === 2) { if (Number(a3) & 1) this.cloexec.add(Number(a1)); else this.cloexec.delete(Number(a1)); ret(0n); break; }  // F_SETFD
         if (cmd === 5 || cmd === 6 || cmd === 7 || cmd === 36 || cmd === 37 || cmd === 38) {
@@ -3073,7 +3160,8 @@ export class LinuxEngine {
         // probes the first shape at startup (fill a page, DONTNEED it, read
         // it back) and falls back to memset purging with a warning when the
         // bytes survive; rustc carried that warning.
-        if (a3 === 4n && a2 > 0n) this._madvDontneed(a1 & ~(PAGE - 1n), align(a1 + a2, PAGE));
+        if (a1 & (PAGE - 1n)) { ret(-22n); break; }         // EINVAL: the start must be page-aligned
+        if (a3 === 4n && a2 > 0n) this._madvDontneed(a1, align(a1 + a2, PAGE));
         ret(0n); break; }
       case 149: case 150: case 151: case 152: ret(0n); break;   // mlock/munlock/mlockall/munlockall: nothing swaps here (gpg's "insecure memory" warning otherwise)
       case 110: ret(BigInt(this.threads[this.ti].proc ? (this.pid ?? 1) : (this.ppid ?? 0))); break;   // getppid
@@ -3127,6 +3215,7 @@ export class LinuxEngine {
         if (lm.has(p)) { lm.delete(p); this.fsBump(); this._inotify(p, 0x200); ret(0n); break; }   // the link, not its target
         if (this.files[p] !== undefined) this._inotify(p, 0x200);   // IN_DELETE (the removal itself follows)
         if (this._fsMeta().fifos?.delete(p)) { this.fsBump(); ret(0n); break; }
+        { const sp = this.resolve(p); if (this._fsMeta().socks?.delete(sp)) { this._sockReg().delete('unix:' + sp); this.fsBump(); ret(0n); break; } }
         if (this.files[p] === undefined) { ret(this.isDir(p) ? -21n : -2n); break; }  // EISDIR
         const g = this._fsMeta().hard?.get(p); if (g) { g.delete(p); this._fsMeta().hard.delete(p); }
         delete this.files[p]; this.fsBump(); ret(0n); break; }
@@ -3181,36 +3270,89 @@ export class LinuxEngine {
 
       // ---- sockets: the display connection (AF_UNIX -> in-process X server) ----
       case 41: {                                              // socket(domain, type, proto)
-        if (Number(a1) !== 1) { ret(-97n); break; }           // EAFNOSUPPORT: AF_UNIX only
-        const fd = this.allocFd();
-        this.fds.set(fd, { sock: { conn: null, nonblock: !!(Number(a2) & 0x800) } });
+        // Local sockets only: AF_UNIX (filesystem and abstract names) and
+        // AF_INET on the loopback. A stream socket is an unconnected `sock`
+        // handle until connect/accept turn it into a crossed pipe pair (the
+        // socketpair shape); a datagram socket is a queue of messages. The
+        // X server connection keeps its own `sock.conn` transport.
+        const fam = Number(a1), ty = Number(a2) & 0xff;
+        if (fam !== 1 && fam !== 2) { ret(-97n); break; }     // EAFNOSUPPORT
+        if (ty !== 1 && ty !== 2) { ret(-93n); break; }       // EPROTONOSUPPORT
+        const fd = this.allocFd(), nb = !!(Number(a2) & 0x800);
+        const sk = { fam, type: ty, name: null, peername: null };
+        this.fds.set(fd, ty === 2 ? { dsock: { queue: [] }, nonblock: nb, sk } : { sock: { conn: null, nonblock: nb }, sk });
+        if (Number(a2) & 0x80000) this.cloexec.add(fd);
         ret(BigInt(fd)); break; }
-      case 42: {                                              // connect(fd, sockaddr_un*, len)
+      case 49: {                                              // bind(fd, sockaddr*, len)
+        const h = this.fds.get(Number(a1)); if (!h?.sk) { ret(h ? -88n : -9n); break; }
+        const sa = this._readSockaddr(a2, Number(a3)); if (sa.fam !== h.sk.fam) { ret(-22n); break; }
+        if (h.sk.name) { ret(-22n); break; }                  // EINVAL: already bound
+        if (sa.fam === 2 && !sa.port) sa.port = this._ephemeralPort();
+        const key = this._sockKey(sa), reg = this._sockReg();
+        if (reg.has(key) && this._handleAlive(reg.get(key).h)) { ret(-98n); break; }   // EADDRINUSE
+        if (sa.fam === 1 && !sa.abstract && (this.files[this.norm(sa.path)] !== undefined || this.isDir(sa.path) || this._sockAt(sa.path))) { ret(-98n); break; }
+        h.sk.name = sa.fam === 2 ? { fam: 2, port: sa.port } : { fam: 1, path: sa.path, abstract: sa.abstract };
+        reg.set(key, { h });
+        if (sa.fam === 1 && !sa.abstract && sa.path) { const m = this._fsMeta(); (m.socks ??= new Map()).set(this.resolve(this.norm(sa.path)), h); this.fsBump(); this._inotify(this.norm(sa.path), 0x100); }
+        ret(0n); break; }
+      case 50: {                                              // listen(fd, backlog)
+        const h = this.fds.get(Number(a1)); if (!h?.sk) { ret(h ? -88n : -9n); break; }
+        if (h.sk.type !== 1) { ret(-95n); break; }            // EOPNOTSUPP
+        if (h.pipe) { ret(-22n); break; }                     // already connected
+        if (!h.sk.name) {                                     // an unbound AF_INET listener gets an ephemeral port
+          if (h.sk.fam !== 2) { ret(-22n); break; }
+          const port = this._ephemeralPort(); h.sk.name = { fam: 2, port }; this._sockReg().set(`inet:${port}`, { h }); }
+        h.lsock ??= { backlog: [] }; ret(0n); break; }
+      case 43: case 288: {                                    // accept(fd, addr*, len*) / accept4(..., flags)
+        const h = this.fds.get(Number(a1)); if (!h?.sk) { ret(h ? -88n : -9n); break; }
+        if (!h.lsock) { ret(-22n); break; }
+        if (!h.lsock.backlog.length) { if (h.sock?.nonblock || h.nonblock) ret(-11n); else this.block(null); break; }
+        const nh = h.lsock.backlog.shift(), fl = nr === 288 ? Number(cpu.regs[10]) : 0;
+        nh.nonblock = !!(fl & 0x800);
+        const fd = this.allocFd(); this.fds.set(fd, nh); if (fl & 0x80000) this.cloexec.add(fd);
+        if (a2) this._writeSockaddr(a2, a3, nh.sk.peername, nh.sk.fam);
+        this._wakeTree(); ret(BigInt(fd)); break; }
+      case 42: {                                              // connect(fd, sockaddr*, len)
         const h = this.fds.get(Number(a1));
-        if (!h?.sock) { ret(-88n); break; }                   // ENOTSOCK
-        const len = Number(a3), b0 = Number(a2 - this.base);
-        const raw = this.ram.subarray(b0, b0 + len);
-        // filesystem ("/tmp/.X11-unix/X0\0") and abstract ("\0/tmp/...") forms
-        let path = '';
-        for (let i = 2; i < len; i++) { const c = raw[i]; if (c === 0 && path) break; if (c !== 0) path += String.fromCharCode(c); }
-        if (/^\/tmp\/\.X11-unix\/X\d+$/.test(path) && this.xserver) {
+        if (!h?.sk && !h?.sock) { ret(h ? -88n : -9n); break; }   // ENOTSOCK
+        const sa = this._readSockaddr(a2, Number(a3));
+        // the X server: filesystem ("/tmp/.X11-unix/X0\0") and abstract ("\0/tmp/...") forms
+        if (sa.fam === 1 && /^\/tmp\/\.X11-unix\/X\d+$/.test(sa.path) && this.xserver && h.sock) {
           h.sock.conn = this.xserver.connect(); ret(0n); break;
         }
-        ret(-111n); break; }                                  // ECONNREFUSED
-      case 44: {                                              // sendto (connected stream: == write)
-        const h = this.fds.get(Number(a1));
+        if (h.dsock) { h.sk.peer = this._sockKey(sa); ret(0n); break; }   // a datagram default destination
+        if (h.pipe || h.sock?.conn) { ret(-106n); break; }    // EISCONN
+        const key = this._sockKey(sa), reg = this._sockReg(), ent = reg.get(key);
+        if (ent && !this._handleAlive(ent.h)) reg.delete(key);   // a listener whose process is gone
+        if (!ent || !ent.h.lsock || !this._handleAlive(ent.h)) {
+          ret(sa.fam === 1 && !sa.abstract && !this._sockAt(sa.path) ? -2n : -111n); break; }   // ENOENT: no such socket file; ECONNREFUSED
+        // a connected pair: two crossed pipe buffers, this end here, the other queued for accept
+        const b1 = { chunks: [], pos: 0, off: 0, size: 0 }, b2 = { chunks: [], pos: 0, off: 0, size: 0 };
+        const nb = !!(h.sock?.nonblock || h.nonblock);
+        if (sa.fam === 2 && !h.sk.name) h.sk.name = { fam: 2, port: this._ephemeralPort() };
+        delete h.sock; h.pipe = b1; h.peer = b2; h.mode = 'rw'; h.nonblock = nb; h.sk.peername = ent.h.sk.name;
+        ent.h.lsock.backlog.push({ pipe: b2, peer: b1, mode: 'rw', nonblock: false, sk: { fam: sa.fam, type: 1, name: ent.h.sk.name, peername: h.sk.name } });
+        this._wakeTree(); ret(0n); break; }
+      case 44: {                                              // sendto(fd, buf, len, flags, addr*, addrlen)
+        const h = this.fds.get(Number(a1)), fl = Number(cpu.regs[10]);
         if (h?.sock?.conn) {
           const b = this.ram.slice(Number(a2 - this.base), Number(a2 - this.base) + Number(a3));
           h.sock.conn.write(b); ret(a3); break;
         }
-        const r = writeChunk(Number(a1), a2, Number(a3)); if (r === -4096) break; ret(r === undefined ? a3 : BigInt(r)); break; }
-      case 45: {                                              // recvfrom
-        const h = this.fds.get(Number(a1));
-        if (h?.pipe) {                                        // a socketpair end (std reads its spawn error channel with recv)
-          const nb = h.nonblock || !!(Number(cpu.regs[10]) & 0x40);   // MSG_DONTWAIT
-          const r = this._pipeDrain({ ...h, nonblock: nb }, a2, Number(a3)); if (r !== null) ret(r); break;
+        if (h?.dsock) { ret(this._dgramSend(h, a2, Number(a3), cpu.regs[8] ? this._readSockaddr(cpu.regs[8], Number(cpu.regs[9])) : null)); break; }
+        if (!h?.pipe && !h?.sock) { ret(h ? -88n : -9n); break; }   // ENOTSOCK
+        if (h.sock) { ret(-107n); break; }                    // ENOTCONN
+        if (h.sk?.shutW) { if (!(fl & 0x4000)) this.raiseSignal(13, null, { pid: 0, code: 0 }); ret(-32n); break; }   // EPIPE after shutdown(SHUT_WR)
+        const r = writeChunk(Number(a1), a2, Number(a3), !!(fl & 0x4000)); if (r === -4096) break; ret(r === undefined ? a3 : BigInt(r)); break; }
+      case 45: {                                              // recvfrom(fd, buf, len, flags, addr*, len*)
+        const h = this.fds.get(Number(a1)), fl = Number(cpu.regs[10]);
+        if (h?.dsock) { const r = this._dgramRecv(h, a2, Number(a3), fl, cpu.regs[8], cpu.regs[9]); if (r !== null) ret(r); break; }
+        if (h?.pipe) {                                        // a connected stream end (std reads its spawn error channel with recv)
+          const nb = h.nonblock || !!(fl & 0x40);             // MSG_DONTWAIT
+          const r = (fl & 2) ? this._pipePeek(h, a2, Number(a3), nb) : this._pipeDrain({ ...h, nonblock: nb }, a2, Number(a3)); if (r !== null) ret(r); break;
         }
-        if (!h?.sock?.conn) { ret(-88n); break; }
+        if (!h?.sock && !h?.sk) { ret(h ? -88n : -9n); break; }
+        if (!h?.sock?.conn) { ret(-107n); break; }            // ENOTCONN
         const data = h.sock.conn.read(Number(a3));
         if (data === null) { if (h.sock.nonblock) ret(-11n); else this.block(null); break; }
         this.jsnap(a2, data.length);
@@ -3227,13 +3369,27 @@ export class LinuxEngine {
           parts.push(this.ram.slice(Number(p - this.base), Number(p - this.base) + l)); total += l;
         }
         if (h?.sock?.conn) { for (const b of parts) h.sock.conn.write(b); }
-        else { let off = 0; for (let i = 0; i < iovn; i++) {
+        else if (h?.dsock) {                                  // a datagram: the iov joined, to msg_name or the connected peer
+          const all = new Uint8Array(total); { let off = 0; for (const b of parts) { all.set(b, off); off += b.length; } }
+          const np = v.getBigUint64(mo, true), nl = v.getUint32(mo + 8, true);
+          ret(this._dgramSendBytes(h, all, np ? this._readSockaddr(np, nl) : null)); break; }
+        else if (h?.pipe && h.sk?.shutW) { if (!(Number(a3) & 0x4000)) this.raiseSignal(13, null, { pid: 0, code: 0 }); ret(-32n); break; }
+        else { if (h?.sock) { ret(-107n); break; }             // ENOTCONN
+               // SCM_RIGHTS: the passed descriptors ride with the first byte
+               // of this message and are delivered by the recvmsg that consumes it
+               const cp = v.getBigUint64(mo + 32, true), cl = Number(v.getBigUint64(mo + 40, true));
+               const rights = h?.pipe && cp && cl >= 16 ? this._cmsgRights(cp, cl) : null;
+               if (rights === -9) { ret(-9n); break; }
+               if (rights?.length) { const pb = h.peer ?? h.pipe; (pb.rights ??= []).push({ at: pb.wtot ?? 0, fds: rights }); }
+               for (let i = 0; i < iovn; i++) {
                  const o = this.RAMOFF + Number(iovp - this.base) + i * 16;
-                 writeChunk(Number(a1), v.getBigUint64(o, true), Number(v.getBigUint64(o + 8, true))); } }
+                 const r = writeChunk(Number(a1), v.getBigUint64(o, true), Number(v.getBigUint64(o + 8, true)), !!(Number(a3) & 0x4000));
+                 if (r !== undefined && r < 0) { ret(BigInt(r)); total = -1; break; } }
+               if (total < 0) break; }
         ret(BigInt(total)); break; }
       case 47: {                                              // recvmsg(fd, msghdr*, flags)
-        const h = this.fds.get(Number(a1));
-        if (!h?.sock?.conn) { ret(-88n); break; }
+        const h = this.fds.get(Number(a1)), fl = Number(a3);
+        if (!h?.sock && !h?.pipe && !h?.dsock) { ret(h ? -88n : -9n); break; }
         const v = new DataView(this.wmem.buffer);
         const mo = this.RAMOFF + Number(a2 - this.base);
         const iovp = v.getBigUint64(mo + 16, true), iovn = Number(v.getBigUint64(mo + 24, true));
@@ -3243,6 +3399,42 @@ export class LinuxEngine {
           const p = v.getBigUint64(o, true), l = Number(v.getBigUint64(o + 8, true));
           list.push([p, l]); want += l;
         }
+        const cl = Number(v.getBigUint64(mo + 40, true)), cp = cl ? v.getBigUint64(mo + 32, true) : 0n;
+        v.setUint32(mo + 48, 0, true);                        // msg_flags
+        if (h.dsock) {                                        // one datagram, spread over the iov
+          const q = h.dsock.queue;
+          if (!q.length) { if (h.nonblock || (fl & 0x40)) ret(-11n); else this.block(null); break; }
+          const d = (fl & 2) ? q[0] : q.shift(); let off = 0;
+          for (const [p, l] of list) { if (off >= d.bytes.length) break; const take = Math.min(l, d.bytes.length - off); this.jsnap(p, take); this.ram.set(d.bytes.subarray(off, off + take), Number(p - this.base)); off += take; }
+          if (off < d.bytes.length) v.setUint32(mo + 48, 0x20, true);   // MSG_TRUNC
+          const np = v.getBigUint64(mo, true); if (np) { const nl = v.getUint32(mo + 8, true); this.jsnap(a2 + 8n, 4); this._writeSockaddr(np, null, d.from, h.sk.fam, nl, (n) => v.setUint32(mo + 8, n, true)); }
+          v.setBigUint64(mo + 40, 0n, true); ret(BigInt((fl & 0x20) ? d.bytes.length : off)); break; }
+        if (h.pipe) {                                         // a connected stream end
+          const nb = h.nonblock || !!(fl & 0x40), pb = h.pipe, before = pb.rtot ?? 0;
+          // stop at a message that carries descriptors so its ancillary data
+          // is delivered with its own bytes and not merged into a neighbour's
+          let cap = want;
+          if (pb.rights?.length) for (const r of pb.rights) { if (r.at > before) cap = Math.min(cap, r.at - before); }
+          let got = 0, blocked = false;
+          for (const [p, l] of list) { if (got >= cap) break;
+            const r = (fl & 2) ? this._pipePeek(h, p, Math.min(l, cap - got), true) : this._pipeDrain({ ...h, nonblock: true }, p, Math.min(l, cap - got));
+            if (r === null || r < 0n) break; got += Number(r); if (Number(r) < Math.min(l, cap - got + Number(r))) break; }
+          if (got === 0 && want > 0 && !pb.weof) { if (nb) { ret(-11n); break; } this.block(null); break; }
+          let clen = 0;
+          if (pb.rights?.length && !(fl & 2)) {
+            const after = pb.rtot ?? 0, due = pb.rights.filter(r => r.at >= before && r.at < after);
+            pb.rights = pb.rights.filter(r => !(r.at >= before && r.at < after));
+            for (const r of due) {
+              const need = 16 + r.fds.length * 4;
+              if (!cp || cl - clen < need) { v.setUint32(mo + 48, v.getUint32(mo + 48, true) | 8, true); continue; }   // MSG_CTRUNC: the descriptors are dropped
+              const fds = r.fds.map(hh => { const fd = this.allocFd(); this.fds.set(fd, hh); if (fl & 0x40000000) this.cloexec.add(fd); return fd; });   // MSG_CMSG_CLOEXEC
+              this.jsnap(cp + BigInt(clen), need); const o = this.RAMOFF + Number(cp - this.base) + clen;
+              v.setBigUint64(o, BigInt(need), true); v.setUint32(o + 8, 1, true); v.setUint32(o + 12, 1, true);   // SOL_SOCKET, SCM_RIGHTS
+              for (let i = 0; i < fds.length; i++) v.setUint32(o + 16 + i * 4, fds[i], true);
+              clen += (need + 7) & ~7; } }
+          v.setBigUint64(mo + 40, BigInt(Math.min(clen, cl)), true);
+          ret(BigInt(got)); break; }
+        if (!h.sock.conn) { ret(-107n); break; }              // ENOTCONN
         const data = h.sock.conn.read(want);
         if (data === null) { if (h.sock.nonblock) ret(-11n); else this.block(null); break; }
         let off = 0;
@@ -3272,6 +3464,11 @@ export class LinuxEngine {
             this.jsnap(p, take); this.ram.set(data.subarray(off, off + take), Number(p - this.base)); off += take; }
           ret(BigInt(data.length)); break;
         }
+        if (h.pipe) {                                         // a pipe or a connected stream socket
+          let got = 0, blocked = false;
+          for (const [p, l] of list) { const r = this._pipeDrain(got ? { ...h, nonblock: true } : h, p, l);
+            if (r === null) { blocked = true; break; } if (r < 0n) { if (!got) got = Number(r); break; } got += Number(r); if (Number(r) < l) break; }
+          if (!blocked) ret(BigInt(got)); break; }
         if (!h.bytes) { ret(-9n); break; }
         let got = 0;
         for (const [p, l] of list) {
@@ -3280,23 +3477,32 @@ export class LinuxEngine {
           h.pos += n; got += n;
         }
         ret(BigInt(got)); break; }
-      case 48: ret(0n); break;                                // shutdown
+      case 48: {                                              // shutdown(fd, how)
+        const h = this.fds.get(Number(a1)); if (!h?.sk && !h?.sock && !h?.pipe) { ret(h ? -88n : -9n); break; }
+        if (!h.pipe && !h.sock?.conn && !h.dsock) { ret(-107n); break; }   // ENOTCONN
+        const how = Number(a2);
+        if (h.pipe && how !== 0) { (h.sk ??= {}).shutW = true; if (h.peer) h.peer.weof = true; }   // the other end reads EOF, our writes get EPIPE
+        if (h.pipe && how !== 1) { (h.sk ??= {}).shutR = true; h.pipe.weof = true; }
+        this._wakeTree(); ret(0n); break; }
       case 51: case 52: {                                     // getsockname / getpeername
-        const name = '/tmp/.X11-unix/X0';
-        const o = Number(a2 - this.base);
-        this.ram[o] = 1; this.ram[o + 1] = 0;                 // AF_UNIX
-        for (let i = 0; i < name.length; i++) this.ram[o + 2 + i] = name.charCodeAt(i);
-        this.ram[o + 2 + name.length] = 0;
-        const lo = this.RAMOFF + Number(cpu.regs[2] - this.base);   // rdx = addrlen*
-        new DataView(this.wmem.buffer).setUint32(lo, 2 + name.length + 1, true);
-        ret(0n); break; }
+        const h = this.fds.get(Number(a1)); if (!h?.sk && !h?.sock && !h?.pipe) { ret(h ? -88n : -9n); break; }
+        if (h.sock?.conn && !h.sk?.name) { this._writeSockaddr(a2, a3, { fam: 1, path: '/tmp/.X11-unix/X0' }, 1); ret(0n); break; }
+        if (nr === 52 && !h.pipe && !h.sk?.peer) { ret(-107n); break; }   // ENOTCONN
+        const nm = nr === 51 ? h.sk?.name : (h.sk?.peername ?? (h.sk?.peer ? this._sockReg().get(h.sk.peer)?.h.sk.name : null));
+        this._writeSockaddr(a2, a3, nm, h.sk?.fam ?? 1); ret(0n); break; }
       case 54: ret(0n); break;                                // setsockopt
-      case 55: {                                              // getsockopt: zero int
+      case 55: {                                              // getsockopt(fd, level, opt, val*, len*)
+        const h = this.fds.get(Number(a1)); if (!h?.sk && !h?.sock && !h?.pipe) { ret(h ? -88n : -9n); break; }
+        const lvl = Number(a2), opt = Number(a3);
+        const val = lvl !== 1 ? 0 : opt === 3 ? (h.sk?.type ?? 1) : opt === 30 ? (h.lsock ? 1 : 0) : (opt === 7 || opt === 8) ? 212992 : 0;   // SO_TYPE, SO_ACCEPTCONN, SO_SNDBUF/RCVBUF; SO_ERROR and the rest read 0
         const vo = this.RAMOFF + Number(cpu.regs[10] - this.base);
         const lo = this.RAMOFF + Number(cpu.regs[8] - this.base);
         const v = new DataView(this.wmem.buffer);
-        v.setUint32(vo, 0, true); v.setUint32(lo, 4, true);
+        this.jsnap(cpu.regs[10], 4); this.jsnap(cpu.regs[8], 4);
+        v.setUint32(vo, val, true); v.setUint32(lo, 4, true);
         ret(0n); break; }
+      case 434: {                                             // pidfd_open(pid, flags): a handle that polls readable once the child has exited
+        const fd = this.allocFd(); this.fds.set(fd, { pidfd: Number(a1) }); this.cloexec.add(fd); ret(BigInt(fd)); break; }
 
       // ---- poll / select: the guest's event wait, mapped onto engine.blocked ----
       case 7: case 271: {                                     // poll / ppoll
@@ -3316,6 +3522,9 @@ export class LinuxEngine {
         const tmask = nr === 271 && cpu.regs[10] ? this.mem.read(cpu.regs[10], 8n) : null;
         const unmask = this._waitMaskIn(cpu, tmask); if (unmask === 'sig') break;
         const readyR = (h) => !h ? false
+          : h.lsock ? h.lsock.backlog.length > 0
+          : h.dsock ? h.dsock.queue.length > 0
+          : h.pidfd ? this._pidDone(h.pidfd)
           : h.sock ? !!(h.sock.conn && h.sock.conn.readable())
           : h.ino ? h.ino.queue.length > 0
           : h.pipe ? (h.pipe.chunks.length > 0 || !!h.pipe.weof)
@@ -3370,6 +3579,9 @@ export class LinuxEngine {
         if (nr === 270 && cpu.regs[9]) { const ssp = this.mem.read(cpu.regs[9], 8n); if (ssp) tmask = this.mem.read(ssp, 8n); }
         const unmask = this._waitMaskIn(cpu, tmask); if (unmask === 'sig') break;
         const readyR = (h) => !h ? false
+          : h.lsock ? h.lsock.backlog.length > 0
+          : h.dsock ? h.dsock.queue.length > 0
+          : h.pidfd ? this._pidDone(h.pidfd)
           : h.sock ? !!(h.sock.conn && h.sock.conn.readable())
           : h.ino ? h.ino.queue.length > 0
           : h.pipe ? (h.pipe.chunks.length > 0 || !!h.pipe.weof)
@@ -3706,7 +3918,8 @@ export class LinuxEngine {
     if (info.timer !== undefined) { this.mem.write(addr + 16n, 4n, BigInt(info.timer)); this.mem.write(addr + 20n, 4n, BigInt(info.overrun ?? 0));
                                     this.mem.write(addr + 24n, 8n, info.sival ?? 0n); }
     else { this.mem.write(addr + 16n, 4n, BigInt(info.pid ?? 0)); this.mem.write(addr + 20n, 4n, 0n);
-           if (sig === 17) this.mem.write(addr + 24n, 4n, BigInt(info.status ?? 0)); }
+           if (info.sival !== undefined) this.mem.write(addr + 24n, 8n, info.sival);   // si_value (sigqueue)
+           else if (sig === 17) this.mem.write(addr + 24n, 4n, BigInt(info.status ?? 0)); }
   }
   _writeSignalfdInfo(addr, sig, info) {                       // 128-byte signalfd_siginfo
     this.jsnap(addr, 128);
@@ -3821,7 +4034,8 @@ export class LinuxEngine {
     w(944, 4, BigInt(sig)); w(952, 4, BigInt.asUintN(32, BigInt(info.code ?? 0)));   // si_signo, si_code
     if (info.timer !== undefined) { w(960, 4, BigInt(info.timer)); w(964, 4, BigInt(info.overrun ?? 0)); w(968, 8, info.sival ?? 0n); }   // si_tid, si_overrun, si_value
     else { w(960, 4, BigInt(info.pid ?? 0)); w(964, 4, 0n);                     // si_pid, si_uid
-           if (sig === 17) w(968, 4, BigInt(info.status ?? 0)); }               // si_status
+           if (info.sival !== undefined) w(968, 8, info.sival);                 // si_value (sigqueue)
+           else if (sig === 17) w(968, 4, BigInt(info.status ?? 0)); }          // si_status
     if (globalThis.__sigtrace) console.error(`<deliver sig=${sig} tid=${t.id} handler=${act.handler.toString(16)} savedRip=${savedRip.toString(16)} rsp0=${cpu.regs[4].toString(16)} frame=${F.toString(16)} alt=${onAlt} flags=${act.flags.toString(16)}>`);
     cpu.regs[7] = BigInt(sig); cpu.regs[6] = F + 944n; cpu.regs[2] = F + 8n;    // rdi rsi rdx
     cpu.regs[0] = 0n; cpu.regs[4] = F; cpu.rip = act.handler; cpu.f.df = 0;
@@ -4093,12 +4307,93 @@ export class LinuxEngine {
       dst += take; got += take; h.pipe.off += take;
       if (h.pipe.off >= c.length) { h.pipe.chunks.shift(); h.pipe.off = 0; }
     }
-    if (got > 0) { h.pipe.size = Math.max(0, (h.pipe.size ?? 0) - got); this.wakeAllBlk(); }   // a blocked writer may fit now
+    if (got > 0) { h.pipe.size = Math.max(0, (h.pipe.size ?? 0) - got); h.pipe.rtot = (h.pipe.rtot ?? 0) + got; this.wakeAllBlk(); }   // a blocked writer may fit now
     if (got === 0 && want > 0 && !h.pipe.weof) {
       if (h.nonblock) return -11n;
       this.block(null); return null;
     }
     return BigInt(got);
+  }
+  _pipePeek(h, addr, want, nb) {                // MSG_PEEK: copy without consuming
+    let dst = Number(addr - this.base), got = 0, off = h.pipe.off;
+    for (const c of h.pipe.chunks) { if (got >= want) break; const take = Math.min(c.length - off, want - got);
+      this.jsnap(this.base + BigInt(dst), take); this.ram.set(c.subarray(off, off + take), dst); dst += take; got += take; off = 0; }
+    if (got === 0 && want > 0 && !h.pipe.weof) { if (nb) return -11n; this.block(null); return null; }
+    return BigInt(got);
+  }
+  // --- local sockets: a process-tree registry of bound names -------------
+  _sockReg() { const m = this._fsMeta(); return m.sockReg ??= new Map(); }
+  _sockKey(sa) { return sa.fam === 2 ? `inet:${sa.port}` : sa.abstract ? `unix@${sa.path}` : `unix:${this.resolve(this.norm(sa.path))}`; }
+  _sockAt(p) { return !!p && !!this._fsMeta().socks?.has(this.resolve(this.norm(p))); }
+  _ephemeralPort() { const m = this._fsMeta(); m.nextPort = (m.nextPort ?? 40000) + 1; return m.nextPort; }
+  _wakeTree() { this.wakeAllBlk(); let root = this; while (root.parentEng) root = root.parentEng; if (root !== this) root.wakeAllBlk(); }
+  _readSockaddr(addr, len) {
+    const o = Number(addr - this.base), fam = this.ram[o] | (this.ram[o + 1] << 8);
+    if (fam === 2) return { fam, port: (this.ram[o + 2] << 8) | this.ram[o + 3] };
+    let path = '';                                            // filesystem, or abstract ("\0name")
+    for (let i = 2; i < len; i++) { const c = this.ram[o + i]; if (c === 0 && path) break; if (c !== 0) path += String.fromCharCode(c); }
+    return { fam, path, abstract: len > 3 && this.ram[o + 2] === 0 };
+  }
+  // write a sockaddr for `nm` ({fam, port} or {fam, path}; null = unnamed) into addr,
+  // truncated to *lenp, and store the full length in *lenp (or via setLen)
+  _writeSockaddr(addr, lenp, nm, fam, cap = null, setLen = null) {
+    let bytes;
+    if ((nm?.fam ?? fam) === 2) { bytes = new Uint8Array(16); bytes[0] = 2; const port = nm?.port ?? 0; bytes[2] = port >> 8; bytes[3] = port & 255; bytes[4] = 127; bytes[7] = 1; }
+    else { const p = nm?.path ?? ''; bytes = new Uint8Array(2 + (p ? p.length + 1 + (nm?.abstract ? 1 : 0) : 0)); bytes[0] = 1; for (let i = 0; i < p.length; i++) bytes[2 + (nm?.abstract ? 1 : 0) + i] = p.charCodeAt(i); if (nm?.abstract) bytes = bytes.subarray(0, bytes.length - 1); }
+    if (cap === null) cap = lenp ? Number(this.mem.read(lenp, 4n)) : 0;
+    const n = Math.min(cap, bytes.length);
+    if (n) { this.jsnap(addr, n); this.ram.set(bytes.subarray(0, n), Number(addr - this.base)); }
+    if (setLen) setLen(bytes.length); else if (lenp) { this.jsnap(lenp, 4); this.mem.write(lenp, 4n, BigInt(bytes.length)); }
+  }
+  _cmsgRights(cp, cl) {                         // SCM_RIGHTS entries of a msg_control block -> handles (-9 for a bad fd)
+    const v = new DataView(this.wmem.buffer), base = this.RAMOFF + Number(cp - this.base), out = [];
+    for (let off = 0; off + 16 <= cl;) {
+      const len = Number(v.getBigUint64(base + off, true)); if (len < 16 || off + len > cl) break;
+      if (v.getUint32(base + off + 8, true) === 1 && v.getUint32(base + off + 12, true) === 1)
+        for (let i = 0; i < (len - 16) >> 2; i++) { const h = this.fds.get(v.getInt32(base + off + 16 + i * 4, true)); if (!h) return -9; out.push(h); }
+      off += (len + 7) & ~7;
+    }
+    return out;
+  }
+  _dgramSend(h, addr, len, sa) { this.guardRange(addr, len); return this._dgramSendBytes(h, this.ram.slice(Number(addr - this.base), Number(addr - this.base) + len), sa); }
+  _dgramSendBytes(h, bytes, sa) {
+    const key = sa ? this._sockKey(sa) : h.sk.peer; if (!key) return -89n;   // EDESTADDRREQ
+    const reg = this._sockReg(), ent = reg.get(key);
+    if (ent && !this._handleAlive(ent.h)) reg.delete(key);
+    if (!ent || !ent.h.dsock || !this._handleAlive(ent.h)) {
+      if (h.sk.fam === 1) return sa && !sa.abstract && !this._sockAt(sa.path) ? -2n : -111n;
+      return BigInt(bytes.length); }                          // UDP to a port nobody listens on: sent, dropped
+    if (!h.sk.name && h.sk.fam === 2) h.sk.name = { fam: 2, port: this._ephemeralPort() };   // autobind so a reply can come back
+    ent.h.dsock.queue.push({ bytes, from: h.sk.name }); this._wakeTree(); return BigInt(bytes.length);
+  }
+  _dgramRecv(h, addr, len, fl, ap, alp) {
+    const q = h.dsock.queue;
+    if (!q.length) { if (h.nonblock || (fl & 0x40)) return -11n; this.block(null); return null; }
+    const d = (fl & 2) ? q[0] : q.shift(), n = Math.min(len, d.bytes.length);   // MSG_PEEK keeps it queued
+    if (n) { this.jsnap(addr, n); this.ram.set(d.bytes.subarray(0, n), Number(addr - this.base)); }
+    if (ap) this._writeSockaddr(ap, alp, d.from, h.sk.fam);
+    return BigInt((fl & 0x20) ? d.bytes.length : n);          // MSG_TRUNC reports the datagram's full size
+  }
+  _handleAlive(h) {                             // some fd in the process tree still refers to this handle
+    let root = this; while (root.parentEng) root = root.parentEng;
+    const seen = new Set();
+    const scan = (e) => {
+      if (seen.has(e)) return false; seen.add(e);
+      const tables = [e.fds]; if (e._mainFds) tables.push(e._mainFds);
+      for (const t of e.threads ?? []) if (t.state !== 'dead' && t.proc?.fds) tables.push(t.proc.fds);
+      for (const tb of tables) for (const [, x] of tb) if (x === h) return true;
+      for (const c of e.children ?? []) if (c.eng && c.exited === null && c.eng.exitCode === null && scan(c.eng)) return true;
+      return false;
+    };
+    return scan(root);
+  }
+  _sockUnreg(h) {                               // the last fd on a bound socket closed: its name is free again (the socket file stays)
+    const reg = this._sockReg(); for (const [k, e] of reg) if (e.h === h) reg.delete(k);
+  }
+  _pidDone(pid) {                               // pidfd readiness: the child has exited
+    let root = this; while (root.parentEng) root = root.parentEng;
+    const f = (e) => { for (const c of e.children ?? []) { if (c.pid === pid) return c.exited !== null || !c.eng || c.eng.exitCode !== null; if (c.eng) { const r = f(c.eng); if (r !== undefined) return r; } } return undefined; };
+    return f(root) ?? true;
   }
   _pipeWriterAlive(buf) {
     let root = this; while (root.parentEng) root = root.parentEng;
@@ -4108,7 +4403,8 @@ export class LinuxEngine {
       const tables = [e.fds];
       if (e._mainFds) tables.push(e._mainFds);
       for (const t of e.threads ?? []) if (t.state !== 'dead' && t.proc?.fds) tables.push(t.proc.fds);
-      for (const tb of tables) for (const [, h] of tb) if ((h?.pipe === buf && h.mode === 'w') || h?.peer === buf) return true;
+      for (const tb of tables) for (const [, h] of tb) { if ((h?.pipe === buf && h.mode === 'w') || h?.peer === buf) return true;
+        if (h?.lsock) for (const x of h.lsock.backlog) if (x.peer === buf) return true; }   // a connection nobody has accepted yet
       for (const c of e.children ?? []) if (c.eng && c.exited === null && c.eng.exitCode === null && scan(c.eng)) return true;
       return false;
     };
@@ -4122,7 +4418,8 @@ export class LinuxEngine {
       const tables = [e.fds];
       if (e._mainFds) tables.push(e._mainFds);
       for (const t of e.threads ?? []) if (t.state !== 'dead' && t.proc?.fds) tables.push(t.proc.fds);
-      for (const tb of tables) for (const [, h] of tb) if (h?.pipe === buf && h.mode !== 'w') return true;   // 'r', or a socketpair end ('rw')
+      for (const tb of tables) for (const [, h] of tb) { if (h?.pipe === buf && h.mode !== 'w') return true;   // 'r', or a socketpair end ('rw')
+        if (h?.lsock) for (const x of h.lsock.backlog) if (x.pipe === buf) return true; }
       for (const c of e.children ?? []) if (c.eng && c.exited === null && c.eng.exitCode === null && scan(c.eng)) return true;
       return false;
     };
