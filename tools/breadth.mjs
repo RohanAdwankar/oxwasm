@@ -171,6 +171,10 @@ const REPSCAN = '/tmp/breadth_repscan';
 if (!existsSync(REPSCAN)) {   // rep scas/cmps flags (rcx=0 keeps them; pushf after a scan reads them) - the JVM's subtype check
   try { execFileSync('gcc', ['-O1', '-o', REPSCAN, new URL('./fixtures/repscan.c', import.meta.url).pathname]); } catch {}
 }
+const CENSUS2 = '/tmp/breadth_census2';
+if (!existsSync(CENSUS2)) {  // the second census: processes, signals, sockets, memory (tools/fixtures/census2.c)
+  try { execFileSync('gcc', ['-O1', '-o', CENSUS2, new URL('./fixtures/census2.c', import.meta.url).pathname]); } catch {}
+}
 const SOCKPAIR = '/tmp/breadth_sockpair';
 if (!existsSync(SOCKPAIR)) {   // socketpair(AF_UNIX): both directions, EOF after the peer closes, a child on the other end
   try { execFileSync('gcc', ['-O1', '-o', SOCKPAIR, new URL('./fixtures/sockpair.c', import.meta.url).pathname]); } catch {}
@@ -378,6 +382,7 @@ const CASES = [
   ['dlfail',  DLFAIL, []],
   ['repscan', REPSCAN, []],
   ['census',  CENSUS, []],
+  ['census2', CENSUS2, []],
   // nasm assembling the recycle fixture's source: a flat binary out (outFile)
   ['nasm',    '/usr/bin/nasm', ['-f', 'bin', '-o', '/tmp/breadth_nasm.bin', new URL('./fixtures/recycle.asm', import.meta.url).pathname],
               { bins: [new URL('./fixtures/recycle.asm', import.meta.url).pathname], outFile: '/tmp/breadth_nasm.bin' }],

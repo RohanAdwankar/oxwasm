@@ -4674,6 +4674,12 @@ every deferred closure unit ahead of it in the queue - 1.3 s of the
 40 s clang run for stubs that assemble in a millisecond; synchronous
 requests now have their own shell, clang -S 38 s to 34-36 s.
 
+What the gated clang profile (40 s) leaves: the emitter 4.7 s self plus
+4.5 s of garbage collection, 3.9 s of module instantiation even with
+lazy compilation, 2.9 s of decode plus analysis, 1.6 s interpreting
+2.5M steps, and the guest's own translated execution. No single bucket
+is above 12%.
+
 **A race the deferred path opened.** The sweep over the new defaults
 failed one case in 182: recycle, the page-recycle fixture (tier code A
 on an rwx page, munmap it, map code B at the same address), printed
@@ -4963,8 +4969,83 @@ readlinkat's EINVAL on a non-link. One regression on the way: sendfile
 consumed its input before discovering stdout was a sink it could not
 feed, and busybox's `cat` (which sendfiles to stdout and falls back on
 EINVAL) printed nothing - the shell differential caught it; the sinks
-are resolved before any read now. The census is a breadth case. the emitter 4.7 s self plus
-4.5 s of garbage collection, 3.9 s of module instantiation even with
-lazy compilation, 2.9 s of decode plus analysis, 1.6 s interpreting
-2.5M steps, and the guest's own translated execution. No single bucket
-is above 12%.
+are resolved before any read now. The census is a breadth case.
+
+### Batch 13: the second census, and a local socket layer
+
+The first census paid for itself in a morning, so a second one covers
+what it skipped: `tools/fixtures/census2.c` (151 lines native) runs
+processes, signals, memory and sockets - prctl names, personality,
+sigqueue with a value, sigpending/sigtimedwait, sigaltstack, setitimer,
+pidfd_open, waitid, a child killed by SIGTERM, mincore, madvise on an
+unaligned address, mremap keeping its bytes, msync, writev/pwritev/
+preadv, dup3 and F_DUPFD_CLOEXEC, FIONREAD, statfs, SEEK_HOLE, a
+negative lseek, getdents64 with the d_type of an entry, faccessat X_OK
+on a 0600 file, mkdirat/unlinkat/openat error paths, chdir/fchdir, a
+socketpair carrying a descriptor through SCM_RIGHTS, MSG_PEEK and
+MSG_DONTWAIT, SO_TYPE, shutdown(SHUT_WR) and the EPIPE after it, an
+AF_INET server on the loopback (bind port 0, listen, connect, accept4,
+getsockname's port, TCP_NODELAY, ppoll on the accepted end, getpeername,
+a refused connect), an AF_UNIX datagram socket bound to a path (stat
+says S_ISSOCK, sendto/recvfrom), close and fstat on a bad descriptor.
+
+The first engine run crashed inside read(2): a directory handle has no
+bytes. Then, once the run went through, twenty-two lines differed.
+The sockets were the bulk of it. Until now the engine's AF_UNIX was the
+X server's connection and a socketpair was two crossed pipe buffers;
+everything else was ENOTSOCK or EAFNOSUPPORT, recvmsg on a socketpair
+included, and MSG_PEEK consumed - after which the next recv blocked the
+process forever. Local sockets are now one model: a stream socket is an
+unconnected handle until connect or accept turn it into the socketpair
+shape (two crossed buffers, so read/write/poll/EOF/SIGPIPE are the pipe
+code paths), a datagram socket is a queue of messages, and bound names
+live in a registry shared by the process tree (`inet:port`, `unix:path`
+and abstract names), so a forked or exec'd child can connect to its
+parent's listener. connect queues the server's end on the listener's
+backlog; accept pops it; a connection nobody has accepted yet counts as
+a live reader and writer for the EOF sweeps. bind of a filesystem name
+makes a socket node (stat: S_IFSOCK) that unlink removes; the name is
+freed when the last descriptor on the bound socket closes, the node
+stays and connecting to it is ECONNREFUSED, as on Linux. Ephemeral
+ports count up from 40001. SCM_RIGHTS rides with the byte offset of the
+message it was sent with: recvmsg stops at the next such boundary and
+installs the handles as new descriptors of the receiving process
+(MSG_CMSG_CLOEXEC honoured, MSG_CTRUNC when the control buffer is
+short). shutdown marks the peer's buffer EOF and the writer EPIPE
+(MSG_NOSIGNAL keeps the signal away); getsockopt answers SO_TYPE,
+SO_ACCEPTCONN and the buffer sizes; getsockname/getpeername write the
+real family and name, or the two-byte unnamed form. AF_INET is loopback
+only: a connect to a port nobody listens on is ECONNREFUSED, a UDP send
+to one is silently dropped, and nothing reaches the host's network.
+
+The rest, line by line: pidfd_open (an fd that polls readable when the
+child is gone; without it the census's later descriptor numbers were
+all off by one), waitid (P_ALL/P_PID, WEXITED, WNOHANG, WNOWAIT, the
+siginfo with CLD_EXITED/CLD_KILLED), rt_sigqueueinfo carrying si_value
+into the handler's siginfo, prctl PR_SET_NAME/PR_GET_NAME per thread
+and PR_GET_DUMPABLE, personality (query and set), getgroups,
+getpriority/setpriority (glibc's nice() is built on them), times,
+preadv/pwritev and their v2 forms, madvise EINVAL on an unaligned start
+(before, it rounded down and dropped the neighbouring page - that is
+what emptied the mremap probe), lseek EINVAL on a negative result,
+access X_OK against the file's mode bits, EBADF from close and fstat of
+a closed descriptor, openat ENOTDIR when the directory fd is a file,
+O_CREAT|O_EXCL EEXIST, O_CREAT ENOENT when the parent directory does
+not exist, readv over a pipe or a connected socket (it was EBADF),
+write to a directory fd EBADF (it went to stdout), read of a directory
+EISDIR. The O_CREAT parent check found a hole of its own: the engine
+knows a directory only as a prefix of provisioned files or a mkdir, so
+a guest with nothing under /tmp had no /tmp, and busybox's `echo hi >
+/tmp/f` in the shell differential failed; the FHS baseline (/tmp,
+/var/tmp, /dev/shm, /run, /root, /home and the rest) is now always
+there, like /proc and /dev were. One probe was dropped from the
+fixture rather than matched: MAP_FIXED_NOREPLACE at 0x10000 maps
+natively and cannot here (the flat window has no such address), a
+structural limit already recorded under go build.
+
+Before this batch shipped, the full sweep after batch 12 had found two
+regressions the small runs had not: tar-x exited 127 and cargo-build
+faulted. One cause: the chown family (chown/fchown/fchownat) shared a
+case label with the new chmod handler and read a uid as a path - tar's
+fchown after every extracted file killed the child. The sweep is the
+check that matters; the small runs cover what the batch touched.
