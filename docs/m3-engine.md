@@ -4739,6 +4739,22 @@ idle machine (58 before batch 8, 32 after the closure gate). Warm
 compiler cases in it: cargo-build 101 s, rustc-asm 98 s, java-hello
 72 s, clang-S 15 s.
 
+**Garbage collection is the largest bucket left.** A CPU profile of the
+gated rustc-asm (120 s sampled): GC 27 s (22%), the emitter 14.5 s
+self, analysis with decode 20 s, module instantiation 7.5 s. `--trace-gc`
+says which collector: 7,448 scavenges totalling 24.3 s at 3.3 ms each,
+and 25 mark-compacts totalling 0.2 s. At a 16 MB young generation that
+is on the order of 120 GB allocated over the run for 750 MB of wat
+text, and the 3.3 ms per scavenge (a near-empty scavenge is well under
+a millisecond) says a unit's working set - its analyses and block texts
+- survives and is copied while the unit is being built. A 64 MB
+semi-space (`--max-semi-space-size=64`) took the run from 110.8 s to
+103.9 s; 128 MB gave nothing more. The sampling heap profiler only
+reports what is live, not the allocation rate, so attributing the
+120 GB to functions needs a different instrument; the candidates are
+the per-instruction emit strings, the analysis objects, and the
+narrowing pass's regex results. Not pursued further today.
+
 What the gated clang profile (40 s) leaves: the emitter 4.7 s self plus
 4.5 s of garbage collection, 3.9 s of module instantiation even with
 lazy compilation, 2.9 s of decode plus analysis, 1.6 s interpreting
