@@ -5123,3 +5123,7 @@ fixture's own race: it armed a 2 ms timer and only then blocked
 SIGALRM, and on the slower engine the expiry landed on the handler
 before the mask went up; the mask now goes up first, which is how the
 pattern is meant to be written. The census is a breadth case.
+The sweep with census3 and python-sock in it: 198 of 198 exact in 23.4
+minutes. (A first attempt stalled in chunk 1 while two other guests of
+mine ran beside it; alone, the chunk is 54 of 54 in 4.5 minutes - one
+big guest at a time remains the rule.)
