@@ -4864,7 +4864,17 @@ both in translated code:
   unknown producer just hands nothing over, as before.
 
 Both fixture variants (pushf and setcc readback) are byte-identical to
-hardware now; repscan is a breadth case; differentials green. the emitter 4.7 s self plus
+hardware now; repscan is a breadth case; differentials green.
+
+With the two flag fixes, `javac -J-Xint Hello.java` compiles under the
+engine: 416 s, and the class file is byte-identical to native javac's.
+It is a breadth case (`javac`, with `execAnon` as a per-case engine
+option children inherit; java-hello stays without it so both paths are
+covered). Batch 10 therefore lands four engine fixes that had nothing
+to do with Java in particular: a longjmp through nested frames, tail
+chaining across an abandoned frame, flags not handed to the interpreter
+at escapes, and zero-count rep scans - each with a two-second fixture
+(dlfail, repscan) that reproduces what took javac six minutes to reach. the emitter 4.7 s self plus
 4.5 s of garbage collection, 3.9 s of module instantiation even with
 lazy compilation, 2.9 s of decode plus analysis, 1.6 s interpreting
 2.5M steps, and the guest's own translated execution. No single bucket
