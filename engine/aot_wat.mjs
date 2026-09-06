@@ -1911,9 +1911,17 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   const ftDec = `(i32.store (i32.const ${FTDEPTH}) (i32.sub (i32.load (i32.const ${FTDEPTH})) (i32.const ${ftW})))`;
   const ftSave = () => { usesFts = true; return `(local.set $fts (i32.load (i32.const ${FTDEPTH})))`; };
   const ftRestore = `(i32.store (i32.const ${FTDEPTH}) (local.get $fts))`;
+  // A tail jump chains only while the guest stack is still within this
+  // frame (rsp <= the entry rsp). A longjmp restores a caller's rsp before
+  // its `jmp *%rdx`; chaining that would splice the landing's continuation
+  // into THIS wasm frame, and when the landing later returned, the wasm
+  // return would resume the function the guest had abandoned (ld.so's
+  // _dl_signal_exception ran its post-longjmp code with rsi=1 and trapped;
+  // javac hit it on every failed dlsym). Above the frame it deopts instead,
+  // and the engine unwinds the stale frames.
   const tailJmp = () => { usesFtr = true; return [
     icResolve('(local.get $rex)'),
-    `(if ${ftHit}`,
+    `(if (i32.and ${ftHit} (i64.le_u (local.get $r4) (local.get $rsp0)))`,
     `  (then ${ftBurn} ${ftDec} (return_call_indirect $ft (type $uft) (local.get $fti))))`,
   ]; };
 
