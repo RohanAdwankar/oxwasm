@@ -4917,7 +4917,14 @@ different wild address on every run: HotSpot patches call sites and
 inline caches in place in its RWX code cache, and a translation of the
 old bytes keeps running. No mprotect, no munmap - no signal. That is
 the case that keeps execAnon opt-in; `java-jit` is a breadth case
-without it. the emitter 4.7 s self plus
+without it.
+
+Two more probes. ffprobe over a lavfi test source is a breadth case
+(exact). Valgrind's memcheck tool (a static binary with its own address-
+space manager and JIT) dies at startup with an aspacem assertion: it
+expects to own the process address space from its 0x58000000 load
+address up, and the flat window's layout is not that - parked with go
+build as an address-space shape the window does not offer. the emitter 4.7 s self plus
 4.5 s of garbage collection, 3.9 s of module instantiation even with
 lazy compilation, 2.9 s of decode plus analysis, 1.6 s interpreting
 2.5M steps, and the guest's own translated execution. No single bucket
