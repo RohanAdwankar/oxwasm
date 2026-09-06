@@ -5485,3 +5485,25 @@ per-function one; the two structural levers that applied broadly
 (node splitting, the pump) are in. Parked; the next lever for the
 call-dense band is the callee's own entry/exit (reloads and spills
 around a direct in-unit call), priced next.
+
+### Batch 22: a vfork left its parent interpreted for life
+
+The slowest breadth cases by engine time were python-mp (161 s),
+rustc-asm, cargo-build, java-jit, java-hello, gdb-batch - and
+vforkexec at 30.7 s for a fixture whose whole work is two 4M-iteration
+loops around one vfork+exec. Its loop-head unit registered at t=4.9 s
+(the pump is fine) and was never entered: the top-level dispatch
+decision at the head read `f=function` but `aotBudget=-1033929`. The
+vfork window sets `aotBudget = 0` while the child thread runs (the
+child interprets so its stores go through the journal) and saves the
+parent's value to restore on the way back - but the parent's value is
+normally UNDEFINED (no budget: dispatch freely), and the restore was
+gated on `saved !== undefined`, so it never fired: every parent of a
+vfork came back with the budget at 0 and `--aotBudget < 0` vetoed
+every top-level AOT dispatch for the rest of its life (chained calls
+inside compiled frames still ran, entries from the interpreter did
+not). gcc's driver, every shell that spawns, make, cargo, the
+multiprocessing pool - all paid it after their first vfork. A flag now
+records whether a save happened; vforkexec 46 s -> 4 s under runbin.
+The DBGRIP=hex (dispatch decision at a rip) and DBGBUDGET=1 (who sets
+the budget, with a stack) levers in runbin found it.
