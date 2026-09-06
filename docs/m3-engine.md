@@ -5161,3 +5161,62 @@ engine when it is materialised. Three-line repros of the shape
 exactly, stderr included.
 The sweep with node-net, http-loop and git-http in it: 202 of 202
 exact in 25 minutes.
+
+### Batch 16: the fourth census - System V IPC, message queues, a pty, sessions
+
+`tools/fixtures/census4.c` (112 lines native): System V shared memory
+(a segment written by a forked child and read back by the parent),
+semaphore sets (SETVAL, a down that would block with IPC_NOWAIT, up,
+RMID), message queues (typed receive, the lowest type at or below a
+bound, E2BIG and MSG_NOERROR), POSIX message queues (priorities,
+EMSGSIZE both ways, unlink), a pty (window size both ends, termios,
+raw mode, bytes both ways, TIOCGPGRP on a pty no session owns, a child
+that setsids and takes it with TIOCSCTTY), pipe capacity (F_GETPIPE_SZ,
+F_SETPIPE_SZ), tee, splice both ways and with zero length, vmsplice,
+O_CLOEXEC across an exec (a sh child writes to the inherited
+descriptor and fails on the other), sessions and groups (setsid by a
+group leader is EPERM, a child's setsid, ESRCH for a foreign pid), the
+hardening probes programs feature-test (seccomp, PR_GET_SECCOMP,
+no_new_privs, membarrier's command mask, rseq's EINVAL, unshare(0) and
+a namespace flag, an unknown prctl option, kcmp), signal flags
+(SA_ONSTACK with the handler's stack checked, SA_RESETHAND, SA_NODEFER
+with a nested raise, SA_NOCLDWAIT reaping the child before waitpid),
+and statx (its mask, AT_EMPTY_PATH on fd 0, a bad flag).
+
+Everything in the first three groups was ENOSYS. System V IPC is now
+one registry for the process tree, in the fs metadata every engine
+shares: a shared-memory attach is a range of the attaching engine's RAM
+holding a copy of the segment, and the copy and the segment are
+reconciled at syscall boundaries (a version on the segment: if someone
+else wrote, take theirs; otherwise if ours changed, publish it - a
+large segment is compared only at attach, detach, exit and fork), which
+is enough for the fork-then-read shapes of real users and is what a
+flat window can do without page traps. A window child's attaches are
+pushed before its journal rolls back; a materialised child inherits
+the attaches with the image. Semaphore ops check the whole array
+before applying it and block (IPC_NOWAIT: EAGAIN) until a change wakes
+the tree; message queues are typed lists with Linux's 8 KB and 16 KB
+bounds. POSIX message queues are descriptors over a shared name table,
+priority-ordered, with EMSGSIZE, EAGAIN and the timed forms. Each
+process now has a group and a session (a record on the engine or on
+the window child's proc, inherited at fork, carried to a materialised
+or exec'd child): setsid refuses a group leader, setpgid/getpgid/getsid
+answer for self and children and ESRCH otherwise, and a pty takes the
+caller's session at TIOCSCTTY, so TIOCGPGRP on a pty no session owns is
+ENOTTY as on Linux (it answered 1). tee copies a pipe's bytes without
+consuming them; vmsplice writes an iov into a pipe; a zero-length
+splice or tee returns at once (it waited for data that would never be
+asked for - the census's one hang). F_SETPIPE_SZ rounds to a power of
+two of pages and the writer's blocking bound follows it. The hardening
+probes answer as Linux does: a seccomp filter installs (returning
+failure makes sandboxed programs abort), an unknown prctl option is
+EINVAL (it was 0), rseq rejects bad arguments, unshare grants the
+flags that need no namespace and refuses the rest with EPERM. SA_NOCLDWAIT
+is remembered even though a SIG_DFL disposition stores no action, and
+wait4 then reaps and answers ECHILD. statx was ENOSYS with glibc
+falling back to fstatat, which lost its argument checks; it now
+validates its flags and produces the statx layout from the fstatat
+answer. The census is a breadth case; the engine differentials and
+the session-sensitive breadth cases (dash, busybox, bash traps and
+process substitution, timeout, xargs, make, python and perl and ruby
+children) stayed exact.

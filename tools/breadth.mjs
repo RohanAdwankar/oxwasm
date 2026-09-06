@@ -182,6 +182,10 @@ const CENSUS3 = '/tmp/breadth_census3';
 if (!existsSync(CENSUS3)) {  // the third census: filesystem edge cases, /proc shapes, timers, threads (tools/fixtures/census3.c)
   try { execFileSync('gcc', ['-O1', '-o', CENSUS3, new URL('./fixtures/census3.c', import.meta.url).pathname]); } catch {}
 }
+const CENSUS4 = '/tmp/breadth_census4';
+if (!existsSync(CENSUS4)) {  // the fourth census: System V IPC, POSIX mq, a pty, tee/splice, sessions, hardening probes, signal flags, statx (tools/fixtures/census4.c)
+  try { execFileSync('gcc', ['-O1', '-o', CENSUS4, new URL('./fixtures/census4.c', import.meta.url).pathname, '-lutil']); } catch {}
+}
 const SOCKPAIR = '/tmp/breadth_sockpair';
 if (!existsSync(SOCKPAIR)) {   // socketpair(AF_UNIX): both directions, EOF after the peer closes, a child on the other end
   try { execFileSync('gcc', ['-O1', '-o', SOCKPAIR, new URL('./fixtures/sockpair.c', import.meta.url).pathname]); } catch {}
@@ -391,6 +395,7 @@ const CASES = [
   ['census',  CENSUS, []],
   ['census2', CENSUS2, []],
   ['census3', CENSUS3, []],
+  ['census4', CENSUS4, [], { bins: ['/bin/sh'] }],
   // nasm assembling the recycle fixture's source: a flat binary out (outFile)
   ['nasm',    '/usr/bin/nasm', ['-f', 'bin', '-o', '/tmp/breadth_nasm.bin', new URL('./fixtures/recycle.asm', import.meta.url).pathname],
               { bins: [new URL('./fixtures/recycle.asm', import.meta.url).pathname], outFile: '/tmp/breadth_nasm.bin' }],
