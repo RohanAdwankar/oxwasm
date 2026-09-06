@@ -175,6 +175,8 @@ const CENSUS2 = '/tmp/breadth_census2';
 if (!existsSync(CENSUS2)) {  // the second census: processes, signals, sockets, memory (tools/fixtures/census2.c)
   try { execFileSync('gcc', ['-O1', '-o', CENSUS2, new URL('./fixtures/census2.c', import.meta.url).pathname]); } catch {}
 }
+if (!existsSync('/tmp/bgit/repo.git/info/refs')) {   // git-http's bare repo, dumb-protocol ready
+  try { mkdirSync('/tmp/bgit', { recursive: true }); execFileSync('git', ['clone', '-q', '--bare', '/tmp/breadth_repo', '/tmp/bgit/repo.git']); execFileSync('git', ['update-server-info'], { cwd: '/tmp/bgit/repo.git' }); } catch {} }
 if (!existsSync('/tmp/bh/hello.txt')) { try { mkdirSync('/tmp/bh', { recursive: true }); writeFileSync('/tmp/bh/hello.txt', 'hello over http\n'); } catch {} }   // http-loop's document root
 const CENSUS3 = '/tmp/breadth_census3';
 if (!existsSync(CENSUS3)) {  // the third census: filesystem edge cases, /proc shapes, timers, threads (tools/fixtures/census3.c)
@@ -575,6 +577,13 @@ const CASES = [
   // across the fork/exec tree), a 404, then kill and wait
   ['http-loop', '/bin/bash', ['-c', 'cd /tmp/bh && python3 -S -m http.server 8765 --bind 127.0.0.1 >/dev/null 2>&1 & for i in $(seq 1 300); do curl -sf http://127.0.0.1:8765/hello.txt && break; sleep 0.2; done; curl -s -o /dev/null -w "%{http_code}\\n" http://127.0.0.1:8765/missing; kill %1; wait; echo rc=$?'],
                 { tree: '/usr/lib/python3.11', bins: ['/tmp/bh/hello.txt', '/usr/bin/python3', '/usr/bin/curl', '/usr/bin/sleep', '/usr/bin/seq', '/usr/bin/kill'], memMB: 1024, childMemMB: 1024 }],
+  // git over HTTP, three programs: python's http.server serves a bare repo
+  // (dumb protocol: info/refs and loose objects), git clone runs
+  // git-remote-http (libcurl) as a child to fetch them, then log and ls
+  ['git-http', '/bin/bash', ['-c', 'cd /tmp/bgit && python3 -S -m http.server 8766 --bind 127.0.0.1 >/dev/null 2>&1 & for i in $(seq 1 300); do curl -sf -o /dev/null http://127.0.0.1:8766/repo.git/HEAD && break; sleep 0.2; done; rm -rf /tmp/bgit/out; git -c protocol.allow=always clone -q http://127.0.0.1:8766/repo.git /tmp/bgit/out 2>&1; cd /tmp/bgit/out && git log --oneline | head -3 && ls; kill %1; wait; echo rc=$?'],
+                { tree: ['/usr/lib/python3.11', '/tmp/bgit/repo.git', '/usr/share/git-core/templates'],
+                  bins: ['/usr/bin/python3', '/usr/bin/curl', '/usr/bin/sleep', '/usr/bin/seq', '/usr/bin/kill', '/usr/bin/rm', '/usr/bin/ls', '/usr/bin/head', '/usr/bin/git', '/usr/lib/git-core/git-remote-http', '/usr/lib/git-core/git'],
+                  env: ['GIT_CONFIG_NOSYSTEM=1', 'GIT_EXEC_PATH=/usr/lib/git-core'], nativeEnv: { GIT_CONFIG_NOSYSTEM: '1', GIT_EXEC_PATH: '/usr/lib/git-core' }, memMB: 1024, childMemMB: 1024 }],
   ['python-mp', '/usr/bin/python3', ['-S', new URL('./fixtures/mp.py', import.meta.url).pathname],
                 { tree: '/usr/lib/python3.11', bins: [new URL('./fixtures/mp.py', import.meta.url).pathname], memMB: 1024 }],
   // python: ITIMER_REAL interrupts time.sleep, PEP 475 retries it
