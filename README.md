@@ -104,8 +104,9 @@ that carries GIMP carries most software — so nothing about GIMP is baked in.
   programs: GIMP 2.8 (`gimp.html`, 179 MB, full UI ~3 min, keyboard +
   emulated mouse) and xcalc (`xcalc.html`, 89 MB, ~1 min). Slow, real,
   entirely client-side — and not specialized to any one app.
-- **M3 — speed, and the actual AppImage. Shipped for static x86-64.**
-  `oxwasm build prog` (an x86-64 static ELF) or `oxwasm build app.AppImage`
+- **M3 — speed, and the actual AppImage. Shipped for x86-64.**
+  `oxwasm build prog` (an x86-64 ELF, static or dynamic) or
+  `oxwasm build app.AppImage`
   emits one self-contained HTML that runs the unmodified binary in the tab:
   a tier-0 interpreter proven against the real CPU by `ptrace`
   single-stepping (316 synthetic cases + real gcc output, zero divergence)
@@ -118,13 +119,19 @@ that carries GIMP carries most software — so nothing about GIMP is baked in.
   `engine/aot/RESULTS.md`; wasm can beat native); cold code interprets, so
   seconds of warmup precede steady state. AppImages are unpacked host-side
   (pure-python squashfs — a browser has no FUSE) and the payload rides in
-  the guest FS, bytes unmodified. Current engine limits, stated plainly:
-  static binaries only (no `ld.so` lane yet, so dynamically-linked
-  AppImages don't run), no x87 long-double (float `printf` paths), CLI
-  apps only (a GUI app needs the display server the M2/v86 lane provides).
-  `engine/test.sh` runs the differential suite; `engine/aot/bench-all.mjs`
-  reproduces the performance table; `tools/breadth.mjs` runs the breadth
-  sweep and `docs/breadth.md` lists every binary in it.
+  the guest FS, bytes unmodified. **Dynamically-linked programs run too** —
+  the packer bundles the `PT_INTERP` loader and the resolved library
+  closure, and the breadth sweep runs 170 unmodified stock system binaries
+  byte-identical to native: gcc through to its linker, clang, python3,
+  node, rustc under cargo, ffmpeg, git, perl, vim on a pty, an OpenJDK JVM
+  compiling with javac. `docs/breadth.md` lists every one. **GUI programs
+  run on this lane too**, against the engine's own X server rather than the
+  v86 machine: GIMP 2.8 opens a canvas and draws in a tab. The limit still
+  worth stating plainly: no x87 long-double, so a `printf("%Lf")` path
+  prints double-precision digits where the hardware prints 80-bit ones.
+  `engine/test.sh` runs the differential suite, `tools/breadth.mjs` the
+  breadth sweep, and `engine/aot/bench-all.mjs` reproduces the performance
+  table.
 - **M4 — the platform. Spike running.** `platform/` is the second lane:
   a syscall ABI as wasm imports, processes as workers, pipes as
   SharedArrayBuffer rings with real blocking reads. Two freestanding C
