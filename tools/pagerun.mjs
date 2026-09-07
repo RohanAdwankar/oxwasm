@@ -12,7 +12,7 @@
 // wabt.js from a path that existed on one machine and die with ENOENT
 // everywhere else without anything noticing.
 import { spawn, execFileSync } from 'node:child_process';
-import { chromePath } from './chrome.mjs';
+import { openBrowser, waitForExit } from './cdp.mjs';
 import { mkdtempSync, rmSync, existsSync, mkdirSync, copyFileSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -55,49 +55,16 @@ catch (e) { done(1, `FAIL pagerun ${bin}: m3pack: ${String(e.stderr || e.message
 
 const port = 8600 + Math.floor(Math.random() * 400);
 serve = spawn(process.execPath, [join(here, 'gui', 'serve.mjs'), dir, String(port)], { stdio: 'ignore' });
-const cport = 9600 + Math.floor(Math.random() * 400);
-// --disable-dev-shm-usage: a CI runner's /dev/shm is small and Chrome dies
-// on it. stderr is kept, not discarded: the first CI run of this reported
-// only "no browser (fetch failed)", which says nothing about why.
-let cerr = '';
-chrome = spawn(chromePath(), ['--headless=new', '--disable-gpu', '--no-sandbox', '--disable-dev-shm-usage',
-  `--remote-debugging-port=${cport}`, 'about:blank'], { stdio: ['ignore', 'ignore', 'pipe'] });
-chrome.stderr.on('data', d => { cerr += d; });
-let cexit = null; chrome.on('exit', (c) => { cexit = c; });
+let br;
+try { br = await openBrowser(); } catch (e) { done(1, `FAIL pagerun ${bin}: ${e.message}`); }
+chrome = { kill: br.close };
+const q = br.q;
+await br.navigate(`http://127.0.0.1:${port}/index.html`);
 
-// The debugger port is up when /json answers. One fixed sleep was enough on a
-// developer's machine and not on a cold runner, so poll for it.
-let ws, list = null;
-for (let i = 0; i < 60; i++) {
-  await new Promise(r => setTimeout(r, 500));
-  if (cexit !== null) break;
-  try { const r = await fetch(`http://127.0.0.1:${cport}/json`); if (r.ok) { list = await r.json(); if (list.length) break; } } catch {}
-}
-if (!list || !list.length)
-  done(1, `FAIL pagerun ${bin}: no browser at ${chromePath()} (${cexit !== null ? `exited ${cexit}` : 'debugger port never answered'})` +
-          (cerr.trim() ? `\n  ${cerr.trim().split('\n').slice(-4).join('\n  ')}` : ''));
-try {
-  ws = new WebSocket(list[0].webSocketDebuggerUrl);
-  await new Promise((res, rej) => { ws.onopen = res; ws.onerror = rej; });
-} catch (e) { done(1, `FAIL pagerun ${bin}: browser found but would not attach (${e.message})`); }
-let id = 0; const waiting = new Map();
-ws.onmessage = (ev) => { const m = JSON.parse(ev.data); if (m.id && waiting.has(m.id)) { waiting.get(m.id)(m.result); waiting.delete(m.id); } };
-const cmd = (method, params = {}) => new Promise(res => { const i = ++id; waiting.set(i, res); ws.send(JSON.stringify({ id: i, method, params })); });
-const q = async (e) => (await cmd('Runtime.evaluate', { expression: e, returnByValue: true })).result.value;
-
-await cmd('Page.enable'); await cmd('Runtime.enable');
-await cmd('Page.navigate', { url: `http://127.0.0.1:${port}/index.html` });
-
-// The page sets window.__oxExit when the guest exits. Poll for it rather than
-// sleeping a fixed time, which would either flake on a slow tier-up or waste a
-// minute on a fast one; the status line is read only to explain a timeout.
+// The page sets window.__oxExit when the guest exits; the status line is read
+// only to explain a timeout.
 const TIMEOUT_S = +(process.env.PAGERUN_TIMEOUT || 300);
-let pageCode = null;
-for (let i = 0; i < TIMEOUT_S * 2; i++) {
-  await new Promise(r => setTimeout(r, 500));
-  const v = await q('typeof window.__oxExit === "number" ? window.__oxExit : null');
-  if (typeof v === 'number') { pageCode = v; break; }
-}
+const pageCode = await waitForExit(q, TIMEOUT_S);
 if (pageCode === null) {
   const stat = (await q('document.getElementById("stat") ? document.getElementById("stat").textContent : ""')) || '';
   done(1, `FAIL pagerun ${bin}: no exit within ${TIMEOUT_S}s (stat: ${JSON.stringify(stat.slice(0, 160))})`);
