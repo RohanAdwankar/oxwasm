@@ -5775,3 +5775,51 @@ in linear memory and is sized separately, so the two are separable, but every
 packed page's units are instantiated against whatever the table is - so it
 gets its own batch, with the suite and a full sweep behind it. The
 measurement is here so the next session does not have to find it again.
+
+### Batch 28: the shared table starts small and doubles
+
+Batch 27 measured the cost and named the shape; this is the change. The
+shared funcref table is created with `initial: 1024, maximum: FTMAP_MAX` and
+doubled in `registerAotFn` when the next index passes its length. A run that
+registers 4,600 functions settles the table at 8,192 rather than 20,000, so
+each instance's V8 dispatch table is 41% of the size it was.
+`OXWASM_FTAB_INIT=20000` restores creating it at the ceiling, which is how the
+two arms below are run.
+
+Three alternating samples per arm, `rustc-asm` breadth case under
+`/usr/bin/time -v`, quiet box:
+
+| arm | peak RSS (MB) | mean | case wall (s) | mean | fns tiered |
+|---|---|---|---|---|---|
+| `OXWASM_FTAB_INIT=20000` | 6038, 6440, 6305 | **6261** | 113.1, 113.1, 112.3 | **112.8** | 4601, 4602, 4600 |
+| default (1024) | 5041, 4951, 5035 | **5009** | 108.4, 109.0, 108.1 | **108.5** | 4601, 4600, 4599 |
+
+**1,252 MB, 20% off peak RSS.** The arms separate completely - the worst run
+of the new arm is still 998 MB under the best run of the old one - and the
+tiered-function counts agree to within 3 across all six runs, so this is the
+table and not the workload. It also matches the mechanism: 8,192/20,000 of a
+492 kB dispatch table is a 290 kB saving per instance, and 1,252 MB / 290 kB
+is about 4,400 instances, which is the order the run instantiates.
+
+The first pair taken before these six is worth recording because it was
+misleading: the control run tiered 5,162 functions against the new arm's
+4,602 and read 6,669 MB vs 5,191 MB, a 22% gap of which some was simply 11%
+more work. The stable counts above are what the case does once its inputs are
+warm; a single cold pair is not evidence.
+
+**Time is a small consistent win, not a wash.** 112.8 s -> 108.5 s, 4.3 s and
+3.8%, with per-arm spreads of 0.8 s and 0.9 s - the arms do not overlap. That
+contradicts the earlier expectation, which was that the three doublings' worth
+of instance fixups would eat the instantiation saving exactly. They do not
+quite: three grows against ~4,400 instances is cheaper than 4,400
+instantiations each paying for 20,000 entries. It is a 4% claim on one case,
+so it steers rather than ships.
+
+**What it does not fix is the ceiling.** GIMP registers 13,173 functions and
+lands at 16,384, an 1.2x saving where rustc gets 2.4x. Anything that needs the
+big cases has to stop every instance owning a dispatch table sized to the
+shared one, which is V8's, or stop every unit importing one global table,
+which is ours.
+
+Correctness: `engine/test.sh 300` green end to end, and `rustc-asm` is
+byte-identical to native on both arms in all eight runs.
