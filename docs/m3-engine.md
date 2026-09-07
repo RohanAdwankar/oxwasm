@@ -5674,6 +5674,18 @@ the five cases produce real output (git-log 47 B of hash and subject where it
 used to produce zero). The sweep's summary also names any case it SKIPPED and
 how many of the list that is, because a skipped case leaves the ratio at N/N.
 
+Auditing every `/tmp` path the case list names found three more of exactly
+this: `javac` had no `Hello.java`, `make` had no makefile, `tar-x` had no
+archive. All three now exist, and `javac` in particular stops comparing two
+empty class files and starts comparing a real 972-byte one, bit-identical -
+a JVM compiling inside the engine, end to end. A fourth case was thin rather
+than empty: `java -version` writes its banner to *stderr*, which this
+harness does not compare, so `java-version` asserted nothing but an exit
+code through every batch that cited it. `--version` puts the same three
+lines on stdout: 162 bytes, byte-identical. The rule the audit suggests is
+that a case whose output is empty is asserting only its exit status, and
+that is worth being deliberate about rather than discovering later.
+
 The common shape is worth naming: each of these is a dependency on the
 host that the tree stated nowhere and checked nowhere, and each failed in a
 way that looked like something else - a slow engine, a hardware divergence, a
