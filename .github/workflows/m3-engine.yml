@@ -43,3 +43,15 @@ jobs:
           cp README.md /tmp/oxpage_f
           node tools/pagerun.mjs /usr/bin/sha256sum \
             --arg sha256sum --arg /tmp/oxpage_in --file /tmp/oxpage_in=/tmp/oxpage_f
+      # A second case whose stdout is BINARY, and whose bytes depend on file
+      # metadata rather than only on the input. sha256sum alone cannot fail
+      # this way: the packer shipped every bundled file with a 1970 timestamp,
+      # which made gzip warn and exit 2, and even once that was fixed the two
+      # sides still differed in the four header bytes that hold the mtime -
+      # 16,788 bytes on each side, same length, different content. A text or
+      # length comparison sees neither.
+      - name: and one whose output is binary
+        run: |
+          node tools/pagerun.mjs /bin/gzip \
+            --arg gzip --arg -9 --arg -c --arg /tmp/oxpage_gzin \
+            --file /tmp/oxpage_gzin=/tmp/oxpage_f
