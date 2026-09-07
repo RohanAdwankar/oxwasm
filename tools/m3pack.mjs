@@ -108,7 +108,12 @@ for (const m of MODS)
 const wabtJs = readWabtJs({ required: true });   // wabt UMD, inlined so the page assembles units offline
 bundleDynamic(readFileSync(elfPath), elfPath);
 const elfB64 = gzb64(readFileSync(elfPath));
-const fileEntries = Object.entries(files).map(([g, h]) => [g, gzb64(readFileSync(h))]);
+// mtimes ride along with the bytes. Dropping them makes every bundled file
+// look like 1970 to the guest, and a zero timestamp is not "unknown" to the
+// programs that read it: gzip refuses to store one, warns, and exits 2 where
+// native exits 0. The node sweep never saw this because breadth.mjs passes
+// mtimes and this packer did not.
+const fileEntries = Object.entries(files).map(([g, h]) => [g, gzb64(readFileSync(h)), Math.floor(statSync(h).mtimeMs / 1000)]);
 
 const html = `<!doctype html>
 <html>
@@ -193,9 +198,10 @@ const watDepth = (s) => {
   };
   const elf = await inflate(${JSON.stringify(elfB64)});
   const files = {};
-  for (const [g, b] of ${JSON.stringify(fileEntries)}) files[g] = await inflate(b);
+  const mtimes = {};
+  for (const [g, b, mt] of ${JSON.stringify(fileEntries)}) { files[g] = await inflate(b); mtimes[g] = mt; }
   stat.textContent = 'running…';
-  const eng = new LinuxEngine(elf, { argv: CONFIG.argv, env: CONFIG.env, files, memMB: 512, assembleWat });
+  const eng = new LinuxEngine(elf, { argv: CONFIG.argv, env: CONFIG.env, files, mtimes, memMB: 512, assembleWat });
   let shown = 0;
   const t0 = performance.now();
   const pump = () => {
