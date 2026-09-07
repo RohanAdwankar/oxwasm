@@ -150,7 +150,12 @@ async function inflate(b64) {
 (async () => {
   const wabt = await WabtModule();
   const assembleWat = (wat) => {
-    const m = wabt.parseWat('unit.wat', wat);
+    // tail_call: the translator emits return_call for every chained call, so
+    // without the feature EVERY unit fails to parse and the page silently runs
+    // the tier-0 interpreter. It is silent because a failed assembly is a
+    // legitimate deopt: correctness is unaffected, only speed, so the only
+    // symptom is the page being ~100x slower than it should be.
+    const m = wabt.parseWat('unit.wat', wat, { tail_call: true });
     const bin = m.toBinary({}).buffer; m.destroy();
     return new Uint8Array(bin);
   };
