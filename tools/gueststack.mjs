@@ -10,7 +10,7 @@
 //
 // Hardcoded to /usr/bin/python3 today; the symbol resolution and rbp walk are
 // general and worth lifting out when a second guest needs them.
-import { LinuxEngine } from '/home/user/0/oxwasm/engine/linux.mjs';
+import { LinuxEngine } from '../engine/linux.mjs';
 import { readFileSync, readdirSync, lstatSync, realpathSync, statSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
