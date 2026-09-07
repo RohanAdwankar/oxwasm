@@ -74,20 +74,24 @@ const q = async (e) => (await cmd('Runtime.evaluate', { expression: e, returnByV
 await cmd('Page.enable'); await cmd('Runtime.enable');
 await cmd('Page.navigate', { url: `http://127.0.0.1:${port}/index.html` });
 
-// The page appends " · exit N" to #stat when the guest exits, and nothing
-// else in it ever says "exit" - poll that rather than a fixed sleep, which
-// would either flake on a slow tier-up or waste a minute on a fast one.
+// The page sets window.__oxExit when the guest exits. Poll for it rather than
+// sleeping a fixed time, which would either flake on a slow tier-up or waste a
+// minute on a fast one; the status line is read only to explain a timeout.
 const TIMEOUT_S = +(process.env.PAGERUN_TIMEOUT || 300);
-let stat = '';
+let pageCode = null;
 for (let i = 0; i < TIMEOUT_S * 2; i++) {
   await new Promise(r => setTimeout(r, 500));
-  stat = (await q('document.getElementById("stat") ? document.getElementById("stat").textContent : ""')) || '';
-  if (/exit\s+-?\d+/.test(stat)) break;
+  const v = await q('typeof window.__oxExit === "number" ? window.__oxExit : null');
+  if (typeof v === 'number') { pageCode = v; break; }
 }
-const m = /exit\s+(-?\d+)/.exec(stat);
-if (!m) done(1, `FAIL pagerun ${bin}: no exit within ${TIMEOUT_S}s (stat: ${JSON.stringify(stat.slice(0, 160))})`);
-const pageCode = +m[1];
-const pageOut = (await q('document.getElementById("term").textContent')) || '';
+if (pageCode === null) {
+  const stat = (await q('document.getElementById("stat") ? document.getElementById("stat").textContent : ""')) || '';
+  done(1, `FAIL pagerun ${bin}: no exit within ${TIMEOUT_S}s (stat: ${JSON.stringify(stat.slice(0, 160))})`);
+}
+// __oxOut is the guest's stdout as the engine has it; #term is the same text
+// after the DOM has had it, and is the fallback for a page built before the
+// signal existed.
+const pageOut = (await q('typeof window.__oxOut === "string" ? window.__oxOut : document.getElementById("term").textContent')) || '';
 
 if (pageOut === natOut && pageCode === natCode)
   done(0, `ok   pagerun ${bin}: ${natOut.length}B stdout and exit ${natCode} identical to native, in the browser`);
