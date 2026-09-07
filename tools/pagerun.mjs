@@ -1,0 +1,97 @@
+// Browser-side gate for the CLI lane: pack a binary with m3pack, run the page
+// in headless Chromium, and pass only if the terminal it prints and the exit
+// code it reports match running the same binary natively.
+//
+//   node tools/pagerun.mjs /usr/bin/sha256sum --arg sha256sum --arg /data/f \
+//        --file /data/f=/tmp/in.txt
+//
+// Nothing covered this before. The node sweep proves 170 binaries byte-exact
+// against native, and the GUI page has pagecheck, but the thing the README's
+// headline command produces - one self-contained HTML running an unmodified
+// binary in a tab - had no check at all, which is how m3pack came to read
+// wabt.js from a path that existed on one machine and die with ENOENT
+// everywhere else without anything noticing.
+import { spawn, execFileSync } from 'node:child_process';
+import { mkdtempSync, rmSync, existsSync, mkdirSync, copyFileSync, unlinkSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const argv = process.argv.slice(2);
+const bin = argv[0];
+if (!bin) { console.error('usage: pagerun.mjs BINARY [--arg A]... [--file guest=host]...'); process.exit(1); }
+// the guest argv m3pack will pass, so the native side can be run the same way
+const guestArgs = [];
+for (let i = 1; i < argv.length; i++) if (argv[i] === '--arg') guestArgs.push(argv[++i]);
+const fileMap = new Map();
+for (let i = 1; i < argv.length; i++) if (argv[i] === '--file') { const [g, h] = argv[++i].split('='); fileMap.set(g, h); }
+
+// Native oracle: argv[0] is the program name the guest sees, so drop it. The
+// remaining arguments have to be the SAME STRINGS the guest gets, because
+// programs print their arguments - sha256sum's output is "<hash>  <path>", and
+// running native against the host path instead reported a 12-byte difference
+// that was entirely the filename. So each --file is materialised at its guest
+// path on the host for the length of the native run, and removed after. A
+// guest path that already exists on the host is refused rather than clobbered.
+const planted = [];
+for (const [g, h] of fileMap) {
+  if (existsSync(g)) { console.log(`FAIL pagerun ${bin}: guest path ${g} already exists on the host; pick another`); process.exit(1); }
+  mkdirSync(dirname(g), { recursive: true }); copyFileSync(h, g); planted.push(g);
+}
+const nativeArgs = guestArgs.slice(1);
+let natOut = '', natCode = 0;
+try { natOut = execFileSync(bin, nativeArgs, { maxBuffer: 1 << 26 }).toString(); }
+catch (e) { natOut = (e.stdout ?? Buffer.alloc(0)).toString(); natCode = e.status ?? -1; }
+finally { for (const g of planted) { try { unlinkSync(g); } catch {} } }
+
+const dir = mkdtempSync('/tmp/oxpagerun_');
+const page = join(dir, 'index.html');
+let serve, chrome;
+const done = (code, msg) => { console.log(msg); try { serve?.kill(); } catch {} try { chrome?.kill('SIGKILL'); } catch {}
+                              try { rmSync(dir, { recursive: true, force: true }); } catch {} process.exit(code); };
+try { execFileSync(process.execPath, [join(here, 'm3pack.mjs'), bin, '-o', page, ...argv.slice(1)], { stdio: 'pipe' }); }
+catch (e) { done(1, `FAIL pagerun ${bin}: m3pack: ${String(e.stderr || e.message).trim().split('\n').pop()}`); }
+
+const port = 8600 + Math.floor(Math.random() * 400);
+serve = spawn(process.execPath, [join(here, 'gui', 'serve.mjs'), dir, String(port)], { stdio: 'ignore' });
+const cport = 9600 + Math.floor(Math.random() * 400);
+chrome = spawn('/opt/pw-browsers/chromium', ['--headless', '--disable-gpu', '--no-sandbox',
+  `--remote-debugging-port=${cport}`, 'about:blank'], { stdio: 'ignore' });
+await new Promise(r => setTimeout(r, 2500));
+
+let ws;
+try {
+  const list = await (await fetch(`http://127.0.0.1:${cport}/json`)).json();
+  ws = new WebSocket(list[0].webSocketDebuggerUrl);
+  await new Promise((res, rej) => { ws.onopen = res; ws.onerror = rej; });
+} catch (e) { done(1, `FAIL pagerun ${bin}: no browser (${e.message})`); }
+let id = 0; const waiting = new Map();
+ws.onmessage = (ev) => { const m = JSON.parse(ev.data); if (m.id && waiting.has(m.id)) { waiting.get(m.id)(m.result); waiting.delete(m.id); } };
+const cmd = (method, params = {}) => new Promise(res => { const i = ++id; waiting.set(i, res); ws.send(JSON.stringify({ id: i, method, params })); });
+const q = async (e) => (await cmd('Runtime.evaluate', { expression: e, returnByValue: true })).result.value;
+
+await cmd('Page.enable'); await cmd('Runtime.enable');
+await cmd('Page.navigate', { url: `http://127.0.0.1:${port}/index.html` });
+
+// The page appends " · exit N" to #stat when the guest exits, and nothing
+// else in it ever says "exit" - poll that rather than a fixed sleep, which
+// would either flake on a slow tier-up or waste a minute on a fast one.
+const TIMEOUT_S = +(process.env.PAGERUN_TIMEOUT || 300);
+let stat = '';
+for (let i = 0; i < TIMEOUT_S * 2; i++) {
+  await new Promise(r => setTimeout(r, 500));
+  stat = (await q('document.getElementById("stat") ? document.getElementById("stat").textContent : ""')) || '';
+  if (/exit\s+-?\d+/.test(stat)) break;
+}
+const m = /exit\s+(-?\d+)/.exec(stat);
+if (!m) done(1, `FAIL pagerun ${bin}: no exit within ${TIMEOUT_S}s (stat: ${JSON.stringify(stat.slice(0, 160))})`);
+const pageCode = +m[1];
+const pageOut = (await q('document.getElementById("term").textContent')) || '';
+
+if (pageOut === natOut && pageCode === natCode)
+  done(0, `ok   pagerun ${bin}: ${natOut.length}B stdout and exit ${natCode} identical to native, in the browser`);
+let d = 0; while (d < pageOut.length && d < natOut.length && pageOut[d] === natOut[d]) d++;
+done(1, `FAIL pagerun ${bin}: ${pageCode === natCode ? '' : `exit ${pageCode} vs native ${natCode}; `}` +
+        `stdout ${pageOut.length}B vs native ${natOut.length}B, first difference at ${d}\n` +
+        `  page:   ${JSON.stringify(pageOut.slice(Math.max(0, d - 20), d + 40))}\n` +
+        `  native: ${JSON.stringify(natOut.slice(Math.max(0, d - 20), d + 40))}`);

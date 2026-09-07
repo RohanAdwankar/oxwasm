@@ -10,6 +10,7 @@
 // any data files are inlined. Nothing about the packaged program is special-
 // cased — the engine sees only its bytes.
 import { readFileSync, writeFileSync, readdirSync, statSync, mkdtempSync } from 'node:fs';
+import { readWabtJs } from './wabtjs.mjs';
 import { execFileSync } from 'node:child_process';
 import { gzipSync } from 'node:zlib';
 import { dirname, join, relative } from 'node:path';
@@ -104,7 +105,7 @@ const importMap = { imports: {} };
 for (const m of MODS)
   importMap.imports['ox/' + m] = 'data:text/javascript;base64,' + Buffer.from(modSrc[m]).toString('base64');
 
-const wabtJs = readFileSync('/tmp/package/index.js', 'utf8');   // wabt 1.0.39 UMD
+const wabtJs = readWabtJs({ required: true });   // wabt UMD, inlined so the page assembles units offline
 bundleDynamic(readFileSync(elfPath), elfPath);
 const elfB64 = gzb64(readFileSync(elfPath));
 const fileEntries = Object.entries(files).map(([g, h]) => [g, gzb64(readFileSync(h))]);
