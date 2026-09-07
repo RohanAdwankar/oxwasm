@@ -147,14 +147,46 @@ async function inflate(b64) {
   const r = new Response(new Blob([u]).stream().pipeThrough(new DecompressionStream('gzip')));
   return new Uint8Array(await r.arrayBuffer());
 }
+// wabt.js parses recursively on an emscripten stack of 64 kB, so past a
+// certain s-expression nesting depth it overflows — and the overflow is a wasm
+// trap, which leaves the instance dead: every later parse fails too, including
+// a trivial module. One deep function therefore costs the whole run its AOT
+// tier, silently, because a failed assembly is a legitimate deopt.
+//
+// So find the limit once, on an instance that is allowed to die, and refuse
+// anything past it. A refused unit is one interpreted function; a trapped
+// assembler is all of them. The limit is probed rather than hardcoded because
+// it is a property of how this wabt build was compiled, not of wabt.
+async function depthLimit() {
+  let probe = await WabtModule();
+  const fits = async (d) => {
+    try { const m = probe.parseWat('p.wat', '(module (func $f ' + '(block '.repeat(d) + 'nop' + ') '.repeat(d) + '))',
+                                   { tail_call: true }); m.destroy(); return true; }
+    catch { probe = await WabtModule(); return false; }   // a success leaves the probe usable; an overflow destroys it, so replace it before the next check
+  };
+  let lo = 0, hi = 1024;
+  while (lo + 1 < hi) { const mid = (lo + hi) >> 1; if (await fits(mid)) lo = mid; else hi = mid; }
+  return lo;
+}
+// Max nesting in a WAT, ignoring parens inside strings.
+const watDepth = (s) => {
+  let d = 0, m = 0, q = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (q) { if (c === '"') q = false; continue; }
+    if (c === '"') q = true; else if (c === '(') { if (++d > m) m = d; } else if (c === ')') d--;
+  }
+  return m;
+};
 (async () => {
+  const maxDepth = await depthLimit();
   const wabt = await WabtModule();
+  let refused = 0;
   const assembleWat = (wat) => {
     // tail_call: the translator emits return_call for every chained call, so
-    // without the feature EVERY unit fails to parse and the page silently runs
-    // the tier-0 interpreter. It is silent because a failed assembly is a
-    // legitimate deopt: correctness is unaffected, only speed, so the only
-    // symptom is the page being ~100x slower than it should be.
+    // without the feature every unit is "opcode not allowed".
+    const d = watDepth(wat);
+    if (d > maxDepth) { refused++; throw new Error('unit nests ' + d + ' deep; this wabt build takes ' + maxDepth); }
     const m = wabt.parseWat('unit.wat', wat, { tail_call: true });
     const bin = m.toBinary({}).buffer; m.destroy();
     return new Uint8Array(bin);
@@ -171,7 +203,10 @@ async function inflate(b64) {
     const outText = eng.stdout.join('');
     if (outText.length > shown) { put(outText.slice(shown)); shown = outText.length; }
     const s = eng.stats;
-    stat.innerHTML = \`interp \${s.interpreted.toLocaleString()} · aot units \${s.tiers.aot||0} · aot runs \${s.aotRuns.toLocaleString()} · \${((performance.now()-t0)/1000).toFixed(1)}s\`;
+    // refused units are named here because their whole cost is invisible
+    // otherwise: the page is correct either way, just slower
+    stat.innerHTML = \`interp \${s.interpreted.toLocaleString()} · aot units \${s.tiers.aot||0} · aot runs \${s.aotRuns.toLocaleString()}\` +
+      (refused ? \` · \${refused} too deep to assemble (>\${maxDepth})\` : '') + \` · \${((performance.now()-t0)/1000).toFixed(1)}s\`;
     if (eng.exitCode === null) setTimeout(pump, 0);
     else { window.__oxMs = performance.now() - t0; window.__oxExit = eng.exitCode; window.__oxOut = outText; }   // a machine-readable end for tools/pagerun.mjs and the clock bench/vspage.mjs subtracts; the line below is for people
     if (eng.exitCode !== null) stat.innerHTML += eng.exitCode === 0
