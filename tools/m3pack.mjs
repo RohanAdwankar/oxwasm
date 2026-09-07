@@ -168,7 +168,8 @@ async function inflate(b64) {
     const s = eng.stats;
     stat.innerHTML = \`interp \${s.interpreted.toLocaleString()} · aot units \${s.tiers.aot||0} · aot runs \${s.aotRuns.toLocaleString()} · \${((performance.now()-t0)/1000).toFixed(1)}s\`;
     if (eng.exitCode === null) setTimeout(pump, 0);
-    else stat.innerHTML += eng.exitCode === 0
+    else { window.__oxExit = eng.exitCode; window.__oxOut = outText; }   // a machine-readable end for tools/pagerun.mjs; the line below is for people
+    if (eng.exitCode !== null) stat.innerHTML += eng.exitCode === 0
       ? ' · <span class="ok">exit 0</span>' : \` · <span class="err">exit \${eng.exitCode}</span>\`;
   };
   pump();
