@@ -6,6 +6,7 @@
 //
 //   node tools/xpack.mjs SYSROOT /usr/bin/xcalc -o xcalc.html --title xcalc
 import { readFileSync, writeFileSync, readdirSync, lstatSync, realpathSync, mkdirSync } from 'node:fs';
+import { readWabtJs } from './wabtjs.mjs';
 import { gzipSync, gunzipSync, brotliCompressSync, constants as zc } from 'node:zlib';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -367,7 +368,7 @@ if (snapPath) {
 }
 
 if (sidecarDir) {
-  const wabtSrc = (() => { try { return readFileSync('/tmp/package/index.js', 'utf8'); } catch { return null; } })();
+  const wabtSrc = readWabtJs();   // optional here: without it the page runs its manifest units and compiles nothing new (hasWabt below)
   if (!snapPath) { console.error('xpack: --sidecar requires --snapshot'); process.exit(1); }
   mkdirSync(sidecarDir, { recursive: true });
   const br = (b, q) => brotliCompressSync(b, { params: {
