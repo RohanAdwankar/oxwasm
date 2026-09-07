@@ -924,7 +924,15 @@ for (const [name, bin, args, opts] of CASES) {
     }
   }
 }
-console.log(`\n${pass}/${pass + fail} unmodified binaries byte-identical to native` +
-            (skipped.length ? ` (${skipped.length} of ${CASES.length} cases SKIPPED, not run: ${skipped.join(' ')})` : ''));   // a skipped case leaves the ratio at N/N, so the sweep can shrink and still read green: five host tools went missing on a new machine and nothing said so
+// The ratio alone hides two things: a case whose binary is missing is skipped
+// and leaves it at N/N (five host tools went missing on a new machine and
+// nothing said so), and a reader with no case list cannot tell N from the
+// number they remember - the running notes reported "210 of 210" for six
+// batches against a list that held 166 to 170. So the summary always carries
+// the size of the list it ran, and names anything it skipped.
+console.log(`\n${pass}/${pass + fail} unmodified binaries byte-identical to native ` +
+            (only.length ? `(${pass + fail + skipped.length} of ${CASES.length} cases matched ${only.join(' ')})`
+                         : `(${CASES.length} cases in the list)`) +
+            (skipped.length ? ` (${skipped.length} SKIPPED, not run: ${skipped.join(' ')})` : ''));
 if (failures.length) { console.log('failures:'); for (const [n, w] of failures) console.log(`  ${n}: ${w}`); }
 process.exit(fail ? 1 : 0);

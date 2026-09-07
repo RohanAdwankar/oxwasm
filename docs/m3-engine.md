@@ -5681,9 +5681,22 @@ missing loader, a broken clone. Two of them did not look like failures at
 all. The project README now lists the host tools a node run needs and what
 each one's absence does.
 
+**And the sweep's headline number was wrong.** The notes above report
+"sweep 210 of 210" from batch 20 onward, and before that 204, 206, 208 -
+each step matching a pair of cases that had just been added. The case list
+never held that many. `CASES` is 166 rows at the 204 note, 167 at 206, 168
+at 208 and 170 at 210: the *deltas* are right and the baseline is about 38
+too high, so the number was being carried forward and incremented rather
+than read off the run. The historical lines are left as they were written -
+their pass/fail verdict stands, only the denominator was inflated - and the
+sweep now prints its own case count when anything is skipped.
+
 Gate on the new machine: the verification suite green end to end (316
 hardware cases, the six real-gcc blobs, every differential); the breadth
 sweep 168 of 169 exact with the AOT tier live, the one failure being
 `git-http` on the missing repo above and one case skipped because its
 fixture was deleted out from under the run. All six of those cases pass on
-re-run with the fixtures built, and a confirming full sweep follows.
+re-run with the fixtures built, and a confirming full sweep follows. The
+shipped page holds up here too: `pagecheck` on `demo/gimp` in headless
+Chromium reads File > New > OK, strokes drawn, 19.5 ms median input-to-paint
+against the 19.2 ms it read when batch 25 shipped it.
