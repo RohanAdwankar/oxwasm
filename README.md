@@ -148,3 +148,19 @@ platform/        M4 — syscall ABI, processes-as-workers, pipe demo
 engine/          M3 — decoder, hardware-verified interpreter, runtime AOT x86-64 -> wasm
 docs/m3-engine.md  M3 — the x86-64 -> WASM JIT design
 ```
+
+## Host tools for a development run
+
+The browser assembles WAT in-page with wabt.js and needs nothing installed.
+A run under node shells out instead, so a development machine needs:
+
+```
+wat2wasm (wabt)   the AOT tier's assembler -- every translated unit goes
+                  through it. Without it each unit is refused and the guest
+                  runs on the interpreter: correct output, no AOT tier, many
+                  times slower. `makeAssembler` proves it works at startup
+                  rather than letting a whole run tier down in silence.
+nasm              builds the engine's asm fixtures (tools/fixtures/*.asm)
+ffmpeg zstd busybox  breadth cases; a missing one is skipped, so the sweep
+                  silently gets smaller
+```
