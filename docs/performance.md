@@ -233,3 +233,45 @@ So the complete runtime story, one line each:
   emulation, so precomputing them is pure win.
 - **fontconfig / gdk-pixbuf / icon caches** warmed in the chroot at build.
 - **doc/locale/theme pruning** to shrink the image and the eventual snapshot.
+
+## The packed page against native, measured in a browser
+
+Everything above this section was measured either under the v86 engine or with
+the M3 engine imported as a module under node. Neither is the product. The
+product is one HTML file in a tab, and until it was measured directly nobody
+had checked that the file runs the engine at all - it did not. wabt.js
+overflows its 64 kB emscripten stack on deeply nested WAT, the overflow is a
+trap that kills the instance, and one deep function therefore refused the
+assembler to every unit behind it. Packed pages ran the tier-0 interpreter,
+silently, because a failed assembly is a legitimate deopt and the page is
+correct either way. `gzip -9` of a 138 kB input read 126,177 ms and 193,913,777
+interpreted steps; with the assembler guarded it reads 1,679 ms and 133,337.
+
+`bench/vspage.mjs` measures the page: packed, served, run in headless
+Chromium, timed by the page's own clock. Two input sizes and a subtraction, so
+ELF load and tiering cancel and what is left is emulation.
+
+`sha256sum`, 41.4 MB against 138 kB, nine reps each, medians:
+
+| | page | native |
+|---|---|---|
+| 138 kB | 1810 ± 21 ms | 3.25 ± 0.13 ms |
+| 41.4 MB | 2024 ± 29 ms | 34.21 ± 0.68 ms |
+| **steady state** | **214 ± 36 ms** | **30.96 ± 0.69 ms** |
+
+**6.9x native, 5.6-8.2x at one standard error.** Single-digit, in a browser,
+on an unmodified dynamically-linked x86-64 binary, from a self-contained file.
+
+Two cautions belong with that number. It is one binary and one kernel -
+SHA-256's inner loop is exactly the shape a whole-function translator does
+well on, and a branchy workload will read worse. And the **page floor is 1810
+ms**, all of it ELF load, translation and in-page assembly, which does not
+shrink with input: for anything short the floor is the whole experience and
+the 6.9x is invisible.
+
+The floor is also why this took three tries to measure. The same bench on a
+2.8 MB input reported 41.9x, because a 115 ms difference against a 1745 ms
+floor is the floor's jitter, not a steady state. The harness now carries the
+standard error through the subtraction and refuses any ratio that is not three
+times it; at the 41 MB gap it refused 7.4x at five reps and only reported a
+number at nine.
