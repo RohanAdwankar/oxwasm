@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
-const chrome = spawn('/opt/pw-browsers/chromium', ['--headless','--disable-gpu','--no-sandbox','--remote-debugging-port=9335','--window-size=1100,900','about:blank'],{stdio:'ignore'});
+import { chromePath } from './../chrome.mjs';
+const chrome = spawn(chromePath(), ['--headless','--disable-gpu','--no-sandbox','--remote-debugging-port=9335','--window-size=1100,900','about:blank'],{stdio:'ignore'});
 await new Promise(r=>setTimeout(r,2500));
 const list = await (await fetch('http://127.0.0.1:9335/json')).json();
 const ws = new WebSocket(list[0].webSocketDebuggerUrl);

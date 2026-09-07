@@ -12,10 +12,11 @@
 // distribution, so "tier-up is slow" can be replaced by a number and a split.
 //   node cdp_tier.mjs URL
 import { spawn } from 'node:child_process';
+import { chromePath } from './../chrome.mjs';
 
 const url = process.argv[2];
 const PORT = 9375;
-const chrome = spawn('/opt/pw-browsers/chromium', ['--headless','--disable-gpu','--no-sandbox',
+const chrome = spawn(chromePath(), ['--headless','--disable-gpu','--no-sandbox',
   `--remote-debugging-port=${PORT}`,'--window-size=1100,900','about:blank'],{stdio:'ignore'});
 await new Promise(r=>setTimeout(r,2500));
 const list = await (await fetch(`http://127.0.0.1:${PORT}/json`)).json();

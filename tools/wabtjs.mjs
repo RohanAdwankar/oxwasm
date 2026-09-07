@@ -13,6 +13,8 @@ import { existsSync, readFileSync } from 'node:fs';
 export function wabtJsPath() {
   for (const p of [process.env.OXWASM_WABT_JS,
                    new URL('../runtime/wabt.js', import.meta.url).pathname,
+                   new URL('../node_modules/wabt/index.js', import.meta.url).pathname,
+                   process.cwd() + '/node_modules/wabt/index.js',   // npm i wabt, which is what CI does
                    '/tmp/package/index.js'])
     if (p && existsSync(p)) return p;
   return null;

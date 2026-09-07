@@ -7,11 +7,12 @@
 //   inject->blit    guest processing across slices + rAF alignment
 //   node cdp_latprof.mjs URL(with ?latprof) [steps=24]
 import { spawn } from 'node:child_process';
+import { chromePath } from './../chrome.mjs';
 
 const [url, stepsS = '24'] = process.argv.slice(2);
 const STEPS = +stepsS;
 const PORT = 9377;
-const chrome = spawn('/opt/pw-browsers/chromium', ['--headless','--disable-gpu','--no-sandbox',
+const chrome = spawn(chromePath(), ['--headless','--disable-gpu','--no-sandbox',
   `--remote-debugging-port=${PORT}`,'--window-size=1100,900','about:blank'],{stdio:'ignore'});
 await new Promise(r=>setTimeout(r,2500));
 const list = await (await fetch(`http://127.0.0.1:${PORT}/json`)).json();
