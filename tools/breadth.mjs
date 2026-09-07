@@ -447,7 +447,10 @@ const CASES = [
   ['go-version', '/usr/local/go/bin/go', ['version'], { memMB: 2048, env: ['GOROOT=/usr/local/go', 'GOTELEMETRY=off'] }],
   // OpenJDK 21: the vsyscall page, pushf/popf, timed futex waits, fixed
   // mappings over holes, and glibc's PIC jump tables all fell out of it
-  ['java-version', '/usr/lib/jvm/java-21-openjdk-amd64/bin/java', ['-Xint', '-XX:+UseSerialGC', '-Xshare:off', '-Xmx256m', '-version'],
+  // --version, not -version: the one-dash form writes the banner to stderr,
+  // which this harness does not compare, so the case asserted nothing but an
+  // exit code. Two dashes puts the same three lines on stdout.
+  ['java-version', '/usr/lib/jvm/java-21-openjdk-amd64/bin/java', ['-Xint', '-XX:+UseSerialGC', '-Xshare:off', '-Xmx256m', '--version'],
               { memMB: 3072, tree: '/usr/lib/jvm/java-21-openjdk-amd64', execAnon: true }],   // the JVM's generated interpreter as code; java-hello stays without it
   ['java-hello', '/usr/lib/jvm/java-21-openjdk-amd64/bin/java', ['-Xint', '-XX:+UseSerialGC', '-Xshare:off', '-Xmx256m', '-cp', '/tmp/breadth_jhello', 'Hello'],
               { memMB: 3072, tree: ['/usr/lib/jvm/java-21-openjdk-amd64', '/tmp/breadth_jhello'] }],
