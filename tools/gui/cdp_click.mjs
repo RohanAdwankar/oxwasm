@@ -1,11 +1,12 @@
 // Drive the GIMP snapshot page in headless Chromium over CDP: wait for
 // restore, click the File menu on the canvas, screenshot the result.
 import { spawn } from 'node:child_process';
+import { chromePath } from './../chrome.mjs';
 import { writeFileSync } from 'node:fs';
 
 const page = process.argv[2], out = process.argv[3];
 const clickX = +process.argv[4], clickY = +process.argv[5];
-const chrome = spawn('/opt/pw-browsers/chromium', ['--headless', '--disable-gpu', '--no-sandbox',
+const chrome = spawn(chromePath(), ['--headless', '--disable-gpu', '--no-sandbox',
   '--remote-debugging-port=9333', '--window-size=1100,900', 'about:blank'], { stdio: 'ignore' });
 await new Promise(r => setTimeout(r, 2500));
 const list = await (await fetch('http://127.0.0.1:9333/json')).json();

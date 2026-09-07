@@ -12,6 +12,7 @@
 // wabt.js from a path that existed on one machine and die with ENOENT
 // everywhere else without anything noticing.
 import { spawn, execFileSync } from 'node:child_process';
+import { chromePath } from './chrome.mjs';
 import { mkdtempSync, rmSync, existsSync, mkdirSync, copyFileSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -55,7 +56,7 @@ catch (e) { done(1, `FAIL pagerun ${bin}: m3pack: ${String(e.stderr || e.message
 const port = 8600 + Math.floor(Math.random() * 400);
 serve = spawn(process.execPath, [join(here, 'gui', 'serve.mjs'), dir, String(port)], { stdio: 'ignore' });
 const cport = 9600 + Math.floor(Math.random() * 400);
-chrome = spawn('/opt/pw-browsers/chromium', ['--headless', '--disable-gpu', '--no-sandbox',
+chrome = spawn(chromePath(), ['--headless', '--disable-gpu', '--no-sandbox',
   `--remote-debugging-port=${cport}`, 'about:blank'], { stdio: 'ignore' });
 await new Promise(r => setTimeout(r, 2500));
 

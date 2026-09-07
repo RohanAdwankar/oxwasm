@@ -1,8 +1,9 @@
 // Type text into the packed leafpad page with native CDP key events.
 import { spawn } from 'node:child_process';
+import { chromePath } from './../chrome.mjs';
 import { writeFileSync } from 'node:fs';
 const page = process.argv[2], out = process.argv[3];
-const chrome = spawn('/opt/pw-browsers/chromium', ['--headless','--disable-gpu','--no-sandbox','--remote-debugging-port=9336','--window-size=800,700','about:blank'],{stdio:'ignore'});
+const chrome = spawn(chromePath(), ['--headless','--disable-gpu','--no-sandbox','--remote-debugging-port=9336','--window-size=800,700','about:blank'],{stdio:'ignore'});
 await new Promise(r=>setTimeout(r,2500));
 const list = await (await fetch('http://127.0.0.1:9336/json')).json();
 const ws = new WebSocket(list[0].webSocketDebuggerUrl);

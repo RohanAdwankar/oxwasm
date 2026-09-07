@@ -4,13 +4,14 @@
 // visit, clicks the File menu and screenshots as interactivity proof, then
 // navigates again in the same profile for the repeat (warm-cache) visit.
 import { spawn } from 'node:child_process';
+import { chromePath } from './../chrome.mjs';
 import { writeFileSync } from 'node:fs';
 
 const [url, outPfx, mbpsS = '100', rttS = '20'] = process.argv.slice(2);
 const mbps = +mbpsS, rtt = +rttS;
 const PORT = 9345;
 const profile = `/tmp/oxprof_${process.pid}`;
-const chrome = spawn('/opt/pw-browsers/chromium', ['--headless','--disable-gpu','--no-sandbox',
+const chrome = spawn(chromePath(), ['--headless','--disable-gpu','--no-sandbox',
   `--remote-debugging-port=${PORT}`,`--user-data-dir=${profile}`,'--disk-cache-size=1073741824',
   '--window-size=1100,900','about:blank'],{stdio:'ignore'});
 await new Promise(r=>setTimeout(r,2500));

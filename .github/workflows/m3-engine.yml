@@ -1,12 +1,13 @@
 name: m3-engine
 # The M3 engine verification suite: differential tests (interpreter oracle vs
 # hardware stepper vs AOT wasm, bit-exact) plus every regression the real-app
-# work has accumulated (lea sizes, entry-live flags, mul/bt flags, ...).
+# work has accumulated (lea sizes, entry-live flags, mul/bt flags, ...), and a
+# browser check of what the packer actually produces.
 on:
   push:
-    paths: ['oxwasm/engine/**', '.github/workflows/m3-engine.yml']
+    paths: ['oxwasm/engine/**', 'oxwasm/tools/**', '.github/workflows/m3-engine.yml']
   pull_request:
-    paths: ['oxwasm/engine/**', '.github/workflows/m3-engine.yml']
+    paths: ['oxwasm/engine/**', 'oxwasm/tools/**', '.github/workflows/m3-engine.yml']
 
 jobs:
   suite:
@@ -17,7 +18,28 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: install nasm + wabt
-        run: sudo apt-get update && sudo apt-get install -y nasm wabt
+      - name: install nasm + wabt + static busybox
+        run: sudo apt-get update && sudo apt-get install -y nasm wabt busybox-static
       - name: run verification suite
         run: ./oxwasm/engine/test.sh 300
+
+  # The packer had no check at all, and stayed broken on every machine but one
+  # for as long as it took someone to run it somewhere else: it read wabt.js
+  # from a path in /tmp that a developer had created by hand. This packs a
+  # dynamically-linked binary into a single HTML file, runs it in the runner's
+  # own headless Chrome, and compares the terminal it prints against native.
+  page:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: install wabt.js
+        run: npm i --no-save wabt@1.0.39
+      - name: the packed page runs the binary in a browser
+        run: |
+          cp oxwasm/README.md /tmp/oxpage_f
+          node oxwasm/tools/pagerun.mjs /usr/bin/sha256sum \
+            --arg sha256sum --arg /tmp/oxpage_in --file /tmp/oxpage_in=/tmp/oxpage_f

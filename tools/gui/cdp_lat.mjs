@@ -5,11 +5,12 @@
 // Reports per-cycle open/close ms plus the page's own __oxLat aggregates
 // (per-event input->paint latency, worst engine pump slice).
 import { spawn } from 'node:child_process';
+import { chromePath } from './../chrome.mjs';
 
 const [url, cyclesS = '8'] = process.argv.slice(2);
 const N = +cyclesS;
 const PORT = 9355;
-const chrome = spawn('/opt/pw-browsers/chromium', ['--headless','--disable-gpu','--no-sandbox',
+const chrome = spawn(chromePath(), ['--headless','--disable-gpu','--no-sandbox',
   `--remote-debugging-port=${PORT}`,'--window-size=1100,900','about:blank'],{stdio:'ignore'});
 await new Promise(r=>setTimeout(r,2500));
 const list = await (await fetch(`http://127.0.0.1:${PORT}/json`)).json();
