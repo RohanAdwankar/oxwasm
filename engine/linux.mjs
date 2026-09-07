@@ -51,6 +51,11 @@ const SIZEGATE = !(typeof process !== 'undefined' && process.env?.OXWASM_SIZEGAT
 const SIZEGATE_SHIFT = Number((typeof process !== 'undefined' && process.env?.OXWASM_SIZEGATE_SHIFT) || 6);
 const EXEC_ANON = typeof process !== 'undefined' && process.env?.OXWASM_EXEC_ANON === '1';   // anonymous PROT_EXEC mmaps count as code for profiling/translation (JIT code caches)
 const UNPRUNE = new Set(((typeof process !== 'undefined' && process.env?.OXWASM_UNPRUNE) || '').split(',').filter(Boolean).map(h => BigInt('0x' + h).toString()));
+// Starting size of the shared funcref table, doubled up to FTMAP_MAX on
+// demand. Every instance pays V8 a dispatch table the size of the imported
+// one, so this is memory per unit, not a one-off. OXWASM_FTAB_INIT=20000
+// restores creating it at the ceiling.
+const FTAB_INIT = Number((typeof process !== 'undefined' && process.env?.OXWASM_FTAB_INIT) || 1024);
 
 export class LinuxEngine {
   // threshold: legacy tier-1.5 loop JIT trigger. Defaults OFF — it miscompiles
@@ -155,12 +160,16 @@ export class LinuxEngine {
     // global dispatch table: every registered compiled function gets a slot
     // here plus a sorted (addr -> slot) entry in wasm memory at FTMAP, so
     // units chain indirect calls / cross-unit calls wasm-to-wasm (see $ftr)
-    // Sized up front rather than grown on demand: every unit imports this
+    // Grown geometrically, not per registration: every unit imports this
     // table, so a grow has to fix up each importing instance's cached table
-    // base — with thousands of units that made growth O(instances), and the
-    // handful of grows during a warm GIMP menu cycle cost 12% of it. Sizing
-    // it once, before any instance exists, is free.
-    this.ftab = new WebAssembly.Table({ element: 'anyfunc', initial: FTMAP_MAX });
+    // base — one grow per doubling keeps that O(instances) cost logarithmic
+    // while a per-registration grow made it linear (12% of a warm GIMP menu
+    // cycle). Creating it at the ceiling instead is worse in the other
+    // direction: V8 gives every instance its own dispatch table sized to the
+    // imported one, so 20,000 entries is 492 kB per unit whether the run maps
+    // 200 functions or 19,000 (see diff/instbench.mjs).
+    this.ftab = new WebAssembly.Table({ element: 'anyfunc',
+                                        initial: Math.min(FTAB_INIT, FTMAP_MAX), maximum: FTMAP_MAX });
     this._ftCount = 0; this._ftSeen = new Set(); this._entries = null;
     this.regview = new BigInt64Array(this.wmem.buffer, 0, 16);
     this.fsview = new BigInt64Array(this.wmem.buffer, 128, 1);   // fs base for AOT TLS accesses
@@ -315,6 +324,7 @@ export class LinuxEngine {
     if (this._ftCount >= FTMAP_MAX) { this._ftFull = (this._ftFull || 0) + 1; return; }
     this._ftSeen.add(a); this._entryAdd(a);
     const idx = this._ftCount++;
+    if (idx >= this.ftab.length) this.ftab.grow(Math.min(this.ftab.length, FTMAP_MAX - this.ftab.length));
     this.ftab.set(idx, f);
     const dv = new DataView(this.wmem.buffer);
     const au = BigInt.asUintN(64, a);
