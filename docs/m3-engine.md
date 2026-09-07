@@ -5725,3 +5725,53 @@ of those deaths cost nothing but the case in flight. The
 shipped page holds up here too: `pagecheck` on `demo/gimp` in headless
 Chromium reads File > New > OK, strokes drawn, 19.5 ms median input-to-paint
 against the 19.2 ms it read when batch 25 shipped it.
+
+### Batch 27: every unit instantiation allocates a table the size of the ceiling
+
+A CPU profile of the rustc compile (163 s of samples, quiet box) puts the
+translator where the last batches left it - `emitUnitFunction` 19.5 s,
+`analyze` 12.1 s with `drain` 11.5 s inside it, `decode` 9.9 s, GC 11.1 s -
+and then names something that had never appeared before:
+**`new WebAssembly.Instance` at 17.1 s, 10.5% of the run.** The run
+instantiates 5,511 units, so that is ~3 ms each, which is far too much for a
+module V8 compiles lazily.
+
+The stack says why. `InstanceBuilder::ProcessImportedTable` ->
+`InitializeImportedIndirectFunctionTable` -> `EnsureMinimumDispatchTableSize`
+-> `WasmDispatchTable::Grow`: **every instance gets its own dispatch table,
+sized to the imported table**. The engine imports one shared funcref table
+into every unit and creates it with `initial: FTMAP_MAX`, which is 20,000.
+
+Measured (`diff/instbench.mjs`, one small module importing a shared table):
+
+| table entries | per instantiation | resident per instance |
+|---|---|---|
+| 1 | 9 us | 3.9 kB |
+| 1,024 | 26 us | |
+| 8,192 | 157 us | |
+| 20,000 (FTMAP_MAX) | | **492 kB** |
+| 65,536 | 1,073 us | |
+
+Linear in the table's size, in both time and memory. For rustc that is
+5,511 x 492 kB - about **2.7 GB of dispatch tables** - and it is the same
+allocation pressure the profile charges to the garbage collector. The memory
+row has to be taken in a fresh process per size: measured in one process
+after the timing rows, the 20,000-entry case reads 33 kB, because the heap
+has already grown and the allocations land in memory that is resident
+already.
+
+This is the cost side of an earlier fix. Batch-era work found `ftab.grow(1024)`
+in `registerAotFn` was O(instances) - a grow makes V8 fix up every importing
+instance - and sized the table once at construction instead, before any
+instance exists. That removed the grow cost and bought 2.1x on GIMP's first
+menu open. Sizing it at the ceiling is what makes each instantiation pay for
+20,000 entries whether the run uses 200 of them or 19,000.
+
+The shape of the fix is geometric growth rather than either extreme: start
+small and double, so most units instantiate against a table of a few thousand
+entries and the O(instances) fixup is paid a handful of times instead of per
+unit. It is an engine change with a real blast radius - the `$ftr` hash lives
+in linear memory and is sized separately, so the two are separable, but every
+packed page's units are instantiated against whatever the table is - so it
+gets its own batch, with the suite and a full sweep behind it. The
+measurement is here so the next session does not have to find it again.
