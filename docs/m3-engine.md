@@ -5715,11 +5715,13 @@ next multiplier is per-instruction code quality inside the unit, as the
 loop30M and GIMP profiles both concluded by their own routes.
 
 Gate on the new machine: the verification suite green end to end (316
-hardware cases, the six real-gcc blobs, every differential); the breadth
-sweep 168 of 169 exact with the AOT tier live, the one failure being
-`git-http` on the missing repo above and one case skipped because its
-fixture was deleted out from under the run. All six of those cases pass on
-re-run with the fixtures built, and a confirming full sweep follows. The
+hardware cases, the six real-gcc blobs, every differential), and the breadth
+sweep **170 of 170 exact** with the AOT tier live - every case run, every
+fixture built, nothing skipped and nothing comparing two identical failures.
+It took four attempts to get a whole one: the host reclaims the machine
+under a half-hour run, and three sweeps died at 110, 42 and 166 cases. The
+fourth finished because the results file makes the sweep resumable, so each
+of those deaths cost nothing but the case in flight. The
 shipped page holds up here too: `pagecheck` on `demo/gimp` in headless
 Chromium reads File > New > OK, strokes drawn, 19.5 ms median input-to-paint
 against the 19.2 ms it read when batch 25 shipped it.
