@@ -5617,3 +5617,73 @@ engine of batches 20-24 - for the browser the vfork budget fix matters
 most: GIMP launches every plug-in by fork+exec, and until it the main
 process came back from the first one never again dispatching compiled
 code from the interpreter.
+
+### Batch 26: three silent skips on a machine that had never run this
+
+Moved to a fresh machine, the engine ran every breadth case correctly and
+the sweep went green - with the AOT tier dead. `wat2wasm` was not
+installed, so every emitted unit came back `wat2wasm failed (127): not
+found`; the engine counts an assembly failure as one more refused
+translation, blacklists the entry and interprets it. Nothing is wrong with
+that behaviour per unit, and applied to all of them it produces a run that
+is correct and many times slower, with no error anywhere. The only tell was
+the counter added at the end of batch 25: `aot=0` on all 25 cases the first
+sweep reached, against 300-500 on a small coreutils case with the
+assembler present. `curl-file` is the size of the difference on this box:
+11.7 s -> 3.6 s, 67 compiled functions -> 545, 8.1M interpreted steps ->
+483k.
+
+`makeAssembler` now assembles a one-instruction module with the run's own
+flags before the translator emits anything, so a missing wabt - or one too
+old for `--enable-tail-call` - is an error at startup instead of a tier-down
+nobody sees.
+
+Two more of the same shape came out of the same move.
+
+**The suite could not build its own fixtures.** `realcode.mjs` incbin'd
+`/tmp/fib-O1.bin` and five siblings that nothing in the tree produced: they
+were whatever a developer had left in /tmp. On a fresh machine the suite
+died there - immediately after the 316 hardware cases passed, which made it
+read as a hardware failure rather than a missing file - and CI had been red
+on that line on every run for days (at least since 2026-09-04), through
+every batch of work in that window. The three
+functions live in `diff/realsrc` now and are compiled at -O1 and -O2 on
+every run. Each is one function with no relocations in `.text`, so its
+`.text` section is the callable blob, and whatever the local gcc emits is a
+valid case: the test compares it against the CPU, not against a recorded
+byte sequence.
+
+**A guard that promised to skip, and crashed instead.** `attest` and
+`shelltest` say in their own comments that they use a static busybox when
+the host has one and skip otherwise. The guard read the ELF class and
+machine words - which a *dynamic* busybox satisfies. Ubuntu ships one in
+the `busybox` package (`busybox-static` is the other), and against it the
+engine threw `interpreter not provided in files` and took the suite down.
+Both now check for a PT_INTERP header and skip when it is there.
+
+**Four cases that passed by comparing two identical failures.** The sweep's
+`git-log`, `git-status`, `find-exec` and `ls-l` all read `/tmp/breadth_repo`,
+and nothing in the tree built it either - it was a directory someone had made
+once. On a machine without it `git -C /tmp/breadth_repo log` fails the same
+way natively and under the engine, so the byte compare matched two error
+messages and four cases counted green while testing nothing. `git-http`,
+which clones that repo over HTTP, is the only one that failed, and it failed
+on `cd: /tmp/bgit: No such file or directory` - three steps downstream of the
+cause. The harness builds the repo now, with pinned dates, names and content;
+the five cases produce real output (git-log 47 B of hash and subject where it
+used to produce zero). The sweep's summary also names any case it SKIPPED and
+how many of the list that is, because a skipped case leaves the ratio at N/N.
+
+The common shape is worth naming: each of these is a dependency on the
+host that the tree stated nowhere and checked nowhere, and each failed in a
+way that looked like something else - a slow engine, a hardware divergence, a
+missing loader, a broken clone. Two of them did not look like failures at
+all. The project README now lists the host tools a node run needs and what
+each one's absence does.
+
+Gate on the new machine: the verification suite green end to end (316
+hardware cases, the six real-gcc blobs, every differential); the breadth
+sweep 168 of 169 exact with the AOT tier live, the one failure being
+`git-http` on the missing repo above and one case skipped because its
+fixture was deleted out from under the run. All six of those cases pass on
+re-run with the fixtures built, and a confirming full sweep follows.
