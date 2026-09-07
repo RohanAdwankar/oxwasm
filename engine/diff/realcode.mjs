@@ -1,6 +1,30 @@
 // Differential test on REAL gcc output: call compiled functions with
 // controlled arguments; every hardware step must match tier-0.
+import { execFileSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { runCase } from './run.mjs';
+
+// The blobs are built here, from realsrc/, every run. They used to be
+// whatever a developer had left in /tmp, so the whole suite died on a fresh
+// machine at `incbin: unable to get length of file /tmp/fib-O1.bin` - after
+// the 316 hardware cases had already passed, which made it read like a
+// hardware failure rather than a missing file. Each source is one function
+// with no relocations in .text, so its .text section IS the callable blob:
+// -fno-pic keeps it free of GOT references and -fno-builtin stops gcc
+// turning strlen_ back into a call to libc's. Whatever this gcc emits is a
+// valid case - the test compares it against the hardware, not against a
+// recorded instruction sequence.
+const SRC = new URL('./realsrc/', import.meta.url).pathname;
+for (const f of ['fib', 'mix', 'strlen_']) for (const O of ['O1', 'O2']) {
+  const o = `/tmp/rc_${f}-${O}.o`;
+  try {
+    execFileSync('gcc', [`-${O}`, '-fno-builtin', '-fcf-protection=none', '-fno-pic',
+                         '-c', `${SRC}${f}.c`, '-o', o]);
+    execFileSync('objcopy', ['-O', 'binary', '--only-section=.text', o, `/tmp/${f}-${O}.bin`]);
+  } catch (e) {
+    if (!existsSync(`/tmp/${f}-${O}.bin`)) { console.log(`FAIL cannot build ${f}-${O}: ${e.message}`); process.exit(1); }
+  }
+}
 
 const calls = [
   ['gcc-fib-O1', 'mov rdi, 30', 'fib-O1'],
