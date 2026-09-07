@@ -10,9 +10,31 @@
 import { spawn, execFileSync, execSync } from 'node:child_process';
 import { mkdtempSync, openSync, writeSync, readSync, writeFileSync, readFileSync, unlinkSync, existsSync, rmSync, constants as FSC } from 'node:fs';
 
+// A host with no wat2wasm on PATH does not break anything visibly: every unit
+// the translator emits comes back "wat2wasm failed (127): not found", the
+// engine treats that as one more refused translation and blacklists the entry,
+// and the run finishes CORRECTLY on the interpreter. A whole breadth sweep can
+// go green that way with the AOT tier dead - the only tell is aot=0 on every
+// case. So prove the assembler works before the first unit is ever emitted:
+// build a one-instruction module with the same flags the run will use, which
+// catches a missing binary and a wabt too old for --enable-tail-call alike.
+function preflight(flags, tag) {
+  const w = `/tmp/${tag}_pre_${process.pid}`;
+  try {
+    writeFileSync(w + '.wat', '(module (func (export "f") (result i32) (i32.const 1)))');
+    execFileSync('wat2wasm', [...flags, w + '.wat', '-o', w + '.wasm'], { stdio: ['ignore', 'ignore', 'pipe'] });
+    if (!readFileSync(w + '.wasm').length) throw new Error('wat2wasm produced no output');
+  } catch (e) {
+    const why = e.code === 'ENOENT' ? 'wat2wasm is not on PATH (install wabt)'
+              : `wat2wasm ${flags.join(' ')} failed: ${String(e.stderr || e.message).slice(0, 200)}`;
+    throw new Error(`the AOT tier cannot assemble: ${why}. Without it every unit is refused and the guest runs interpreted - correct, and many times slower.`);
+  } finally { for (const s of ['.wat', '.wasm']) { try { unlinkSync(w + s); } catch {} } }
+}
+
 export function makeAssembler({ debugNames = false, tag = 'oxasm', workers = +(process.env.OXWASM_ASM_WORKERS || 1) } = {}) {
   const flags = ['--enable-tail-call', ...(debugNames ? ['--debug-names'] : [])];
   let n = 0;
+  preflight(flags, tag);
   // workers > 1: extra broker shells, each with its own fifo pair and queue;
   // deferred submissions go to the least loaded one, so several wat2wasm run
   // at once while the guest continues. The synchronous path uses shell 0.
