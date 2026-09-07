@@ -56,16 +56,30 @@ catch (e) { done(1, `FAIL pagerun ${bin}: m3pack: ${String(e.stderr || e.message
 const port = 8600 + Math.floor(Math.random() * 400);
 serve = spawn(process.execPath, [join(here, 'gui', 'serve.mjs'), dir, String(port)], { stdio: 'ignore' });
 const cport = 9600 + Math.floor(Math.random() * 400);
-chrome = spawn(chromePath(), ['--headless', '--disable-gpu', '--no-sandbox',
-  `--remote-debugging-port=${cport}`, 'about:blank'], { stdio: 'ignore' });
-await new Promise(r => setTimeout(r, 2500));
+// --disable-dev-shm-usage: a CI runner's /dev/shm is small and Chrome dies
+// on it. stderr is kept, not discarded: the first CI run of this reported
+// only "no browser (fetch failed)", which says nothing about why.
+let cerr = '';
+chrome = spawn(chromePath(), ['--headless=new', '--disable-gpu', '--no-sandbox', '--disable-dev-shm-usage',
+  `--remote-debugging-port=${cport}`, 'about:blank'], { stdio: ['ignore', 'ignore', 'pipe'] });
+chrome.stderr.on('data', d => { cerr += d; });
+let cexit = null; chrome.on('exit', (c) => { cexit = c; });
 
-let ws;
+// The debugger port is up when /json answers. One fixed sleep was enough on a
+// developer's machine and not on a cold runner, so poll for it.
+let ws, list = null;
+for (let i = 0; i < 60; i++) {
+  await new Promise(r => setTimeout(r, 500));
+  if (cexit !== null) break;
+  try { const r = await fetch(`http://127.0.0.1:${cport}/json`); if (r.ok) { list = await r.json(); if (list.length) break; } } catch {}
+}
+if (!list || !list.length)
+  done(1, `FAIL pagerun ${bin}: no browser at ${chromePath()} (${cexit !== null ? `exited ${cexit}` : 'debugger port never answered'})` +
+          (cerr.trim() ? `\n  ${cerr.trim().split('\n').slice(-4).join('\n  ')}` : ''));
 try {
-  const list = await (await fetch(`http://127.0.0.1:${cport}/json`)).json();
   ws = new WebSocket(list[0].webSocketDebuggerUrl);
   await new Promise((res, rej) => { ws.onopen = res; ws.onerror = rej; });
-} catch (e) { done(1, `FAIL pagerun ${bin}: no browser (${e.message})`); }
+} catch (e) { done(1, `FAIL pagerun ${bin}: browser found but would not attach (${e.message})`); }
 let id = 0; const waiting = new Map();
 ws.onmessage = (ev) => { const m = JSON.parse(ev.data); if (m.id && waiting.has(m.id)) { waiting.get(m.id)(m.result); waiting.delete(m.id); } };
 const cmd = (method, params = {}) => new Promise(res => { const i = ++id; waiting.set(i, res); ws.send(JSON.stringify({ id: i, method, params })); });
