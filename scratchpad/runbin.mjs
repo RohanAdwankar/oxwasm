@@ -8,14 +8,15 @@ import { makeAssembler } from '../tools/assemble.mjs';
 import { readFileSync, readdirSync, lstatSync, realpathSync, existsSync, opendirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { writeFileSync, unlinkSync } from 'node:fs';
+import { writeFileSync, unlinkSync, mkdirSync } from 'node:fs';
 let an = 0;
 globalThis.__jtabStats = { structured: 0 }; globalThis.__layoutOf = new Map();
 let watBytes = 0, watUnits = 0;
 if (process.env.DBGRIP) globalThis.__dbgRip = BigInt("0x" + process.env.DBGRIP);   // DBGRIP=hex: log the top-level dispatch decision at this rip
 if (process.env.ASMTRACE) globalThis.__asmTrace = true;   // ASMTRACE=1: deferred-assembly submit/return per unit, and the stack of a unit that fails
 if (process.env.CFGDUMP) globalThis.__cfgDump = process.env.CFGDUMP;   // CFGDUMP=hex: when this function falls back to dispatch, write its N/succs to CFGDUMP_TO
-const assembleWat = (wat) => { watBytes += wat.length; watUnits++; if (process.env.WATDUMP === 'all') writeFileSync('/tmp/claude-0/-home-user-0/39bd4f7f-c25c-5004-92d0-ce544ed5705a/scratchpad/dump/unit_' + watUnits + '.wat', wat); else if (process.env.WATDUMP && wat.includes('$f_' + process.env.WATDUMP)) writeFileSync(process.env.WATDUMP_TO || ('/tmp/claude-0/-home-user-0/39bd4f7f-c25c-5004-92d0-ce544ed5705a/scratchpad/unit_' + process.env.WATDUMP + '.wat'), wat);                       // AOT=1: tier live, like breadth
+const WATDIR = process.env.WATDUMP_DIR || '/tmp/oxwasm-wat';   // WATDUMP=all dumped into one developer's scratchpad, a path that exists on no other machine, so the lever silently wrote nothing
+const assembleWat = (wat) => { watBytes += wat.length; watUnits++; if (process.env.WATDUMP === 'all') { mkdirSync(WATDIR, { recursive: true }); writeFileSync(WATDIR + '/unit_' + watUnits + '.wat', wat); } else if (process.env.WATDUMP && wat.includes('$f_' + process.env.WATDUMP)) { mkdirSync(WATDIR, { recursive: true }); writeFileSync(process.env.WATDUMP_TO || (WATDIR + '/unit_' + process.env.WATDUMP + '.wat'), wat); }                       // AOT=1: tier live, like breadth
   return asm(wat); };
 const asm = makeAssembler({ debugNames: true, tag: 'rb' });   // pre-forked: 4 ms a unit instead of 133 from a 3 GB process
 const bin = process.argv[2], args = process.argv.slice(3);
