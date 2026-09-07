@@ -5703,6 +5703,17 @@ than read off the run. The historical lines are left as they were written -
 their pass/fail verdict stands, only the denominator was inflated - and the
 sweep now prints its own case count when anything is skipped.
 
+**What the interpreted-step counter found, once it could see anything.**
+Ranked across the whole sweep, the interpreted work is concentrated exactly
+where the case list puts it on purpose: `java-hello` 116M steps and
+`java-jit` 81M (HotSpot's generated interpreter and its nmethods, neither
+run with `execAnon` - that is the coverage those two cases exist for),
+`node-jit` 11M, `ffprobe`/`ffmpeg` 12.7M each. Every other case is under 3M.
+So after the vfork-budget fix there is no case left that is accidentally
+interpreted at scale, and the lever batch 25 opened is, for now, spent - the
+next multiplier is per-instruction code quality inside the unit, as the
+loop30M and GIMP profiles both concluded by their own routes.
+
 Gate on the new machine: the verification suite green end to end (316
 hardware cases, the six real-gcc blobs, every differential); the breadth
 sweep 168 of 169 exact with the AOT tier live, the one failure being
