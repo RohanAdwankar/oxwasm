@@ -13,7 +13,7 @@
 // everywhere else without anything noticing.
 import { spawn, execFileSync } from 'node:child_process';
 import { openBrowser, waitForExit } from './cdp.mjs';
-import { mkdtempSync, rmSync, existsSync, mkdirSync, copyFileSync, unlinkSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, mkdirSync, copyFileSync, unlinkSync, statSync, utimesSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -37,13 +37,28 @@ for (let i = 1; i < argv.length; i++) if (argv[i] === '--file') { const [g, h] =
 const planted = [];
 for (const [g, h] of fileMap) {
   if (existsSync(g)) { console.log(`FAIL pagerun ${bin}: guest path ${g} already exists on the host; pick another`); process.exit(1); }
-  mkdirSync(dirname(g), { recursive: true }); copyFileSync(h, g); planted.push(g);
+  mkdirSync(dirname(g), { recursive: true }); copyFileSync(h, g);
+  // and the same mtime: copyFileSync stamps the copy with now, while the page
+  // carries the mtime of the file m3pack packed. gzip stores that timestamp in
+  // its header, so without this the two sides differ by four bytes for a
+  // reason that is the harness, not the engine.
+  const st = statSync(h); utimesSync(g, st.atime, st.mtime);
+  planted.push(g);
 }
 const nativeArgs = guestArgs.slice(1);
-let natOut = '', natCode = 0;
-try { natOut = execFileSync(bin, nativeArgs, { maxBuffer: 1 << 26 }).toString(); }
-catch (e) { natOut = (e.stdout ?? Buffer.alloc(0)).toString(); natCode = e.status ?? -1; }
+let natBytes = Buffer.alloc(0), natCode = 0;
+try { natBytes = execFileSync(bin, nativeArgs, { maxBuffer: 1 << 26 }); }
+catch (e) { natBytes = e.stdout ?? Buffer.alloc(0); natCode = e.status ?? -1; }
 finally { for (const g of planted) { try { unlinkSync(g); } catch {} } }
+const natOut = natBytes.toString();
+// The same digest the page computes over its raw stdout chunks. Comparing the
+// decoded text instead cannot see a binary difference at all - gzip's output
+// differs from native's in the four header bytes holding the file's mtime, and
+// that divergence shipped for as long as the packer has existed.
+const digest = (b) => { let h1 = 0x811c9dc5, h2 = 0x01000193;
+  for (let i = 0; i < b.length; i++) { h1 = Math.imul(h1 ^ b[i], 0x01000193) >>> 0; h2 = Math.imul(h2 + b[i], 0x85ebca6b) >>> 0; }
+  return h1.toString(16).padStart(8, '0') + h2.toString(16).padStart(8, '0'); };
+const natHash = digest(natBytes);
 
 const dir = mkdtempSync('/tmp/oxpagerun_');
 const page = join(dir, 'index.html');
@@ -73,11 +88,14 @@ if (pageCode === null) {
 // after the DOM has had it, and is the fallback for a page built before the
 // signal existed.
 const pageOut = (await q('typeof window.__oxOut === "string" ? window.__oxOut : document.getElementById("term").textContent')) || '';
+const pageHash = await q('window.__oxOutHash'), pageLen = await q('window.__oxOutLen');
 
-if (pageOut === natOut && pageCode === natCode)
-  done(0, `ok   pagerun ${bin}: ${natOut.length}B stdout and exit ${natCode} identical to native, in the browser`);
+if (pageHash === natHash && pageLen === natBytes.length && pageCode === natCode)
+  done(0, `ok   pagerun ${bin}: ${natBytes.length}B stdout (${natHash}) and exit ${natCode} identical to native, in the browser`);
 let d = 0; while (d < pageOut.length && d < natOut.length && pageOut[d] === natOut[d]) d++;
 done(1, `FAIL pagerun ${bin}: ${pageCode === natCode ? '' : `exit ${pageCode} vs native ${natCode}; `}` +
-        `stdout ${pageOut.length}B vs native ${natOut.length}B, first difference at ${d}\n` +
+        `stdout ${pageLen}B/${pageHash} vs native ${natBytes.length}B/${natHash}` +
+        (pageLen === natBytes.length ? ' (same length, different bytes)' : '') +
+        `, first text difference at ${d}\n` +
         `  page:   ${JSON.stringify(pageOut.slice(Math.max(0, d - 20), d + 40))}\n` +
         `  native: ${JSON.stringify(natOut.slice(Math.max(0, d - 20), d + 40))}`);

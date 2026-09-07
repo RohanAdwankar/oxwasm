@@ -214,7 +214,24 @@ const watDepth = (s) => {
     stat.innerHTML = \`interp \${s.interpreted.toLocaleString()} · aot units \${s.tiers.aot||0} · aot runs \${s.aotRuns.toLocaleString()}\` +
       (refused ? \` · \${refused} too deep to assemble (>\${maxDepth})\` : '') + \` · \${((performance.now()-t0)/1000).toFixed(1)}s\`;
     if (eng.exitCode === null) setTimeout(pump, 0);
-    else { window.__oxMs = performance.now() - t0; window.__oxExit = eng.exitCode; window.__oxOut = outText; }   // a machine-readable end for tools/pagerun.mjs and the clock bench/vspage.mjs subtracts; the line below is for people
+    else {
+      // eng.stdout is the decoded text and is what the terminal shows; it
+      // cannot represent a binary stream, so the CHECK is over eng.stdoutBytes
+      // - the raw chunks - via a digest a harness can compare against native.
+      // gzip's output differs from native's in the four header bytes that hold
+      // the file's mtime, which no text or length comparison can see.
+      let n = 0; for (const c of eng.stdoutBytes) n += c.length;
+      const raw = new Uint8Array(n); let o = 0;
+      for (const c of eng.stdoutBytes) { raw.set(c, o); o += c.length; }
+      let h1 = 0x811c9dc5, h2 = 0x01000193;                  // two FNV-1a streams, so the 64 bits a harness compares are not one 32-bit space
+      for (let i = 0; i < raw.length; i++) {
+        h1 = Math.imul(h1 ^ raw[i], 0x01000193) >>> 0;
+        h2 = Math.imul(h2 + raw[i], 0x85ebca6b) >>> 0;
+      }
+      window.__oxMs = performance.now() - t0; window.__oxExit = eng.exitCode; window.__oxOut = outText;
+      window.__oxOutLen = raw.length;
+      window.__oxOutHash = h1.toString(16).padStart(8, '0') + h2.toString(16).padStart(8, '0');
+    }   // a machine-readable end for tools/pagerun.mjs and the clock bench/vspage.mjs subtracts; the line below is for people
     if (eng.exitCode !== null) stat.innerHTML += eng.exitCode === 0
       ? ' · <span class="ok">exit 0</span>' : \` · <span class="err">exit \${eng.exitCode}</span>\`;
   };
