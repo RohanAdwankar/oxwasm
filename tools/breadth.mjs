@@ -16,7 +16,7 @@ import { LinuxEngine } from '../engine/linux.mjs';
 import { setFlagsFromString } from 'node:v8';
 if (process.env.WASM_LAZY !== '0') setFlagsFromString('--wasm-lazy-compilation');   // V8 compiles each wasm function at its first call: most translated functions of a compiler run are never entered (clang -S 45 s -> 39 s), m4 steady state neutral on a quiet machine; WASM_LAZY=0 restores eager
 import { makeAssembler } from './assemble.mjs';
-import { readFileSync, readdirSync, lstatSync, realpathSync, statSync, writeFileSync, existsSync, mkdirSync, unlinkSync, copyFileSync, opendirSync } from 'node:fs';
+import { readFileSync, readdirSync, lstatSync, realpathSync, statSync, writeFileSync, existsSync, mkdirSync, unlinkSync, copyFileSync, symlinkSync, opendirSync } from 'node:fs';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -138,6 +138,38 @@ if (!existsSync(JHELLO + '/Hello.class')) {   // Java: HotSpot's runtime-generat
       '}', ''].join('\n'));
     execFileSync('/usr/lib/jvm/java-21-openjdk-amd64/bin/javac', ['-d', JHELLO, JHELLO + '/Hello.java'], { env: { PATH: process.env.PATH } });
   } catch (e) { console.log('  (javac unavailable: ' + String(e.stderr || e.message).split('\n')[0] + ')'); }
+}
+// Three more inputs nothing in the tree used to build, each of which made its
+// case pass while testing nothing: without them `javac`, `make` and `tar-x`
+// fail identically natively and under the engine, and the byte compare matches
+// two identical failures. Source for javac to compile (the class file is the
+// oracle), a makefile with a real dependency chain, and a tar carrying a
+// symlink - all deterministic, so the two sides have something to disagree on.
+const JAVAC = '/tmp/breadth_javac';
+if (!existsSync(JAVAC + '/Hello.java')) {
+  try { mkdirSync(JAVAC, { recursive: true });
+        writeFileSync(JAVAC + '/Hello.java', [
+          'public class Hello {',
+          '  static int twice(int n) { return n + n; }',
+          '  public static void main(String[] a) {',
+          '    int s = 0; for (int i = 0; i < 8; i++) s += twice(i);',
+          '    System.out.println("javac fixture " + s);',
+          '  }',
+          '}', ''].join('\n')); }
+  catch (e) { console.log(`  note: ${JAVAC} not built (${String(e.message).slice(0, 120)}) - the javac case will compare two empty class files`); }
+}
+if (!existsSync('/tmp/bm/Makefile')) {
+  try { mkdirSync('/tmp/bm', { recursive: true });
+        writeFileSync('/tmp/bm/Makefile', 'all: out.txt\n\na.txt:\n\techo alpha > a.txt\n\nb.txt:\n\techo beta > b.txt\n\nout.txt: a.txt b.txt\n\tcat a.txt b.txt > out.txt\n'); }
+  catch (e) { console.log(`  note: /tmp/bm not built (${String(e.message).slice(0, 120)}) - the make case will compare two failed cd's`); }
+}
+if (!existsSync('/tmp/bt/arc.tar')) {
+  try { mkdirSync('/tmp/bt/tree/src', { recursive: true });
+        writeFileSync('/tmp/bt/tree/src/file.txt', 'tar payload\n');
+        try { unlinkSync('/tmp/bt/tree/src/link'); } catch {}
+        symlinkSync('file.txt', '/tmp/bt/tree/src/link');
+        execFileSync('tar', ['-cf', '/tmp/bt/arc.tar', '-C', '/tmp/bt/tree', 'src']); }
+  catch (e) { console.log(`  note: /tmp/bt/arc.tar not built (${String(e.message).slice(0, 120)}) - the tar-x case will compare two failed extractions`); }
 }
 const GOSTR = '/tmp/breadth_gostrings';
 if (!existsSync(GOSTR)) {
