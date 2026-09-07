@@ -177,8 +177,34 @@ const CENSUS2 = '/tmp/breadth_census2';
 if (!existsSync(CENSUS2)) {  // the second census: processes, signals, sockets, memory (tools/fixtures/census2.c)
   try { execFileSync('gcc', ['-O1', '-o', CENSUS2, new URL('./fixtures/census2.c', import.meta.url).pathname]); } catch {}
 }
+// The repo four cases read (git-log, git-status, find-exec, ls-l) and the one
+// git-http serves. Nothing in the tree used to build it: it was a directory a
+// developer had made once, and on a machine without it those four cases PASSED
+// - `git -C /tmp/breadth_repo log` fails the same way natively and under the
+// engine, so the byte compare matched two identical error messages and the
+// sweep counted four vacuous greens. Dates, names and content are pinned so
+// the commit hashes are the same everywhere.
+if (!existsSync('/tmp/breadth_repo/.git')) {
+  const D = '2021-01-01T00:00:00+0000';
+  const genv = { ...process.env, GIT_AUTHOR_NAME: 'oxwasm', GIT_AUTHOR_EMAIL: 'oxwasm@example.invalid',
+                 GIT_COMMITTER_NAME: 'oxwasm', GIT_COMMITTER_EMAIL: 'oxwasm@example.invalid',
+                 GIT_AUTHOR_DATE: D, GIT_COMMITTER_DATE: D };
+  try {
+    const git = (...a) => execFileSync('git', a, { env: genv, stdio: 'ignore' });
+    mkdirSync('/tmp/breadth_repo/sub', { recursive: true });
+    git('init', '-q', '-b', 'main', '/tmp/breadth_repo');
+    writeFileSync('/tmp/breadth_repo/a.txt', 'alpha\n');
+    writeFileSync('/tmp/breadth_repo/b.txt', 'beta\n');
+    writeFileSync('/tmp/breadth_repo/sub/c.txt', 'gamma\n');
+    git('-C', '/tmp/breadth_repo', 'add', '-A');
+    git('-C', '/tmp/breadth_repo', 'commit', '-q', '-m', 'first');
+    writeFileSync('/tmp/breadth_repo/a.txt', 'alpha again\n');            // a modified file and an untracked one, so
+    writeFileSync('/tmp/breadth_repo/new.txt', 'untracked\n');            // git status --porcelain has something to say
+  } catch (e) { console.log(`  note: /tmp/breadth_repo not built (${String(e.message).slice(0, 120)}) - the four git/repo cases will compare two identical failures`); }
+}
 if (!existsSync('/tmp/bgit/repo.git/info/refs')) {   // git-http's bare repo, dumb-protocol ready
-  try { mkdirSync('/tmp/bgit', { recursive: true }); execFileSync('git', ['clone', '-q', '--bare', '/tmp/breadth_repo', '/tmp/bgit/repo.git']); execFileSync('git', ['update-server-info'], { cwd: '/tmp/bgit/repo.git' }); } catch {} }
+  try { mkdirSync('/tmp/bgit', { recursive: true }); execFileSync('git', ['clone', '-q', '--bare', '/tmp/breadth_repo', '/tmp/bgit/repo.git']); execFileSync('git', ['update-server-info'], { cwd: '/tmp/bgit/repo.git' }); }
+  catch (e) { console.log(`  note: /tmp/bgit not built (${String(e.message).slice(0, 120)}) - git-http will fail on a missing directory`); } }
 if (!existsSync('/tmp/bh/hello.txt')) { try { mkdirSync('/tmp/bh', { recursive: true }); writeFileSync('/tmp/bh/hello.txt', 'hello over http\n'); } catch {} }   // http-loop's document root
 const CENSUS3 = '/tmp/breadth_census3';
 if (!existsSync(CENSUS3)) {  // the third census: filesystem edge cases, /proc shapes, timers, threads (tools/fixtures/census3.c)
@@ -848,14 +874,14 @@ const engine = (bin, args, stdin, opts = {}) => {
 };
 
 let pass = 0, fail = 0;
-const failures = [];
+const failures = [], skipped = [];
 for (const [name, bin, args, opts] of CASES) {
   if (!pick(name)) continue;
   // V8 does not collect a finished case's wasm memory on its own pressure
   // accounting: without this a chunk of 50 cases grew to 13.7 GB and was
   // OOM-killed (run with --expose-gc; a no-op without it)
   if (globalThis.gc) globalThis.gc();
-  if (!existsSync(bin)) { console.log(`  SKIP ${name.padEnd(9)} (${bin} not present)`); continue; }
+  if (!existsSync(bin)) { skipped.push(name); console.log(`  SKIP ${name.padEnd(9)} (${bin} not present)`); continue; }
   const stdin = STDIN[name] || null;
   if (opts && opts.tree) for (const t of [].concat(opts.tree)) walk(t);
   if (opts && opts.bins) for (const b of opts.bins) add(b, b);   // child-exec binaries
@@ -898,6 +924,7 @@ for (const [name, bin, args, opts] of CASES) {
     }
   }
 }
-console.log(`\n${pass}/${pass + fail} unmodified binaries byte-identical to native`);
+console.log(`\n${pass}/${pass + fail} unmodified binaries byte-identical to native` +
+            (skipped.length ? ` (${skipped.length} of ${CASES.length} cases SKIPPED, not run: ${skipped.join(' ')})` : ''));   // a skipped case leaves the ratio at N/N, so the sweep can shrink and still read green: five host tools went missing on a new machine and nothing said so
 if (failures.length) { console.log('failures:'); for (const [n, w] of failures) console.log(`  ${n}: ${w}`); }
 process.exit(fail ? 1 : 0);
