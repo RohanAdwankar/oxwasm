@@ -83,21 +83,39 @@ try {
     const page = [], nat = [];
     const input = which === 'big' ? BIG : SMALL;
     for (let i = 0; i < REPS; i++) { page.push(await pageOnce(pages[which])); nat.push(nativeOnce(input)); }
-    out[which] = { page: median(page), nat: median(nat), bytes: statSync(input).size };
-    console.log(`  ${which.padEnd(5)} ${out[which].bytes}B  page ${out[which].page.toFixed(0)}ms  native ${out[which].nat.toFixed(2)}ms  (${REPS} reps, medians)`);
+    // standard error, not max-minus-min: the range is a biased noise estimate
+    // that grows with the number of samples, so more reps would make a good
+    // measurement look worse. The error on a median of n falls as sqrt(n),
+    // which is what more reps are for.
+    const stderr = (a) => { const m = a.reduce((x, y) => x + y, 0) / a.length;
+      return Math.sqrt(a.reduce((s, v) => s + (v - m) ** 2, 0) / Math.max(1, a.length - 1)) / Math.sqrt(a.length); };
+    out[which] = { page: median(page), nat: median(nat), pageErr: stderr(page), natErr: stderr(nat), bytes: statSync(input).size };
+    console.log(`  ${which.padEnd(5)} ${out[which].bytes}B  page ${out[which].page.toFixed(0)}±${out[which].pageErr.toFixed(0)}ms  ` +
+                `native ${out[which].nat.toFixed(2)}±${out[which].natErr.toFixed(2)}ms  (${REPS} reps, medians ± standard error)`);
   }
   const dPage = out.big.page - out.small.page, dNat = out.big.nat - out.small.nat;
   const dBytes = out.big.bytes - out.small.bytes;
+  // The subtraction carries both runs' noise, so the difference is only a
+  // measurement if it is large against that noise. A positive difference is
+  // not enough on its own: at a narrow size gap this reported 41.9x where a
+  // 15x wider gap on the same binary read 7.1x, because the narrow one was
+  // measuring the floor's jitter and whatever tiering had not finished.
+  // errors add in quadrature across the subtraction
+  const pageNoise = Math.hypot(out.big.pageErr, out.small.pageErr);
+  const natNoise = Math.hypot(out.big.natErr, out.small.natErr);
   console.log(`\n  steady state over ${dBytes}B of extra input:`);
-  console.log(`    page   ${dPage.toFixed(0)}ms`);
-  console.log(`    native ${dNat.toFixed(2)}ms`);
-  // A subtraction of two noisy medians can come out negative or near zero, at
-  // which point the ratio is not a measurement of anything. Say so instead of
-  // printing a number.
+  console.log(`    page   ${dPage.toFixed(0)} ± ${pageNoise.toFixed(0)}ms`);
+  console.log(`    native ${dNat.toFixed(2)} ± ${natNoise.toFixed(2)}ms`);
   if (dNat <= 0 || dPage <= 0)
     console.log(`\n  RESULT unusable: the two sizes did not separate (page ${dPage.toFixed(0)}ms, native ${dNat.toFixed(2)}ms) — widen the gap between --big and --small`);
-  else
-    console.log(`\n  RESULT ${(dPage / dNat).toFixed(1)}x native, in the browser, steady state`);
+  else if (dPage < 3 * pageNoise || dNat < 3 * natNoise)
+    console.log(`\n  RESULT unreliable: ${(dPage / dNat).toFixed(1)}x, but the difference is not 3x its own noise ` +
+                `(page ${dPage.toFixed(0)}±${pageNoise.toFixed(0)}, native ${dNat.toFixed(2)}±${natNoise.toFixed(2)}) — widen the size gap or raise --reps`);
+  else {
+    // worst case in each direction, so the range is the measurement's own
+    const lo = (dPage - pageNoise) / (dNat + natNoise), hi = (dPage + pageNoise) / (dNat - natNoise);
+    console.log(`\n  RESULT ${(dPage / dNat).toFixed(1)}x native, in the browser, steady state (${lo.toFixed(1)}–${hi.toFixed(1)}x at one standard error)`);
+  }
   console.log(`  (page floor, all of load+tier: ${out.small.page.toFixed(0)}ms at ${out.small.bytes}B)`);
   stop(0);
 } catch (e) { console.log(`FAIL: ${e.message}`); stop(1); }
