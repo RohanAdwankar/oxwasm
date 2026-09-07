@@ -23,7 +23,7 @@ forces the native path; `--snapshot` additionally needs Node + headless
 Chromium, so run that step on Linux.) Inside is a WebAssembly machine that boots a tiny
 Linux and runs the program you named. **The tool is general — GIMP is just
 the test case.** `examples/xcalc.app` is the same pipeline with a different
-program; a new app is a new spec, not new code. Issue: drapoz/0#1345.
+program; a new app is a new spec, not new code.
 
 ## The tool is program-agnostic
 
@@ -85,7 +85,7 @@ oxwasm never patches the software it packages.
 
 ## Why
 
-The end goal (issue #1345): `oxwasm anything.AppImage` → a static site that
+The end goal: `oxwasm anything.AppImage` → a static site that
 runs that program. Not a rewrite, not a streaming server — the real program,
 running client-side. The tool is general on purpose; GIMP is only the
 forcing function, because it is brutally honest: multi-process, threaded,
