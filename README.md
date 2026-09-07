@@ -161,6 +161,10 @@ wat2wasm (wabt)   the AOT tier's assembler -- every translated unit goes
                   times slower. `makeAssembler` proves it works at startup
                   rather than letting a whole run tier down in silence.
 nasm              builds the engine's asm fixtures (tools/fixtures/*.asm)
-ffmpeg zstd busybox  breadth cases; a missing one is skipped, so the sweep
+busybox-static    the process-machinery tests (attest, shelltest) and three
+                  breadth cases run a real static busybox. It has to be the
+                  -static package: Ubuntu's plain `busybox` is dynamic, and
+                  the tests skip rather than run against it.
+ffmpeg zstd       breadth cases; a missing one is skipped, so the sweep
                   silently gets smaller
 ```

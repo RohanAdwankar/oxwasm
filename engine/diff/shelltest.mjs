@@ -8,7 +8,18 @@ import { readFileSync } from 'node:fs';
 
 let bb;
 try { bb = new Uint8Array(readFileSync('/bin/busybox')); } catch {}
-if (!bb || bb[4] !== 2 || new DataView(bb.buffer, bb.byteOffset).getUint16(18, true) !== 0x3e) {
+// "static" is the part of the guard that used to be missing: the class and
+// machine words match a DYNAMIC busybox too (Ubuntu's busybox package ships
+// one; busybox-static is the other package), and the engine then threw
+// "interpreter not provided in files" and took the whole suite down instead
+// of skipping. A static image has no PT_INTERP program header.
+const isStatic = (b) => {
+  const d = new DataView(b.buffer, b.byteOffset);
+  const off = Number(d.getBigUint64(0x20, true)), sz = d.getUint16(0x36, true), n = d.getUint16(0x38, true);
+  for (let i = 0; i < n; i++) if (d.getUint32(off + i * sz, true) === 3) return false;   // PT_INTERP
+  return true;
+};
+if (!bb || bb[4] !== 2 || new DataView(bb.buffer, bb.byteOffset).getUint16(18, true) !== 0x3e || !isStatic(bb)) {
   console.log('shelltest SKIPPED: no static x86-64 /bin/busybox on this host');
   process.exit(0);
 }
