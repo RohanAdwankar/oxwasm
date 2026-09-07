@@ -5,9 +5,9 @@ name: m3-engine
 # browser check of what the packer actually produces.
 on:
   push:
-    paths: ['oxwasm/engine/**', 'oxwasm/tools/**', '.github/workflows/m3-engine.yml']
+    paths: ['engine/**', 'tools/**', '.github/workflows/m3-engine.yml']
   pull_request:
-    paths: ['oxwasm/engine/**', 'oxwasm/tools/**', '.github/workflows/m3-engine.yml']
+    paths: ['engine/**', 'tools/**', '.github/workflows/m3-engine.yml']
 
 jobs:
   suite:
@@ -21,7 +21,7 @@ jobs:
       - name: install nasm + wabt + static busybox
         run: sudo apt-get update && sudo apt-get install -y nasm wabt busybox-static
       - name: run verification suite
-        run: ./oxwasm/engine/test.sh 300
+        run: ./engine/test.sh 300
 
   # The packer had no check at all, and stayed broken on every machine but one
   # for as long as it took someone to run it somewhere else: it read wabt.js
@@ -40,6 +40,6 @@ jobs:
         run: npm i --no-save wabt@1.0.39
       - name: the packed page runs the binary in a browser
         run: |
-          cp oxwasm/README.md /tmp/oxpage_f
-          node oxwasm/tools/pagerun.mjs /usr/bin/sha256sum \
+          cp README.md /tmp/oxpage_f
+          node tools/pagerun.mjs /usr/bin/sha256sum \
             --arg sha256sum --arg /tmp/oxpage_in --file /tmp/oxpage_in=/tmp/oxpage_f
