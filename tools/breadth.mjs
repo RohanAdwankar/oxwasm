@@ -137,7 +137,7 @@ if (!existsSync(JHELLO + '/Hello.class')) {   // Java: HotSpot's runtime-generat
       '  }',
       '}', ''].join('\n'));
     execFileSync('/usr/lib/jvm/java-21-openjdk-amd64/bin/javac', ['-d', JHELLO, JHELLO + '/Hello.java'], { env: { PATH: process.env.PATH } });
-  } catch (e) { console.log('  (javac unavailable: ' + String(e.stderr || e.message).split('\n')[0] + ')'); }
+  } catch (e) { console.error('  (javac unavailable: ' + String(e.stderr || e.message).split('\n')[0] + ')'); }
 }
 // Three more inputs nothing in the tree used to build, each of which made its
 // case pass while testing nothing: without them `javac`, `make` and `tar-x`
@@ -145,6 +145,8 @@ if (!existsSync(JHELLO + '/Hello.class')) {   // Java: HotSpot's runtime-generat
 // two identical failures. Source for javac to compile (the class file is the
 // oracle), a makefile with a real dependency chain, and a tar carrying a
 // symlink - all deterministic, so the two sides have something to disagree on.
+// fixture diagnostics go to stderr: a sweep's log captures both, and
+// `--list` writes a file that must contain nothing but the table
 const JAVAC = '/tmp/breadth_javac';
 if (!existsSync(JAVAC + '/Hello.java')) {
   try { mkdirSync(JAVAC, { recursive: true });
@@ -156,12 +158,12 @@ if (!existsSync(JAVAC + '/Hello.java')) {
           '    System.out.println("javac fixture " + s);',
           '  }',
           '}', ''].join('\n')); }
-  catch (e) { console.log(`  note: ${JAVAC} not built (${String(e.message).slice(0, 120)}) - the javac case will compare two empty class files`); }
+  catch (e) { console.error(`  note: ${JAVAC} not built (${String(e.message).slice(0, 120)}) - the javac case will compare two empty class files`); }
 }
 if (!existsSync('/tmp/bm/Makefile')) {
   try { mkdirSync('/tmp/bm', { recursive: true });
         writeFileSync('/tmp/bm/Makefile', 'all: out.txt\n\na.txt:\n\techo alpha > a.txt\n\nb.txt:\n\techo beta > b.txt\n\nout.txt: a.txt b.txt\n\tcat a.txt b.txt > out.txt\n'); }
-  catch (e) { console.log(`  note: /tmp/bm not built (${String(e.message).slice(0, 120)}) - the make case will compare two failed cd's`); }
+  catch (e) { console.error(`  note: /tmp/bm not built (${String(e.message).slice(0, 120)}) - the make case will compare two failed cd's`); }
 }
 if (!existsSync('/tmp/bt/arc.tar')) {
   try { mkdirSync('/tmp/bt/tree/src', { recursive: true });
@@ -169,7 +171,7 @@ if (!existsSync('/tmp/bt/arc.tar')) {
         try { unlinkSync('/tmp/bt/tree/src/link'); } catch {}
         symlinkSync('file.txt', '/tmp/bt/tree/src/link');
         execFileSync('tar', ['-cf', '/tmp/bt/arc.tar', '-C', '/tmp/bt/tree', 'src']); }
-  catch (e) { console.log(`  note: /tmp/bt/arc.tar not built (${String(e.message).slice(0, 120)}) - the tar-x case will compare two failed extractions`); }
+  catch (e) { console.error(`  note: /tmp/bt/arc.tar not built (${String(e.message).slice(0, 120)}) - the tar-x case will compare two failed extractions`); }
 }
 const GOSTR = '/tmp/breadth_gostrings';
 if (!existsSync(GOSTR)) {
@@ -232,11 +234,11 @@ if (!existsSync('/tmp/breadth_repo/.git')) {
     git('-C', '/tmp/breadth_repo', 'commit', '-q', '-m', 'first');
     writeFileSync('/tmp/breadth_repo/a.txt', 'alpha again\n');            // a modified file and an untracked one, so
     writeFileSync('/tmp/breadth_repo/new.txt', 'untracked\n');            // git status --porcelain has something to say
-  } catch (e) { console.log(`  note: /tmp/breadth_repo not built (${String(e.message).slice(0, 120)}) - the four git/repo cases will compare two identical failures`); }
+  } catch (e) { console.error(`  note: /tmp/breadth_repo not built (${String(e.message).slice(0, 120)}) - the four git/repo cases will compare two identical failures`); }
 }
 if (!existsSync('/tmp/bgit/repo.git/info/refs')) {   // git-http's bare repo, dumb-protocol ready
   try { mkdirSync('/tmp/bgit', { recursive: true }); execFileSync('git', ['clone', '-q', '--bare', '/tmp/breadth_repo', '/tmp/bgit/repo.git']); execFileSync('git', ['update-server-info'], { cwd: '/tmp/bgit/repo.git' }); }
-  catch (e) { console.log(`  note: /tmp/bgit not built (${String(e.message).slice(0, 120)}) - git-http will fail on a missing directory`); } }
+  catch (e) { console.error(`  note: /tmp/bgit not built (${String(e.message).slice(0, 120)}) - git-http will fail on a missing directory`); } }
 if (!existsSync('/tmp/bh/hello.txt')) { try { mkdirSync('/tmp/bh', { recursive: true }); writeFileSync('/tmp/bh/hello.txt', 'hello over http\n'); } catch {} }   // http-loop's document root
 const CENSUS3 = '/tmp/breadth_census3';
 if (!existsSync(CENSUS3)) {  // the third census: filesystem edge cases, /proc shapes, timers, threads (tools/fixtures/census3.c)
@@ -824,6 +826,26 @@ const STDIN = { tr: readFileSync(IN), bc: Buffer.from('scale=20\n7/3\n2^64\nsqrt
 
 const only = process.argv.slice(2);
 const pick = (n) => !only.length || only.some(o => n.includes(o));
+
+// `--list`: the case table as markdown, generated so it cannot drift from the
+// array. What the sweep runs IS the claim - "unmodified Linux binaries, byte
+// identical to native" is only as good as the list behind it - and a list
+// nobody can read is how four cases sat there comparing two identical
+// failures. Regenerate docs/breadth.md from this after adding a case.
+if (only.length === 1 && only[0] === '--list') {
+  const ROOT = new URL('../', import.meta.url).pathname;   // fixture paths are absolute on this host; print them relative to the project
+  const cell = (s) => String(s).replaceAll(ROOT, '').replace(/\|/g, '\\|').replace(/\n/g, ' ');
+  console.log(`# What the breadth sweep runs\n
+${CASES.length} cases. Each runs an unmodified host binary twice - natively and
+under the engine with the AOT tier live - and passes only if stdout (or the
+file it writes) and the exit status are byte-identical. Generated by
+\`node tools/breadth.mjs --list\`; do not edit by hand.\n`);
+  console.log('| case | binary | arguments | compared |');
+  console.log('|---|---|---|---|');
+  for (const [name, bin, args, opts] of CASES)
+    console.log(`| ${cell(name)} | \`${cell(bin)}\` | ${args.length ? '`' + cell(args.join(' ')) + '`' : ''} | ${opts && opts.outFile ? '`' + cell(opts.outFile) + '`' : 'stdout'} |`);
+  process.exit(0);
+}
 
 // a native process killed by a signal has status null in node; normalize to
 // the shell's 128+sig so it compares against the engine's default-action code

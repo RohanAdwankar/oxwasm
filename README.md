@@ -123,7 +123,8 @@ that carries GIMP carries most software — so nothing about GIMP is baked in.
   AppImages don't run), no x87 long-double (float `printf` paths), CLI
   apps only (a GUI app needs the display server the M2/v86 lane provides).
   `engine/test.sh` runs the differential suite; `engine/aot/bench-all.mjs`
-  reproduces the performance table.
+  reproduces the performance table; `tools/breadth.mjs` runs the breadth
+  sweep and `docs/breadth.md` lists every binary in it.
 - **M4 — the platform. Spike running.** `platform/` is the second lane:
   a syscall ABI as wasm imports, processes as workers, pipes as
   SharedArrayBuffer rings with real blocking reads. Two freestanding C
