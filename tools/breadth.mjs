@@ -16,7 +16,7 @@ import { LinuxEngine } from '../engine/linux.mjs';
 import { setFlagsFromString } from 'node:v8';
 if (process.env.WASM_LAZY !== '0') setFlagsFromString('--wasm-lazy-compilation');   // V8 compiles each wasm function at its first call: most translated functions of a compiler run are never entered (clang -S 45 s -> 39 s), m4 steady state neutral on a quiet machine; WASM_LAZY=0 restores eager
 import { makeAssembler } from './assemble.mjs';
-import { readFileSync, readdirSync, lstatSync, realpathSync, statSync, writeFileSync, existsSync, mkdirSync, unlinkSync, copyFileSync, symlinkSync, opendirSync } from 'node:fs';
+import { readFileSync, readdirSync, lstatSync, realpathSync, statSync, writeFileSync, appendFileSync, existsSync, mkdirSync, unlinkSync, copyFileSync, symlinkSync, opendirSync } from 'node:fs';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -930,10 +930,30 @@ const engine = (bin, args, stdin, opts = {}) => {
            yields: `${eng.stats.loopYieldTop | 0}/${eng.stats.loopYieldNested | 0}/${eng.stats.loopHot | 0}` };   // top-level yields / nested (deopt) yields / units rooted on request
 };
 
+// BREADTH_RESULTS=path: one JSON line per case, appended as it finishes, and
+// every case already in the file is counted and skipped on the next run. A
+// full sweep is half an hour; a host that reclaims the machine under it (or a
+// terminal that goes away) used to throw all of it away, and re-running from
+// the top spends the same half hour re-proving what was already exact. With
+// this the sweep is resumable: run it, and run it again, until the file holds
+// every case. Delete the file to start over.
+const RESULTS = process.env.BREADTH_RESULTS;
 let pass = 0, fail = 0;
-const failures = [], skipped = [];
+const failures = [], skipped = [], done = new Set();
+if (RESULTS && existsSync(RESULTS)) {
+  for (const line of readFileSync(RESULTS, 'utf8').split('\n')) {
+    if (!line.trim()) continue;
+    let r; try { r = JSON.parse(line); } catch { continue; }
+    if (done.has(r.name)) continue;                       // an interrupted run can leave a case twice
+    done.add(r.name);
+    if (r.ok) pass++; else { fail++; failures.push([r.name, r.why + ' (from a previous run)']); }
+  }
+  console.log(`  resuming: ${done.size} cases already recorded in ${RESULTS}`);
+}
+const record = (name, ok, why) => { if (RESULTS) appendFileSync(RESULTS, JSON.stringify({ name, ok, why }) + '\n'); };
 for (const [name, bin, args, opts] of CASES) {
   if (!pick(name)) continue;
+  if (done.has(name)) continue;
   // V8 does not collect a finished case's wasm memory on its own pressure
   // accounting: without this a chunk of 50 cases grew to 13.7 GB and was
   // OOM-killed (run with --expose-gc; a no-op without it)
@@ -949,7 +969,7 @@ for (const [name, bin, args, opts] of CASES) {
   // compare the bytes, not a summary: a truncated stdout that happens to
   // share a prefix is exactly the failure a length check alone would miss
   const same = eng.code === nat.code && Buffer.compare(eng.out, nat.out) === 0;
-  if (same) { pass++;
+  if (same) { pass++; record(name, true);
     console.log(`  ok   ${name.padEnd(9)} ${String(nat.out.length).padStart(8)}B out, ` +
                 `${eng.units} fns, ${(eng.ms).toFixed(0)}ms yields=${eng.yields} interp=${eng.insns} aot=${eng.aotRuns}`);   // interp: interpreted steps - a case whose count is out of proportion to its work is running code it should have compiled (vforkexec read 64M for two 4M-iteration loops)
     if (process.env.BREADTH_STDERR && eng.stderr) console.log(`         guest stderr: ${JSON.stringify(eng.stderr.slice(0, 600))}`);   // BREADTH_STDERR=1: show it on success too (warnings the byte compare cannot see)
@@ -964,7 +984,7 @@ for (const [name, bin, args, opts] of CASES) {
     const why = eng.err ? `threw: ${eng.err}`
       : eng.code !== nat.code ? `exit ${eng.code} vs native ${nat.code}`
       : `stdout ${eng.out.length}B vs native ${nat.out.length}B`;
-    failures.push([name, why]);
+    failures.push([name, why]); record(name, false, why);
     console.log(`  FAIL ${name.padEnd(9)} ${why}`);
     // the guest's own words first: "error while loading shared libraries:
     // libfoo" is a provisioning gap, a fault address is an engine bug
