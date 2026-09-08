@@ -43,6 +43,15 @@ export const MXCSR_SLOT = 144;   // regfile slot: the SSE control word, kept ine
 export const DF_SLOT = 152;      // regfile slot: the direction flag, so std/cld survive the unit boundary
 export const ESTICKY_SLOT = 160;  // regfile slot: the AC/ID bits popf stored, which pushf reads back
 export const FCW_SLOT = 164;      // regfile slot: the x87 control word, so fnstcw/fldcw need not escape
+// MEASUREMENT ONLY (OXWASM_STOREGUARD=1): what would it cost to make compiled
+// code's stores observable? Two of the three largest interpretation costs in
+// the sweep are the same missing mechanism - a JIT patching its own generated
+// code, and a forked child whose writes must be journaled - and both need the
+// engine to see a store that compiled code makes. This emits the check and
+// nothing else, so the price can be measured before the mechanism is designed.
+// Slots: the guarded window's base and length, and where a hit is recorded.
+const CWLO_SLOT = 168, CWLEN_SLOT = 172, CWHIT_SLOT = 176;
+const STOREGUARD = typeof process !== 'undefined' && process.env?.OXWASM_STOREGUARD === '1';
 // Largest wat text this emitter will hand the runtime for ONE function; see
 // the refusal at the end of the function emitter for the two measurements
 // that bracket it.
@@ -1766,6 +1775,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   // mask expr to `bits`, unless it is already that narrow
   const nmask = (e, bits) => cleanBits(e) <= bits
     ? e : `(i64.and ${e} (i64.const 0x${((1n << BigInt(bits)) - 1n).toString(16).toUpperCase()}))`;
+  let usesGa = false;                 // a guarded store needs an i32 local for the address
   const wr = (op, size, expr, next) => {
     if (op.kind === 'reg') {
       if (isI32(op.r)) {
@@ -1780,7 +1790,16 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       if (op.high) return `(local.set ${reg(op.r)} (i64.or (i64.and (local.get ${reg(op.r)}) (i64.const ${(~0xFF00n)&MASKl[8]})) (i64.shl (i64.and ${expr} (i64.const 0xFF)) (i64.const 8))))`;
       return `(local.set ${reg(op.r)} (i64.or (i64.and (local.get ${reg(op.r)}) (i64.const ${(~m)&MASKl[8]})) ${nmask(expr, size * 8)}))`;
     }
-    return `(${ST[size]} ${wasmAddr(op, next)} ${expr})`;
+    if (!STOREGUARD) return `(${ST[size]} ${wasmAddr(op, next)} ${expr})`;
+    // One unsigned subtract and compare against a window the engine owns. The
+    // address is computed once into a local so the guard and the store share
+    // it, which keeps the evaluation order the unguarded form already has:
+    // address first, then the value.
+    usesGa = true;
+    return `(local.set $ga ${wasmAddr(op, next)}) ` +
+           `(if (i32.lt_u (i32.sub (local.get $ga) (i32.load (i32.const ${CWLO_SLOT}))) (i32.load (i32.const ${CWLEN_SLOT}))) ` +
+           `(then (i32.store (i32.const ${CWHIT_SLOT}) (local.get $ga)))) ` +
+           `(${ST[size]} (local.get $ga) ${expr})`;
   };
   const ALU = { add:'i64.add', sub:'i64.sub', and:'i64.and', or:'i64.or', xor:'i64.xor' };
   const ALU32 = { add:'i32.add', sub:'i32.sub', and:'i32.and', or:'i32.or', xor:'i32.xor' };
@@ -3696,6 +3715,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   if (DISP || hasJtab) wat += '    (local $pc i32)\n';
   if (usesFtr) wat += '    (local $fti i32)\n';
   if (usesFts) wat += '    (local $fts i32)\n';
+  if (usesGa) wat += '    (local $ga i32)\n';
   if (usesIcp) wat += '    (local $icp i32)\n';
   for (const r of xUsed) wat += `    (local ${xreg(r)} v128)\n`;
   for (const t of tmps) wat += `    (local ${t} i64)\n`;
