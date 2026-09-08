@@ -2058,6 +2058,30 @@ function emitUnitFunction(a0, fnAddr, ctx) {
         else put(`(f64x2.promote_low_f32x4 ${xv(rm, next)})`);
         break; }
       case 0x2B: storeRm(16, dst); break;                                     // movntps/pd
+      // p{srl,sra,sll}{w,d,q} with the count in a REGISTER or memory rather
+      // than an immediate. The immediate forms have been here for a while and
+      // these were not, so any function using one stayed interpreted.
+      //
+      // x86 takes the whole low quadword of the source as the count and
+      // answers zero for a shift at or past the lane width; wasm takes the
+      // count modulo the lane width, so a count of 16 on i16x8 is a shift of
+      // nothing rather than a wipe. The arithmetic form clamps to width-1
+      // instead, because shifting a signed lane out entirely leaves the sign.
+      case 0xD1: case 0xD2: case 0xD3: case 0xE1: case 0xE2: case 0xF1: case 0xF2: case 0xF3: {
+        const EB = { 0xD1:2, 0xE1:2, 0xF1:2, 0xD2:4, 0xE2:4, 0xF2:4, 0xD3:8, 0xF3:8 }[op], W = EB * 8;
+        const LN = { 2:'i16x8', 4:'i32x4', 8:'i64x2' }[EB];
+        const c = T();
+        L.push(`(local.set ${c} ${rm.kind === 'xmm' ? `(i64x2.extract_lane 0 ${xv(rm, next)})`
+                                                    : `(i64.load ${wasmAddr(rm, next)})`})`);
+        const inR = `(i64.lt_u (local.get ${c}) (i64.const ${W}))`;
+        if (op >= 0xE1 && op <= 0xE2)
+          put(`(${LN}.shr_s ${dst} (i32.wrap_i64 (select (local.get ${c}) (i64.const ${W - 1}) ${inR})))`);
+        else {
+          const keep = `(i64x2.splat (i64.sub (i64.const 0) (i64.extend_i32_u ${inR})))`;
+          const sh = op >= 0xF1 ? `${LN}.shl` : `${LN}.shr_u`;
+          put(`(v128.and (${sh} ${dst} (i32.wrap_i64 (local.get ${c}))) ${keep})`);
+        }
+        break; }
       // comis/ucomis (0x2E/0x2F) write RFLAGS from a float compare; the
       // lazy-flag machinery would need a float-compare producer kind. Not yet
       // modeled -> poison so the interpreter runs the whole function.
