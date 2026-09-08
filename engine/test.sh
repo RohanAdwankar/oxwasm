@@ -59,6 +59,7 @@ node cmppstest.mjs
 node cvtpdtest.mjs
 node sseshifttest.mjs
 node packedfloattest.mjs
+node dotconvtest.mjs
 node fuzzaot.mjs 200 1
 node bsrtest.mjs
 node narrowtest.mjs
