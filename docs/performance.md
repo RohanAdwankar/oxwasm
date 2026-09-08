@@ -489,14 +489,40 @@ previous round never saw. Rounds continue until one adds nothing. On this
 binary it converges after a single round - and the page still misses 47, so
 iteration was not the cause.
 
-Ruled out, each by measurement rather than argument: the load addresses (both
-put ld.so at 140c000-1436195, and the 116 hits prove the bases agree), the
-slice size (the training runs the page's 3e6 chunks; 5e7 gave the same 116),
-the tier-up budget (`tierMsMax` is unset in the page), and the depth-refused
-units (the page's 12 "too deep to assemble" are a consequence of the misses,
-not their cause - they are units it had to attempt because the manifest did
-not carry them). Why a browser run tiers up 47 entries a node run does not is
-not yet known, and the honest state is that it is open.
+Ruled out, each by measurement rather than argument, and each of them a
+hypothesis that looked convincing first:
+
+- **The load addresses.** Both put ld.so at 140c000-1436195, and the 116 hits
+  prove the bases agree.
+- **The slice size.** The training runs the page's 3e6 chunks; 5e7 gave the
+  same 116 units.
+- **The tier-up budget.** `tierMsMax` is unset in the page.
+- **The depth refusals.** Training through the page's own wabt build with the
+  same probed limit (149 here, 13 units needing the CLI) produced the same 116.
+  The page's "too deep to assemble" units are downstream of the misses - it
+  only attempts them because the manifest does not carry them.
+- **The threshold.** Of the 47 misses, 32 had been SEEN in the training run
+  just under the line: calls=3 against a threshold of 4, back edges 5-11
+  against 12. Once a caller compiles, its calls stop passing through the
+  interpreter's profiler, so which callees reach the threshold depends on what
+  compiled first - which suggested training permissively (`aotCallThreshold`
+  1, `aotLoopThreshold` 2) to capture a superset. **It made things worse.**
+  338 units instead of 116, and the page still assembled 24 rather than fewer:
+
+  | manifest | total | tier-up | assembled in page |
+  |---|---|---|---|
+  | 116 units | 1421, 1443, 1653 ms | 824-957 ms | 23 |
+  | 338 units | 1658, 1672, 1728 ms | 1061-1113 ms | 24 |
+
+  Median 1443 ms to 1672 ms - 222 unused units cost ~230 ms of instantiation
+  and 0.12 MB, and bought nothing. Reverted.
+
+That last result is the informative one: a training run that captures every
+entry called even ONCE still misses what the page asks for, so the page is
+executing guest code this host does not. The remaining 15 entries that were
+"never seen at all" are the thing to explain, not the 32 near the threshold.
+Why is open, and the two changes tried against it are reverted rather than
+left in for looking like progress.
 
 **The manifest is a correctness surface, so it carries a fingerprint.** Handed
 units trained against a different binary the engine registers code whose
