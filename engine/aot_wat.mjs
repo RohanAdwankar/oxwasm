@@ -1980,7 +1980,9 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       // undefined). Sharing one kind made `shr rax,1; adc rbx,0` compile with
       // CF=0 and return the wrong answer, so they get a kind of their own that
       // carries only the result-derived conditions.
-      case 'shl': case 'shr': case 'sar': return { kind:'shift', size:S };
+      case 'shl': case 'shr': case 'sar':
+        // must agree with the emit above: a count of 1 also defines OF
+        return { kind: (insn.src.kind === 'imm' && Number(insn.src.v & BigInt(S === 8 ? 63 : 31)) === 1) ? 'shiftf' : 'shift', size:S };
       // bsf/bsr define ZF and nothing else - SF, CF and OF are architecturally
       // undefined - and $fr holds the SOURCE, so reading a sign off it is
       // reading the operand, not a result.
@@ -2270,8 +2272,21 @@ function emitUnitFunction(a0, fnAddr, ctx) {
         switch (cc) { case 'e':return zf; case 'ne':return nz; }
         throw new Error('cond '+cc+'/'+fs.kind);
       }
-      if (fs.kind === 'shift') switch (cc) {
-        case 'e':return zf; case 'ne':return nz; case 's':return sf; case 'ns':return nsf; }
+      if (fs.kind === 'shift' || fs.kind === 'shiftf') {
+        const CF = `(i64.ne ${b} (i64.const 0))`, OF = `(i64.ne ${a} (i64.const 0))`;
+        switch (cc) {
+          case 'e':return zf; case 'ne':return nz; case 's':return sf; case 'ns':return nsf;
+          case 'b':return CF; case 'ae':return `(i32.eqz ${CF})`;
+          case 'be':return `(i32.or ${CF} ${zf})`; case 'a':return `(i32.and (i32.eqz ${CF}) (i32.eqz ${zf}))`; }
+        // OF only exists for a count of 1; for any other count x86 leaves it
+        // undefined and the interpreter leaves it untouched, so refuse.
+        if (fs.kind === 'shiftf') switch (cc) {
+          case 'o':return OF; case 'no':return `(i32.eqz ${OF})`;
+          case 'l':return `(i32.ne ${sf} ${OF})`; case 'ge':return `(i32.eq ${sf} ${OF})`;
+          case 'le':return `(i32.or ${zf} (i32.ne ${sf} ${OF}))`;
+          case 'g':return `(i32.and (i32.eqz ${zf}) (i32.eq ${sf} ${OF}))`; }
+        throw new Error('cond '+cc+'/'+fs.kind);
+      }
       else switch (cc) {   // result-derived; correct where OF is known clear
         case 'e':return zf; case 'ne':return nz; case 's':return sf; case 'ns':return nsf;
         case 'le':return `(i64.le_s ${sx(r,S)} (i64.const 0))`; case 'g':return `(i64.gt_s ${sx(r,S)} (i64.const 0))`;
@@ -2289,7 +2304,8 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       if (fs.kind === 'add') return `(i64.extend_i32_u (i64.lt_u ${r} ${a}))`;
       if (fs.kind === 'adc' || fs.kind === 'sbb') return `(local.get $cf)`;
       if (fs.kind === 'cf') return r;
-      if (fs.kind === 'logic') return `(i64.const 0)`;
+      if (fs.kind === 'logic') return `(i64.const 0)`;   // and/or/xor/test clear CF
+      if (fs.kind === 'shift' || fs.kind === 'shiftf') return `(local.get $fb)`;
       throw new Error('AOT: adc/sbb CF-in from kind '+fs.kind);
     };
     for (ii = 0; ii < blk.insns.length; ii++) {
@@ -2401,17 +2417,41 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           L.push(wr(insn.dst,S,`(local.get ${t})`,next));
           setFlags('sub',S,'(i64.const 0)',`(local.get ${orig})`,`(local.get ${t})`); break; }
         case 'shl': case 'shr': case 'sar': {
+          // Materialize CF, and OF where x86 defines it, instead of leaving a
+          // consumer to poison the function. modeled() only accepts a nonzero
+          // IMMEDIATE count, so the count is known here and the two cases are
+          // static: CF is always the last bit shifted out, and OF is defined
+          // only for a count of 1 (the interpreter leaves it untouched
+          // otherwise, so anything else must still refuse). $fb carries CF and
+          // $fa carries OF, which is what the 'shiftf' kind means.
+          const W = S * 8;
+          const cImm = insn.src.kind === 'imm' ? Number(insn.src.v & BigInt(S === 8 ? 63 : 31)) : null;
+          const orig = (cImm !== null && cImm !== 0) ? T() : null;
+          if (orig) L.push(`(local.set ${orig} ${rd(insn.dst,S,next)})`);   // before the write: the destination is about to change
           if (S === 4 && insn.dst.kind === 'reg') {
             const c=shmask32(rd32(insn.src,next), 31); const a=rd32(insn.dst,next); let e;
             if (insn.mnem==='shl') e=`(i32.shl ${a} ${c})`; else if (insn.mnem==='shr') e=`(i32.shr_u ${a} ${c})`; else e=`(i32.shr_s ${a} ${c})`;
             L.push(wr32reg(insn.dst.r, e));
-            setFlags('shift', S, null, null, rd(insn.dst,S,next));   // nonzero-imm counts only (modeled() gates)
-            break;
+          } else {
+            const c=`(i64.and ${rd(insn.src,1,next)} (i64.const ${S===8?63:31}))`; const a=rd(insn.dst,S,next); let e;
+            if (insn.mnem==='shl') e=`(i64.shl ${a} ${c})`; else if (insn.mnem==='shr') e=`(i64.shr_u ${a} ${c})`; else e=`(i64.shr_s ${sx(a,S)} ${c})`;
+            L.push(wr(insn.dst,S,`(i64.and ${e} (i64.const ${m}))`,next));
           }
-          const c=`(i64.and ${rd(insn.src,1,next)} (i64.const ${S===8?63:31}))`; const a=rd(insn.dst,S,next); let e;
-          if (insn.mnem==='shl') e=`(i64.shl ${a} ${c})`; else if (insn.mnem==='shr') e=`(i64.shr_u ${a} ${c})`; else e=`(i64.shr_s ${sx(a,S)} ${c})`;
-          L.push(wr(insn.dst,S,`(i64.and ${e} (i64.const ${m}))`,next));
-          setFlags('shift', S, null, null, rd(insn.dst,S,next));
+          const res = rd(insn.dst,S,next);
+          if (!orig) { setFlags('shift', S, null, null, res); break; }   // register count: not a modeled producer anyway
+          const O = `(local.get ${orig})`;
+          const cf = insn.mnem === 'shl'
+            ? `(i64.and (i64.shr_u ${O} (i64.const ${W - cImm})) (i64.const 1))`
+            : `(i64.and (i64.shr_u ${O} (i64.const ${cImm - 1})) (i64.const 1))`;
+          if (cImm !== 1) { setFlags('shift', S, null, cf, res); break; }
+          // count 1: OF too. shl -> MSB(result) xor CF; shr -> MSB(original); sar -> 0.
+          const sgnc = SIGNl[S];
+          const of = insn.mnem === 'shl'
+            ? `(i64.xor (i64.shr_u (i64.and ${res} (i64.const ${sgnc})) (i64.const ${W - 1})) ${cf})`
+            : insn.mnem === 'shr'
+            ? `(i64.shr_u (i64.and ${O} (i64.const ${sgnc})) (i64.const ${W - 1}))`
+            : `(i64.const 0)`;
+          setFlags('shiftf', S, of, cf, res);
           break; }
         case 'bsf': case 'bsr': {
           // dst = index of lowest (bsf) / highest (bsr) set bit; ZF <- src==0.
