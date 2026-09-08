@@ -2213,6 +2213,17 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     if (ok && k) blkFlagIn[b] = k;
   }
   const matProducers = new Set();                   // producer keys that must materialize
+  // Producer keys that must ALSO materialize the real EFLAGS word into $fbits.
+  // A consumer whose flags come from another block needs one uniform lazy kind
+  // on every path in, and two predecessors ending in `cmp` and `test` do not
+  // have one - that is the single biggest refusal class the fuzzer reports.
+  // The kinds below carry all six flags exactly (see flagWord), so a join over
+  // them can hand the consumer a WORD instead of a shared kind, and it reads
+  // the bit it wants. Kinds that leave a flag undefined stay out: inc/dec do
+  // not touch CF, a shift without the count-1 rule has no OF, bsf/bsr define
+  // only ZF, and a word with a made-up bit in it is worse than a refusal.
+  const bitsProducers = new Set();
+  const BITSOK = new Set(['sub', 'add', 'logic', 'shiftf']);
   // Soft consumers read the flags too, but an unknown producer must not
   // poison the function - they just get no flags:
   //  - an escape to the interpreter (udec terminator: pushf, x87, cpuid ...)
@@ -2237,10 +2248,36 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     }
     if (term[b].kind === 'jcc') consumers.push(insns.length - 1);
     else if (term[b].kind === 'deopt' && !term[b].src) { consumers.push(insns.length - 1); soft.add(insns.length - 1); }
+    const from = new Map();                         // consumer index -> nearest producer, or -1/-2
     for (const j of consumers) {
       let p = -1, clob = null;
       for (let kk = j - 1; kk >= 0; kk--) { const insn = insns[kk];
         if (modeled(insn)) { p = kk; break; } if (CLOBBER.has(insn.mnem)) { clob = insn; p = -2; break; } }
+      from.set(j, { p, clob });
+    }
+    // Promote the block's incoming state to a materialized word BEFORE any
+    // consumer is answered, not while walking them. Deciding per consumer made
+    // the answer depend on the ORDER: a pushf ahead of the setcc that forced
+    // the promotion recorded "no flags reach here" and escaped handing the
+    // interpreter nothing, in a function that now compiles instead of being
+    // refused outright - which is a worse trade than the refusal was.
+    // Every reaching definition must be a real producer of a buildable kind.
+    // 'KILL' is not one and must NOT be filtered out of the set: it marks a
+    // path that reached here with the flags destroyed by an unmodeled writer,
+    // and a word materialized on the OTHER path is exactly the stale answer
+    // the sentinel exists to prevent. Dropping it put Go's memeqbody
+    // (`sub; shl %cl; sete`, entered by a `je` from an earlier `cmp`) back to
+    // answering false for every 1-7 byte string, and the go tool back to
+    // "invalid Getenv GOOS" - the same failure this sentinel was added for.
+    if (!blkFlagIn[b] && [...from.values()].some((f) => f.p === -1)) {
+      const keys = [...inDefs[b]];
+      if (keys.length && keys.every((k) => BITSOK.has(defKind.get(k)?.kind))) {
+        blkFlagIn[b] = { kind: 'bits', size: 8 };
+        for (const key of keys) bitsProducers.add(key);
+      }
+    }
+    for (const j of consumers) {
+      const { p, clob } = from.get(j);
       if (soft.has(j)) {
         if (p >= 0) { matProducers.add(b+':'+p); softFlags.set(b+':'+j, flagKind(insns[p])); }
         else if (p === -1 && blkFlagIn[b]) { for (const key of inDefs[b]) if (key !== 'EXT' && key !== 'KILL') matProducers.add(key); softFlags.set(b+':'+j, blkFlagIn[b]); }
@@ -2256,6 +2293,8 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     }
   }
 
+  if (typeof process !== 'undefined' && process.env.OXBITS && bitsProducers.size)
+    console.error(`<bits fn=${fnAddr.toString(16)} n=${bitsProducers.size} blocks=${N}>`);
   // indirect TAIL call ($rex holds the computed target, regfile spilled): if
   // the target is a registered compiled function, run it wasm-to-wasm — the
   // callee's ret pops OUR caller's return address, so its frame-exit rip is
@@ -2327,7 +2366,19 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       // cost javac: the JVM escapes constantly (cpuid, x87, fxsave), and it
       // died with an AbstractMethodError while every differential still
       // passed, because the differentials never escape.
+      // 'bits' IS the word already - a join materialized it (see flagWord).
+      if (fs && fs.kind === 'bits')
+        return want === 'value' ? '(local.get $fbits)'
+          : `(i64.store (i32.const ${EFLAGS_SLOT}) (i64.or (local.get $fbits) (i64.const -9223372036854775808)))`;
       if (!fs || !['sub', 'add', 'logic', 'shiftf', 'zf'].includes(fs.kind)) return '';
+      return want === 'value' ? flagWord(fs, '514')      // 0x202: bit 1 reserved-set, IF set
+                              : `(i64.store (i32.const ${EFLAGS_SLOT}) ${flagWord(fs, '-9223372036854775296')})`;   // marker | 0x202
+    };
+    // The EFLAGS word the lazy state implies, as one expression. Two callers
+    // want it: an escape, which hands it to the interpreter, and a control-flow
+    // JOIN, which stores it in $fbits so a consumer in a later block can read
+    // real flag bits instead of re-deriving them from operands it cannot see.
+    const flagWord = (fs, base) => {
       const S = fs.size, sgn = SIGNl[S], m = MASK[S];
       const a = '(local.get $fa)', b = '(local.get $fb)', r = '(local.get $fr)';
       const zf = `(i64.extend_i32_u (i64.eqz ${r}))`, sf = `(i64.extend_i32_u (i64.ne (i64.and ${r} (i64.const ${sgn})) (i64.const 0)))`;
@@ -2359,12 +2410,10 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       // Folded rather than written out: the hand-nested version of this had one
       // paren too many and produced a wat that closed the function early.
       const orAll = (xs) => xs.reduce((acc, x) => `(i64.or ${acc} ${x})`);
-      const word = (base) => orAll([`(i64.const ${base})`, cf,
+      return orAll([`(i64.const ${base})`, cf,
         `(i64.shl ${pf} (i64.const 2))`, `(i64.shl ${af} (i64.const 4))`,
         `(i64.shl ${zf} (i64.const 6))`, `(i64.shl ${sf} (i64.const 7))`,
         `(i64.shl ${of} (i64.const 11))`]);
-      return want === 'value' ? word('514')      // 0x202: bit 1 reserved-set, IF set
-                              : `(i64.store (i32.const ${EFLAGS_SLOT}) ${word('-9223372036854775296')})`;   // marker | 0x202
     };
     const setFlags = (kind, size, aE, bE, rE) => {
       if (!producers.has(ii)) return;              // dead flags: skip
@@ -2374,6 +2423,26 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     const cond = (cc) => {
       const fs = flagState, S = fs.size, sgn = SIGNl[S];
       const a='(local.get $fa)', b='(local.get $fb)', r='(local.get $fr)';
+      // A JOIN: two paths reach this consumer with different lazy kinds, so
+      // each of them materialized the real EFLAGS word into $fbits and the
+      // condition is read out of it. Every bit is a plain test here - the
+      // derivation happened where the flags were produced, which is the only
+      // place that still had the operands.
+      if (fs.kind === 'bits') {
+        const B = (n) => `(i32.wrap_i64 (i64.and (i64.shr_u (local.get $fbits) (i64.const ${n})) (i64.const 1)))`;
+        const CF = B(0), PF = B(2), ZF = B(6), SF = B(7), OF = B(11);
+        switch (cc) {
+          case 'e':return ZF; case 'ne':return `(i32.eqz ${ZF})`;
+          case 'b':return CF; case 'ae':return `(i32.eqz ${CF})`;
+          case 'be':return `(i32.or ${CF} ${ZF})`; case 'a':return `(i32.eqz (i32.or ${CF} ${ZF}))`;
+          case 's':return SF; case 'ns':return `(i32.eqz ${SF})`;
+          case 'o':return OF; case 'no':return `(i32.eqz ${OF})`;
+          case 'p':return PF; case 'np':return `(i32.eqz ${PF})`;
+          case 'l':return `(i32.ne ${SF} ${OF})`; case 'ge':return `(i32.eq ${SF} ${OF})`;
+          case 'le':return `(i32.or ${ZF} (i32.ne ${SF} ${OF}))`;
+          case 'g':return `(i32.and (i32.eqz ${ZF}) (i32.eq ${SF} ${OF}))`; }
+        throw new Error('cond '+cc+'/bits');
+      }
       const zf=`(i64.eqz ${r})`, nz=`(i64.ne ${r} (i64.const 0))`;
       const sf=`(i64.ne (i64.and ${r} (i64.const ${sgn})) (i64.const 0))`, nsf=`(i64.eq (i64.and ${r} (i64.const ${sgn})) (i64.const 0))`;
       // OF for sub (a-b=r) and add (a+b=r), matching the interpreter's flag rules
@@ -2502,6 +2571,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       if (fs.kind === 'sub') return `(i64.extend_i32_u (i64.lt_u ${a} ${b}))`;
       if (fs.kind === 'add') return `(i64.extend_i32_u (i64.lt_u ${r} ${a}))`;
       if (fs.kind === 'adc' || fs.kind === 'sbb') return `(local.get $cf)`;
+      if (fs.kind === 'bits') return `(i64.and (local.get $fbits) (i64.const 1))`;
       if (fs.kind === 'cf') return r;
       if (fs.kind === 'logic') return `(i64.const 0)`;   // and/or/xor/test clear CF
       if (fs.kind === 'shift' || fs.kind === 'shiftf') return `(local.get $fb)`;
@@ -3159,6 +3229,17 @@ function emitUnitFunction(a0, fnAddr, ctx) {
         case 'jmp': case 'jcc': case 'ret': case 'retn': case 'jmpind': case 'udec': break;  // terminator handled below
         default: throw new Error('AOT: unhandled '+insn.mnem+' @ '+insn.rip.toString(16));
       }
+      // this producer's flags are read from another block, where the operands
+      // are gone: freeze them into the word now, while $fa/$fb/$fr still hold
+      // what made them
+      if (bitsProducers.has(i+':'+ii)) {
+        // the dataflow pass promised this kind was buildable. If it is not,
+        // the two disagree - refuse, rather than leave the consumer reading
+        // the word some earlier join happened to leave in $fbits.
+        if (!flagState || !BITSOK.has(flagState.kind))
+          throw new Error('AOT: flag join over '+(flagState ? flagState.kind : 'nothing')+' @ '+insn.rip.toString(16));
+        L.push(`(local.set $fbits ${flagWord(flagState, '514')})`);
+      }
     }
     // terminator as label-based branches (RPO indices). In dispatch mode a
     // non-fallthrough edge sets $pc and re-enters the dispatch loop instead of
@@ -3549,8 +3630,8 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   // nothing to catch and the whole run is lost. The largest function the same
   // run compiles and tiers up without complaint is 4.2 MB, so the limit sits
   // between the two measurements rather than at a guess. Refusing is the safe
-  // answer: the function stays interpreted, which is where a function this
-  // emitter declines always ends up. Both layouts exit through here - the
+  // answer: the function stays interpreted, which is where it was before the
+  // flag join let it translate at all. Both layouts exit through here - the
   // dispatch one returns early, and a cap on the other alone caught nothing,
   // because a function big enough to worry about is exactly the kind that
   // gets the dispatch layout.
@@ -3560,7 +3641,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   };
   let wat = `  (func $${name} (export "${name}") (result i64)\n`;
   for (let r=0;r<16;r++) wat += `    (local $r${r} ${isI32(r)?'i32':'i64'})\n`;
-  wat += '    (local $fa i64) (local $fb i64) (local $fr i64) (local $cf i64) (local $rsp0 i64) (local $rex i64)\n';
+  wat += '    (local $fa i64) (local $fb i64) (local $fr i64) (local $cf i64) (local $fbits i64) (local $rsp0 i64) (local $rex i64)\n';
   if (DISP || hasJtab) wat += '    (local $pc i32)\n';
   if (usesFtr) wat += '    (local $fti i32)\n';
   if (usesFts) wat += '    (local $fts i32)\n';
