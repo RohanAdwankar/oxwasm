@@ -1993,10 +1993,17 @@ function emitUnitFunction(a0, fnAddr, ctx) {
         const e = op===0x51 ? `(${F}.sqrt ${b})` : op===0x58 ? `(${F}.add ${a} ${b})` : op===0x59 ? `(${F}.mul ${a} ${b})`
                 : op===0x5C ? `(${F}.sub ${a} ${b})` : op===0x5D ? `(${F}.min ${a} ${b})` : op===0x5E ? `(${F}.div ${a} ${b})` : `(${F}.max ${a} ${b})`;
         put(`(${LN}.replace_lane 0 ${dst} ${e})`); break; }
-      case 0x5A: {                                                            // cvtss2sd / cvtsd2ss (scalar low lane)
+      case 0x5A: {                                            // cvtss2sd / cvtsd2ss / cvtps2pd / cvtpd2ps
         if (insn.pF3) put(`(f64x2.replace_lane 0 ${dst} (f64.promote_f32 (f32x4.extract_lane 0 ${xv(rm,next)})))`);
         else if (insn.pF2) put(`(f32x4.replace_lane 0 ${dst} (f32.demote_f64 (f64x2.extract_lane 0 ${xv(rm,next)})))`);
-        else throw new Error('AOT sse 5a packed');
+        // The PACKED forms, which were refused for want of two opcodes that
+        // wasm happens to have exactly. cvtps2pd widens the low two f32 lanes
+        // to f64 and replaces the whole register; cvtpd2ps narrows two f64 to
+        // the low two f32 lanes and ZEROES the upper half, which is what the
+        // `_zero` in the wasm name means. Both match the interpreter's rule
+        // without any lane fixing around them.
+        else if (insn.p66) put(`(f32x4.demote_f64x2_zero ${xv(rm, next)})`);
+        else put(`(f64x2.promote_low_f32x4 ${xv(rm, next)})`);
         break; }
       case 0x2B: storeRm(16, dst); break;                                     // movntps/pd
       // comis/ucomis (0x2E/0x2F) write RFLAGS from a float compare; the
