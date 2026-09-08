@@ -2879,9 +2879,25 @@ function emitUnitFunction(a0, fnAddr, ctx) {
         case 'movs': {
           const woffc = Number(BigInt.asIntN(32, woff));
           if (insn.rep && hasStd) throw new Error('AOT: rep movs with std @ '+insn.rip.toString(16));
-          if (insn.rep && S === 1) {                                          // byte copy: one bulk op
-            L.push(`(memory.copy (i32.add (i32.wrap_i64 (local.get $r7)) (i32.const ${woffc})) (i32.add (i32.wrap_i64 (local.get $r6)) (i32.const ${woffc})) (i32.wrap_i64 (local.get $r1)))`);
-            L.push(`(local.set $r6 (i64.add (local.get $r6) (local.get $r1)))`, `(local.set $r7 (i64.add (local.get $r7) (local.get $r1)))`, `(local.set $r1 (i64.const 0))`);
+          if (insn.rep && S === 1) {
+            // Byte copy: one bulk op, but memory.copy is MEMMOVE and rep movsb
+            // is an element-at-a-time copy. Those agree unless the ranges
+            // overlap with rdi above rsi by less than the count: iteration k
+            // then reads a byte iteration k-d already wrote, so x86 replicates
+            // the first d bytes as a pattern where memmove reads the original.
+            // (`rep movsb` with rsi = rdi-1 is exactly that idiom.) Test the
+            // overlap at run time and take the exact loop when it holds; the
+            // interpreter has always made the same distinction.
+            const d = T(), e = '$moe_'+insn.rip.toString(16), lp = '$mol_'+insn.rip.toString(16);
+            L.push(`(local.set ${d} (i64.sub (local.get $r7) (local.get $r6)))`);
+            L.push(`(if (i32.and (i64.ne (local.get ${d}) (i64.const 0)) (i64.lt_u (local.get ${d}) (local.get $r1)))`,
+                   `  (then (block ${e} (loop ${lp} (br_if ${e} (i64.eqz (local.get $r1)))`,
+                   `    (i32.store8 ${wasmAddr({base:7,index:-1,disp:0n},next)} (i32.load8_u ${wasmAddr({base:6,index:-1,disp:0n},next)}))`,
+                   `    (local.set $r6 (i64.add (local.get $r6) (i64.const 1))) (local.set $r7 (i64.add (local.get $r7) (i64.const 1)))`,
+                   `    (local.set $r1 (i64.sub (local.get $r1) (i64.const 1))) (br ${lp}))))`,
+                   `  (else (memory.copy (i32.add (i32.wrap_i64 (local.get $r7)) (i32.const ${woffc})) (i32.add (i32.wrap_i64 (local.get $r6)) (i32.const ${woffc})) (i32.wrap_i64 (local.get $r1)))`,
+                   `        (local.set $r6 (i64.add (local.get $r6) (local.get $r1))) (local.set $r7 (i64.add (local.get $r7) (local.get $r1)))`,
+                   `        (local.set $r1 (i64.const 0))))`);
           } else if (insn.rep) {
             const e = '$me_'+insn.rip.toString(16), lp = '$ml_'+insn.rip.toString(16);
             L.push(`(block ${e} (loop ${lp} (br_if ${e} (i64.eqz (local.get $r1)))`,
