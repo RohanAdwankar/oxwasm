@@ -273,12 +273,24 @@ whole-function translator does well on, and a branchy workload will read
 worse." Measuring instead of guessing produced this, and one entry of it was
 worth more than the rest put together:
 
-| binary | steady state | at one standard error |
-|---|---|---|
-| md5sum, 41 MB | **2.3x** native | 1.8-2.9x |
-| sha256sum, 41 MB | **6.9x** native | 5.6-8.2x |
-| grep -c, 41 MB | **6.8x** native | 5.5-8.2x |
-| wc -l, 41 MB | refused | 37+-23 ms is not a measurement |
+| binary | steady state | at one standard error | re-measured after the flag batch |
+|---|---|---|---|
+| md5sum, 41 MB | **2.3x** native | 1.8-2.9x | 2.6x (1.9-3.3) |
+| sha256sum, 41 MB | **6.9x** native | 5.6-8.2x | 8.2x (5.9-10.6) |
+| grep -c, 41 MB | **6.8x** native | 5.5-8.2x | 6.9x (5.1-8.9) |
+| wc -l, 41 MB | refused | 37+-23 ms is not a measurement | - |
+
+The right-hand column is the same three binaries re-run after six correctness
+fixes and a large reduction in refusals (imul3 flags, MXCSR, pop ordering,
+shift CF/OF, the cross-block flag kind). **Every interval overlaps its
+original: no detectable change.** That is the expected result and worth
+stating rather than burying - these three had their hot paths compiled
+already, so removing refusals had nothing to win here. Refusal work shows up
+on workloads that were losing functions, and grep at 741x was that case.
+
+Two of the three needed 15 reps rather than 7 to clear the harness's
+three-sigma rule; at 7 they read 5.4x and 1.8x and were refused. Those refused
+readings are not results and are not quoted as any.
 
 grep first read **741x native** (493-1233x), and the same under node, so it
 was never the browser. The cause was one unmodelled instruction - see the
