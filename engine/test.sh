@@ -35,6 +35,7 @@ node leatest.mjs
 node mulbtftest.mjs
 node flagkindtest.mjs
 node crossblocktest.mjs
+node pinsrtest.mjs
 node shiftoftest.mjs
 node mxcsrtest.mjs
 node poptest.mjs

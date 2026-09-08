@@ -1408,8 +1408,8 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     if (op.kind === 'mem') { if (op.base>=0) { seenR[op.base]=true; any64[op.base]=true; } if (op.index>=0) { seenR[op.index]=true; any64[op.index]=true; } } };
   const WRITES_DST = new Set(['mov','movzx','movsx','add','sub','and','or','xor','adc','sbb','inc','dec','not','neg','shl','shr','sar','rol','ror','cmov','setcc','imul2','imul3','xchg','bswap','bts','btr','btc','shld','shrd']);
   // SSE ops that name a GPR (not xmm) via xr or rm — see sseXrIsGpr/sseRmIsGpr below
-  const sseGprXr = (insn) => [0x2C, 0x2D, 0xD7, 0x50].includes(insn.op);
-  const sseGprRm = (insn) => insn.op === 0x6E || insn.op === 0x2A || (insn.op === 0x7E && !insn.pF3);
+  const sseGprXr = (insn) => [0x2C, 0x2D, 0xD7, 0x50, 0xC5].includes(insn.op);   // 0xC5 pextrw writes a GPR
+  const sseGprRm = (insn) => insn.op === 0x6E || insn.op === 0x2A || insn.op === 0xC4 || (insn.op === 0x7E && !insn.pF3);   // 0xC4 pinsrw reads a GPR/m16
   for (const b of blocks) for (const insn of b.insns) {
     const S = insn.size || 8;
     switch (insn.mnem) {
@@ -1597,8 +1597,8 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   const XMMOFF = 256;
   // Some SSE ops name a GPR via the xr (reg) or rm field, not an xmm: movd/movq
   // and cvtsi2sd read/write GPRs; pmovmskb/movmskps/cvt*2si write a GPR.
-  const sseXrIsGpr = (insn) => [0x2C, 0x2D, 0xD7, 0x50].includes(insn.op);
-  const sseRmIsGpr = (insn) => insn.op === 0x6E || insn.op === 0x2A || (insn.op === 0x7E && !insn.pF3);
+  const sseXrIsGpr = (insn) => [0x2C, 0x2D, 0xD7, 0x50, 0xC5].includes(insn.op);
+  const sseRmIsGpr = (insn) => insn.op === 0x6E || insn.op === 0x2A || insn.op === 0xC4 || (insn.op === 0x7E && !insn.pF3);
   const xUsed = new Set();
   for (const b of blocks) for (const insn of b.insns) {
     if (insn.mnem === 'sse') {
@@ -1872,6 +1872,18 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       case 0x70: {                                                            // pshufd (66) / pshuflw (F2) / pshufhw (F3)
         const idx = insn.pF2 ? pshufwIdx(insn.imm8, 0) : insn.pF3 ? pshufwIdx(insn.imm8, 8) : pshufdIdx(insn.imm8);
         put(`(i8x16.shuffle ${idx.join(' ')} ${xv(rm, next)} ${xv(rm, next)})`); break; }
+      // pinsrw/pextrw: one 16-bit lane in or out. The interpreter has had both
+      // for a long time; the emitter refused them, and since a unit whose
+      // ENTRY is unsupported is refused whole, that put real functions in the
+      // interpreter - 10 of the sweep's remaining hot refusals were this.
+      case 0xC4:                                                              // pinsrw xmm[imm3] <- r/m16
+        put(`(i16x8.replace_lane ${insn.imm8 & 7} ${dst} ${rm.kind === 'xmm'
+          ? rd32({ kind:'reg', r: rm.r, size: 4 }, next)
+          : `(i32.load16_u ${wasmAddr(rm, next)})`})`);
+        break;
+      case 0xC5:                                                              // pextrw r32 <- xmm[imm3], zero-extended
+        L.push(wr32reg(xr, `(i16x8.extract_lane_u ${insn.imm8 & 7} ${xv(rm, next)})`));
+        break;
       case 0xC6: {                                                            // shufps (ps) / shufpd (66): low half from dst, high half from src
         const im = insn.imm8, idx = [];
         if (insn.p66) { for (let i = 0; i < 8; i++) idx.push((im & 1) * 8 + i); for (let i = 0; i < 8; i++) idx.push(16 + ((im >> 1) & 1) * 8 + i); }
