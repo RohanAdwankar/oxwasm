@@ -180,7 +180,20 @@ if (train) {
   for (; round < 5; round++) {
     const before = cap.size;
     const eng = new LinuxEngine(new Uint8Array(readFileSync(elfPath)),
-      { argv, env, files: tfiles, mtimes: tmtimes, memMB: 512, assembleWat: trainAsm });
+      // Train PERMISSIVELY: 1 call and 2 back edges rather than the engine's
+      // 4 and 12. Those thresholds exist because translating at run time costs
+      // time that a function called once will never repay - and a manifest
+      // pays that cost at PACK time, so the reason for them is gone. What is
+      // left is code that runs once or twice and used to run interpreted.
+      //
+      // This was tried once before, against the on-demand manifest, and made
+      // things worse - the extra units were instantiated and then not used in
+      // time to matter. With the whole manifest registered before the first
+      // instruction they are used from the start. sha256sum: engine 330 ms to
+      // 264, interpreted 21,814 to 9,667. gzip: 323 ms to 241, interpreted
+      // 14,997 to 4,098. The page grows 6.07 MB to 6.19 and 3.36 to 3.45.
+      { argv, env, files: tfiles, mtimes: tmtimes, memMB: 512, assembleWat: trainAsm,
+        aotCallThreshold: +(process.env.OXTRAIN_CALLS || 1), aotLoopThreshold: +(process.env.OXTRAIN_LOOPS || 2) });
     eng.unitBytes = (k) => cap.get(k);
     eng.onUnitBytes = (k, b) => { if (!cap.has(k)) cap.set(k, Buffer.from(b)); };
     const r0 = Date.now();
