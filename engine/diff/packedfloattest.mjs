@@ -47,6 +47,16 @@ const PAIRS = [
   // a NaN in the first source, then in the second
   [f64(NaN) | (f64(1) << 64n), f64(2) | (f64(NaN) << 64n)],
   [f64(2) | (f64(3) << 64n), f64(NaN) | (f64(NaN) << 64n)],
+  // BOTH operands NaN, with different payloads. x86 has a rule here and a JS
+  // number cannot carry one: add/sub/mul/div return SRC1 quieted, min/max
+  // return SRC2. The interpreter got 5 of 10 of these wrong against hardware
+  // while the translator got them right, so the ORACLE was the one to fix.
+  [0x7FF8000000000001n | (0x7FF8000000000001n << 64n), 0xFFF8000000000002n | (0xFFF8000000000002n << 64n)],
+  // and a signalling NaN in the first source, which must come back quieted
+  [0x7FF0000000000001n | (0x7FF0000000000001n << 64n), 0xFFF8000000000003n | (0xFFF8000000000003n << 64n)],
+  // the same in single precision, where the quiet bit sits elsewhere
+  [0x7FC00001n | (0x7FC00001n << 32n) | (0x7F800001n << 64n) | (0x7FC00001n << 96n),
+   0xFFC00002n | (0xFFC00002n << 32n) | (0xFFC00002n << 64n) | (0xFFC00002n << 96n)],
   // infinities, and a division that makes one
   [f64(Infinity) | (f64(-Infinity) << 64n), f64(0) | (f64(2) << 64n)],
   // values that only fit as doubles, so a 32-bit lowering cannot coincide

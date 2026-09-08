@@ -474,11 +474,31 @@ export class CPU {
                        : this.mem.read(this.ea(insn.rm), scalar ? (dbl ? 8n : 4n) : 16n);
             const mask = (1n << eb) - 1n;
             let out = this.xmm[insn.xr];
+            // NaN operands are handled on the BITS, not through JS numbers. A
+            // JS number does not carry a NaN payload, so `a + b` on two NaNs
+            // returns whichever one the host engine happens to hand back - and
+            // x86 has a rule: add/sub/mul/div return SRC1 quieted when SRC1 is
+            // NaN, otherwise SRC2 quieted; min/max return SRC2 either way.
+            // Against hardware this was wrong in 5 of 10 both-NaN cases, and
+            // the AOT had it right, so the ORACLE was the one disagreeing.
+            const EXP = dbl ? 0x7FF0000000000000n : 0x7F800000n;
+            const MANT = dbl ? 0x000FFFFFFFFFFFFFn : 0x007FFFFFn;
+            const QBIT = dbl ? 0x0008000000000000n : 0x00400000n;
+            const isNan = (b) => (b & EXP) === EXP && (b & MANT) !== 0n;
+            const minmax = insn.op === 0x5D || insn.op === 0x5F;
             for (let k = 0n; k < BigInt(lanes); k++) {
-              const av = dbl ? FP.getF64((out >> (k*eb)) & mask) : FP.getF32((out >> (k*eb)) & mask);
-              const bv = dbl ? FP.getF64((src >> (k*eb)) & mask) : FP.getF32((src >> (k*eb)) & mask);
-              const rv = OP(av, bv);
-              const bits = dbl ? FP.putF64(rv) : FP.putF32(rv);
+              const ab = (out >> (k*eb)) & mask, bb = (src >> (k*eb)) & mask;
+              let bits;
+              if (insn.op === 0x51) bits = isNan(bb) ? (bb | QBIT) : (dbl ? FP.putF64(Math.sqrt(FP.getF64(bb))) : FP.putF32(Math.sqrt(FP.getF32(bb))));
+              else if (minmax && (isNan(ab) || isNan(bb))) bits = bb;   // x86 min/max: the SECOND source
+              else if (!minmax && isNan(ab)) bits = ab | QBIT;          // add/sub/mul/div: SRC1 first
+              else if (!minmax && isNan(bb)) bits = bb | QBIT;
+              else {
+                const av = dbl ? FP.getF64(ab) : FP.getF32(ab);
+                const bv = dbl ? FP.getF64(bb) : FP.getF32(bb);
+                const rv = OP(av, bv);
+                bits = dbl ? FP.putF64(rv) : FP.putF32(rv);
+              }
               out = (out & ~(mask << (k*eb))) | (bits << (k*eb));
             }
             this.xmm[insn.xr] = out & M128; break; }
