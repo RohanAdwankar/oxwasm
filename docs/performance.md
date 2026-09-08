@@ -629,3 +629,38 @@ with a different limit falls through to the same search as before. The probe
 measured **59 ms against 81-149 ms**; the wall-clock effect on a trained page
 (~800 ms against ~830) is at the edge of what four runs resolve, and is
 reported as such rather than as the 90 ms the probe number would suggest.
+
+
+## Training permissively, now that the manifest lands before the guest runs
+
+The engine tiers a function up after 4 calls, or a loop after 12 back edges.
+Those thresholds exist because translating at RUN time costs time a function
+called once will never repay. A manifest pays that cost at PACK time, so the
+reason for them is gone - and what is left under them is code that runs once
+or twice and used to run interpreted.
+
+Training at 1 call and 2 back edges, six and five alternating runs:
+
+| | units | wall (median) | engine (median) | interpreted | assembled in page |
+|---|---|---|---|---|---|
+| sha256sum, 4/12 | 116 | 909 ms | 330 ms | 21,814 | 0 |
+| sha256sum, 1/2 | 338 | 844 ms | **264 ms** | **9,667** | 0 |
+| gzip -9, 4/12 | 77 | 746 ms | 323 ms | 14,997 | 1 |
+| gzip -9, 1/2 | 255 | 642 ms | **241 ms** | **4,098** | 0 |
+
+Engine time falls 20% and 25%; the interpreted counts, which are deterministic
+and not subject to the wall clock's noise, fall by more than half. Registration
+goes from 8-10 ms to 13-20 ms and the page grows 6.07 MB to 6.19 and 3.36 to
+3.45.
+
+**This is the same change that made things worse two hours ago**, when the
+manifest was consulted on demand: 338 units then cost ~230 ms of instantiation
+and bought nothing, because the units were not registered in time to be used.
+The measurement was right and the conclusion drawn from it - that permissive
+training does not help - was only true of the delivery mechanism it was tested
+against. Changing that mechanism made the same change worth 20%.
+
+`OXTRAIN_CALLS` and `OXTRAIN_LOOPS` override the thresholds. The tradeoff is
+page size against startup, and it scales with the program: a large application
+whose default-threshold manifest is already thousands of units will grow more
+than these do.
