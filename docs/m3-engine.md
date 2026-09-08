@@ -5882,3 +5882,65 @@ than an expression. What did move was the 11,967-call one, in the batch
 before, and it now stops on `pop [rsp-based]` instead. The claim was written
 before the measurement it describes, which is the whole failure mode this
 session keeps finding in its own instruments.
+
+### Batch 30: rep movsb is not memmove, and the direction flag stops poisoning
+
+Two string-op findings, one correctness and one performance, from reading the
+interpreter's `movs` next to the emitter's rather than from a failing test.
+
+**The correctness one.** wasm's `memory.copy` is memmove: defined as if the
+source were copied through a temporary, so every read sees the original. x86's
+`rep movs` is an element-at-a-time copy. Those are the same thing only when the
+ranges do not overlap, or when the copy runs away from its source.
+
+Forward, with rdi above rsi by `d` and a count above `d`: iteration `k` reads
+`rsi+k`, and iteration `k-d` already wrote that byte. So x86 replicates the
+first `d` bytes as a repeating pattern to the end, where memmove does not.
+`rep movsb` with `rsi = rdi-1` is precisely that byte-fill idiom.
+
+The interpreter has always guarded it - its `overlapUp` check drops to the
+exact per-element loop. The emitter lowered every `rep movsb` to one
+`memory.copy`. That is the compile-or-refuse invariant broken in the direction
+that matters: not a refusal (correct, slower) but an accepted function that
+answers differently from the oracle. Nothing in the suite could see it, because
+no test copied overlapping ranges.
+
+`diff/movsovertest.mjs` sweeps source/destination overlap: **204/216 before,
+216/216 after**, with all twelve failures forward overlaps on the byte path.
+The strided widths (2/4/8) copy element by element and were always right. The
+fix tests `rdi-rsi != 0 && rdi-rsi <u rcx` at run time and takes an exact byte
+loop when it holds - one subtract and a branch ahead of a bulk copy, so the
+non-overlapping path keeps the bulk op.
+
+**The performance one.** Any function containing `std` was refused whole: the
+bulk ops assume a forward copy, so the emitter poisoned the function rather
+than emit a wrong one. Refusing is the safe answer and it was costing every
+string op in such a function, plus everything the function called, for one bit
+that is nearly always zero. `rep movs with std` was the last such refusal in
+the go-version case.
+
+The step is now `+S` or `-S` read from `DF_SLOT`, and the bulk paths take the
+range's LOW address rather than the register, since x86 names the first element
+touched and going backward that is the range's top. A function with no `std` in
+it emits exactly the wat it did before - the ABI keeps DF=0 at entry and exit,
+so the step folds to the constant and the common path is untouched.
+
+Backward carries the mirror hazard: a backward copy runs into its source when
+rsi is above rdi, where a forward one does when rdi is above rsi. The overlap
+test follows the direction.
+
+**1188/1188** across twelve string ops, both directions, nine overlaps and six
+counts. Neutering the backward step drops that to **378/1188**, which is what
+establishes the direction is exercised rather than passing by agreeing with
+forward - a test that cannot fail proves nothing about the code it covers.
+`rep cmps`/`scas` with rcx=0 still escapes to the interpreter, because hardware
+leaves the flags alone there and the unit cannot express that; the test counts
+those separately instead of scoring them.
+
+**An instrument failure, the fifth this project.** The first version of
+movsovertest failed 213/216, including cases with no overlap at all. Its buffer
+sat at guest 0x410000, which maps to wasm offset 0x10000 - exactly `FTMAP`,
+where the engine keeps its chain-depth and fuel counters. The unit incremented
+its own counter and the test read that as a memory mismatch. Moving the buffer
+above FTMAP collapsed the failures to precisely the twelve forward overlaps,
+and it was that collapse, not the redness, that made the diagnosis believable.
