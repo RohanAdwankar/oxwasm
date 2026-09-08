@@ -72,7 +72,7 @@ function program(id) {
   let lab = 0;
   const n = 10 + rnd(14);
   for (let i = 0; i < n; i++) {
-    switch (rnd(33)) {
+    switch (rnd(34)) {
       case 0: L.push(`mov ${pick(R64)}, ${(rnd(2) ? -1 : 1) * rnd(0x7fffffff)}`); break;
       case 1: L.push(`${pick(['add','sub','and','or','xor','cmp','test'])} ${pick(R64)}, ${pick(R64)}`); break;
       case 2: L.push(`${pick(['add','sub','and','or','xor','cmp'])} ${pick(R32)}, ${pick(R32)}`); break;
@@ -193,6 +193,27 @@ function program(id) {
                             `${pick(['add','sub','and','or','xor'])} [fs:${rnd(SPAN-8)}], ${pick(R64)}`,
                             `movdqu ${pick(XR)}, [fs:${rnd(SPAN-16)}]`,
                             `movdqu [fs:${rnd(SPAN-16)}], ${pick(XR)}`])); break;
+      // A consumer two paths reach, where ONE OF THEM DESTROYED THE FLAGS.
+      // Every diamond above produces flags on both arms; this one produces on
+      // the taken arm and clobbers on the other, which is the shape where an
+      // answer derived from either arm alone is wrong half the time. The
+      // translator must refuse it, and it did until a join was added that
+      // treated the clobbered path as if it simply had no flags - Go's
+      // memeqbody (`sub; shl %cl; sete` entered by a `je`) then answered
+      // false for every 1-7 byte string. The breadth sweep caught that; this
+      // generator could not, because it only ever shifted by an immediate.
+      case 33: { const t = `K${id}_${lab++}`;
+        L.push(prod(), `j${pick(CC)} ${t}`,
+               `mov rcx, ${rnd(70)}`,
+               pick([`shl ${pick(R64)}, cl`, `shr ${pick(R64)}, cl`, `sar ${pick(R64)}, cl`,
+                     `rol ${pick(R64)}, cl`, `ror ${pick(R64)}, cl`,
+                     `rol ${pick(R64)}, ${rnd(63)+1}`, `ror ${pick(R64)}, ${rnd(63)+1}`,
+                     `shld ${pick(R64)}, ${pick(R64)}, ${rnd(63)+1}`,
+                     `shrd ${pick(R64)}, ${pick(R64)}, ${rnd(63)+1}`,
+                     `clc`, `stc`]),
+               `${t}:`,
+               pick([`set${pick(CC)} ${pick(R8)}`, `cmov${pick(CC)} ${pick(R64)}, ${pick(R64)}`,
+                     `adc ${pick(R64)}, ${pick(R64)}`, `sbb ${pick(R64)}, ${pick(R64)}`])); break; }
     }
   }
   // observe the flags one last time through defined means, and spill every
