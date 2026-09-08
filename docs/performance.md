@@ -539,3 +539,53 @@ manifest entries changes nothing: the engine registers by the `f_<addr>`
 export name inside the unit, not by the key it was looked up under, so a
 mis-keyed entry places itself correctly anyway. The lookup key is a hint. That
 is why the fingerprint covers the program rather than the individual units.
+
+
+## What is left of startup once the manifest lands
+
+With the units shipped, the page's own clock is ~260 ms and the wall clock is
+~815 ms, so most of what a reader waits through is no longer the engine. The
+page now times each phase, because "page load and inflate" was three words
+covering four different things:
+
+| phase | ms | what it is |
+|---|---|---|
+| wabt init | 79-104 | the depth probe plus building the assembler |
+| ELF inflate | 3 | 22 kB of base64 |
+| file inflate | 54-64 | 4 bundled files, 4.13 MB of the page |
+| engine constructor | 1-2 | |
+| manifest registration | 7-10 | 116 units, 143 functions |
+| guest run | ~250 | the emulation itself |
+| **wall clock** | **~815** | navigation to exit |
+
+Those sum to ~400 ms against a wall of ~815, so **~400 ms is the browser
+loading the page**: parsing 6.08 MB of HTML and evaluating the engine modules,
+which ride in an import map as base64 data: URLs.
+
+Page composition, measured rather than assumed:
+
+| | bytes | |
+|---|---|---|
+| bundled files | 4,129,504 | ld.so, libc, libcrypto, the input |
+| engine modules | 947,224 | base64 data: URLs in the import map |
+| wabt.js | 636,399 | the in-page assembler |
+| manifest | 329,032 | |
+| the ELF | 22,148 | |
+
+The bundled libraries are the program's own dependencies and are not the
+engine's to remove. The 947 kB of engine source is base64, which costs 33% over
+the bytes it carries.
+
+**One change tried here bought nothing and is reverted.** The wabt depth probe
+binary-searches `parseWat` and rebuilds the module on every overflow, ~90 ms,
+and it was paid BEFORE the inflate and the manifest registration, neither of
+which needs it. Starting it first and collecting it just before the guest runs
+should have hidden it behind the ~70 ms of decompression. Six alternating runs
+each: **791 ms overlapped against 775 ms sequential.** No gain, slightly worse.
+Both are main-thread CPU, and interleaving two main-thread tasks costs what
+running them in order costs; `DecompressionStream` may be off-thread but the
+wabt work is not.
+
+A first read of four runs said 830 ms against 780 and looked like a win. It was
+drift between runs taken twenty minutes apart - the same failure the `--runs`
+work was added for, repeated by not using it.
