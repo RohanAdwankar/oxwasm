@@ -1975,11 +1975,23 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       case 'adc': return { kind:'adc', size:S };
       case 'sbb': return { kind:'sbb', size:S };
       case 'or': case 'and': case 'xor': case 'test':
-      case 'shl': case 'shr': case 'sar': case 'bsf': case 'bsr': return { kind:'logic', size:S };
+      // 'logic' means CF and OF are CLEARED, which is true of and/or/xor/test
+      // and NOT of a shift (CF is the last bit shifted out) or bsf/bsr (CF
+      // undefined). Sharing one kind made `shr rax,1; adc rbx,0` compile with
+      // CF=0 and return the wrong answer, so they get a kind of their own that
+      // carries only the result-derived conditions.
+      case 'shl': case 'shr': case 'sar': return { kind:'shift', size:S };
+      // bsf/bsr define ZF and nothing else - SF, CF and OF are architecturally
+      // undefined - and $fr holds the SOURCE, so reading a sign off it is
+      // reading the operand, not a result.
+      case 'bsf': case 'bsr': return { kind:'zf', size:S };
       case 'inc': return { kind:'inc', size:S };
       case 'dec': return { kind:'dec', size:S };
+      // 'cf' is CF alone (bt family leaves OF undefined); 'cfof' is the
+      // multiply case where CF and OF are the same bit. Sharing one kind made
+      // `bt rax,rsi; jo` answer with CF.
       case 'bt': case 'bts': case 'btr': case 'btc': return { kind:'cf', size:S };
-      case 'mul1': case 'imul1': case 'imul2': case 'imul3': return { kind:'cf', size:S };
+      case 'mul1': case 'imul1': case 'imul2': case 'imul3': return { kind:'cfof', size:S };
       default: return null;
     } };
 
@@ -2192,8 +2204,20 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           case 'l':return `(i32.ne ${sf} ${OF})`; case 'ge':return `(i32.eq ${sf} ${OF})`;
           case 'le':return `(i32.or ${zf} (i32.ne ${sf} ${OF}))`; case 'g':return `(i32.and (i32.eqz ${zf}) (i32.eq ${sf} ${OF}))`; }
       }
-      else if (fs.kind === 'cf') switch (cc) {      // fr holds the CF bit (bt family, mul overflow: CF==OF)
-        case 'b': case 'o': return nz; case 'ae': case 'no': return zf; }
+      // fr holds the CF BIT here, not a result (bt family, mul overflow where
+      // CF==OF), so only the CF/OF conditions mean anything. This branch has
+      // to be terminal: falling through to the result-derived cases below read
+      // that single bit as if it were the value, which made `imul rax,rsi; jz`
+      // test CF instead of the product. Latent for bt and mul1 before
+      // imul2/imul3 started producing this kind and made it reachable.
+      else if (fs.kind === 'cf' || fs.kind === 'cfof') {
+        switch (cc) {
+          case 'b': return nz; case 'ae': return zf;
+          case 'o': if (fs.kind === 'cfof') return nz; break;
+          case 'no': if (fs.kind === 'cfof') return zf; break;
+        }
+        throw new Error('cond '+cc+'/'+fs.kind);
+      }
       else if (fs.kind === 'fcmp') {                // ucomis: ZF/PF/CF from an f64 compare; OF/SF cleared
         const A = `(f64.reinterpret_i64 ${a})`, B = `(f64.reinterpret_i64 ${b})`;
         const unord = `(i32.or (f64.ne ${A} ${A}) (f64.ne ${B} ${B}))`;
@@ -2210,10 +2234,50 @@ function emitUnitFunction(a0, fnAddr, ctx) {
         }
       }
 
-      else switch (cc) {
+      // inc/dec leave CF UNTOUCHED and set OF on signed overflow, which for
+      // these two is an exact function of the result alone: inc overflows only
+      // into the sign bit, dec only out of it. Without this they fell through
+      // to the result-derived comparisons below, which read jl as "result is
+      // negative" and got `dec` of 0x8000000000000000 backwards - OF is set
+      // there, so jl is taken and the AOT did not take it. CF is not
+      // materialized, so b/ae/be/a still refuse.
+      else if (fs.kind === 'inc' || fs.kind === 'dec') {
+        const OF = fs.kind === 'inc' ? `(i64.eq ${r} (i64.const ${sgn}))`
+                                     : `(i64.eq ${r} (i64.const ${sgn - 1n}))`;
+        switch (cc) {
+          case 'e':return zf; case 'ne':return nz; case 's':return sf; case 'ns':return nsf;
+          case 'o':return OF; case 'no':return `(i32.eqz ${OF})`;
+          case 'l':return `(i32.ne ${sf} ${OF})`; case 'ge':return `(i32.eq ${sf} ${OF})`;
+          case 'le':return `(i32.or ${zf} (i32.ne ${sf} ${OF}))`;
+          case 'g':return `(i32.and (i32.eqz ${zf}) (i32.eq ${sf} ${OF}))`; }
+      }
+
+      // and/or/xor/test clear CF and OF, so those conditions are constants -
+      // exact, not an approximation. Leaving them out refused any function
+      // with `test`/`and` followed by jbe/ja, which is 11,967 calls in one
+      // node case alone.
+      else if (fs.kind === 'logic') switch (cc) {
+        case 'b': case 'o': return `(i32.const 0)`;
+        case 'ae': case 'no': return `(i32.const 1)`;
+        case 'be': return zf; case 'a': return nz; }
+
+      // A shift materializes only its result, so ZF and SF are available and
+      // CF and OF are not. The signed comparisons need OF: `shl rax,1` of
+      // 0x8000000000000000 leaves a zero result with OF set, so jl is taken
+      // and reading it as "result is negative" gets it backwards. Answer the
+      // two that are exact and refuse the rest.
+      if (fs.kind === 'zf') {                       // bsf/bsr: ZF is the only defined flag
+        switch (cc) { case 'e':return zf; case 'ne':return nz; }
+        throw new Error('cond '+cc+'/'+fs.kind);
+      }
+      if (fs.kind === 'shift') switch (cc) {
+        case 'e':return zf; case 'ne':return nz; case 's':return sf; case 'ns':return nsf; }
+      else switch (cc) {   // result-derived; correct where OF is known clear
         case 'e':return zf; case 'ne':return nz; case 's':return sf; case 'ns':return nsf;
         case 'le':return `(i64.le_s ${sx(r,S)} (i64.const 0))`; case 'g':return `(i64.gt_s ${sx(r,S)} (i64.const 0))`;
         case 'l':return `(i64.lt_s ${sx(r,S)} (i64.const 0))`; case 'ge':return `(i64.ge_s ${sx(r,S)} (i64.const 0))`; }
+      // anything left wants a flag that was never materialized: refuse rather
+      // than answer with a value that is right for some producers only.
       throw new Error('cond '+cc+'/'+fs.kind);
     };
     // CF-in for adc/sbb, reconstructed from the live flag producer (as an i64 0/1)
@@ -2341,13 +2405,13 @@ function emitUnitFunction(a0, fnAddr, ctx) {
             const c=shmask32(rd32(insn.src,next), 31); const a=rd32(insn.dst,next); let e;
             if (insn.mnem==='shl') e=`(i32.shl ${a} ${c})`; else if (insn.mnem==='shr') e=`(i32.shr_u ${a} ${c})`; else e=`(i32.shr_s ${a} ${c})`;
             L.push(wr32reg(insn.dst.r, e));
-            setFlags('logic', S, null, null, rd(insn.dst,S,next));   // nonzero-imm counts only (modeled() gates)
+            setFlags('shift', S, null, null, rd(insn.dst,S,next));   // nonzero-imm counts only (modeled() gates)
             break;
           }
           const c=`(i64.and ${rd(insn.src,1,next)} (i64.const ${S===8?63:31}))`; const a=rd(insn.dst,S,next); let e;
           if (insn.mnem==='shl') e=`(i64.shl ${a} ${c})`; else if (insn.mnem==='shr') e=`(i64.shr_u ${a} ${c})`; else e=`(i64.shr_s ${sx(a,S)} ${c})`;
           L.push(wr(insn.dst,S,`(i64.and ${e} (i64.const ${m}))`,next));
-          setFlags('logic', S, null, null, rd(insn.dst,S,next));
+          setFlags('shift', S, null, null, rd(insn.dst,S,next));
           break; }
         case 'bsf': case 'bsr': {
           // dst = index of lowest (bsf) / highest (bsr) set bit; ZF <- src==0.
@@ -2368,7 +2432,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           const e = insn.mnem === 'bsf'
             ? (S8 ? `(i64.ctz (local.get ${t}))` : `(i64.extend_i32_u (i32.ctz (i32.wrap_i64 (local.get ${t}))))`)
             : (S8 ? `(i64.sub (i64.const 63) (i64.clz (local.get ${t})))` : `(i64.extend_i32_u (i32.sub (i32.const 31) (i32.clz (i32.wrap_i64 (local.get ${t})))))`);
-          if (producers.has(ii)) { L.push(`(local.set $fr (local.get ${t}))`); flagState = { kind: 'logic', size: S }; }
+          if (producers.has(ii)) { L.push(`(local.set $fr (local.get ${t}))`); flagState = { kind: 'zf', size: S }; }
           L.push(`(if (i64.ne (local.get ${t}) (i64.const 0)) (then ${wr(insn.dst, S, e, next)}))`);
           break; }
         case 'bswap': {
@@ -2468,7 +2532,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
             L.push(`(local.set ${full} (i64.mul (local.get ${av}) (local.get ${bv})))`);
             if (S === 4 && insn.dst.kind === 'reg') L.push(wr32reg(insn.dst.r, `(i32.wrap_i64 (local.get ${full}))`));
             else L.push(wr(insn.dst,S,andmask(`(local.get ${full})`,S),next));
-            setFlags('cf', S, null, null,
+            setFlags('cfof', S, null, null,
               `(i64.extend_i32_u (i64.ne (local.get ${full}) ${sx(andmask(`(local.get ${full})`,S),S)}))`);
           } else {
             // 64x64 -> 128: no mulhi in wasm, so build the high word from the
@@ -2498,7 +2562,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
             L.push(`(local.set ${hi} (i64.sub (local.get ${hi}) ` +
                    `(i64.and (i64.shr_s (local.get ${b}) (i64.const 63)) (local.get ${a}))))`);
             L.push(wr(insn.dst,8,`(local.get ${lo})`,next));
-            setFlags('cf', 8, null, null,
+            setFlags('cfof', 8, null, null,
               `(i64.extend_i32_u (i64.ne (local.get ${hi}) (i64.shr_s (local.get ${lo}) (i64.const 63))))`);
           }
           break; }
@@ -2513,7 +2577,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
             L.push(wr32reg(0, `(i32.wrap_i64 ${andmask(`(local.get ${t})`,S)})`));       // rax = low
             L.push(wr32reg(2, `(i32.wrap_i64 (i64.shr_u (local.get ${t}) (i64.const ${S*8})))`)); // rdx = high
             // CF=OF: product does not fit the low half
-            setFlags('cf', S, null, null, sgn
+            setFlags('cfof', S, null, null, sgn
               ? `(i64.extend_i32_u (i64.ne (local.get ${t}) ${sx(andmask(`(local.get ${t})`,S),S)}))`
               : `(i64.extend_i32_u (i64.ne (i64.shr_u (local.get ${t}) (i64.const ${S*8})) (i64.const 0)))`);
             break;
@@ -2551,7 +2615,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           L.push(wr({kind:'reg',r:0,size:8},8,`(local.get ${lo})`,next));   // rax = low 64
           L.push(wr({kind:'reg',r:2,size:8},8,`(local.get ${hi})`,next));   // rdx = high 64
           // CF=OF: high half is not the zero/sign extension of the low half
-          setFlags('cf', 8, null, null, sgn
+          setFlags('cfof', 8, null, null, sgn
             ? `(i64.extend_i32_u (i64.ne (local.get ${hi}) (i64.shr_s (local.get ${lo}) (i64.const 63))))`
             : `(i64.extend_i32_u (i64.ne (local.get ${hi}) (i64.const 0)))`);
           break; }
