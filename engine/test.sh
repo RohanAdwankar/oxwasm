@@ -40,6 +40,7 @@ node dftest.mjs
 node movsovertest.mjs
 node eflagstest.mjs
 node manifesttest.mjs
+node snaptest.mjs
 node fcwtest.mjs
 node shiftoftest.mjs
 node mxcsrtest.mjs
