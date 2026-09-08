@@ -72,7 +72,7 @@ function program(id) {
   let lab = 0;
   const n = 10 + rnd(14);
   for (let i = 0; i < n; i++) {
-    switch (rnd(32)) {
+    switch (rnd(33)) {
       case 0: L.push(`mov ${pick(R64)}, ${(rnd(2) ? -1 : 1) * rnd(0x7fffffff)}`); break;
       case 1: L.push(`${pick(['add','sub','and','or','xor','cmp','test'])} ${pick(R64)}, ${pick(R64)}`); break;
       case 2: L.push(`${pick(['add','sub','and','or','xor','cmp'])} ${pick(R32)}, ${pick(R32)}`); break;
@@ -177,6 +177,22 @@ function program(id) {
                      `movd ${pick(XR)}, dword [r12+${rnd(SPAN-4)+1}]`,
                      `movhps ${pick(XR)}, [r12+${rnd(SPAN-8)+1}]`,
                      `movlps ${pick(XR)}, [r12+${rnd(SPAN-8)+1}]`])); break; }
+      // fs-segment accesses. Every glibc binary in the sweep reads its stack
+      // canary through one, and the emitter reaches the base by a path nothing
+      // else here takes: a runtime load of regfile slot 16 folded into the
+      // address, where the interpreter adds a GUEST address and the AOT adds a
+      // WASM offset. The two only agree because the displacement carries the
+      // correction, and that agreement was untested.
+      case 32: L.push(pick([`mov ${pick(R64)}, [fs:${rnd(SPAN-8)}]`,
+                            `mov [fs:${rnd(SPAN-8)}], ${pick(R64)}`,
+                            `mov ${pick(R32)}, [fs:${rnd(SPAN-4)}]`,
+                            `mov ${pick(R8)}, [fs:${rnd(SPAN-1)}]`,
+                            `mov [fs:${rnd(SPAN-1)}], ${pick(R8)}`,
+                            `movzx ${pick(R64)}, word [fs:${rnd(SPAN-2)}]`,
+                            `${pick(['add','sub','and','or','xor','cmp'])} ${pick(R64)}, [fs:${rnd(SPAN-8)}]`,
+                            `${pick(['add','sub','and','or','xor'])} [fs:${rnd(SPAN-8)}], ${pick(R64)}`,
+                            `movdqu ${pick(XR)}, [fs:${rnd(SPAN-16)}]`,
+                            `movdqu [fs:${rnd(SPAN-16)}], ${pick(XR)}`])); break;
     }
   }
   // observe the flags one last time through defined means, and spill every
@@ -186,10 +202,15 @@ function program(id) {
   return L.join('\n') + '\nret';
 }
 
+// Temporary files carry the pid: two fuzz runs at different seeds are the
+// obvious way to use a spare core, and sharing /tmp/fz.wat between them made
+// one of them assemble the other's half-written module and report an ENGINE
+// failure ("empty module") that did not exist.
+const T = (ext) => `/tmp/fz.${process.pid}.${ext}`;
 const asmOf = (body) => {
-  writeFileSync('/tmp/fz.asm', 'BITS 64\n' + body);
-  execFileSync('nasm', ['-f', 'bin', '-o', '/tmp/fz.bin', '/tmp/fz.asm']);
-  const b = readFileSync('/tmp/fz.bin'); const c = new Uint8Array(0x30000); c.set(b); return c;
+  writeFileSync(T('asm'), 'BITS 64\n' + body);
+  execFileSync('nasm', ['-f', 'bin', '-o', T('bin'), T('asm')]);
+  const b = readFileSync(T('bin')); const c = new Uint8Array(0x30000); c.set(b); return c;
 };
 const seedByte = (i) => (i * 31 + 7) & 0xFF;
 
@@ -212,10 +233,10 @@ for (let k = 0; k < N; k++) {
     why.set(k, (why.get(k) || 0) + 1);
     continue;
   }
-  writeFileSync('/tmp/fz.wat', r.wat);
-  try { execFileSync('wat2wasm', ['--enable-tail-call', '/tmp/fz.wat', '-o', '/tmp/fz.wasm']); }
+  writeFileSync(T('wat'), r.wat);
+  try { execFileSync('wat2wasm', ['--enable-tail-call', T('wat'), '-o', T('wasm')]); }
   catch (e) { fail++; console.log(`  ASSEMBLY FAILED for case ${k}: ${String(e.message).slice(0, 120)}\n${body}\n`); continue; }
-  const mod = new WebAssembly.Module(readFileSync('/tmp/fz.wasm'));
+  const mod = new WebAssembly.Module(readFileSync(T('wasm')));
 
   // oracle
   const m = new Memory([{ base: CODE, bytes: code.slice() }]);
@@ -223,6 +244,7 @@ for (let k = 0; k < N; k++) {
   const cpu = new CPU(m);
   for (let q = 0; q < 16; q++) cpu.regs[q] = 0x0101010101010100n + BigInt(q);
   cpu.regs[4] = CODE + 0x1000n; m.write(cpu.regs[4], 8n, SENT); cpu.rip = CODE;
+  cpu.fsBase = BUF;                                       // so [fs:disp] lands in the compared buffer
   let g = 0, ran = true;
   try { while (cpu.rip !== SENT) { cpu.step(); if (++g > 20000) { ran = false; break; } } }
   catch { ran = false; }
@@ -241,6 +263,10 @@ for (let k = 0; k < N; k++) {
   for (let i = 0; i < SPAN; i++) u8[bufOff + i] = seedByte(i);
   for (let q = 0; q < 16; q++) rv[q] = BigInt.asIntN(64, 0x0101010101010100n + BigInt(q));
   rv[4] = BigInt.asIntN(64, CODE + 0x1000n);
+  // slot 16 of the regfile, the fs base the emitter loads at every fs access.
+  // It holds the GUEST base: the emitter folds the guest->wasm correction into
+  // the displacement constant, so the raw guest value is what belongs here.
+  dv.setBigUint64(128, BUF, true);
   dv.setBigUint64(0x1000, SENT, true);
   try { inst.exports[r.entryName](); }
   catch (e) { if (e.escape) { escaped++; continue; } throw e; }   // a unit may escape mid-way; that is the interpreter's answer, not a wrong one
