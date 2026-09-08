@@ -444,3 +444,53 @@ to fill one.
 
 That is a ceiling, not a promise. Coverage depends on the input a training run
 uses, and anything it misses still translates in the page.
+
+
+## Shipping the units: m3pack --train
+
+The floor is the translator, so the page can skip it for code a run at pack
+time already translated. `m3pack --train` runs the program once on the packing
+host, captures the wasm units it produced, and embeds them; the page hands
+them to the engine's `unitBytes` hook, which registers a unit with no
+translation and no assembler.
+
+This rests on determinism, which was checked before it was relied on: two
+training runs of the same binary produce the same entries with byte-identical
+wasm. `diff/manifesttest.mjs` pins that, and pins the rest of the property -
+the replayed run matches a translating run byte for byte, both match the
+binary run natively, and the replay actually USED the manifest (a run that
+silently fell back to translating everything would pass the first two and test
+nothing).
+
+sha256sum over 138 kB, three runs each, same page, same host:
+
+| | total | tier-up | assembled in page |
+|---|---|---|---|
+| plain | 2417, 2611, 3617 ms | 1928-2874 ms | 106 units |
+| `--train` | 1463, 1504, 1592 ms | 839-939 ms | 23 units |
+
+**Medians 2611 ms to 1504 ms**, and the two ranges do not overlap. Output hash
+identical (`e75d8b475e0554e1`). The page grows 5.80 MB to 6.13 MB - 116 units,
+1.89 MB of wasm, 0.33 MB once gzipped and base64'd.
+
+Two things this does NOT do. It does not help the steady state, which is
+already compiled code either way. And 23 units still translate in the page:
+the training run and the page do not tier up on identical schedules, so
+coverage is 83 of 106 rather than all of it. The remainder is the next thing
+to look at, not a rounding error.
+
+**The manifest is a correctness surface, so it carries a fingerprint.** Handed
+units trained against a different binary the engine registers code whose
+addresses mean something else, and the guest dies somewhere unrelated with
+nothing pointing back at the manifest - verified by doing it: a manifest from
+`md5sum` replayed under `sha256sum` crashes inside a dispatched unit. The page
+therefore hashes the program bytes plus argv, env and memMB and refuses a
+manifest that does not match, with a message that names the mismatch. In
+normal use it cannot fire, because both come from the same pack; it is there
+because the failure it prevents is silent and total.
+
+One mutation that did NOT fail is worth recording. Swapping the bytes of two
+manifest entries changes nothing: the engine registers by the `f_<addr>`
+export name inside the unit, not by the key it was looked up under, so a
+mis-keyed entry places itself correctly anyway. The lookup key is a hint. That
+is why the fingerprint covers the program rather than the individual units.
