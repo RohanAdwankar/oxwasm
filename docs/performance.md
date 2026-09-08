@@ -704,3 +704,48 @@ of the libraries would trade its 4.13 MB of compressed .so files for a
 compressed image of the memory they were loaded into, which is a different
 size rather than obviously a smaller one, and skip the ~150 ms. That is
 measured as worth doing and not yet done.
+
+
+## A snapshot page for a batch program does not pay, and why
+
+The last section measured ~150 ms of sha256sum's ~243 ms guest run as the
+dynamic linker, and the machinery to skip it already exists: `snapshotEngine`
+captures a settled engine, `snapshot_core` is browser-safe restore, and
+`xpack` has shipped snapshots to a page for X11 GUI apps for a while. So
+m3pack got a `--snapshot` that runs the guest to its program ENTRY, ships that
+state, and drops the shared libraries the memory image already holds.
+
+It works - the output hash is identical - and it is slower.
+
+sha256sum, 138 kB, six alternating runs of each page:
+
+| | page | wall (median) | engine (median) | restore | interpreted |
+|---|---|---|---|---|---|
+| trained | 6.19 MB | 1197 ms | 224 ms | - | 9,667 |
+| trained + snapshot | 6.40 MB | 1292 ms | 205 ms | **205-256 ms** | **28,900** |
+
+The engine clock does not include the restore (it starts after it), so the
+comparable figure is ~205 + ~230 against 224. **The restore costs more than
+the linking it skips.** Three things go wrong at once:
+
+- **The restore is 205-256 ms.** Most of it is not the guest: it is
+  base64-decoding and inflating a 4.14 MB image and writing 3.4 MB of tiles
+  into wasm memory. Emitting raw `SPR2` tiles compressed once instead of
+  `SPRS`'s per-tile gzip - one DecompressionStream round trip instead of one
+  per tile - moved it from 194 ms to 256 ms rather than down, which is not
+  explained and was not chased further.
+- **The page grew**, 6.19 MB to 6.40. The memory image at 4.14 MB is bigger
+  than the 4.13 MB of compressed libraries it replaced, and page load is
+  already the largest item in startup.
+- **Interpretation went UP**, 9,667 to 28,900. A restore drops tier state by
+  design, and the manifest was trained from a run that started at the
+  beginning, so a run that starts at the entry asks for entries it does not
+  carry.
+
+The fixed cost is what kills it: a batch program's whole startup is ~800 ms,
+and a ~230 ms restore against ~150 ms of linking cannot win. It would look
+different for a program whose linking is seconds rather than 150 ms - which is
+exactly the case `xpack` already covers, and is not this packer's.
+
+Reverted. What is kept from the attempt is the snapshot bug it exposed (the
+382 MB of JSON) and `diff/snaptest.mjs`.
