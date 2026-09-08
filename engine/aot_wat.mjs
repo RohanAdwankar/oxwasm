@@ -2595,6 +2595,13 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       if (fs.kind === 'cf') return r;
       if (fs.kind === 'logic') return `(i64.const 0)`;   // and/or/xor/test clear CF
       if (fs.kind === 'shift' || fs.kind === 'shiftf') return `(local.get $fb)`;
+      // comis sets CF when the compare is BELOW or unordered, which is the
+      // negation of one wasm f64.ge - and a NaN makes ge false, so the
+      // unordered case comes out right without a separate test. glibc's
+      // long-double formatting reaches an `adc` two instructions after a
+      // `ucomisd`, and the whole function was refused for the want of this.
+      if (fs.kind === 'fcmp')
+        return `(i64.extend_i32_u (i32.eqz (f64.ge (f64.reinterpret_i64 ${a}) (f64.reinterpret_i64 ${b}))))`;
       throw new Error('AOT: adc/sbb CF-in from kind '+fs.kind);
     };
     for (ii = 0; ii < blk.insns.length; ii++) {
