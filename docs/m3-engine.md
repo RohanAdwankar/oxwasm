@@ -5823,3 +5823,62 @@ which is ours.
 
 Correctness: `engine/test.sh 300` green end to end, and `rustc-asm` is
 byte-identical to native on both arms in all eight runs.
+
+### Batch 29: the flag matrix, and an oracle that was wrong
+
+Chasing a performance refusal produced a correctness batch. `cond ae/logic`
+was refusing a function called 11,967 times in the node-net case, and behind
+it sat a bug that had been shipping.
+
+`diff/flagkindtest.mjs` pairs every flag PRODUCER with every flag CONSUMER -
+18 x 12 x 144 operand pairs, generated rather than enumerated - under one
+invariant: the translator may REFUSE a function (it stays interpreted, correct
+and slower), but anything it ACCEPTS must match the interpreter bit for bit.
+Refusing is a performance bug; answering wrongly is a correctness bug. Nothing
+here told them apart, because every other test only asks about pairs it
+already expects to work.
+
+It found five miscompiles:
+
+| pair | what it did |
+|---|---|
+| `shr rax,1; adc rbx,0` | read CF as 0 - and/or/xor/test clear CF, a shift sets it, one kind for both |
+| `dec 0x8000...; jl` | inc/dec had no case and fell through to comparisons that ignore OF |
+| `shl 0x8000...,1; jl` | same, and a shift's OF was not materialized at all |
+| `bsf rax,rsi; js` | bsf/bsr define only ZF, and $fr holds the SOURCE, so the sign read was the operand |
+| `bt rax,rsi; jo` | one kind meant both "CF alone" (bt) and "CF==OF" (mul) |
+
+The fifth was introduced by the previous batch: making imul2/imul3 produce the
+`cf` kind made that branch reachable from result-derived conditions, so
+`imul rax,rsi; jz` tested CF instead of the product. It was latent for `bt`
+and `mul1` the entire time.
+
+Then the shifts, which were the largest refusal group. CF is the last bit
+shifted out and is always defined; OF is where it got interesting. The
+interpreter guarded OF with `if (count === 1)`, treating the manual's
+"undefined" as "unchanged" and leaving the previous instruction's OF in place.
+
+**The hardware computes it.** `diff/shiftoftest.mjs` asks the CPU - each case
+runs natively (shift, then `jo` to a distinguishable exit status) and through
+the interpreter, with the incoming OF set both ways, because "unchanged" and
+"computed" are only distinguishable when the incoming value differs. 3 ops x
+6 counts x 8 operands x 2 incoming values.
+
+**Before: 168/288. After: 288/288.** The interpreter was wrong on 42% of them.
+
+The rule is independent of the count and is the count-1 rule applied to the
+ORIGINAL operand: `sar` clears OF, `shr` takes its top bit, `shl` takes
+whether its top two bits differ. It is NOT `MSB(result) xor CF` - that uses
+the shifted result and the count-th bit and coincides only at a count of 1,
+which is exactly why the old code looked right.
+
+Flag matrix: **22320/22320 compiled pairs bit-exact**, refusals 101 -> 61.
+
+**A correction.** The commit that landed the oracle fix claims node-net's
+24,523-call `cond le/shift` is gone. It is not: that function shifts by a
+REGISTER, and a dynamic count is still not a modeled producer, because a shift
+by zero leaves the flags entirely untouched and that needs a branch rather
+than an expression. What did move was the 11,967-call one, in the batch
+before, and it now stops on `pop [rsp-based]` instead. The claim was written
+before the measurement it describes, which is the whole failure mode this
+session keeps finding in its own instruments.
