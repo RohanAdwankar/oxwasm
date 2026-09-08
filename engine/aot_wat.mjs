@@ -2223,7 +2223,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   // not touch CF, a shift without the count-1 rule has no OF, bsf/bsr define
   // only ZF, and a word with a made-up bit in it is worse than a refusal.
   const bitsProducers = new Set();
-  const BITSOK = new Set(['sub', 'add', 'logic', 'shiftf']);
+  const BITSOK = new Set(['sub', 'add', 'logic', 'shiftf', 'adc', 'sbb', 'fcmp']);
   // Soft consumers read the flags too, but an unknown producer must not
   // poison the function - they just get no flags:
   //  - an escape to the interpreter (udec terminator: pushf, x87, cpuid ...)
@@ -2379,6 +2379,17 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     // JOIN, which stores it in $fbits so a consumer in a later block can read
     // real flag bits instead of re-deriving them from operands it cannot see.
     const flagWord = (fs, base) => {
+      // ucomis/comis is the one kind whose flags do not come from a result:
+      // $fa and $fb hold the two f64 bit patterns and $fr is nothing. x86
+      // writes ZF, PF and CF from the compare and clears OF, SF and AF -
+      // unordered sets all three, below sets CF alone, equal sets ZF alone.
+      if (fs.kind === 'fcmp') {
+        const A = '(f64.reinterpret_i64 (local.get $fa))', B = '(f64.reinterpret_i64 (local.get $fb))';
+        const un = `(i64.extend_i32_u (i32.or (f64.ne ${A} ${A}) (f64.ne ${B} ${B})))`;
+        const zf = `(i64.extend_i32_u (i32.or (f64.eq ${A} ${B}) (i32.wrap_i64 ${un})))`;
+        const cf = `(i64.extend_i32_u (i32.eqz (f64.ge ${A} ${B})))`;   // below OR unordered
+        return `(i64.or (i64.or (i64.const ${base}) ${cf}) (i64.or (i64.shl ${un} (i64.const 2)) (i64.shl ${zf} (i64.const 6))))`;
+      }
       const S = fs.size, sgn = SIGNl[S], m = MASK[S];
       const a = '(local.get $fa)', b = '(local.get $fb)', r = '(local.get $fr)';
       const zf = `(i64.extend_i32_u (i64.eqz ${r}))`, sf = `(i64.extend_i32_u (i64.ne (i64.and ${r} (i64.const ${sgn})) (i64.const 0)))`;
@@ -2389,6 +2400,15 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       // count-independent rule ($fa). 'logic' and 'zf' keep CF=OF=0, which is
       // exact for and/or/xor/test and is what bsf/bsr handed over before.
       else if (fs.kind === 'shiftf') { cf = `(i64.and ${b} (i64.const 1))`; of = `(i64.and ${a} (i64.const 1))`; }
+      // adc/sbb carry their CF in $cf rather than deriving it, and their OF is
+      // the add or subtract rule over the same operands. Every flag is exact,
+      // so a join over them is as sound as one over a plain add.
+      else if (fs.kind === 'adc' || fs.kind === 'sbb') {
+        cf = '(local.get $cf)';
+        of = fs.kind === 'adc'
+          ? `(i64.extend_i32_u (i64.ne (i64.and (i64.and (i64.xor ${a} ${r}) (i64.xor ${b} ${r})) (i64.const ${sgn})) (i64.const 0)))`
+          : `(i64.extend_i32_u (i64.ne (i64.and (i64.and (i64.xor ${a} ${b}) (i64.xor ${a} ${r})) (i64.const ${sgn})) (i64.const 0)))`;
+      }
       // PF and AF. syncIn assigns all six flags unconditionally, so a word
       // that omits these does not leave them alone - it forces them to zero,
       // and the interpreter then runs `pushf`, `jp` or `lahf` on a flag the
@@ -2404,7 +2424,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       // answer there, and a guest reading AF after a shift is reading garbage
       // on hardware too.
       const pf = `(i64.and (i64.xor (i64.popcnt (i64.and ${r} (i64.const 255))) (i64.const 1)) (i64.const 1))`;
-      const af = (fs.kind === 'sub' || fs.kind === 'add')
+      const af = ['sub', 'add', 'adc', 'sbb'].includes(fs.kind)
         ? `(i64.and (i64.shr_u (i64.xor (i64.xor ${a} ${b}) ${r}) (i64.const 4)) (i64.const 1))` : '(i64.const 0)';
       // 0x202 | CF | PF<<2 | AF<<4 | ZF<<6 | SF<<7 | OF<<11, with `base` on top.
       // Folded rather than written out: the hand-nested version of this had one
