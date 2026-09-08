@@ -1472,10 +1472,12 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     }
   }
   if (hasDeopt) any64.fill(true);
-  // `rep movs/stos` translate to forward bulk-memory ops, valid only when
-  // DF=0. The ABI keeps DF=0 except transiently around a std/cld pair; a
-  // function that never executes `std` has DF=0 throughout, so bulk ops are
-  // sound. If it does, poison (the interpreter honors DF exactly).
+  // Whether the string ops need a runtime direction. The ABI keeps DF=0 except
+  // transiently around a std/cld pair, so a function that never executes `std`
+  // steps forward throughout and gets the constant step it always got. One that
+  // does reads DF_SLOT per string op instead (see strDir) — it used to be
+  // refused whole, which took every string op in it interpreted along with
+  // everything the function called.
   let hasStd = false;
   for (const b of blocks) for (const insn of b.insns) if (insn.mnem === 'std') hasStd = true;
   const pushed = new Set();
@@ -1659,6 +1661,31 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   let vtmpN = 0; const vtmps = new Set();
   const VT = () => { const n = '$vt' + (vtmpN++); vtmps.add(n); return n; };
   const reg = (r) => '$r' + r;
+  // Direction for the string ops. A function with no `std` in it has DF=0
+  // throughout — the ABI guarantees DF=0 at entry and exit and only a std/cld
+  // pair breaks it — so the step is the constant +S and the emitted wat is
+  // exactly what it was before DF became a runtime value. A function that does
+  // contain `std` reads the flag at run time, which is what lets it compile at
+  // all: it used to be refused whole, taking every string op in it interpreted.
+  //
+  // `lo(r)` is the LOW address of the range a bulk op covers, which is the
+  // register going forward and rN-(rcx-1) going backward, since x86 names the
+  // FIRST element touched and backward that is the range's top.
+  // `away(a, b)` is how far a runs into b, positive when the copy overwrites
+  // source it has not read yet: it is the overlap test in whichever direction
+  // the copy is going.
+  const strDir = (S, L) => {
+    if (!hasStd) return { step: `(i64.const ${S})`, lo: (r) => `(local.get $r${r})`,
+                          away: (a, b) => `(i64.sub (local.get $r${a}) (local.get $r${b}))` };
+    const st = T();
+    L.push(`(local.set ${st} (select (i64.const ${-S}) (i64.const ${S}) (i32.load (i32.const ${DF_SLOT}))))`);
+    const back = `(i64.lt_s (local.get ${st}) (i64.const 0))`;
+    return {
+      step: `(local.get ${st})`,
+      lo: (r) => `(select (i64.sub (local.get $r${r}) (i64.mul (i64.sub (local.get $r1) (i64.const 1)) (i64.const ${S}))) (local.get $r${r}) ${back})`,
+      away: (a, b) => `(select (i64.sub (local.get $r${b}) (local.get $r${a})) (i64.sub (local.get $r${a}) (local.get $r${b})) ${back})`,
+    };
+  };
   const sx = (e, S) => S === 8 ? e : `(i64.shr_s (i64.shl ${e} (i64.const ${64-S*8})) (i64.const ${64-S*8}))`;
   const guestAddr = (op, next) => {
     if (op.ripRel) return `(i64.const ${hexs(next + op.disp)})`;
@@ -2861,57 +2888,61 @@ function emitUnitFunction(a0, fnAddr, ctx) {
         case 'std': L.push(`(i32.store (i32.const ${DF_SLOT}) (i32.const 1))`); break;
         case 'stos': {
           const woffc = Number(BigInt.asIntN(32, woff));
-          const rdiOff = `(i32.add (i32.wrap_i64 (local.get $r7)) (i32.const ${woffc}))`;
-          if (insn.rep && hasStd) throw new Error('AOT: rep stos with std @ '+insn.rip.toString(16));
-          if (insn.rep && S === 1) {                                          // byte fill: one bulk op
-            L.push(`(memory.fill ${rdiOff} (i32.wrap_i64 (i64.and (local.get $r0) (i64.const 0xFF))) (i32.wrap_i64 (local.get $r1)))`);
-            L.push(`(local.set $r7 (i64.add (local.get $r7) (local.get $r1)))`, `(local.set $r1 (i64.const 0))`);
-          } else if (insn.rep) {                                             // strided: forward wasm loop
+          const { step, lo } = strDir(S, L);
+          if (insn.rep && S === 1) {
+            // Byte fill: one bulk op. Direction cannot change WHICH bytes end
+            // up written - the value is a constant from al, not memory - so
+            // backward only moves the range's base and the sign of the rdi
+            // update.
+            L.push(`(memory.fill (i32.add (i32.wrap_i64 ${lo(7)}) (i32.const ${woffc})) (i32.wrap_i64 (i64.and (local.get $r0) (i64.const 0xFF))) (i32.wrap_i64 (local.get $r1)))`);
+            L.push(`(local.set $r7 (i64.add (local.get $r7) (i64.mul (local.get $r1) ${step})))`, `(local.set $r1 (i64.const 0))`);
+          } else if (insn.rep) {                                             // strided: wasm loop
             const e = '$se_'+insn.rip.toString(16), lp = '$sl_'+insn.rip.toString(16);
             L.push(`(block ${e} (loop ${lp} (br_if ${e} (i64.eqz (local.get $r1)))`,
                    `(${ST[S]} ${wasmAddr({base:7,index:-1,disp:0n},next)} ${rd({kind:'reg',r:0,size:S},S,next)})`,
-                   `(local.set $r7 (i64.add (local.get $r7) (i64.const ${S}))) (local.set $r1 (i64.sub (local.get $r1) (i64.const 1))) (br ${lp})))`);
+                   `(local.set $r7 (i64.add (local.get $r7) ${step})) (local.set $r1 (i64.sub (local.get $r1) (i64.const 1))) (br ${lp})))`);
           } else {
             L.push(`(${ST[S]} ${wasmAddr({base:7,index:-1,disp:0n},next)} ${rd({kind:'reg',r:0,size:S},S,next)})`,
-                   `(local.set $r7 (i64.add (local.get $r7) (i64.const ${S})))`);
+                   `(local.set $r7 (i64.add (local.get $r7) ${step}))`);
           }
           break; }
         case 'movs': {
           const woffc = Number(BigInt.asIntN(32, woff));
-          if (insn.rep && hasStd) throw new Error('AOT: rep movs with std @ '+insn.rip.toString(16));
+          const { step, lo, away } = strDir(S, L);
           if (insn.rep && S === 1) {
             // Byte copy: one bulk op, but memory.copy is MEMMOVE and rep movsb
             // is an element-at-a-time copy. Those agree unless the ranges
-            // overlap with rdi above rsi by less than the count: iteration k
+            // overlap and the copy runs INTO the source: going forward that is
+            // rdi above rsi, going backward it is rsi above rdi. Iteration k
             // then reads a byte iteration k-d already wrote, so x86 replicates
             // the first d bytes as a pattern where memmove reads the original.
-            // (`rep movsb` with rsi = rdi-1 is exactly that idiom.) Test the
-            // overlap at run time and take the exact loop when it holds; the
-            // interpreter has always made the same distinction.
+            // (`rep movsb` with rsi = rdi-1 is exactly that idiom.) Test it at
+            // run time and take the exact loop when it holds; the interpreter
+            // has always made the same distinction.
             const d = T(), e = '$moe_'+insn.rip.toString(16), lp = '$mol_'+insn.rip.toString(16);
-            L.push(`(local.set ${d} (i64.sub (local.get $r7) (local.get $r6)))`);
+            L.push(`(local.set ${d} ${away(7, 6)})`);
             L.push(`(if (i32.and (i64.ne (local.get ${d}) (i64.const 0)) (i64.lt_u (local.get ${d}) (local.get $r1)))`,
                    `  (then (block ${e} (loop ${lp} (br_if ${e} (i64.eqz (local.get $r1)))`,
                    `    (i32.store8 ${wasmAddr({base:7,index:-1,disp:0n},next)} (i32.load8_u ${wasmAddr({base:6,index:-1,disp:0n},next)}))`,
-                   `    (local.set $r6 (i64.add (local.get $r6) (i64.const 1))) (local.set $r7 (i64.add (local.get $r7) (i64.const 1)))`,
+                   `    (local.set $r6 (i64.add (local.get $r6) ${step})) (local.set $r7 (i64.add (local.get $r7) ${step}))`,
                    `    (local.set $r1 (i64.sub (local.get $r1) (i64.const 1))) (br ${lp}))))`,
-                   `  (else (memory.copy (i32.add (i32.wrap_i64 (local.get $r7)) (i32.const ${woffc})) (i32.add (i32.wrap_i64 (local.get $r6)) (i32.const ${woffc})) (i32.wrap_i64 (local.get $r1)))`,
-                   `        (local.set $r6 (i64.add (local.get $r6) (local.get $r1))) (local.set $r7 (i64.add (local.get $r7) (local.get $r1)))`,
+                   `  (else (memory.copy (i32.add (i32.wrap_i64 ${lo(7)}) (i32.const ${woffc})) (i32.add (i32.wrap_i64 ${lo(6)}) (i32.const ${woffc})) (i32.wrap_i64 (local.get $r1)))`,
+                   `        (local.set $r6 (i64.add (local.get $r6) (i64.mul (local.get $r1) ${step}))) (local.set $r7 (i64.add (local.get $r7) (i64.mul (local.get $r1) ${step})))`,
                    `        (local.set $r1 (i64.const 0))))`);
           } else if (insn.rep) {
             const e = '$me_'+insn.rip.toString(16), lp = '$ml_'+insn.rip.toString(16);
             L.push(`(block ${e} (loop ${lp} (br_if ${e} (i64.eqz (local.get $r1)))`,
                    `(${ST[S]} ${wasmAddr({base:7,index:-1,disp:0n},next)} (${LD[S]} ${wasmAddr({base:6,index:-1,disp:0n},next)}))`,
-                   `(local.set $r6 (i64.add (local.get $r6) (i64.const ${S}))) (local.set $r7 (i64.add (local.get $r7) (i64.const ${S}))) (local.set $r1 (i64.sub (local.get $r1) (i64.const 1))) (br ${lp})))`);
+                   `(local.set $r6 (i64.add (local.get $r6) ${step})) (local.set $r7 (i64.add (local.get $r7) ${step})) (local.set $r1 (i64.sub (local.get $r1) (i64.const 1))) (br ${lp})))`);
           } else {
             L.push(`(${ST[S]} ${wasmAddr({base:7,index:-1,disp:0n},next)} (${LD[S]} ${wasmAddr({base:6,index:-1,disp:0n},next)}))`,
-                   `(local.set $r6 (i64.add (local.get $r6) (i64.const ${S})))`, `(local.set $r7 (i64.add (local.get $r7) (i64.const ${S})))`);
+                   `(local.set $r6 (i64.add (local.get $r6) ${step}))`, `(local.set $r7 (i64.add (local.get $r7) ${step}))`);
           }
           break; }
         case 'cmps': case 'scas': {
           // repe/repne string compare; flags ('sub' kind) come from the LAST
           // element pair, stored into $fa/$fb/$fr every iteration
-          if (hasStd) throw new Error('AOT: cmps/scas with std @ '+insn.rip.toString(16));
+          const { step } = strDir(S, L);
           const isCmps = insn.mnem === 'cmps';
           const ldA = isCmps ? `(${LD[S]} ${wasmAddr({base:6,index:-1,disp:0n},next)})`
                              : (S === 8 ? `(local.get $r0)` : `(i64.and (local.get $r0) (i64.const ${m}))`);
@@ -2920,8 +2951,8 @@ function emitUnitFunction(a0, fnAddr, ctx) {
             `(local.set $fa ${ldA})`,
             `(local.set $fb ${ldB})`,
             `(local.set $fr (i64.and (i64.sub (local.get $fa) (local.get $fb)) (i64.const ${m})))`,
-            ...(isCmps ? [`(local.set $r6 (i64.add (local.get $r6) (i64.const ${S})))`] : []),
-            `(local.set $r7 (i64.add (local.get $r7) (i64.const ${S})))`,
+            ...(isCmps ? [`(local.set $r6 (i64.add (local.get $r6) ${step}))`] : []),
+            `(local.set $r7 (i64.add (local.get $r7) ${step}))`,
           ];
           if (insn.rep || insn.rep2) {
             // rcx == 0: hardware leaves the flags alone. The incoming flags
