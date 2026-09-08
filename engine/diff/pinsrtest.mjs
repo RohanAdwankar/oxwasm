@@ -1,4 +1,5 @@
-// Differential: pinsrw / pextrw, the 16-bit lane moves.
+// Differential: the SSE ops the emitter refused while the interpreter had
+// them - pinsrw/pextrw (the 16-bit lane moves) and psadbw.
 //
 // The interpreter has had both for a long time and the emitter refused them,
 // which mattered out of proportion to two instructions: a unit whose ENTRY is
@@ -34,6 +35,15 @@ for (let lane = 0; lane < 8; lane++) {
   CASES.push([`pextrw-l${lane}`, `${SEED}pextrw eax, xmm0, ${lane}\nret`]);
 }
 
+// psadbw sums |a-b| per 8-byte half into that half's low 16 bits. wasm has no
+// such instruction, so the emitter builds it from saturating subtraction both
+// ways (the unsigned absolute difference) and two extadd_pairwise folds - a
+// construction with more places to be wrong than a lane move, hence the
+// random vectors below rather than a handful of chosen ones.
+CASES.push(['psadbw',
+  'movdqu xmm0, [0x400800]\nmovdqu xmm1, [0x400810]\npsadbw xmm0, xmm1\n' +
+  'movdqu [0x400820], xmm0\nmov rax, [0x400820]\nxor rax, [0x400828]\nret']);
+
 let pass = 0, fail = 0, refused = 0;
 for (const [name, body] of CASES) {
   const code = asm(body);
@@ -46,7 +56,12 @@ for (const [name, body] of CASES) {
   for (const seedHi of [0x0123456789ABCDEFn, 0xFFFFFFFFFFFFFFFFn]) {
     for (const w of [0n, 0x1234n, 0xFFFFn, 0xBEEFn]) {
       const seedLo = 0xFEDCBA9876543210n;
-      const plant = (writeU64) => { writeU64(0x800, seedLo); writeU64(0x808, seedHi); };
+      // 0x800/0x808 is the first vector; 0x810/0x818 the second, which only
+      // psadbw reads. Derived from the same seeds so the pair varies together.
+      const plant = (writeU64) => {
+        writeU64(0x800, seedLo); writeU64(0x808, seedHi);
+        writeU64(0x810, seedLo ^ (w * 0x0101010101010101n)); writeU64(0x818, ~seedHi & 0xFFFFFFFFFFFFFFFFn);
+      };
 
       const m = new Memory([{ base: CODE, bytes: code.slice() }]);
       plant((off, v) => m.write(CODE + BigInt(off), 8n, v));
@@ -75,6 +90,6 @@ for (const [name, body] of CASES) {
     }
   }
 }
-console.log(`\n${pass}/${pass + fail} pinsrw/pextrw lane results bit-exact (AOT vs interpreter), all 8 lanes`);
+console.log(`\n${pass}/${pass + fail} SSE results bit-exact (AOT vs interpreter): pinsrw/pextrw all 8 lanes, psadbw`);
 if (refused) console.log(`${refused} refused`);
 if (fail || refused) process.exit(1);
