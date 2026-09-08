@@ -473,57 +473,57 @@ sha256sum over 138 kB, three runs each, same page, same host:
 identical (`e75d8b475e0554e1`). The page grows 5.80 MB to 6.13 MB - 116 units,
 1.89 MB of wasm, 0.33 MB once gzipped and base64'd.
 
-Two things this does NOT do. It does not help the steady state, which is
-already compiled code either way. And the page still translates 23 units,
-which is an open gap rather than a rounding error.
+It does not help the steady state, which is already compiled code either way.
 
-**What the gap is, and what it is not.** The page asks the manifest for **163
-distinct entries**; 116 hit and **47 miss**. All 116 training units are in the
-page's set, so the page is not asking for different code - it is asking for
-MORE, and the extra 47 sit in the dynamic linker and the mmapped libraries.
+### Registering the manifest up front closes the gap entirely
 
-Training now iterates, because the manifest changes what it is training for: a
-run with units registered interprets less, so its loop back-edge counters
-reach the tier-up threshold in different places and it wants entries the
-previous round never saw. Rounds continue until one adds nothing. On this
-binary it converges after a single round - and the page still misses 47, so
-iteration was not the cause.
+The first version handed the engine a `unitBytes` lookup and let it consult
+that on demand, which is what the engine does under node - and under node
+instantiation is SYNCHRONOUS, so a unit is there the moment it is asked for.
+A browser cannot compile a module of this size synchronously on the main
+thread, so the engine takes its async path: it parks a null placeholder and
+the unit appears some microtasks later. Execution continues interpreted across
+that window, and the unit boundaries it establishes there are not the ones a
+synchronous run establishes.
 
-Ruled out, each by measurement rather than argument, and each of them a
-hypothesis that looked convincing first:
+That is what the coverage gap was. The page asked for 163 distinct entries
+against the training run's 116, and the misses were not mysterious code: 32
+had been seen here just under the tier-up threshold, and of the 15 the
+profiler never saw, 10 had run INSIDE a compiled unit under node rather than
+being tiered separately. Different boundaries, not different code.
 
-- **The load addresses.** Both put ld.so at 140c000-1436195, and the 116 hits
-  prove the bases agree.
-- **The slice size.** The training runs the page's 3e6 chunks; 5e7 gave the
-  same 116 units.
-- **The tier-up budget.** `tierMsMax` is unset in the page.
-- **The depth refusals.** Training through the page's own wabt build with the
-  same probed limit (149 here, 13 units needing the CLI) produced the same 116.
-  The page's "too deep to assemble" units are downstream of the misses - it
-  only attempts them because the manifest does not carry them.
-- **The threshold.** Of the 47 misses, 32 had been SEEN in the training run
-  just under the line: calls=3 against a threshold of 4, back edges 5-11
-  against 12. Once a caller compiles, its calls stop passing through the
-  interpreter's profiler, so which callees reach the threshold depends on what
-  compiled first - which suggested training permissively (`aotCallThreshold`
-  1, `aotLoopThreshold` 2) to capture a superset. **It made things worse.**
-  338 units instead of 116, and the page still assembled 24 rather than fewer:
+Instantiating the whole manifest before the first guest instruction removes
+the window. It costs one pass - 116 units, 143 functions, **8-10 ms** - and it
+is the same registration the engine does itself.
 
-  | manifest | total | tier-up | assembled in page |
-  |---|---|---|---|
-  | 116 units | 1421, 1443, 1653 ms | 824-957 ms | 23 |
-  | 338 units | 1658, 1672, 1728 ms | 1061-1113 ms | 24 |
+`wall` is navigation to exit, which is everything the reader waits through
+including the inflate; `engine` is the page's own clock, which starts after
+the binary is decompressed.
 
-  Median 1443 ms to 1672 ms - 222 unused units cost ~230 ms of instantiation
-  and 0.12 MB, and bought nothing. Reverted.
+**sha256sum, 138 kB, four runs each:**
 
-That last result is the informative one: a training run that captures every
-entry called even ONCE still misses what the page asks for, so the page is
-executing guest code this host does not. The remaining 15 entries that were
-"never seen at all" are the thing to explain, not the 32 near the threshold.
-Why is open, and the two changes tried against it are reverted rather than
-left in for looking like progress.
+| | wall | engine | tier-up | assembled in page |
+|---|---|---|---|---|
+| plain | 2724, 2732, 2741, 3031 ms | 2173-2395 ms | 1697-1857 ms | 106 units |
+| lazy manifest | ~1450 ms | 1439-1479 ms | 832-843 ms | 23 units |
+| **up front** | **774, 808, 819, 944 ms** | **240-398 ms** | **119-143 ms** | **0 units** |
 
+**gzip -9, 138 kB, three runs each:**
+
+| | wall | engine | assembled in page |
+|---|---|---|---|
+| plain | 1949, 1965, 2454 ms | 1580-1932 ms | 69 units |
+| **up front** | **667, 679, 758 ms** | **301-391 ms** | **1 unit** |
+
+Wall clock **2736 ms to 813 ms** on sha256sum and **1965 ms to 679 ms** on
+gzip. Output hashes identical across every run of both. In-page assembly goes
+to zero, which is the coverage gap closing rather than shrinking: with the
+manifest registered from instruction zero, the page's tier-up set is the
+training run's.
+
+What is left in the wall figure is the page load and the inflate, ~550 ms on
+sha256sum, which a manifest cannot help and slightly grows (6.07 MB against
+5.80 MB).
 **The manifest is a correctness surface, so it carries a fingerprint.** Handed
 units trained against a different binary the engine registers code whose
 addresses mean something else, and the guest dies somewhere unrelated with
