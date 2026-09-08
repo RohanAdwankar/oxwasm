@@ -3,3 +3,4 @@ runtime/
 *.html
 node_modules/
 watcache/
+__pycache__/
