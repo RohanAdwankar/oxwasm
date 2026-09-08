@@ -56,6 +56,7 @@ node enginetest.mjs
 node atomictest.mjs
 node fcmptest.mjs
 node cmppstest.mjs
+node cvtpdtest.mjs
 node bsrtest.mjs
 node narrowtest.mjs
 node implicittest.mjs
