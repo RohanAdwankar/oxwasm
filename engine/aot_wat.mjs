@@ -1872,6 +1872,20 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       case 0x70: {                                                            // pshufd (66) / pshuflw (F2) / pshufhw (F3)
         const idx = insn.pF2 ? pshufwIdx(insn.imm8, 0) : insn.pF3 ? pshufwIdx(insn.imm8, 8) : pshufdIdx(insn.imm8);
         put(`(i8x16.shuffle ${idx.join(' ')} ${xv(rm, next)} ${xv(rm, next)})`); break; }
+      // psadbw: per 8-byte half, the sum of |a-b| over its bytes, landing in
+      // that half's low 16 bits. wasm has no such op, but it has the two
+      // pieces: saturating subtraction both ways ORed together is the unsigned
+      // absolute difference (one side is always zero), and two rounds of
+      // extadd_pairwise fold 16 bytes down to four 32-bit lane sums - lanes
+      // 0+1 are the low half, 2+3 the high. The maximum per half is 8*255 =
+      // 2040, so nothing can overflow on the way.
+      case 0xF6: {
+        const d = VT(), q = VT();
+        L.push(`(local.set ${d} (v128.or (i8x16.sub_sat_u ${dst} ${xv(rm, next)}) (i8x16.sub_sat_u ${xv(rm, next)} ${dst})))`);
+        L.push(`(local.set ${q} (i32x4.extadd_pairwise_i16x8_u (i16x8.extadd_pairwise_i8x16_u (local.get ${d}))))`);
+        const half = (a, b) => `(i64.extend_i32_u (i32.add (i32x4.extract_lane ${a} (local.get ${q})) (i32x4.extract_lane ${b} (local.get ${q}))))`;
+        put(`(i64x2.replace_lane 1 (i64x2.replace_lane 0 ${ZERO} ${half(0, 1)}) ${half(2, 3)})`);
+        break; }
       // pinsrw/pextrw: one 16-bit lane in or out. The interpreter has had both
       // for a long time; the emitter refused them, and since a unit whose
       // ENTRY is unsupported is refused whole, that put real functions in the
