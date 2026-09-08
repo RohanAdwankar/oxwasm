@@ -39,6 +39,7 @@ node pinsrtest.mjs
 node dftest.mjs
 node movsovertest.mjs
 node eflagstest.mjs
+node manifesttest.mjs
 node fcwtest.mjs
 node shiftoftest.mjs
 node mxcsrtest.mjs

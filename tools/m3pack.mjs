@@ -6,6 +6,12 @@
 //   node tools/m3pack.mjs ./program -o out.html --arg md5sum --arg /data/f \
 //        --file /data/f=./somefile --title "prog"
 //
+// --train runs the program once HERE, at pack time, and embeds the wasm units
+// it translated. The page registers those with no translation at all, which is
+// where its startup goes: on sha256sum the floor is ~2500 ms, of which ~1850 ms
+// is the translator generating 4.34 MB of WAT text, ~190 ms is the in-page
+// assembler and ~15 ms is the browser compiling the result.
+//
 // The output is self-contained and offline: engine, wabt, the binary, and
 // any data files are inlined. Nothing about the packaged program is special-
 // cased — the engine sees only its bytes.
@@ -22,13 +28,14 @@ const ENGINE = join(HERE, '..', 'engine');
 
 const args = process.argv.slice(2);
 let elfPath = null, out = 'm3.html', title = 'oxwasm m3';
-let argv = [], files = {};
+let argv = [], files = {}, train = false;
 for (let i = 0; i < args.length; i++) {
   const a = args[i];
   if (a === '-o') out = args[++i];
   else if (a === '--arg') argv.push(args[++i]);
   else if (a === '--file') { const [g, h] = args[++i].split('='); files[g] = h; }
   else if (a === '--title') title = args[++i];
+  else if (a === '--train') train = true;
   else if (!elfPath) elfPath = a;
   else { console.error('unknown arg', a); process.exit(1); }
 }
@@ -115,6 +122,71 @@ const elfB64 = gzb64(readFileSync(elfPath));
 // mtimes and this packer did not.
 const fileEntries = Object.entries(files).map(([g, h]) => [g, gzb64(readFileSync(h)), Math.floor(statSync(h).mtimeMs / 1000)]);
 
+// ---- optional pack-time training run -------------------------------------
+// The units a run translates are a function of the guest's memory image and
+// the entry address, and both are deterministic for a given binary, argv and
+// memMB: two runs here produce the same 107 entries with byte-identical wasm.
+// So they can be translated once, at pack time, and shipped.
+//
+// The training assembler is the wat2wasm CLI, one process per unit. That is
+// slower than the in-page wabt and it is the right choice here: a fresh
+// process cannot be poisoned by a too-deep unit the way one long-lived wabt
+// instance is, so the manifest also carries units the page would have refused
+// as too deep to assemble.
+//
+// Anything the training run did not reach still translates in the page. The
+// manifest is an optimisation, never a requirement.
+// Fingerprint over exactly the things a unit is compiled against: the program
+// bytes, the argv and env that decide the guest's layout, and the memory size.
+// The manifest and the binary always come from the same pack, so this never
+// fires in normal use - it is here because the failure it prevents is silent
+// and total. Handed a manifest trained on a different binary, the engine
+// registers units whose addresses mean other code and the guest crashes
+// somewhere unrelated, with nothing pointing back at the manifest.
+const fingerprint = (buf) => {
+  let h1 = 0x811c9dc5, h2 = 0x01000193;
+  for (let i = 0; i < buf.length; i++) {
+    h1 = Math.imul(h1 ^ buf[i], 0x01000193) >>> 0;
+    h2 = Math.imul(h2 + buf[i], 0x85ebca6b) >>> 0;
+  }
+  return h1.toString(16).padStart(8, '0') + h2.toString(16).padStart(8, '0');
+};
+const packFp = fingerprint(Buffer.concat([readFileSync(elfPath),
+  Buffer.from(JSON.stringify([argv, env, 512]))]));
+
+let manifestB64 = '';
+if (train) {
+  const { LinuxEngine } = await import(join(ENGINE, 'linux.mjs'));
+  const tdir = mkdtempSync(join(tmpdir(), 'oxtrain-'));
+  let tn = 0;
+  const trainAsm = (wat) => {
+    const f = join(tdir, 't' + (tn++));
+    writeFileSync(f + '.wat', wat);
+    execFileSync('wat2wasm', ['--enable-tail-call', f + '.wat', '-o', f + '.wasm']);
+    return new Uint8Array(readFileSync(f + '.wasm'));
+  };
+  const tfiles = {}, tmtimes = {};
+  for (const [g, h] of Object.entries(files)) { tfiles[g] = new Uint8Array(readFileSync(h)); tmtimes[g] = Math.floor(statSync(h).mtimeMs / 1000); }
+  const cap = new Map();
+  const eng = new LinuxEngine(new Uint8Array(readFileSync(elfPath)),
+    { argv, env, files: tfiles, mtimes: tmtimes, memMB: 512, assembleWat: trainAsm });
+  eng.onUnitBytes = (k, b) => { if (!cap.has(k)) cap.set(k, Buffer.from(b)); };
+  const t0 = Date.now();
+  while (eng.exitCode === null && Date.now() - t0 < 600000) { eng.run(5e7); if (eng.blocked) eng.wake(); }
+  // A training run that did not finish the program is not a reason to fail the
+  // pack - the page still works - but it IS a reason to say so, because a
+  // half-covered manifest looks like a working one.
+  if (eng.exitCode !== 0)
+    console.log(`m3pack: WARNING training run exited ${eng.exitCode}; the manifest covers only what ran before that`);
+  // one blob rather than per-unit base64: entry u64le, length u32le, bytes
+  let total = 0; for (const v of cap.values()) total += 12 + v.length;
+  const blob = Buffer.alloc(total); let o = 0;
+  for (const [k, v] of cap) { blob.writeBigUInt64LE(BigInt(k), o); blob.writeUInt32LE(v.length, o + 8); v.copy(blob, o + 12); o += 12 + v.length; }
+  manifestB64 = gzb64(blob);
+  console.log(`m3pack: trained ${cap.size} units, ${(blob.length / 1e6).toFixed(2)} MB wasm -> ` +
+              `${(manifestB64.length / 1e6).toFixed(2)} MB base64 in the page (exit ${eng.exitCode}, ${((Date.now() - t0) / 1000).toFixed(0)}s)`);
+}
+
 const html = `<!doctype html>
 <html>
 <head>
@@ -144,6 +216,8 @@ const html = `<!doctype html>
 <script type="module">
 import { LinuxEngine } from 'ox/linux';
 const CONFIG = { argv: ${JSON.stringify(argv)}, env: ${JSON.stringify(env)}, title: ${JSON.stringify(title)} };
+const MANIFEST = ${JSON.stringify(manifestB64)} || null;
+const MANIFEST_FP = ${JSON.stringify(manifestB64 ? packFp : '')};
 const term = document.getElementById('term'), stat = document.getElementById('stat');
 const put = (s) => { term.textContent += s; term.scrollTop = term.scrollHeight; };
 async function inflate(b64) {
@@ -221,6 +295,28 @@ const watDepth = (s) => {
   for (const [g, b, mt] of ${JSON.stringify(fileEntries)}) { files[g] = await inflate(b); mtimes[g] = mt; }
   stat.textContent = 'running…';
   const eng = new LinuxEngine(elf, { argv: CONFIG.argv, env: CONFIG.env, files, mtimes, memMB: 512, assembleWat });
+  // Precompiled units from the pack-time training run, if there was one. The
+  // engine registers these with no translation and no assembler; anything not
+  // in here still goes the long way.
+  if (MANIFEST) {
+    // refuse a manifest that was not trained against this exact program
+    let h1 = 0x811c9dc5, h2 = 0x01000193;
+    const fp = new Uint8Array(elf.length + 0);
+    for (let i = 0; i < elf.length; i++) { h1 = Math.imul(h1 ^ elf[i], 0x01000193) >>> 0; h2 = Math.imul(h2 + elf[i], 0x85ebca6b) >>> 0; }
+    const tail = new TextEncoder().encode(JSON.stringify([CONFIG.argv, CONFIG.env, 512]));
+    for (let i = 0; i < tail.length; i++) { h1 = Math.imul(h1 ^ tail[i], 0x01000193) >>> 0; h2 = Math.imul(h2 + tail[i], 0x85ebca6b) >>> 0; }
+    const here = h1.toString(16).padStart(8, '0') + h2.toString(16).padStart(8, '0');
+    if (here !== MANIFEST_FP) throw new Error('precompiled units were trained against a different program (' + MANIFEST_FP + ' vs ' + here + ')');
+    const blob = await inflate(MANIFEST);
+    const dv = new DataView(blob.buffer, blob.byteOffset, blob.length);
+    const units = new Map();
+    for (let o = 0; o + 12 <= blob.length; ) {
+      const k = dv.getBigUint64(o, true), n = dv.getUint32(o + 8, true);
+      units.set(k, blob.subarray(o + 12, o + 12 + n)); o += 12 + n;
+    }
+    window.__oxManifestUnits = units.size;
+    eng.unitBytes = (k) => units.get(k);
+  }
   let shown = 0;
   // Total time inside tier-up, so the floor splits three ways: this minus the
   // assembler and V8 is the translator generating WAT text, which nothing had
