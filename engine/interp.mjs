@@ -600,7 +600,12 @@ export class CPU {
         // honored on integer conversion), status word C0/C2/C3. 80-bit memory
         // operands convert through f64 — a documented precision approximation;
         // formatting/strtod paths that only need double-precision math are exact.
-        if (!this.fst) { this.fst = new Float64Array(8); this.ftop = 0; this.fcw = 0x037F; this.fsw = 0; }
+        // fcw is initialized SEPARATELY from the register stack: a unit can
+        // set it with fldcw before the interpreter has run any x87 at all,
+        // and folding it into this lazy init would reset the rounding mode
+        // the guest just chose the first time the interpreter sees an x87 op.
+        if (!this.fst) { this.fst = new Float64Array(8); this.ftop = 0; this.fsw = 0; }
+        if (this.fcw === undefined) this.fcw = 0x037F;
         const ST = (k) => this.fst[(this.ftop + k) & 7];
         const setST = (k, v) => { this.fst[(this.ftop + k) & 7] = v; };
         const fpush = (v) => { this.ftop = (this.ftop - 1) & 7; this.fst[this.ftop] = v; };
