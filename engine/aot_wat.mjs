@@ -329,11 +329,23 @@ export function compileFunctionWatDispatch(mem, entry, { guestBase, ramBase, max
           L.push(wr(insn.dst, S, S===8?e:`(i64.and ${e} (i64.const ${m}))`, next)); break; }
         case 'push': L.push(`(local.set $r4 (i64.sub (local.get $r4) (i64.const 8)))`,
                             `(i64.store ${wasmAddr({base:4,index:-1,disp:0n},next)} ${rd(insn.src,8,next)})`); break;
-        case 'pop':
-          if (insn.dst.kind === 'mem' && (insn.dst.base === 4 || insn.dst.index === 4))
-            throw new Error('pop [rsp-based]');   // address is post-increment; interp is exact
+        case 'pop': {
+          // `pop [mem]` with an rsp-based address computes the address AFTER
+          // the increment (Intel grp1a). Confirmed against this CPU rather
+          // than assumed: `pop qword [rsp]` writes the popped value to the
+          // slot ABOVE the one it came from. So pop into a temp, move rsp,
+          // then store - the emitter used to write first, which is why this
+          // shape was refused outright and cost node-net a function called
+          // 11,967 times.
+          if (insn.dst.kind === 'mem' && (insn.dst.base === 4 || insn.dst.index === 4)) {
+            const t = T();
+            L.push(`(local.set ${t} (i64.load ${wasmAddr({base:4,index:-1,disp:0n},next)}))`,
+                   `(local.set $r4 (i64.add (local.get $r4) (i64.const 8)))`,
+                   wr(insn.dst,8,`(local.get ${t})`,next));
+            break;
+          }
           L.push(wr(insn.dst,8,`(i64.load ${wasmAddr({base:4,index:-1,disp:0n},next)})`,next),
-                 `(local.set $r4 (i64.add (local.get $r4) (i64.const 8)))`); break;
+                 `(local.set $r4 (i64.add (local.get $r4) (i64.const 8)))`); break; }
         case 'jmp': L.push(goto((next+insn.rel)&MASK[8])); break;
         case 'jcc': { const tk = bidx.get(((next+insn.rel)&MASK[8]).toString()), fl = bidx.get(next.toString());
           L.push(`(if ${cond(insn.cond)} (then (local.set $label (i32.const ${tk}))) (else (local.set $label (i32.const ${fl})))) (br $loop)`); break; }
@@ -2873,12 +2885,20 @@ function emitUnitFunction(a0, fnAddr, ctx) {
                  `(local.set $r4 (i64.sub (local.get $r4) (i64.const 8)))`,
                  `(i64.store ${wasmAddr({base:4,index:-1,disp:0n},next)} (local.get ${t}))`); break; }
         case 'pop': {
-          // pop [mem] with an rsp-based address computes the address AFTER
-          // the increment (Intel grp1a); this emitter writes first, so
-          // refuse that rare shape - poison sends it to the interpreter,
-          // whose set-after-pop order is exact
-          if (insn.dst.kind === 'mem' && (insn.dst.base === 4 || insn.dst.index === 4))
-            throw new Error('AOT: pop [rsp-based] @ ' + insn.rip.toString(16));
+          // `pop [mem]` with an rsp-based address computes the address AFTER
+          // the increment (Intel grp1a). Confirmed against this CPU rather
+          // than assumed: `pop qword [rsp]` writes the popped value to the
+          // slot ABOVE the one it came from. So pop into a temp, move rsp,
+          // then store - the emitter used to write first, which is why this
+          // shape was refused outright and cost node-net a function called
+          // 11,967 times.
+          if (insn.dst.kind === 'mem' && (insn.dst.base === 4 || insn.dst.index === 4)) {
+            const t = T();
+            L.push(`(local.set ${t} (i64.load ${wasmAddr({base:4,index:-1,disp:0n},next)}))`,
+                   `(local.set $r4 (i64.add (local.get $r4) (i64.const 8)))`,
+                   wr(insn.dst,8,`(local.get ${t})`,next));
+            break;
+          }
           if (insn.dst.kind === 'reg' && savedI32(insn.dst.r))   // epilogue restore straight to the regfile
             L.push(`(i64.store (i32.const ${insn.dst.r*8}) (i64.load ${wasmAddr({base:4,index:-1,disp:0n},next)}))`, `(local.set $r4 (i64.add (local.get $r4) (i64.const 8)))`);
           else
