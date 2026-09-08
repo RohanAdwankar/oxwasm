@@ -1034,20 +1034,28 @@ export class CPU {
         this.f.af = 0; this.szp(r, S);      // SF/ZF/PF undefined on HW; masked in diff
         this.setReg(insn.dst, r); break;
       }
+      // OF on a shift is documented "undefined" for any count but 1, and this
+      // read it as "unchanged" and left the previous instruction's OF in
+      // place. Hardware computes it. Probed directly over 3 ops x 5 operands x
+      // counts 1/3/5/17, with the incoming OF set both ways: the value is
+      // independent of both the count and the incoming flag, and equals the
+      // count-1 rule applied to the ORIGINAL operand. So there is no guard.
+      // Note this is NOT `MSB(result) ^ CF` for a multi-bit shl - that uses
+      // the shifted result and the count-th bit, and only coincides at c == 1.
       case 'shl': { const c = Number(this.get(insn.src) & (S === 8 ? 0x3Fn : 0x1Fn));
-        if (c) { const a = this.get(insn.dst), r = (a << BigInt(c)) & M;
+        if (c) { const a = this.get(insn.dst), r = (a << BigInt(c)) & M, W = BigInt(S * 8);
           this.f.cf = (a >> BigInt((S * 8) - c)) & 1n ? 1 : 0;
-          if (c === 1) this.f.of = ((r & SIGN[S] ? 1 : 0) ^ this.f.cf) ? 1 : 0;
+          this.f.of = (((a >> (W - 1n)) & 1n) ^ ((a >> (W - 2n)) & 1n)) ? 1 : 0;
           this.szp(r, S); this.set(insn.dst, r); } break; }
       case 'shr': { const c = Number(this.get(insn.src) & (S === 8 ? 0x3Fn : 0x1Fn));
         if (c) { const a = this.get(insn.dst), r = a >> BigInt(c);
           this.f.cf = (a >> BigInt(c - 1)) & 1n ? 1 : 0;
-          if (c === 1) this.f.of = a & SIGN[S] ? 1 : 0;
+          this.f.of = a & SIGN[S] ? 1 : 0;
           this.szp(r, S); this.set(insn.dst, r); } break; }
       case 'sar': { const c = Number(this.get(insn.src) & (S === 8 ? 0x3Fn : 0x1Fn));
         if (c) { const a = (this.get(insn.dst) ^ SIGN[S]) - SIGN[S], r = (a >> BigInt(c)) & M;
           this.f.cf = (a >> BigInt(c - 1)) & 1n ? 1 : 0;
-          if (c === 1) this.f.of = 0;
+          this.f.of = 0;
           this.szp(r, S); this.set(insn.dst, r); } break; }
       case 'rol': { const w = BigInt(S*8);
         // the write ALWAYS happens (a zero-count 32-bit rotate still zeroes
