@@ -6002,3 +6002,45 @@ Every component is checked by mutation rather than assumed: neutering PF, AF,
 DF or the sticky bit each changes the digest on its own. Before the DF and ID
 probes existed the emitter could have hardcoded both bits to zero and every
 digest would still have matched.
+
+### Batch 32: the last entry refusals were the x87 control word
+
+After pushf came off the deopt list, the sweep's remaining `entry undecodable`
+hot refusals were decoded rather than assumed to be the same thing. Snapshotting
+the bytes at the refusal site (the mapping is often unmapped by exit, so the
+dump has to happen at `onAotFail`, not afterwards) gave the answer in one run:
+
+| site | bytes | what |
+|---|---|---|
+| mawk 0x95afe6f, 1996 calls | `D9 7D C6` | `fnstcw` |
+| mawk-prog 0x407591, 3988 calls | `DD 85 ...` | `fldl` |
+
+`fldl` is the FPU register stack and stays an escape - units do not model it,
+and 80-bit extended precision is not something wasm hands over. `fnstcw` is
+not the stack. It is 16 bits of rounding and precision mode, the same shape as
+MXCSR, which the emitter already round-trips through a slot. The decoder lumps
+every D8-DF opcode under one `x87` mnem, so D9 /7 and D9 /5 rode along into
+the blanket escape for no reason beyond the shape of the mnem.
+
+The cost was not the two instructions. A unit whose ENTRY decodes to a deopt is
+refused entirely, and glibc's float formatting opens with
+`fnstcw; movzx; and; cmp; jcc` to dispatch on the rounding mode. mawk ran that
+whole function interpreted 1,996 times in one sweep case and 5,996 in another,
+and the sweep called both cases exact the entire time. Because they were - a
+hot refusal is correct and slow, which is exactly what makes it invisible to
+anything that compares output.
+
+They now get their own mnem before the blanket escape claims them, plus a slot
+syncOut/syncIn carry. One consequence had to be fixed in the interpreter: its
+x87 lazy init set `fcw` alongside the register stack, so a unit that ran `fldcw`
+before the interpreter had executed any x87 at all would have its rounding mode
+reset the first time the interpreter saw one. The control word is initialized
+separately now.
+
+`diff/fcwtest.mjs`: four shapes across seven control words including all four
+rounding modes - the round trip, set-then-get, the glibc rounding dispatch
+(which must COMPILE, not merely agree), and save/narrow/restore around a
+float-to-int conversion. **56/56.** Dropping the fldcw store takes it to 42/56.
+The interpreter was also checked to really set the word rather than no-op in
+agreement with a no-op emitter, which is the failure mode a differential
+between two implementations of nothing cannot see.
