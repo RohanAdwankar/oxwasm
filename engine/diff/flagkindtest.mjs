@@ -48,6 +48,24 @@ const PRODUCERS = [
   ['bsf',   'bsf rax, rsi'],
   ['bsr',   'bsr rax, rsi'],
   ['bt',    'bt rax, rsi'],
+  // narrow widths, because the 64-bit-only list missed a real bug: `jo` after
+  // a shift was wrong and every producer here shifted rax
+  ['shl32', 'shl eax, 1'],
+  ['shr32', 'shr eax, 1'],
+  ['sar32', 'sar eax, 1'],
+  ['shl32b','shl eax, 3'],
+  ['shr32b','shr eax, 3'],
+  ['shl16', 'shl ax, 1'],
+  ['shr16', 'shr ax, 3'],
+  ['sar16', 'sar ax, 1'],
+  ['shl8',  'shl al, 1'],
+  ['shr8',  'shr al, 3'],
+  ['add32', 'add eax, esi'],
+  ['sub32', 'sub eax, esi'],
+  ['and32', 'and eax, esi'],
+  ['inc32', 'inc eax'],
+  ['dec32', 'dec eax'],
+  ['imul32','imul eax, esi'],
 ];
 // each turns the flags into a value in rax, so a wrong flag is a wrong answer
 const CONSUMERS = [
