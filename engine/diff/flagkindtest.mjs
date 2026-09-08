@@ -66,6 +66,16 @@ const PRODUCERS = [
   ['inc32', 'inc eax'],
   ['dec32', 'dec eax'],
   ['imul32','imul eax, esi'],
+  // memory destinations: every producer above writes a register, and a shift
+  // whose destination is memory reads its original from a different place
+  ['shl-m64', 'mov [0x400800], rdi\nshl qword [0x400800], 1'],
+  ['shr-m64', 'mov [0x400800], rdi\nshr qword [0x400800], 3'],
+  ['sar-m64', 'mov [0x400800], rdi\nsar qword [0x400800], 1'],
+  ['shl-m32', 'mov [0x400800], edi\nshl dword [0x400800], 1'],
+  ['shr-m32', 'mov [0x400800], edi\nshr dword [0x400800], 1'],
+  ['and-m64', 'mov [0x400800], rdi\nand qword [0x400800], rsi'],
+  ['add-m64', 'mov [0x400800], rdi\nadd qword [0x400800], rsi'],
+  ['inc-m64', 'mov [0x400800], rdi\ninc qword [0x400800]'],
 ];
 // each turns the flags into a value in rax, so a wrong flag is a wrong answer
 const CONSUMERS = [
