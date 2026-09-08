@@ -985,6 +985,13 @@ for (const [name, bin, args, opts] of CASES) {
     if (eng.hotFail.length) console.log(`         HOT-INTERPRETED (translation refused, ran anyway):\n           ${eng.hotFail.join('\n           ')}`);
     if (eng.unknown.length) console.log(`         ENOSYS syscalls: ${eng.unknown.join(' ')}`);
     if (eng.ioctls.length) console.log(`         ENOTTY ioctls: ${eng.ioctls.join(' ')}`); }
+  // The trace is written whether the case passed or failed. Only writing it on
+  // failure makes the one comparison that matters impossible: a case that
+  // passes under one engine configuration and fails under another is diffed by
+  // its syscalls, and half a diff is nothing.
+  if (eng.strace && process.env.BREADTH_STRACE_FILE)
+    writeFileSync(process.env.BREADTH_STRACE_FILE, eng.strace.join('\n'));
+  if (same) { /* recorded above */ }
   else { fail++;
     const why = eng.err ? `threw: ${eng.err}`
       : eng.code !== nat.code ? `exit ${eng.code} vs native ${nat.code}`
@@ -997,7 +1004,7 @@ for (const [name, bin, args, opts] of CASES) {
     if (eng.unknown.length) console.log(`         ENOSYS syscalls: ${eng.unknown.join(' ')}`);
     if (eng.ioctls.length) console.log(`         ENOTTY ioctls: ${eng.ioctls.join(' ')}`);
     if (eng.strace) console.log(`         last syscalls:\n           ${eng.strace.slice(-60).join('\n           ')}`);
-    if (eng.strace && process.env.BREADTH_STRACE_FILE) writeFileSync(process.env.BREADTH_STRACE_FILE, eng.strace.join('\n'));   // the whole trace of a failing case
+
     if (!eng.err && eng.out.length && nat.out.length) {
       let i = 0; while (i < eng.out.length && i < nat.out.length && eng.out[i] === nat.out[i]) i++;
       console.log(`         first difference at byte ${i}`);

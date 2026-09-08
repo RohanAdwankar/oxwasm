@@ -14,17 +14,24 @@ import { CPU, Memory } from '../interp.mjs';
 import { execFileSync } from 'node:child_process';
 import { writeFileSync, unlinkSync } from 'node:fs';
 
+// Widths matter: the first version of this only ever shifted rax, and the AOT
+// side agreed with the interpreter at every width, so a narrow-width error in
+// the ORACLE would have been invisible to every other test in this directory.
+const REGS = { rax: 64, eax: 32, ax: 16, al: 8 };
 const OPS = ['shl', 'shr', 'sar'];
 const COUNTS = [1, 2, 3, 5, 17, 31];
 const VALS = ['0x8000000000000000', '0x4000000000000000', '0xC000000000000000',
               '0x2000000000000000', '0x6000000000000000', '0x1',
               '0xFFFFFFFFFFFFFFFF', '0x0000000100000000'];
 const PRE = { 0: '  xor rax, rax\n', 1: '  mov rax, 0x7FFFFFFFFFFFFFFF\n  add rax, 1\n' };
+// the operand loaded into the register under test, masked to its width
+const load = (reg, val) => reg === 'rax' ? `  mov rax, ${val}\n`
+  : `  mov rax, ${val}\n  mov ${reg}, ${reg === 'eax' ? 'eax' : reg === 'ax' ? 'ax' : 'al'}\n`;
 
 // native: exit status is OF
-const nativeOF = (op, n, val, inOf) => {
+const nativeOF = (op, n, val, inOf, reg = 'rax') => {
   const src = `BITS 64\nglobal _start\nsection .text\n_start:\n${PRE[inOf]}` +
-    `  mov rax, ${val}\n  ${op} rax, ${n}\n  jo t\n  mov rdi, 0\n  jmp o\nt:\n  mov rdi, 1\no:\n  mov rax, 60\n  syscall\n`;
+    `${load(reg, val)}  ${op} ${reg}, ${n}\n  jo t\n  mov rdi, 0\n  jmp o\nt:\n  mov rdi, 1\no:\n  mov rax, 60\n  syscall\n`;
   writeFileSync('/tmp/sof.asm', src);
   execFileSync('nasm', ['-f', 'elf64', '-o', '/tmp/sof.o', '/tmp/sof.asm']);
   execFileSync('ld', ['-o', '/tmp/sof', '/tmp/sof.o']);
@@ -33,8 +40,8 @@ const nativeOF = (op, n, val, inOf) => {
 
 // interpreter: same instruction stream, read cpu.f.of
 const CODE = 0x400000n, SENT = 0xdeadbee0n;
-const interpOF = (op, n, val, inOf) => {
-  const src = `BITS 64\n${PRE[inOf]}  mov rax, ${val}\n  ${op} rax, ${n}\n  ret\n`;
+const interpOF = (op, n, val, inOf, reg = 'rax') => {
+  const src = `BITS 64\n${PRE[inOf]}${load(reg, val)}  ${op} ${reg}, ${n}\n  ret\n`;
   writeFileSync('/tmp/sof2.asm', src);
   execFileSync('nasm', ['-f', 'bin', '-o', '/tmp/sof2.bin', '/tmp/sof2.asm']);
   const b = execFileSync('cat', ['/tmp/sof2.bin'], { encoding: 'buffer' });
@@ -48,10 +55,12 @@ const interpOF = (op, n, val, inOf) => {
 };
 
 let pass = 0, fail = 0;
+for (const [reg, W] of Object.entries(REGS))
 for (const op of OPS) for (const n of COUNTS) for (const val of VALS) for (const inOf of [0, 1]) {
-  const hw = nativeOF(op, n, val, inOf), sw = interpOF(op, n, val, inOf);
+  if (n >= W) continue;                       // a count at or past the width is a different question
+  const hw = nativeOF(op, n, val, inOf, reg), sw = interpOF(op, n, val, inOf, reg);
   if (hw === sw) pass++;
-  else { fail++; if (fail <= 8) console.log(`  MISMATCH ${op} ${val} by ${n}, incoming OF=${inOf}: hardware=${hw} interpreter=${sw}`); }
+  else { fail++; if (fail <= 10) console.log(`  MISMATCH ${reg} ${op} ${val} by ${n}, incoming OF=${inOf}: hardware=${hw} interpreter=${sw}`); }
 }
 for (const f of ['/tmp/sof.asm', '/tmp/sof.o', '/tmp/sof', '/tmp/sof2.asm', '/tmp/sof2.bin'])
   try { unlinkSync(f); } catch {}
