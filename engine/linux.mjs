@@ -176,6 +176,7 @@ export class LinuxEngine {
     this.mxview = new Uint32Array(this.wmem.buffer, 144, 1);     // MXCSR, so units can run stmxcsr/ldmxcsr instead of escaping
     this.dfview = new Uint32Array(this.wmem.buffer, 152, 1);     // direction flag, so std/cld in a unit reach the interpreter
     this.stickyview = new Uint32Array(this.wmem.buffer, 160, 1); // the AC/ID bits popf stored, so a unit can build a full RFLAGS for pushf
+    this.fcwview = new Uint32Array(this.wmem.buffer, 164, 1);    // x87 control word, so fnstcw/fldcw in a unit need not escape
     this.flagview = new BigInt64Array(this.wmem.buffer, 136, 1);  // EFLAGS a unit hands over at an escape (bit 63 = valid)
     this.xmmview = new BigInt64Array(this.wmem.buffer, 256, 32); // 16 xmm regs (2 words each) for AOT SIMD
     this.ram = new Uint8Array(this.wmem.buffer, this.RAMOFF, Number(total));
@@ -743,6 +744,7 @@ export class LinuxEngine {
               this.mxview[0] = this.cpu.mxcsr ?? 0x1f80;
               this.dfview[0] = this.cpu.f.df ? 1 : 0;
               this.stickyview[0] = this.cpu.eflagsSticky || 0;
+              this.fcwview[0] = this.cpu.fcw ?? 0x037F;
               const x = this.xmmview; const M = (1n << 64n) - 1n;
               for (let r = 0; r < 16; r++) { const v = this.cpu.xmm[r] || 0n;
                 x[r*2] = BigInt.asIntN(64, v & M); x[r*2+1] = BigInt.asIntN(64, (v >> 64n) & M); } }
@@ -751,6 +753,7 @@ export class LinuxEngine {
               this.cpu.fsBase = BigInt.asUintN(64, this.fsview[0]);
               this.cpu.mxcsr = this.mxview[0];
               this.cpu.f.df = this.dfview[0] ? 1 : 0;
+              this.cpu.fcw = this.fcwview[0];
               // flags a unit materialized at its escape (pushf, x87, cpuid, a
               // zero-count rep scan ...): without this the interpreter carried
               // on with whatever flags it last computed itself

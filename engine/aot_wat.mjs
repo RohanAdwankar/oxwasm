@@ -42,6 +42,7 @@ export const FTMAP_MAX = 20000;
 export const MXCSR_SLOT = 144;   // regfile slot: the SSE control word, kept inert (see the stmxcsr/ldmxcsr emit)
 export const DF_SLOT = 152;      // regfile slot: the direction flag, so std/cld survive the unit boundary
 export const ESTICKY_SLOT = 160;  // regfile slot: the AC/ID bits popf stored, which pushf reads back
+export const FCW_SLOT = 164;      // regfile slot: the x87 control word, so fnstcw/fldcw need not escape
 export const EFLAGS_SLOT = 136;   // regfile slot: EFLAGS handed to the interpreter at an escape (bit 63 = valid; syncIn applies and clears it)
 export const FNPROF_BASE = 0x20000, FNPROF_SLOTS = 1 << 14;   // OXWASM_FNPROF counters: 16384 x i64, in the dead space below FTHASH
 export const fnprofSlot = (a) => FNPROF_BASE + ((Number((BigInt(a) >> 4n) & 0x3fffn)) * 8);
@@ -438,6 +439,15 @@ export function analyze(mem, entry, { maxInsns = 20000, noJtab = false, entries 
     //    CPU state, which syncOut/syncIn do not touch, so escaping at every
     //    x87 instruction keeps that state exact while the integer/SSE parts
     //    of the same function still compile (strtod, printf float paths).
+    // fnstcw/fldcw (D9 /7 and D9 /5 with a memory operand) are the x87
+    // CONTROL WORD, not the FPU stack: 16 bits of rounding and precision
+    // mode, exactly the shape stmxcsr/ldmxcsr already have. Nothing about
+    // them needs the register stack, so they get their own mnem before the
+    // blanket x87 escape below claims them. glibc's float formatting opens
+    // with `fnstcw; movzx; and; cmp; jcc` to dispatch on the rounding mode,
+    // and that fnstcw being an escape made it an `entry undecodable`
+    // refusal - mawk ran the whole function interpreted 1,996 times.
+    if (insn.mnem === 'x87' && insn.op === 0xD9 && (insn.sub === 5 || insn.sub === 7) && insn.rm) insn.mnem = 'fcw';
     if (['hlt','ud2','int3','int','cpuid','fxsave','fxrstor','x87','rcl','rcr','emms','popf'].includes(insn.mnem)) {   // rcl/rcr: rare, interpreter-only
       insnAt.set(key, { mnem: 'udec', rip, next: rip + BigInt(insn.len), len: insn.len });
       continue;
@@ -3063,6 +3073,14 @@ function emitUnitFunction(a0, fnAddr, ctx) {
         // deopt is refused outright, and glibc's libm opens several math
         // functions with `stmxcsr`, so one of them ran 31,307 times
         // interpreted in the ffprobe case while the sweep called it exact.
+        // fnstcw stores the control word, fldcw loads it. Both are 16 bit and
+        // both round-trip through FCW_SLOT, which syncOut/syncIn carry - so
+        // the interpreter's rounding mode and a unit's agree without either
+        // one owning it.
+        case 'fcw':
+          if (insn.sub === 7) L.push(`(i32.store16 ${wasmAddr(insn.rm, next)} (i32.load (i32.const ${FCW_SLOT})))`);
+          else L.push(`(i32.store (i32.const ${FCW_SLOT}) (i32.load16_u ${wasmAddr(insn.rm, next)}))`);
+          break;
         case 'stmxcsr': L.push(wr(insn.dst, 4, `(i64.extend_i32_u (i32.load (i32.const ${MXCSR_SLOT})))`, next)); break;
         case 'ldmxcsr': L.push(`(i32.store (i32.const ${MXCSR_SLOT}) (i32.wrap_i64 ${rd(insn.dst, 4, next)}))`); break;
         case 'sse':          emitSSE(insn, next, L, setFlags); break;
