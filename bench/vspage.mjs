@@ -13,7 +13,16 @@
 // compares like with like.
 //
 //   node bench/vspage.mjs --big /tmp/big.txt --small /tmp/small.txt [--reps 3] \
-//        -- /bin/gzip -9 -c {IN}
+//        [--runs 3] -- /bin/gzip -9 -c {IN}
+//
+// --runs repeats the WHOLE two-size measurement and reports the spread across
+// repeats. That is not the same noise --reps measures, and the difference is
+// not academic: comparing two engine trees on the same box, one run reported
+// 424 +- 57 ms where two others of the same tree read 246 and 278. It passed
+// its own 3-sigma gate at 7.4 sigma and was still an outlier, because the
+// within-run error bar does not see whatever the machine does BETWEEN runs.
+// A single run's interval is a lower bound on the uncertainty, not the
+// uncertainty.
 //
 // {IN} is the guest path the input is mounted at; the same path is planted on
 // the host for the native side so both see identical argv (a program that
@@ -29,7 +38,7 @@ const argv = process.argv.slice(2);
 const dd = argv.indexOf('--');
 if (dd < 0) { console.log('usage: vspage.mjs --big F --small F [--reps N] -- <binary> <args with {IN}>'); process.exit(1); }
 const opt = (n, d) => { const i = argv.indexOf('--' + n); return i >= 0 && i < dd ? argv[i + 1] : d; };
-const BIG = opt('big'), SMALL = opt('small'), REPS = Number(opt('reps', 3));
+const BIG = opt('big'), SMALL = opt('small'), REPS = Number(opt('reps', 3)), RUNS = Number(opt('runs', 1));
 const GUEST_IN = opt('guest-in', '/data/in');
 const cmd = argv.slice(dd + 1);
 if (!BIG || !SMALL) { console.log('need --big and --small'); process.exit(1); }
@@ -90,6 +99,9 @@ try {
     if (code !== 0) console.log(`  note: ${name} exited ${code}`);
     return { ms: await br.q('window.__oxMs'), hash: await br.q('window.__oxOutHash') };
   };
+  const runs = [];
+  for (let run = 0; run < RUNS; run++) {
+  if (RUNS > 1) console.log(`\n  run ${run + 1} of ${RUNS}`);
   const out = {};
   for (const which of ['small', 'big']) {
     const page = [], nat = [];
@@ -124,6 +136,9 @@ try {
   }
   const dPage = out.big.page - out.small.page, dNat = out.big.nat - out.small.nat;
   const dBytes = out.big.bytes - out.small.bytes;
+  runs.push({ dPage, dNat, dBytes, floor: out.small.page, bytes: out.small.bytes,
+              pageErr: Math.hypot(out.big.pageErr, out.small.pageErr),
+              natErr: Math.hypot(out.big.natErr, out.small.natErr) });
   // The subtraction carries both runs' noise, so the difference is only a
   // measurement if it is large against that noise. A positive difference is
   // not enough on its own: at a narrow size gap this reported 41.9x where a
@@ -146,5 +161,31 @@ try {
     console.log(`\n  RESULT ${(dPage / dNat).toFixed(1)}x native, in the browser, steady state (${lo.toFixed(1)}–${hi.toFixed(1)}x at one standard error)`);
   }
   console.log(`  (page floor, all of load+tier: ${out.small.page.toFixed(0)}ms at ${out.small.bytes}B)`);
+  }
+  if (RUNS > 1) {
+    // Between-run spread. Whichever noise is LARGER is the honest one, so the
+    // summary below takes the max rather than the flattering one.
+    const sp = (a) => { const m = a.reduce((x, y) => x + y, 0) / a.length;
+      return Math.sqrt(a.reduce((s, v) => s + (v - m) ** 2, 0) / Math.max(1, a.length - 1)) / Math.sqrt(a.length); };
+    const dps = runs.map(r => r.dPage), dns = runs.map(r => r.dNat);
+    const mp = median(dps), mn = median(dns);
+    const betweenP = sp(dps), betweenN = sp(dns);
+    const withinP = median(runs.map(r => r.pageErr)), withinN = median(runs.map(r => r.natErr));
+    console.log(`\n  ACROSS ${RUNS} RUNS`);
+    console.log(`    page   steady state per run: ${dps.map(v => v.toFixed(0)).join(', ')} ms`);
+    console.log(`    native steady state per run: ${dns.map(v => v.toFixed(2)).join(', ')} ms`);
+    console.log(`    page   median ${mp.toFixed(0)}ms  within-run +-${withinP.toFixed(0)}  between-run +-${betweenP.toFixed(0)}`);
+    console.log(`    native median ${mn.toFixed(2)}ms  within-run +-${withinN.toFixed(2)}  between-run +-${betweenN.toFixed(2)}`);
+    const noiseP = Math.max(withinP, betweenP), noiseN = Math.max(withinN, betweenN);
+    if (mn <= 0 || mp <= 0) console.log(`\n  RESULT unusable: the two sizes did not separate`);
+    else if (mp < 3 * noiseP || mn < 3 * noiseN)
+      console.log(`\n  RESULT unreliable: ${(mp / mn).toFixed(1)}x, not 3x the LARGER of the two noises ` +
+                  `(page ${mp.toFixed(0)}+-${noiseP.toFixed(0)}, native ${mn.toFixed(2)}+-${noiseN.toFixed(2)})`);
+    else {
+      const lo = (mp - noiseP) / (mn + noiseN), hi = (mp + noiseP) / (mn - noiseN);
+      console.log(`\n  RESULT ${(mp / mn).toFixed(1)}x native, in the browser, steady state ` +
+                  `(${lo.toFixed(1)}-${hi.toFixed(1)}x at one standard error, the larger of within- and between-run)`);
+    }
+  }
   stop(0);
 } catch (e) { console.log(`FAIL: ${e.message}`); stop(1); }

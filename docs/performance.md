@@ -351,3 +351,59 @@ both agree with native.
 The other half of the comparison needs no statistics. On x86-64 the sweep is
 170 of 170 unmodified binaries byte-identical to native, and v86 runs none of
 them, because it stops at 32 bits.
+
+
+## The browser ratio is not comparable across sessions, and one run is not a measurement
+
+Two things went wrong with re-measuring the page, and both are about the
+instrument rather than the engine.
+
+**The host changes between sessions.** This project's containers are
+reprovisioned, and the machine that recorded 34.21 ms for native `sha256sum`
+over 41.4 MB is not the machine that records 117.67 ms for the same work
+today - 1.2 GB/s against 375 MB/s. `/proc/cpuinfo` on today's host has `avx2`
+and `avx512f` and **no `sha_ni`**, so native SHA-256 runs in software here and
+in hardware there. That is exactly the instruction the benchmark stresses, so
+the ratio does not cancel the host: a machine without SHA-NI makes the page
+look better for a reason that has nothing to do with the page. **Any
+cross-session comparison of these numbers is invalid unless the hosts match.**
+The 6.9x recorded earlier and the 3.7x that came out of the first run today
+are not two measurements of the same thing.
+
+The v86 comparison survives this, because both sides of it ran on one host in
+one session and the gap (28x) is far outside anything here.
+
+**The only valid question is a same-session A/B**, so that is what was run: a
+git worktree at the last commit before this batch, against the current tree,
+alternating on an idle box, nine reps each.
+
+| tree | page steady state, per run |
+|---|---|
+| before (dfdb839) | 276 +- 43, 259 +- 71, 315 +- 55 ms |
+| after | 424 +- 57, 278 +- 48, 246 +- 42 ms |
+
+Medians **276 ms against 278 ms**: no detectable difference. That is the
+expected answer - sha256sum's steady state was already fully compiled, and
+none of this batch's fixes (overlapping `rep movsb`, the direction flag, the
+escape handover, inline `pushf`, `fnstcw`) touches its inner loop. They buy
+correctness and breadth, not this number.
+
+**The 424 is the finding.** It reported `424 +- 57 ms`, which passed the
+harness's own 3-sigma gate at **7.4 sigma**, and it did not reproduce: two
+further runs of the same tree read 278 and 246. The within-run standard error
+does not see whatever the machine does BETWEEN runs, so a single run's
+interval is a lower bound on the uncertainty rather than the uncertainty. Had
+that run been taken alone it would have been recorded as a 1.5x regression
+this batch did not cause.
+
+`vspage` now takes `--runs N`, repeats the whole two-size measurement, prints
+the per-run steady states, and gates on **the larger of the within-run and
+between-run noise** rather than the flattering one. On this host:
+
+    page   steady state per run: 204, 328, 359 ms
+    page   median 328ms  within-run +-50  between-run +-47
+    RESULT 2.9x native, steady state (2.4-3.4x at one standard error)
+
+This does not retroactively widen the numbers in the tables above, which were
+single runs; it means their real intervals are wider than printed, and the
+small differences between adjacent columns were never differences.
