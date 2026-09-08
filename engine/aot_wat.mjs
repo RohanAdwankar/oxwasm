@@ -40,6 +40,7 @@ export const FTHBYTES = FTSLOTS * 16;
 // that linear probing stays short
 export const FTMAP_MAX = 20000;
 export const MXCSR_SLOT = 144;   // regfile slot: the SSE control word, kept inert (see the stmxcsr/ldmxcsr emit)
+export const DF_SLOT = 152;      // regfile slot: the direction flag, so std/cld survive the unit boundary
 export const EFLAGS_SLOT = 136;   // regfile slot: EFLAGS handed to the interpreter at an escape (bit 63 = valid; syncIn applies and clears it)
 export const FNPROF_BASE = 0x20000, FNPROF_SLOTS = 1 << 14;   // OXWASM_FNPROF counters: 16384 x i64, in the dead space below FTHASH
 export const fnprofSlot = (a) => FNPROF_BASE + ((Number((BigInt(a) >> 4n) & 0x3fffn)) * 8);
@@ -2850,7 +2851,14 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           // recording this rip so resume re-executes the syscall exactly here
           L.push(SA_MARK, `(call $x_syscall (i64.const ${hexs(insn.rip)}))`, RL_MARK);
           break;
-        case 'cld': break;                                                    // DF stays 0 (bulk ops assume it)
+        // std/cld have to reach the interpreter: a unit that sets DF and then
+        // returns or escapes leaves the guest expecting DF=1, and a `cld` that
+        // was a no-op here would fail to clear a DF the caller had set. The
+        // string ops still refuse in any function containing `std` (see
+        // hasStd) - this is about the flag crossing the boundary, not about
+        // running the bulk ops backwards.
+        case 'cld': L.push(`(i32.store (i32.const ${DF_SLOT}) (i32.const 0))`); break;
+        case 'std': L.push(`(i32.store (i32.const ${DF_SLOT}) (i32.const 1))`); break;
         case 'stos': {
           const woffc = Number(BigInt.asIntN(32, woff));
           const rdiOff = `(i32.add (i32.wrap_i64 (local.get $r7)) (i32.const ${woffc}))`;
