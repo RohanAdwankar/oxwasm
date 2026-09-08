@@ -262,12 +262,38 @@ ELF load and tiering cancel and what is left is emulation.
 **6.9x native, 5.6-8.2x at one standard error.** Single-digit, in a browser,
 on an unmodified dynamically-linked x86-64 binary, from a self-contained file.
 
-Two cautions belong with that number. It is one binary and one kernel -
-SHA-256's inner loop is exactly the shape a whole-function translator does
-well on, and a branchy workload will read worse. And the **page floor is 1810
-ms**, all of it ELF load, translation and in-page assembly, which does not
-shrink with input: for anything short the floor is the whole experience and
-the 6.9x is invisible.
+The **page floor is ~1800-2100 ms**, all of it ELF load, translation and
+in-page assembly, and it does not shrink with input: for anything short the
+floor is the whole experience and the ratio is invisible.
+
+### Across workloads
+
+The caution above used to read "SHA-256's inner loop is the shape a
+whole-function translator does well on, and a branchy workload will read
+worse." Measuring instead of guessing produced this, and one entry of it was
+worth more than the rest put together:
+
+| binary | steady state | at one standard error |
+|---|---|---|
+| md5sum, 41 MB | **2.3x** native | 1.8-2.9x |
+| sha256sum, 41 MB | **6.9x** native | 5.6-8.2x |
+| grep -c, 41 MB | **6.8x** native | 5.5-8.2x |
+| wc -l, 41 MB | refused | 37+-23 ms is not a measurement |
+
+grep first read **741x native** (493-1233x), and the same under node, so it
+was never the browser. The cause was one unmodelled instruction - see the
+`imul3` batch in `docs/m3-engine.md`: the translator refuses a whole function
+when it cannot model a flag producer, `imul r,r/m,imm` is what a compiler
+emits for a struct-index multiply, and grep's matcher was blacklisted after
+five calls and then ran 47,875 times interpreted. Modelling CF=OF took it to
+6.8x. The 41 MB case had hung for four hours before that fix and now finishes
+in seconds.
+
+**That is the shape of the risk this table hides.** Every failure of this kind
+is silent: the answer stays correct and only the speed collapses, so no
+output-comparing test can see it, and the breadth sweep runs grep and calls it
+exact. The single-digit numbers above are what the engine does when it
+translates the hot path; they say nothing about how often it fails to.
 
 The floor is also why this took three tries to measure. The same bench on a
 2.8 MB input reported 41.9x, because a 115 ms difference against a 1745 ms
