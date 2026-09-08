@@ -407,3 +407,40 @@ between-run noise** rather than the flattering one. On this host:
 This does not retroactively widen the numbers in the tables above, which were
 single runs; it means their real intervals are wider than printed, and the
 small differences between adjacent columns were never differences.
+
+
+## What the page floor actually is
+
+The floor - what a short run costs before the input matters - had been recorded
+as "~1800-2100 ms, all of it ELF load, translation and in-page assembly", which
+is three things named and none of them measured. It is now split, in the page,
+on sha256sum over 138 kB (three runs):
+
+| | ms | share of floor |
+|---|---|---|
+| total | 2583, 2596, 2800 | |
+| tier-up (all of it) | 2060, 2078, 2228 | **~80%** |
+| ... wabt parse | 177, 190, 235 | ~7% |
+| ... V8 Module+Instance | 9, 10, 25 | **~0.5%** |
+| ... translation itself | ~1850 | **~72%** |
+| guest execution and the rest | ~450 | ~18% |
+
+The guest interprets 422,224 instructions and dispatches 1,700 AOT runs to
+reach that floor, and 106 units are translated into **4.34 MB of WAT text**.
+
+So the floor is neither the assembler nor the browser: it is the translator
+generating text, at roughly 41 kB of WAT per unit. Two of the three obvious
+suspects are nearly free - V8 compiles all 106 units in 10-25 ms.
+
+**A correction to a conclusion drawn earlier in this batch.** Seeing wabt at
+182 ms of a 2350 ms floor, the note read "shipping precompiled units would buy
+at most 8%". That is wrong, and wrong in the direction that would have killed
+the right idea: a page that ships precompiled units skips the TRANSLATION as
+well as the parse, so the ceiling on that change is the ~80% in the tier-up
+row, not the ~7% in the wabt row. The engine already has the machinery
+(`onUnitBytes` captures entry -> compiled wasm, and `cacheOnly` runs from a
+manifest with no assembler at all); what it lacks is a pack-time training run
+to fill one.
+
+That is a ceiling, not a promise. Coverage depends on the input a training run
+uses, and anything it misses still translates in the page.
