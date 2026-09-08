@@ -2251,7 +2251,25 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       // count-independent rule ($fa). 'logic' and 'zf' keep CF=OF=0, which is
       // exact for and/or/xor/test and is what bsf/bsr handed over before.
       else if (fs.kind === 'shiftf') { cf = `(i64.and ${b} (i64.const 1))`; of = `(i64.and ${a} (i64.const 1))`; }
-      return `(i64.store (i32.const ${EFLAGS_SLOT}) (i64.or (i64.const -9223372036854775296) (i64.or ${cf} (i64.or (i64.shl ${zf} (i64.const 6)) (i64.or (i64.shl ${sf} (i64.const 7)) (i64.shl ${of} (i64.const 11)))))))`;   // marker | 0x202 | CF | ZF<<6 | SF<<7 | OF<<11
+      // PF and AF. syncIn assigns all six flags unconditionally, so a word
+      // that omits these does not leave them alone - it forces them to zero,
+      // and the interpreter then runs `pushf`, `jp` or `lahf` on a flag the
+      // unit silently cleared. No bare-unit differential can see it, because a
+      // bare unit never escapes.
+      //
+      // PF is the parity of the result's low byte for every kind that derives
+      // flags from a result, which is what the interpreter's szp() computes.
+      // AF is defined only for add and sub - a carry or borrow across bit 3 -
+      // and the interpreter zeroes it for logic. After a shift or bsf/bsr the
+      // architecture leaves AF undefined and the interpreter leaves it stale,
+      // which is not a value the lazy model can reproduce; zero stays the
+      // answer there, and a guest reading AF after a shift is reading garbage
+      // on hardware too.
+      const pf = `(i64.and (i64.xor (i64.popcnt (i64.and ${r} (i64.const 255))) (i64.const 1)) (i64.const 1))`;
+      const af = (fs.kind === 'sub' || fs.kind === 'add')
+        ? `(i64.and (i64.shr_u (i64.xor (i64.xor ${a} ${b}) ${r}) (i64.const 4)) (i64.const 1))` : '(i64.const 0)';
+      // marker | 0x202 | CF | PF<<2 | AF<<4 | ZF<<6 | SF<<7 | OF<<11
+      return `(i64.store (i32.const ${EFLAGS_SLOT}) (i64.or (i64.const -9223372036854775296) (i64.or ${cf} (i64.or (i64.shl ${pf} (i64.const 2)) (i64.or (i64.shl ${af} (i64.const 4)) (i64.or (i64.shl ${zf} (i64.const 6)) (i64.or (i64.shl ${sf} (i64.const 7)) (i64.shl ${of} (i64.const 11)))))))))`;
     };
     const setFlags = (kind, size, aE, bE, rE) => {
       if (!producers.has(ii)) return;              // dead flags: skip
