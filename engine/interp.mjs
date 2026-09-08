@@ -515,7 +515,15 @@ export class CPU {
             let out = 0n;
             for (let k = 0n; k < 4n; k++) { const lane = (src >> (32n*k)) & 0xFFFFFFFFn;
               if (!insn.p66 && !insn.pF3) out |= FP.putF32(Number(BigInt.asIntN(32, lane))) << (32n*k);
-              else { const f = FP.getF32(lane); const g = insn.pF3 ? Math.trunc(f) : Math.round(f);
+              // cvtps2dq rounds to NEAREST-EVEN, which is the default MXCSR
+              // mode and is not what Math.round does: Math.round breaks ties
+              // upward, so 0.5 came back 1 where hardware gives 0, 2.5 gave 3
+              // where hardware gives 2, and -1.5 gave -1 where hardware gives
+              // -2. Checked against the CPU rather than reasoned about.
+              else { const f = FP.getF32(lane);
+                const rne = (x) => { const fl = Math.floor(x), d = x - fl;
+                  return d < 0.5 ? fl : d > 0.5 ? fl + 1 : (fl % 2 === 0 ? fl : fl + 1); };
+                const g = insn.pF3 ? Math.trunc(f) : (Number.isFinite(f) ? rne(f) : f);
                 const v = (!Number.isFinite(g) || g >= 2**31 || g < -(2**31)) ? 0x80000000n : BigInt.asUintN(32, BigInt(g));
                 out |= v << (32n*k); } }
             this.xmm[insn.xr] = out; break; }

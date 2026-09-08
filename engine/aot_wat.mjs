@@ -2021,9 +2021,26 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       // and are NOT this - x86 hands back 0x80000000 for anything out of range
       // or NaN, where wasm's trunc_sat saturates to INT_MAX or gives 0, so
       // they stay refused rather than be lowered to something close.
-      case 0x5B:
-        if (insn.p66 || insn.pF3) throw new Error('AOT sse op 5b to-integer @ ' + insn.rip.toString(16));
-        put(`(f32x4.convert_i32x4_s ${xv(rm, next)})`); break;
+      case 0x5B: {
+        if (!insn.p66 && !insn.pF3) { put(`(f32x4.convert_i32x4_s ${xv(rm, next)})`); break; }
+        // The to-integer forms. x86 hands back 0x80000000 - the "integer
+        // indefinite" - for a NaN or anything that will not fit, where wasm's
+        // trunc_sat gives 0 for a NaN and clamps to INT_MAX or INT_MIN. So
+        // compute the saturating conversion, work out per lane whether the
+        // value was actually in range, and choose.
+        //
+        // 66 rounds to nearest-EVEN first (f32x4.nearest is exactly that, and
+        // is the default MXCSR mode this engine keeps); F3 truncates. The
+        // range test runs on the ROUNDED value, so 2147483647.5 rounds up out
+        // of range and yields the indefinite rather than a clamp.
+        const t = VT();
+        L.push(`(local.set ${t} ${insn.p66 ? `(f32x4.nearest ${xv(rm, next)})` : xv(rm, next)})`);
+        const v = `(local.get ${t})`;
+        const LIM = '(v128.const f32x4 2147483648 2147483648 2147483648 2147483648)';
+        const NEG = '(v128.const f32x4 -2147483648 -2147483648 -2147483648 -2147483648)';
+        const inRange = `(v128.and (f32x4.eq ${v} ${v}) (v128.and (f32x4.lt ${v} ${LIM}) (f32x4.ge ${v} ${NEG})))`;
+        put(`(v128.bitselect (i32x4.trunc_sat_f32x4_s ${v}) (i32x4.splat (i32.const -2147483648)) ${inRange})`);
+        break; }
       case 0x5A: {                                            // cvtss2sd / cvtsd2ss / cvtps2pd / cvtpd2ps
         if (insn.pF3) put(`(f64x2.replace_lane 0 ${dst} (f64.promote_f32 (f32x4.extract_lane 0 ${xv(rm,next)})))`);
         else if (insn.pF2) put(`(f32x4.replace_lane 0 ${dst} (f32.demote_f64 (f64x2.extract_lane 0 ${xv(rm,next)})))`);

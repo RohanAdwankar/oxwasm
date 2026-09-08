@@ -6,10 +6,11 @@
 // way. Both were reported as refusals by diff/fuzzaot.mjs once its generator
 // learned the wide vector forms.
 //
-// The other two forms of 0F 5B stay refused on purpose, and this checks that:
-// cvtps2dq and cvttps2dq hand back 0x80000000 for anything out of range or
-// NaN, where wasm's trunc_sat saturates to INT_MAX or yields zero. Close is
-// not the same, and refusing is correct where a near-miss would not be.
+// This used to assert that the other two forms of 0F 5B stayed REFUSED, which
+// was right while they were: x86 hands back 0x80000000 for a NaN or anything
+// out of range, and wasm's trunc_sat does not. They are implemented now, from
+// trunc_sat plus a per-lane range test, and diff/cvtintest.mjs checks them
+// against hardware - so that assertion is gone rather than left to fail.
 //
 // Hardware is the oracle. The operand pairs are built for the multiply-add:
 // both signs, both extremes, and products that overflow 32 bits so the
@@ -34,11 +35,10 @@ const PAIRS = [
   [0x8001F0F07FFF0001n | (0xFFFF8000A5A5C3C3n << 64n), 0x7FFF7FFF80008000n | (0x0001FFFF3C3C5A5An << 64n)],
 ];
 const OPS = ['pmaddwd', 'cvtdq2ps'];
-const REFUSE = ['cvtps2dq', 'cvttps2dq'];   // must stay refused, not approximated
 const hex = (v) => v.toString(16).padStart(32, '0');
 
 let bad = 0, n = 0;
-for (const op of [...OPS, ...REFUSE]) {
+for (const op of OPS) {
   const body = `movdqu xmm0, [0x420000]\nmovdqu xmm1, [0x420020]\n${op} xmm0, xmm1\nmovdqu [0x420010], xmm0\nret`;
   writeFileSync('/tmp/dc.asm', 'BITS 64\n' + body);
   execFileSync('nasm', ['-f', 'bin', '-o', '/tmp/dc.bin', '/tmp/dc.asm']);
@@ -46,11 +46,6 @@ for (const op of [...OPS, ...REFUSE]) {
   let r = null;
   try { r = compileFunctionWat(new Memory([{ base: CODE, bytes: code }]), CODE, { guestBase: CODE, ramBase: 0 }); }
   catch { r = null; }
-  if (REFUSE.includes(op)) {
-    if (r) { console.log(`  FAIL ${op} was ACCEPTED; x86 yields 0x80000000 out of range and wasm's trunc_sat does not`); bad++; }
-    else console.log(`  ${op}: refused, as it must be`);
-    continue;
-  }
   if (!r) { console.log(`  FAIL ${op} refused`); bad++; continue; }
   writeFileSync('/tmp/dc.wat', r.wat);
   execFileSync('wat2wasm', ['--enable-tail-call', '/tmp/dc.wat', '-o', '/tmp/dc.wasm']);
@@ -99,5 +94,5 @@ for (const op of [...OPS, ...REFUSE]) {
   }
 }
 console.log(`\n${n - bad}/${n} pmaddwd and cvtdq2ps results match hardware in BOTH engines ` +
-            `(${PAIRS.length} operand pairs), and the two to-integer forms of 0F 5B stay refused`);
+            `(${PAIRS.length} operand pairs)`);
 if (bad) process.exit(1);
