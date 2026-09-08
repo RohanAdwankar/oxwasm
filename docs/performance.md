@@ -589,3 +589,43 @@ wabt work is not.
 A first read of four runs said 830 ms against 780 and looked like a win. It was
 drift between runs taken twenty minutes apart - the same failure the `--runs`
 work was added for, repeated by not using it.
+
+
+## The assembler's startup cost, and a change that was worse where it counted
+
+With the manifest registered up front, `assembled` is 0 on sha256sum and 1 on
+gzip - and the page was still spending 81-95 ms probing the assembler's nesting
+limit before the guest ran. Building the assembler itself is 3-4 ms; the probe
+is everything else, because it binary-searches `parseWat` over 0..1024 and
+about half its ten steps OVERFLOW, and each overflow traps the instance and
+needs a fresh one.
+
+**The obvious fix was worse.** Drop the probe, catch a failed parse, replace
+the dead instance and refuse that unit - detect instead of predict. It is
+strictly more robust in principle (a rebuild handles any cause of death, not
+only nesting) and it was verified to work: a shallow module fails on the
+poisoned instance and parses on the replacement.
+
+Four alternating runs of each page, in one session:
+
+| page | wall | assembled |
+|---|---|---|
+| trained, probe | 842 ms | 0 |
+| trained, self-healing | **758 ms** | 0 |
+| untrained, probe | 2728 ms | 106 |
+| untrained, self-healing | **9012 ms** | **21** |
+
+It saves 84 ms on a trained page and makes an untrained one **3.3x slower**.
+`WabtModule()` is async, so `wabt` is null across the whole synchronous
+tier-up burst that follows an overflow, and every unit in that burst is
+refused permanently - 85 of 106 of them. `--train` is opt-in, so the untrained
+page is the default one. Reverted.
+
+**What replaced it** is smaller and has no such edge: try the answer before
+searching for it. Every wabt build this has run against takes 149, and
+confirming that costs one success and one overflow instead of ten steps. It is
+exact either way, because it verifies BOTH sides of the boundary, and a build
+with a different limit falls through to the same search as before. The probe
+measured **59 ms against 81-149 ms**; the wall-clock effect on a trained page
+(~800 ms against ~830) is at the edge of what four runs resolve, and is
+reported as such rather than as the 90 ms the probe number would suggest.

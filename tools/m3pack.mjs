@@ -236,6 +236,11 @@ const html = `<!doctype html>
 <script type="importmap">${JSON.stringify(importMap)}</script>
 <script type="module">
 import { LinuxEngine } from 'ox/linux';
+// performance.now() is relative to navigation start, so this is everything
+// that happened before a line of our code ran: fetching 6 MB of HTML, parsing
+// it, base64-decoding the engine modules out of the import map and compiling
+// them. ~390 ms of a ~815 ms startup, and the largest single item in it.
+window.__oxModuleEntryMs = performance.now();
 const CONFIG = { argv: ${JSON.stringify(argv)}, env: ${JSON.stringify(env)}, title: ${JSON.stringify(title)} };
 const MANIFEST = ${JSON.stringify(manifestB64)} || null;
 const MANIFEST_FP = ${JSON.stringify(manifestB64 ? packFp : '')};
@@ -264,6 +269,17 @@ async function depthLimit() {
                                    { tail_call: true }); m.destroy(); return true; }
     catch { probe = await WabtModule(); return false; }   // a success leaves the probe usable; an overflow destroys it, so replace it before the next check
   };
+  // Cost is dominated by the OVERFLOWS, not the successes: each one traps the
+  // instance and needs a fresh one. A blind binary search over 0..1024 takes
+  // ten steps, about half of them overflows, and measured 81-95 ms of every
+  // page load - against 3-4 ms to build the assembler itself.
+  //
+  // So try the answer first. Every wabt build this has run against takes 149;
+  // confirming that costs one success and one overflow. The check is exact
+  // either way - it verifies BOTH sides of the boundary - and a build with a
+  // different limit just falls through to the search.
+  const SEED = 149;
+  if (await fits(SEED) && !(await fits(SEED + 1))) return SEED;
   let lo = 0, hi = 1024;
   while (lo + 1 < hi) { const mid = (lo + hi) >> 1; if (await fits(mid)) lo = mid; else hi = mid; }
   return lo;
