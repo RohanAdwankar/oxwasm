@@ -97,14 +97,15 @@ try {
     const code = await waitForExit(br.q, TIMEOUT_S);
     if (code === null) { console.log(`FAIL: ${name} did not exit within ${TIMEOUT_S}s`); stop(1); }
     if (code !== 0) console.log(`  note: ${name} exited ${code}`);
-    return { ms: await br.q('window.__oxMs'), hash: await br.q('window.__oxOutHash') };
+    return { ms: await br.q('window.__oxMs'), hash: await br.q('window.__oxOutHash'),
+             asmMs: await br.q('window.__oxAsmMs || 0'), asmN: await br.q('window.__oxAsmN || 0') };
   };
   const runs = [];
   for (let run = 0; run < RUNS; run++) {
   if (RUNS > 1) console.log(`\n  run ${run + 1} of ${RUNS}`);
   const out = {};
   for (const which of ['small', 'big']) {
-    const page = [], nat = [];
+    const page = [], nat = [], asm = []; let asmN = 0;
     const input = which === 'big' ? BIG : SMALL;
     let natCode = 0, natBytes = 0;
     // A benchmark that never checks the answer can be timing anything at all.
@@ -113,7 +114,7 @@ try {
     // bytes.
     for (let i = 0; i < REPS; i++) {
       const p = await pageOnce(pages[which]);
-      page.push(p.ms);
+      page.push(p.ms); asm.push(p.asmMs); asmN = p.asmN;
       const r = nativeOnce(input); nat.push(r.ms); natCode = r.code; natBytes = r.bytes;
       if (p.hash !== r.hash) {
         console.log(`FAIL: ${which} output differs from native (page ${p.hash} vs native ${r.hash}) — timing a wrong answer`);
@@ -130,7 +131,8 @@ try {
     // which is what more reps are for.
     const stderr = (a) => { const m = a.reduce((x, y) => x + y, 0) / a.length;
       return Math.sqrt(a.reduce((s, v) => s + (v - m) ** 2, 0) / Math.max(1, a.length - 1)) / Math.sqrt(a.length); };
-    out[which] = { page: median(page), nat: median(nat), pageErr: stderr(page), natErr: stderr(nat), bytes: statSync(input).size };
+    out[which] = { page: median(page), nat: median(nat), pageErr: stderr(page), natErr: stderr(nat), bytes: statSync(input).size,
+                   asm: median(asm), asmN };
     console.log(`  ${which.padEnd(5)} ${out[which].bytes}B  page ${out[which].page.toFixed(0)}±${out[which].pageErr.toFixed(0)}ms  ` +
                 `native ${out[which].nat.toFixed(2)}±${out[which].natErr.toFixed(2)}ms  (${REPS} reps, medians ± standard error)`);
   }
@@ -160,7 +162,8 @@ try {
     const lo = (dPage - pageNoise) / (dNat + natNoise), hi = (dPage + pageNoise) / (dNat - natNoise);
     console.log(`\n  RESULT ${(dPage / dNat).toFixed(1)}x native, in the browser, steady state (${lo.toFixed(1)}–${hi.toFixed(1)}x at one standard error)`);
   }
-  console.log(`  (page floor, all of load+tier: ${out.small.page.toFixed(0)}ms at ${out.small.bytes}B)`);
+  console.log(`  (page floor, all of load+tier: ${out.small.page.toFixed(0)}ms at ${out.small.bytes}B` +
+              (out.small.asmN ? `, of which ${out.small.asm.toFixed(0)}ms is in-page wabt over ${out.small.asmN} units` : '') + `)`);
   }
   if (RUNS > 1) {
     // Between-run spread. Whichever noise is LARGER is the honest one, so the

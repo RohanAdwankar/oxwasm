@@ -187,13 +187,32 @@ const watDepth = (s) => {
   const maxDepth = await depthLimit();
   const wabt = await WabtModule();
   let refused = 0;
+  // The page floor - what a short run costs before any input matters - is
+  // ~2.2 s, and "ELF load, translation and in-page assembly" was as far as
+  // anyone had broken it down. These split the assembler out of it: whether
+  // shipping precompiled units would help depends entirely on this share, and
+  // guessing at it would pick the work for the wrong reason.
+  let asmMs = 0, asmN = 0, asmBytes = 0;
+  // ... and V8's share, separately from the assembler's. Between them and the
+  // total these say whether the floor is us generating WAT text, wabt parsing
+  // it, or V8 compiling the result - three different pieces of work with three
+  // different fixes, and the floor is most of what a short run costs.
+  let wasmMs = 0;
+  for (const k of ['Module', 'Instance']) {
+    const O = WebAssembly[k];
+    const W = function (...a) { const t = performance.now(); try { return new O(...a); } finally { wasmMs += performance.now() - t; window.__oxWasmMs = wasmMs; } };
+    W.prototype = O.prototype; WebAssembly[k] = W;
+  }
   const assembleWat = (wat) => {
     // tail_call: the translator emits return_call for every chained call, so
     // without the feature every unit is "opcode not allowed".
     const d = watDepth(wat);
     if (d > maxDepth) { refused++; throw new Error('unit nests ' + d + ' deep; this wabt build takes ' + maxDepth); }
+    const a0 = performance.now();
     const m = wabt.parseWat('unit.wat', wat, { tail_call: true });
     const bin = m.toBinary({}).buffer; m.destroy();
+    asmMs += performance.now() - a0; asmN++; asmBytes += wat.length;
+    window.__oxAsmMs = asmMs; window.__oxAsmN = asmN; window.__oxAsmWatBytes = asmBytes;
     return new Uint8Array(bin);
   };
   const elf = await inflate(${JSON.stringify(elfB64)});
@@ -203,6 +222,12 @@ const watDepth = (s) => {
   stat.textContent = 'running…';
   const eng = new LinuxEngine(elf, { argv: CONFIG.argv, env: CONFIG.env, files, mtimes, memMB: 512, assembleWat });
   let shown = 0;
+  // Total time inside tier-up, so the floor splits three ways: this minus the
+  // assembler and V8 is the translator generating WAT text, which nothing had
+  // ever separated from the two pieces that are easy to blame.
+  let tierMs = 0;
+  { const o = eng.tierUpAot.bind(eng);
+    eng.tierUpAot = (a) => { const t = performance.now(); try { return o(a); } finally { tierMs += performance.now() - t; window.__oxTierMs = tierMs; } }; }
   const t0 = performance.now();
   const pump = () => {
     eng.run(3e6);                                          // chunked so the page stays live
@@ -229,6 +254,7 @@ const watDepth = (s) => {
         h2 = Math.imul(h2 + raw[i], 0x85ebca6b) >>> 0;
       }
       window.__oxMs = performance.now() - t0; window.__oxExit = eng.exitCode; window.__oxOut = outText;
+      window.__oxInterp = eng.stats.interpreted; window.__oxAotRuns = eng.stats.aotRuns;
       window.__oxOutLen = raw.length;
       window.__oxOutHash = h1.toString(16).padStart(8, '0') + h2.toString(16).padStart(8, '0');
     }   // a machine-readable end for tools/pagerun.mjs and the clock bench/vspage.mjs subtracts; the line below is for people
