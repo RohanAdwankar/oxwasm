@@ -43,6 +43,10 @@ export const MXCSR_SLOT = 144;   // regfile slot: the SSE control word, kept ine
 export const DF_SLOT = 152;      // regfile slot: the direction flag, so std/cld survive the unit boundary
 export const ESTICKY_SLOT = 160;  // regfile slot: the AC/ID bits popf stored, which pushf reads back
 export const FCW_SLOT = 164;      // regfile slot: the x87 control word, so fnstcw/fldcw need not escape
+// Largest wat text this emitter will hand the runtime for ONE function; see
+// the refusal at the end of the function emitter for the two measurements
+// that bracket it.
+const MAXWAT = 5_000_000;
 export const EFLAGS_SLOT = 136;   // regfile slot: EFLAGS handed to the interpreter at an escape (bit 63 = valid; syncIn applies and clears it)
 export const FNPROF_BASE = 0x20000, FNPROF_SLOTS = 1 << 14;   // OXWASM_FNPROF counters: 16384 x i64, in the dead space below FTHASH
 export const fnprofSlot = (a) => FNPROF_BASE + ((Number((BigInt(a) >> 4n) & 0x3fffn)) * 8);
@@ -3537,6 +3541,23 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   }
 
   const name = 'f_' + fnAddr.toString(16);
+  // A function the RUNTIME cannot compile is as useless as one this emitter
+  // cannot translate, and until now nothing checked. rustc's biggest function
+  // reaches 5.9 MB of text; V8 compiles it fine at baseline and then dies
+  // inside its optimizing compiler when the function tiers up - a hard process
+  // abort (Check failed: IdField::is_valid(id)), not an exception, so there is
+  // nothing to catch and the whole run is lost. The largest function the same
+  // run compiles and tiers up without complaint is 4.2 MB, so the limit sits
+  // between the two measurements rather than at a guess. Refusing is the safe
+  // answer: the function stays interpreted, which is where a function this
+  // emitter declines always ends up. Both layouts exit through here - the
+  // dispatch one returns early, and a cap on the other alone caught nothing,
+  // because a function big enough to worry about is exactly the kind that
+  // gets the dispatch layout.
+  const finish = (w) => {
+    if (w.length > MAXWAT) throw new Error('emitted function exceeds the runtime limit: ' + w.length + ' bytes of wat');
+    return w;
+  };
   let wat = `  (func $${name} (export "${name}") (result i64)\n`;
   for (let r=0;r<16;r++) wat += `    (local $r${r} ${isI32(r)?'i32':'i64'})\n`;
   wat += '    (local $fa i64) (local $fb i64) (local $fr i64) (local $cf i64) (local $rsp0 i64) (local $rex i64)\n';
@@ -3608,7 +3629,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     wat += '    ))\n';                                                 // close loop + exit block
     if (usesYield) wat += '    (unreachable))\n' + yieldTail();          // close $yield; its tail follows
     wat += '    (unreachable)\n  )\n';
-    return wat + jtrFunc();
+    return finish(wat + jtrFunc());
   }
   for (let i=0;i<N;i++) {
     for (const s of open[i]) wat += s.type==='loop' ? `      (loop ${s.label}\n` : `      (block ${s.label}\n`;
@@ -3617,7 +3638,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   }
   if (usesYield) wat += '    (unreachable))\n' + yieldTail();            // close $yield; its tail follows
   wat += '    (unreachable)\n  )\n';        // every path leaves via ret/deopt
-  return wat + jtrFunc();
+  return finish(wat + jtrFunc());
 }
 
 // ---- unit driver -----------------------------------------------------------
