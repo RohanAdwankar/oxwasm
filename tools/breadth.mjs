@@ -927,6 +927,10 @@ const engine = (bin, args, stdin, opts = {}) => {
                             walk(eng); return [...m].map(([k, n]) => `${k}x${n}`); })(),
            ms: Number(process.hrtime.bigint() - t0) / 1e6,
            units: eng.aotFns.size, insns: eng.stats.interpreted, aotRuns: eng.stats.aotRuns | 0, err,
+           // refused translations that then ran hot: correct output, collapsed
+           // speed, and nothing else in this harness can see it
+           hotFail: eng.hotFailures(Number(process.env.BREADTH_HOTFAIL_MIN || 1000))
+             .slice(0, 5).map(h => `${h.addr.toString(16)}x${h.calls}`),
            yields: `${eng.stats.loopYieldTop | 0}/${eng.stats.loopYieldNested | 0}/${eng.stats.loopHot | 0}` };   // top-level yields / nested (deopt) yields / units rooted on request
 };
 
@@ -978,6 +982,7 @@ for (const [name, bin, args, opts] of CASES) {
       if (big.length) console.log(`         file entries viewing large buffers: ${big.length}: ${big.slice(0, 6).join(' ')}`);
     }
     if (process.env.BREADTH_MEM) { const m = process.memoryUsage(); console.log(`         host rss ${(m.rss / 1e6) | 0}MB heap ${(m.heapUsed / 1e6) | 0}MB ext ${(m.external / 1e6) | 0}MB ab ${(m.arrayBuffers / 1e6) | 0}MB`); }   // BREADTH_MEM=1: host memory after each case (a chunk was OOM-killed at 13.7 GB)
+    if (eng.hotFail.length) console.log(`         HOT-INTERPRETED (translation refused, ran anyway): ${eng.hotFail.join(' ')}`);
     if (eng.unknown.length) console.log(`         ENOSYS syscalls: ${eng.unknown.join(' ')}`);
     if (eng.ioctls.length) console.log(`         ENOTTY ioctls: ${eng.ioctls.join(' ')}`); }
   else { fail++;

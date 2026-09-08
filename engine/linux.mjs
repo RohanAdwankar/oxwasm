@@ -246,11 +246,29 @@ export class LinuxEngine {
 
   profileTarget(t) {
     const k = t;
-    if (this.aotFns.has(k) || this.aotFailed.has(k)) return;
+    if (this.aotFns.has(k)) return;
     const n = (this.aotCalls.get(k) || 0) + 1;
-    this.aotCalls.set(k, n); this._entryAdd(k);
+    this.aotCalls.set(k, n);
+    // Keep counting a function whose translation was REFUSED. It is never
+    // retried, so this costs one map write per call and buys the only signal
+    // there is for a failure mode that is otherwise invisible: the answer
+    // stays correct and only the speed collapses, so no output comparison can
+    // see it. grep's matcher refused to translate after five calls and then
+    // ran 47,875 times interpreted, at 741x native, while the sweep called
+    // the case exact.
+    if (this.aotFailed.has(k)) return;
+    this._entryAdd(k);
     if (n === 1) (this._callTargets ??= new Set()).add(k.toString());   // the string view compileUnitWat takes; rebuilt per tier-up it was 5 s of clang -S
     if (n >= this.aotCallThreshold && n >= (this._sizeDefer?.get(k) ?? 0)) { this._gateCalls = true; try { this.tierUpAot(t); } finally { this._gateCalls = false; } }
+  }
+
+  // Functions whose translation was refused and which then ran anyway, worst
+  // first. `min` filters the ones nobody would notice: a stub called twice is
+  // not a performance defect, a matcher called 47,875 times is.
+  hotFailures(min = 1000) {
+    const out = [];
+    for (const a of this.aotFailed) { const n = this.aotCalls.get(a) || 0; if (n >= min) out.push({ addr: a, calls: n }); }
+    return out.sort((x, y) => y.calls - x.calls);
   }
 
   // A PLT/IFUNC stub is `endbr64?; jmp *GOT` — compiling it just deopts back
