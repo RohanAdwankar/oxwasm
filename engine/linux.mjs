@@ -175,6 +175,7 @@ export class LinuxEngine {
     this.fsview = new BigInt64Array(this.wmem.buffer, 128, 1);   // fs base for AOT TLS accesses
     this.mxview = new Uint32Array(this.wmem.buffer, 144, 1);     // MXCSR, so units can run stmxcsr/ldmxcsr instead of escaping
     this.dfview = new Uint32Array(this.wmem.buffer, 152, 1);     // direction flag, so std/cld in a unit reach the interpreter
+    this.stickyview = new Uint32Array(this.wmem.buffer, 160, 1); // the AC/ID bits popf stored, so a unit can build a full RFLAGS for pushf
     this.flagview = new BigInt64Array(this.wmem.buffer, 136, 1);  // EFLAGS a unit hands over at an escape (bit 63 = valid)
     this.xmmview = new BigInt64Array(this.wmem.buffer, 256, 32); // 16 xmm regs (2 words each) for AOT SIMD
     this.ram = new Uint8Array(this.wmem.buffer, this.RAMOFF, Number(total));
@@ -741,6 +742,7 @@ export class LinuxEngine {
               this.fsview[0] = BigInt.asIntN(64, this.cpu.fsBase || 0n);
               this.mxview[0] = this.cpu.mxcsr ?? 0x1f80;
               this.dfview[0] = this.cpu.f.df ? 1 : 0;
+              this.stickyview[0] = this.cpu.eflagsSticky || 0;
               const x = this.xmmview; const M = (1n << 64n) - 1n;
               for (let r = 0; r < 16; r++) { const v = this.cpu.xmm[r] || 0n;
                 x[r*2] = BigInt.asIntN(64, v & M); x[r*2+1] = BigInt.asIntN(64, (v >> 64n) & M); } }

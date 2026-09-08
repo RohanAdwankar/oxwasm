@@ -23,8 +23,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const dir = mkdtempSync(join(tmpdir(), 'eflags-'));
-let asmN = 0;
+let asmN = 0, inlinePushf = 0;
 const assembleWat = (wat) => {
+  // ESTICKY_SLOT is loaded by exactly one thing: an inline pushf. Counting it
+  // is how this test knows the compiled path is being taken rather than
+  // everything quietly falling back to the escape.
+  if (wat.includes('(i32.const 160)')) inlinePushf++;
   const w = join(dir, `u${asmN++}`); writeFileSync(w + '.wat', wat);
   execFileSync('wat2wasm', ['--enable-tail-call', w + '.wat', '-o', w + '.wasm']);
   return new Uint8Array(readFileSync(w + '.wasm'));
@@ -69,7 +73,44 @@ __attribute__((noinline)) static u64 probeShl(u64 a){
   return f & 0x8C5UL;                       // CF PF ZF SF OF, no AF
 }
 
+// The ESCAPE probe. pushf compiles inline now, so a cmp/pushf pair no
+// longer leaves the unit and no longer tests the handover at all. cpuid is
+// still a deopt and does not touch flags, so cmp/cpuid/pushf sets the
+// flags inside the unit, escapes, and reads them back in the interpreter -
+// which is the shape the handover exists for. eax is loaded with mov, not xor,
+// because xor would clobber the flags being probed.
+__attribute__((noinline)) static u64 probeEsc(u64 a, u64 b){
+  u64 f;
+  asm volatile("movl $0, %%eax\\n\\tcmpq %2, %1\\n\\tcpuid\\n\\tpushfq\\n\\tpopq %0"
+               : "=r"(f) : "r"(a), "r"(b) : "cc","rax","rbx","rcx","rdx");
+  return f & 0x8D5UL;
+}
+__attribute__((noinline)) static u64 probeEscAdd(u64 a, u64 b){
+  u64 f;
+  asm volatile("movl $0, %%eax\\n\\taddq %2, %1\\n\\tcpuid\\n\\tpushfq\\n\\tpopq %0"
+               : "=r"(f) : "r"(a), "r"(b) : "cc","rax","rbx","rcx","rdx");
+  return f & 0x8D5UL;
+}
+
+// DF and the sticky ID bit are part of the RFLAGS word an inline pushf builds,
+// and neither is reachable from the arithmetic probes above: without these two
+// the emitter could hardcode both to zero and every digest would still match.
+// DF comes from DF_SLOT; the ID bit is whatever a popf last stored, which is
+// engine state the unit reads out of ESTICKY_SLOT.
+__attribute__((noinline)) static u64 probeDf(u64 a, u64 b){
+  u64 f;
+  asm volatile("cmpq %2, %1\\n\\tstd\\n\\tpushfq\\n\\tpopq %0\\n\\tcld" : "=r"(f) : "r"(a), "r"(b) : "cc");
+  return f & 0xCD5UL;                       // CF PF AF ZF SF DF OF
+}
+__attribute__((noinline)) static u64 probeId(u64 a, u64 b){
+  u64 f;
+  asm volatile("cmpq %2, %1\\n\\tpushfq\\n\\tpopq %0" : "=r"(f) : "r"(a), "r"(b) : "cc");
+  return f & 0x2008D5UL;                    // the arithmetic flags plus ID (21)
+}
+
 int _start(void){
+  // set the ID bit once, through popf, so every later pushf must carry it
+  { u64 v = 0x200202UL; asm volatile("pushq %0\\n\\tpopfq" :: "r"(v) : "cc"); }
   u64 h = 0xcbf29ce484222325UL;
   // enough iterations that the tier compiles each probe; the accumulator folds
   // every flag word in, so one wrong PF anywhere changes the printed digest
@@ -84,6 +125,11 @@ int _start(void){
     h = (h ^ probeAdd(i & 0x3F, (i >> 3) & 0x3F)) * 0x100000001b3UL;
     h = (h ^ probeShl(a)) * 0x100000001b3UL;
     h = (h ^ probeShl(i & 0xFF)) * 0x100000001b3UL;
+    h = (h ^ probeEsc(a, b)) * 0x100000001b3UL;
+    h = (h ^ probeEsc(i & 0x3F, (i >> 3) & 0x3F)) * 0x100000001b3UL;
+    h = (h ^ probeEscAdd(i & 0x3F, (i >> 3) & 0x3F)) * 0x100000001b3UL;
+    h = (h ^ probeDf(a, b)) * 0x100000001b3UL;
+    h = (h ^ probeId(a, b)) * 0x100000001b3UL;
   }
   char out[17];
   for (int k = 0; k < 16; k++) out[k] = "0123456789abcdef"[(h >> (60 - 4*k)) & 15];
@@ -116,4 +162,5 @@ if (!ok) {
   process.exit(1);
 }
 if (deopts < 100000) { console.log(`EFLAGS FAIL: only ${deopts} deopts - this run never exercised the handover`); process.exit(1); }
-console.log(`escape-handover EFLAGS exact vs hardware over ${deopts} deopts (digest ${native.trim()})`);
+if (!inlinePushf) { console.log('EFLAGS FAIL: no unit compiled a pushf inline - only the escape path was tested'); process.exit(1); }
+console.log(`EFLAGS exact vs hardware: ${inlinePushf} units with an inline pushf, ${deopts} escape handovers (digest ${native.trim()})`);

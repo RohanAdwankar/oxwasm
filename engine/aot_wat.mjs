@@ -41,6 +41,7 @@ export const FTHBYTES = FTSLOTS * 16;
 export const FTMAP_MAX = 20000;
 export const MXCSR_SLOT = 144;   // regfile slot: the SSE control word, kept inert (see the stmxcsr/ldmxcsr emit)
 export const DF_SLOT = 152;      // regfile slot: the direction flag, so std/cld survive the unit boundary
+export const ESTICKY_SLOT = 160;  // regfile slot: the AC/ID bits popf stored, which pushf reads back
 export const EFLAGS_SLOT = 136;   // regfile slot: EFLAGS handed to the interpreter at an escape (bit 63 = valid; syncIn applies and clears it)
 export const FNPROF_BASE = 0x20000, FNPROF_SLOTS = 1 << 14;   // OXWASM_FNPROF counters: 16384 x i64, in the dead space below FTHASH
 export const fnprofSlot = (a) => FNPROF_BASE + ((Number((BigInt(a) >> 4n) & 0x3fffn)) * 8);
@@ -437,7 +438,7 @@ export function analyze(mem, entry, { maxInsns = 20000, noJtab = false, entries 
     //    CPU state, which syncOut/syncIn do not touch, so escaping at every
     //    x87 instruction keeps that state exact while the integer/SSE parts
     //    of the same function still compile (strtod, printf float paths).
-    if (['hlt','ud2','int3','int','cpuid','fxsave','fxrstor','x87','rcl','rcr','emms','pushf','popf'].includes(insn.mnem)) {   // rcl/rcr: rare, interpreter-only
+    if (['hlt','ud2','int3','int','cpuid','fxsave','fxrstor','x87','rcl','rcr','emms','popf'].includes(insn.mnem)) {   // rcl/rcr: rare, interpreter-only
       insnAt.set(key, { mnem: 'udec', rip, next: rip + BigInt(insn.len), len: insn.len });
       continue;
     }
@@ -2147,6 +2148,11 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     for (let j = 0; j < insns.length; j++) {
       if (['cmov','setcc','adc','sbb'].includes(insns[j].mnem)) consumers.push(j);
       else if ((insns[j].mnem === 'cmps' || insns[j].mnem === 'scas') && (insns[j].rep || insns[j].rep2)) { consumers.push(j); soft.add(j); }
+      // pushf reads every arithmetic flag and produces none, so it is a soft
+      // consumer exactly like a zero-count rep scan. It was one only by
+      // accident before - as a deopt it ended the block, and the deopt
+      // terminator was the thing registered.
+      else if (insns[j].mnem === 'pushf') { consumers.push(j); soft.add(j); }
     }
     if (term[b].kind === 'jcc') consumers.push(insns.length - 1);
     else if (term[b].kind === 'deopt' && !term[b].src) { consumers.push(insns.length - 1); soft.add(insns.length - 1); }
@@ -2231,7 +2237,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     // EFLAGS from the lazy state, stored (bit 63 set as the marker) in the
     // regfile's flag slot for syncIn to apply; kinds whose CF the lazy model
     // does not carry (inc/dec/adc/sbb/cf/fcmp) hand nothing over.
-    const eflagsStore = (fs) => {
+    const eflagsStore = (fs, want) => {
       // 'shiftf' and 'zf' belong here because shifts and bsf/bsr USED to be
       // the 'logic' kind and so handed flags over. Splitting them out without
       // adding them here made a unit hand over NOTHING at an escape, and the
@@ -2268,8 +2274,16 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       const pf = `(i64.and (i64.xor (i64.popcnt (i64.and ${r} (i64.const 255))) (i64.const 1)) (i64.const 1))`;
       const af = (fs.kind === 'sub' || fs.kind === 'add')
         ? `(i64.and (i64.shr_u (i64.xor (i64.xor ${a} ${b}) ${r}) (i64.const 4)) (i64.const 1))` : '(i64.const 0)';
-      // marker | 0x202 | CF | PF<<2 | AF<<4 | ZF<<6 | SF<<7 | OF<<11
-      return `(i64.store (i32.const ${EFLAGS_SLOT}) (i64.or (i64.const -9223372036854775296) (i64.or ${cf} (i64.or (i64.shl ${pf} (i64.const 2)) (i64.or (i64.shl ${af} (i64.const 4)) (i64.or (i64.shl ${zf} (i64.const 6)) (i64.or (i64.shl ${sf} (i64.const 7)) (i64.shl ${of} (i64.const 11)))))))))`;
+      // 0x202 | CF | PF<<2 | AF<<4 | ZF<<6 | SF<<7 | OF<<11, with `base` on top.
+      // Folded rather than written out: the hand-nested version of this had one
+      // paren too many and produced a wat that closed the function early.
+      const orAll = (xs) => xs.reduce((acc, x) => `(i64.or ${acc} ${x})`);
+      const word = (base) => orAll([`(i64.const ${base})`, cf,
+        `(i64.shl ${pf} (i64.const 2))`, `(i64.shl ${af} (i64.const 4))`,
+        `(i64.shl ${zf} (i64.const 6))`, `(i64.shl ${sf} (i64.const 7))`,
+        `(i64.shl ${of} (i64.const 11))`]);
+      return want === 'value' ? word('514')      // 0x202: bit 1 reserved-set, IF set
+                              : `(i64.store (i32.const ${EFLAGS_SLOT}) ${word('-9223372036854775296')})`;   // marker | 0x202
     };
     const setFlags = (kind, size, aE, bE, rE) => {
       if (!producers.has(ii)) return;              // dead flags: skip
@@ -2989,6 +3003,26 @@ function emitUnitFunction(a0, fnAddr, ctx) {
                    `(br_if ${e} ${stop}) (br ${lp})))`);
           } else L.push(...body);
           flagState = { kind: 'sub', size: S };
+          break; }
+        case 'pushf': {
+          // The whole RFLAGS word, which is why this was a deopt for so long:
+          // the lazy model carried CF/ZF/SF/OF and nothing else. It now has PF
+          // and AF too (see eflagsStore), DF lives in DF_SLOT, and the sticky
+          // AC/ID bits popf stored live in ESTICKY_SLOT - so for the kinds
+          // eflagsStore can build, pushf is expressible inline.
+          //
+          // Where it is not, this still deopts. The interpreter is the correct
+          // answer there and the point of compiling this at all is the CALLER:
+          // repscan's `repnz scas; pushf` escaped on every call and ran the
+          // rest of the function interpreted from the pushf on.
+          const inF = softFlags.get(i+':'+ii);
+          const v = eflagsStore(inF, 'value');
+          if (!v) { hasDeopt = true; L.push(`${eflagsStore(inF)} (local.set $rex (i64.const ${hexs(insn.rip)}))`, SA_MARK,
+                                            `(return (call $x_deopt (local.get $rex) (local.get $rsp0)))`); break; }
+          const t = T();
+          L.push(`(local.set ${t} (i64.or ${v} (i64.or (i64.shl (i64.load32_u (i32.const ${DF_SLOT})) (i64.const 10)) (i64.load32_u (i32.const ${ESTICKY_SLOT})))))`,
+                 `(local.set $r4 (i64.sub (local.get $r4) (i64.const 8)))`,
+                 `(i64.store ${wasmAddr({base:4,index:-1,disp:0n},next)} (local.get ${t}))`);
           break; }
         case 'push': {
           // a disciplined savedI32 reg's prologue push reads its regfile slot,
