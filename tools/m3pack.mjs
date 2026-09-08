@@ -316,6 +316,14 @@ const watDepth = (s) => {
   for (const [g, b, mt] of ${JSON.stringify(fileEntries)}) { files[g] = await inflate(b); mtimes[g] = mt; }
   stat.textContent = 'running…';
   const eng = new LinuxEngine(elf, { argv: CONFIG.argv, env: CONFIG.env, files, mtimes, memMB: 512, assembleWat });
+  let shown = 0;
+  // Total time inside tier-up, so the floor splits three ways: this minus the
+  // assembler and V8 is the translator generating WAT text, which nothing had
+  // ever separated from the two pieces that are easy to blame.
+  let tierMs = 0;
+  { const o = eng.tierUpAot.bind(eng);
+    eng.tierUpAot = (a) => { const t = performance.now(); try { return o(a); } finally { tierMs += performance.now() - t; window.__oxTierMs = tierMs; } }; }
+  const t0 = performance.now();
   // Precompiled units from the pack-time training run, if there was one. The
   // engine registers these with no translation and no assembler; anything not
   // in here still goes the long way.
@@ -336,16 +344,37 @@ const watDepth = (s) => {
       units.set(k, blob.subarray(o + 12, o + 12 + n)); o += 12 + n;
     }
     window.__oxManifestUnits = units.size;
-    eng.unitBytes = (k) => units.get(k);
+    // Register the WHOLE manifest before the guest runs a single instruction,
+    // rather than handing the engine a unitBytes lookup it consults on demand.
+    //
+    // On demand is what the engine does in node, where instantiation is
+    // synchronous - a unit is available the moment it is asked for. A browser
+    // cannot compile a module of this size synchronously on the main thread,
+    // so the engine takes its async path: it parks a null placeholder and the
+    // unit appears some microtasks later. Execution continues interpreted
+    // across that window, and the unit boundaries it establishes there are not
+    // the ones a synchronous run establishes. Measured on sha256sum: the page
+    // asked for 163 distinct entries against a training run's 116, and 10 of
+    // the entries it wanted had run INSIDE a compiled unit in node rather than
+    // being tiered separately.
+    //
+    // Instantiating up front removes the window. It costs one pass over the
+    // manifest before the first instruction - V8 compiles 106 of these units
+    // in 10-25 ms - and it is the same registration the engine does itself.
+    const t0m = performance.now();
+    let regd = 0;
+    await Promise.all([...units.values()].map(async (bytes) => {
+      const { instance } = await WebAssembly.instantiate(bytes, eng.aotImports());
+      for (const name of Object.keys(instance.exports))
+        if (name.startsWith('f_')) {
+          const a = BigInt('0x' + name.slice(2));
+          if (!eng.aotFns.get(a)) { eng.registerAotFn(a, instance.exports[name]); regd++; }
+        }
+      if (instance.exports.drive) eng.aotDrive = instance.exports.drive;
+    }));
+    window.__oxManifestFns = regd;
+    window.__oxManifestMs = performance.now() - t0m;
   }
-  let shown = 0;
-  // Total time inside tier-up, so the floor splits three ways: this minus the
-  // assembler and V8 is the translator generating WAT text, which nothing had
-  // ever separated from the two pieces that are easy to blame.
-  let tierMs = 0;
-  { const o = eng.tierUpAot.bind(eng);
-    eng.tierUpAot = (a) => { const t = performance.now(); try { return o(a); } finally { tierMs += performance.now() - t; window.__oxTierMs = tierMs; } }; }
-  const t0 = performance.now();
   const pump = () => {
     eng.run(3e6);                                          // chunked so the page stays live
     const outText = eng.stdout.join('');
