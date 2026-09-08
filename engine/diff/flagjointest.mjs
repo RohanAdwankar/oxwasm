@@ -32,6 +32,14 @@ const PAIRS = [
   ['add rax, rbx',  'and rdx, rax'],    // add    / logic
   ['shl rax, 1',    'cmp rdx, rbx'],    // shiftf / sub
   ['sub rax, rbx',  'xor rdx, rax'],    // sub    / logic
+  // adc/sbb keep their carry in a local of their own and derive the rest, and
+  // comis writes ZF, PF and CF from a FLOAT compare with no result at all -
+  // three kinds whose word is built differently from the five above
+  ['adc rax, rbx',  'cmp rdx, rax'],    // adc    / sub
+  ['sbb rax, rbx',  'test rdx, rdx'],   // sbb    / logic
+  ['comisd xmm0, xmm1',  'cmp rax, rbx'],   // fcmp / sub
+  ['ucomisd xmm0, xmm1', 'add rdx, rax'],   // fcmp / add
+  ['ucomisd xmm0, xmm1', 'adc rdx, rax'],   // fcmp / adc
 ];
 const M = (1n << 64n) - 1n;
 const SETS = [                          // rcx picks the path; 0 takes the second producer
@@ -49,6 +57,9 @@ const SETS = [                          // rcx picks the path; 0 takes the secon
 const body = (a, b, cc, ptr) => [
   'push rbx', 'push r12', `mov r12, ${ptr}`,
   'mov rax, [r12]', 'mov rbx, [r12+8]', 'mov rcx, [r12+16]', 'mov rdx, [r12+24]',
+  // the same two values as doubles, so a float compare has NaNs, zeros of both
+  // signs and a denormal to work with without a second operand table
+  'movq xmm0, [r12]', 'movq xmm1, [r12+8]',
   'test rcx, rcx', 'jz .second',
   a, 'jmp .join',
   '.second:', b,
