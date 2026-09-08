@@ -28,6 +28,7 @@ sete sil
 setne dil
 setp r8b
 setnp r9b
+adc r10, r11
 ret`;
   writeFileSync('/tmp/fc.asm', asm);
   execFileSync('nasm', ['-f', 'bin', '-o', '/tmp/fc.bin', '/tmp/fc.asm']);
@@ -46,7 +47,7 @@ ret`;
     m.write(SCRATCH, 8n, wide ? yb : yb);
     cpu.regs[4] = CODE + 0x800n; m.write(cpu.regs[4], 8n, SENT); cpu.rip = CODE;
     let g = 0; while (cpu.rip !== SENT) { cpu.step(); if (++g > 60) throw new Error('runaway'); }
-    const want = [0,3,1,2,6,7,8,9].map(i => BigInt.asUintN(64, cpu.regs[i]));
+    const want = [0,3,1,2,6,7,8,9,10].map(i => BigInt.asUintN(64, cpu.regs[i]));
 
     const wmem = new WebAssembly.Memory({ initial: 4096 });
     const stub = () => { throw new Error('escape'); };
@@ -61,7 +62,7 @@ ret`;
     dv.setBigUint64(0x800, SENT, true);
     dv.setBigUint64(0x10000, yb, true);
     inst.exports[r.entryName]();
-    const got = [0,3,1,2,6,7,8,9].map(i => BigInt.asUintN(64, rv[i]));
+    const got = [0,3,1,2,6,7,8,9,10].map(i => BigInt.asUintN(64, rv[i]));
     if (got.every((v, i) => v === want[i])) pass++;
     else { fail++;
       if (fail <= 6) console.log(`MISMATCH ${op} mem=${mem} ${x} vs ${y}: interp=${want.join(',')} aot=${got.join(',')}`); }
