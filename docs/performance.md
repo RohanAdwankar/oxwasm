@@ -313,3 +313,41 @@ floor is the floor's jitter, not a steady state. The harness now carries the
 standard error through the subtraction and refuses any ratio that is not three
 times it; at the 41 MB gap it refused 7.4x at five reps and only reported a
 number at nine.
+
+## Against the incumbent, measured on this machine
+
+Every comparison to v86 in this document until now was a citation. This one is
+a measurement: the same program, the same host, the same browser, the same
+input, on the same afternoon.
+
+`bench/v86guest.py` packs a v86 guest - Ubuntu bionic i386 kernel, busybox,
+and GNU coreutils sha256sum with the i386 loader and libc it links against.
+It prints a marker and halts, so the harness times host wall-clock from
+navigation to marker, at two input sizes, and subtracts the boot exactly as
+`bench/vspage.mjs` subtracts the page floor.
+
+sha256sum over 41.4 MB against 138 kB, five paired runs each, medians:
+
+| | steady state | vs native |
+|---|---|---|
+| native amd64 | 33.9 ms | 1x |
+| **oxwasm M3 page** | **265 +- 83 ms** | **7.8x** |
+| v86 (this project's M1 engine) | 7,326 +- 396 ms | 232x |
+
+**oxwasm is 28x faster than v86 on this workload** (19.9-42.4x at one standard
+error). Both run in headless Chromium on the same machine; both produce the
+same hash as native, checked rather than assumed - `vspage` now compares a
+digest of the page's stdout against native's and refuses to print a ratio when
+they differ, and the v86 guest's hash was read off the screen and compared by
+hand.
+
+**The caveat is the ABI and it is not small.** v86 is 32-bit. It cannot run the
+amd64 binary the M3 page runs, so this is the same program from the same
+source compiled for i386 against a 2018 glibc, versus an amd64 build against a
+2024 one. A share of the gap is that difference rather than the engine. What
+it is not is a difference of workload: both hash the identical 41.4 MB and
+both agree with native.
+
+The other half of the comparison needs no statistics. On x86-64 the sweep is
+170 of 170 unmodified binaries byte-identical to native, and v86 runs none of
+them, because it stops at 32 bits.
