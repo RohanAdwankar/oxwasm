@@ -6044,3 +6044,65 @@ float-to-int conversion. **56/56.** Dropping the fldcw store takes it to 42/56.
 The interpreter was also checked to really set the word rather than no-op in
 agreement with a no-op emitter, which is the failure mode a differential
 between two implementations of nothing cannot see.
+
+
+### Batch 33: what the translator refuses across code it never runs
+
+Every refusal signal this project has had comes from the sweep's hot list, and
+that list only reports functions 170 programs executed often enough to tier. An
+instruction no sweep case reaches is invisible to it however common it is, and
+after this session the hot list is down to trampolines and one x87 site - which
+says more about what 170 programs do than about the translator.
+
+`tools/refusals.mjs` asks the other question. Take every function in a corpus
+of real binaries AND shared libraries, hand each one to the translator, and
+tally why it says no. It over-counts on purpose: a function that never runs
+still counts, because the point is to rank work by how much CODE contains a
+thing rather than by what one workload touched.
+
+**55 binaries, 15,404 functions: 15,254 translate, 150 refused (1.0%).**
+
+| refused | cause |
+|---|---|
+| 79 | function too large |
+| 34 | cross-block flags for jcc |
+| 20 | cross-block flags for setcc |
+| 6 | trampoline -> callout |
+| 6 | AOT sse 5a packed |
+| 4 | overlapping decode |
+| 1 | AOT sse op d2 |
+
+The shape of that list is the finding. Only 7 of 150 are a missing
+INSTRUCTION; the rest are the translator's own limits - a size cap and the
+lazy flag model's reach across blocks - or refusals that are correct
+(trampolines, and code that decodes two ways).
+
+**The packed half of `0F 5A` was the largest instruction gap**, and wasm has
+both of them exactly: `cvtps2pd` widens the low two f32 lanes and replaces the
+register, which is `f64x2.promote_low_f32x4`; `cvtpd2ps` narrows two f64 into
+the low two lanes and zeroes the upper half, which is what the `_zero` in
+`f32x4.demote_f64x2_zero` means. `diff/cvtpdtest.mjs` covers both directions
+from register and memory plus the two scalar forms, over ten operand sets
+chosen for the narrowing direction - doubles too large and too small for a
+float, both infinities, a NaN, a negative zero whose sign must survive - and
+reads back all 128 bits, since the two rules differ in what they leave up
+there. **60/60.** The interpreter is the oracle and this session has already
+caught it wrong about float-adjacent semantics once, so it was checked against
+hardware first: same instructions, same seeds, run natively, agreeing on all
+ten.
+
+**Three broken versions of the instrument before it said anything true**, which
+is now the most reliable pattern in this project:
+
+1. A symbol-driven census reported **zero functions**. System binaries are
+   stripped; `nm` returns nothing.
+2. Scanning for `endbr64` over the whole executable segment reported **556
+   refusals of which 556 were "trampoline -> callout"**. endbr64 opens every
+   PLT stub, and a PLT stub IS a trampoline, so the census was measuring the
+   PLT and reporting the emitter answering correctly about code that is not a
+   function. It reads section headers for `.text` now.
+3. Getting the PIE bias backwards - `ET_DYN` addresses are file-relative and
+   need the load base, `ET_EXEC` ones are absolute - produced an empty result a
+   third time.
+
+Only after all three did it report the 1.0%.
