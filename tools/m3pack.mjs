@@ -279,8 +279,16 @@ const watDepth = (s) => {
   return m;
 };
 (async () => {
+  // The depth probe binary-searches parseWat and rebuilds the module on every
+  // overflow, so getting the assembler ready costs ~90 ms. Starting it before
+  // the inflate and collecting it just before the guest runs - so the two
+  // overlap - measured 791 ms against 775 ms over six alternating runs each:
+  // no gain. Both are main-thread CPU, and interleaving two main-thread tasks
+  // costs what running them in order costs.
+  const w0 = performance.now();
   const maxDepth = await depthLimit();
   const wabt = await WabtModule();
+  window.__oxWabtInitMs = performance.now() - w0;
   let refused = 0;
   // The page floor - what a short run costs before any input matters - is
   // ~2.2 s, and "ELF load, translation and in-page assembly" was as far as
@@ -310,12 +318,22 @@ const watDepth = (s) => {
     window.__oxAsmMs = asmMs; window.__oxAsmN = asmN; window.__oxAsmWatBytes = asmBytes;
     return new Uint8Array(bin);
   };
+  // Everything before the guest's first instruction, split. With the manifest
+  // registered up front the translator is no longer the floor, and what is
+  // left had never been measured at all - it was just "page load and inflate".
+  const b0 = performance.now();
   const elf = await inflate(${JSON.stringify(elfB64)});
+  window.__oxElfMs = performance.now() - b0;
   const files = {};
   const mtimes = {};
+  const f0 = performance.now();
   for (const [g, b, mt] of ${JSON.stringify(fileEntries)}) { files[g] = await inflate(b); mtimes[g] = mt; }
+  window.__oxFilesMs = performance.now() - f0; window.__oxFilesN = Object.keys(files).length;
   stat.textContent = 'running…';
+  const e0 = performance.now();
   const eng = new LinuxEngine(elf, { argv: CONFIG.argv, env: CONFIG.env, files, mtimes, memMB: 512, assembleWat });
+  window.__oxEngMs = performance.now() - e0;
+  window.__oxBootMs = performance.now() - b0;
   let shown = 0;
   // Total time inside tier-up, so the floor splits three ways: this minus the
   // assembler and V8 is the translator generating WAT text, which nothing had
