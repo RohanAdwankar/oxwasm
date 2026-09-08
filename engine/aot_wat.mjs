@@ -1956,12 +1956,13 @@ function emitUnitFunction(a0, fnAddr, ctx) {
         insn.src.kind === 'imm' && (insn.src.v & (BigInt((insn.size||8)===8?63:31))) !== 0n) return true;
     if (insn.mnem === 'bt' || insn.mnem === 'bts' || insn.mnem === 'btr' || insn.mnem === 'btc') return true;
     if (insn.mnem === 'mul1' || insn.mnem === 'imul1') return true;   // CF=OF = widening overflow, in $fr
+    if (insn.mnem === 'imul2' || insn.mnem === 'imul3') return true;   // same: CF=OF = the product did not fit
     if (insn.mnem === 'bsf' || insn.mnem === 'bsr') return true;   // ZF <- (src==0)
     return false;
   };
   // Instructions that write flags in a way we DON'T model: a nearest such
   // writer before a consumer means the lazy flags are unrecoverable.
-  const CLOBBER = new Set(['shl','shr','sar','rol','ror','imul2','imul3','mul1','imul1','div1','idiv1',
+  const CLOBBER = new Set(['shl','shr','sar','rol','ror','mul1','imul1','div1','idiv1',
                            'bt','bts','btr','btc','shld','shrd','call','callind','syscall',
                            'clc','stc','x87']);
   // Static (kind,size) a modeled producer yields — MUST match the setFlags
@@ -1978,7 +1979,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       case 'inc': return { kind:'inc', size:S };
       case 'dec': return { kind:'dec', size:S };
       case 'bt': case 'bts': case 'btr': case 'btc': return { kind:'cf', size:S };
-      case 'mul1': case 'imul1': return { kind:'cf', size:S };
+      case 'mul1': case 'imul1': case 'imul2': case 'imul3': return { kind:'cf', size:S };
       default: return null;
     } };
 
@@ -2448,13 +2449,57 @@ function emitUnitFunction(a0, fnAddr, ctx) {
         case 'setcc': L.push(wr(insn.dst, 1, `(i64.extend_i32_u ${cond(insn.cond)})`, next)); break;
         case 'imul2': case 'imul3': {
           // low-half product; identical bits for signed/unsigned, so a plain mul suffices.
+          // CF=OF is the overflow of the SIGNED product out of the destination
+          // width, which is the only flag x86 defines here (SF/ZF/AF/PF are
+          // architecturally undefined and the differential harness masks them).
+          // Modelling it matters out of proportion to its size: an unmodelled
+          // flag producer poisons the whole function, and `imul r,r/m,imm` is
+          // what a compiler emits for a struct-index multiply, so it sits in
+          // the middle of hot code. 13 of grep's 15 translation failures were
+          // this one instruction, and its hot matcher then ran interpreted.
           const bExpr = insn.mnem === 'imul3' ? insn.src2 : insn.src;
-          if (S === 4 && insn.dst.kind === 'reg') {
-            const a = insn.mnem === 'imul3' ? rd32(insn.src,next) : rd32(insn.dst,next);
-            L.push(wr32reg(insn.dst.r, `(i32.mul ${a} ${rd32(bExpr,next)})`));
+          const sa = insn.mnem === 'imul3' ? insn.src : insn.dst;
+          if (S <= 4) {
+            // 32x32 -> 64 is exact in an i64, so the check is a comparison
+            // against the sign-extension of the truncated result.
+            const av = T(), bv = T(), full = T();
+            L.push(`(local.set ${av} ${sx(rd(sa,S,next),S)})`);
+            L.push(`(local.set ${bv} ${sx(rd(bExpr,S,next),S)})`);
+            L.push(`(local.set ${full} (i64.mul (local.get ${av}) (local.get ${bv})))`);
+            if (S === 4 && insn.dst.kind === 'reg') L.push(wr32reg(insn.dst.r, `(i32.wrap_i64 (local.get ${full}))`));
+            else L.push(wr(insn.dst,S,andmask(`(local.get ${full})`,S),next));
+            setFlags('cf', S, null, null,
+              `(i64.extend_i32_u (i64.ne (local.get ${full}) ${sx(andmask(`(local.get ${full})`,S),S)}))`);
           } else {
-            const a = insn.mnem === 'imul3' ? rd(insn.src,S,next) : rd(insn.dst,S,next);
-            L.push(wr(insn.dst,S,andmask(`(i64.mul ${a} ${rd(bExpr,S,next)})`,S),next));
+            // 64x64 -> 128: no mulhi in wasm, so build the high word from the
+            // four 32-bit half-products, same construction as imul1.
+            const a = T(), b = T(), al = T(), ah = T(), bl = T(), bh = T(),
+                  lh = T(), hl = T(), mid = T(), hi = T(), lo = T();
+            L.push(`(local.set ${a} ${rd(sa,8,next)})`);
+            L.push(`(local.set ${b} ${rd(bExpr,8,next)})`);
+            L.push(`(local.set ${lo} (i64.mul (local.get ${a}) (local.get ${b})))`);
+            L.push(`(local.set ${al} (i64.and (local.get ${a}) (i64.const 0xFFFFFFFF)))`);
+            L.push(`(local.set ${ah} (i64.shr_u (local.get ${a}) (i64.const 32)))`);
+            L.push(`(local.set ${bl} (i64.and (local.get ${b}) (i64.const 0xFFFFFFFF)))`);
+            L.push(`(local.set ${bh} (i64.shr_u (local.get ${b}) (i64.const 32)))`);
+            L.push(`(local.set ${lh} (i64.mul (local.get ${al}) (local.get ${bh})))`);
+            L.push(`(local.set ${hl} (i64.mul (local.get ${ah}) (local.get ${bl})))`);
+            L.push(`(local.set ${mid} (i64.add (i64.add ` +
+                   `(i64.shr_u (i64.mul (local.get ${al}) (local.get ${bl})) (i64.const 32)) ` +
+                   `(i64.and (local.get ${lh}) (i64.const 0xFFFFFFFF))) ` +
+                   `(i64.and (local.get ${hl}) (i64.const 0xFFFFFFFF))))`);
+            L.push(`(local.set ${hi} (i64.add (i64.add (i64.add ` +
+                   `(i64.mul (local.get ${ah}) (local.get ${bh})) ` +
+                   `(i64.shr_u (local.get ${lh}) (i64.const 32))) ` +
+                   `(i64.shr_u (local.get ${hl}) (i64.const 32))) ` +
+                   `(i64.shr_u (local.get ${mid}) (i64.const 32))))`);
+            L.push(`(local.set ${hi} (i64.sub (local.get ${hi}) ` +
+                   `(i64.and (i64.shr_s (local.get ${a}) (i64.const 63)) (local.get ${b}))))`);
+            L.push(`(local.set ${hi} (i64.sub (local.get ${hi}) ` +
+                   `(i64.and (i64.shr_s (local.get ${b}) (i64.const 63)) (local.get ${a}))))`);
+            L.push(wr(insn.dst,8,`(local.get ${lo})`,next));
+            setFlags('cf', 8, null, null,
+              `(i64.extend_i32_u (i64.ne (local.get ${hi}) (i64.shr_s (local.get ${lo}) (i64.const 63))))`);
           }
           break; }
         case 'mul1': case 'imul1': {

@@ -1,4 +1,5 @@
-// Differential: mul/imul overflow flags (CF=OF) consumed by jc/jo/setc, and
+// Differential: mul/imul overflow flags (CF=OF) consumed by jc/jo/setc -
+// one-operand widening, and the two- and three-operand forms - and
 // the bt/bts/btr/btc MEMORY forms including bit-string addressing (register
 // bit offsets beyond the word, negative offsets) — glib's g_bit_lock shape.
 import { compileFunctionWat } from '../aot_wat.mjs';
@@ -39,6 +40,46 @@ mov rax, 1
 ret
 t: mov rax, 2
 ret`],
+  // two- and three-operand imul: CF=OF is the only flag x86 defines here, and
+  // leaving it unmodelled poisoned every function containing one - which is
+  // most of grep's hot path, since `imul r,r/m,imm` is what a compiler emits
+  // for a struct-index multiply.
+  ['imul2-64-jo',`mov rax, rdi
+imul rax, rsi
+jo t
+mov rax, 1
+ret
+t: mov rax, 2
+ret`],
+  ['imul3-64-jc',`imul rax, rdi, 0x12345
+jc t
+mov rax, 1
+ret
+t: mov rax, 2
+ret`],
+  ['imul3-64-imm8',`imul rax, rdi, 7
+jo t
+ret
+t: mov rax, 2
+ret`],
+  ['imul2-32-setc',`mov rax, rdi
+imul eax, esi
+setc al
+movzx rax, al
+ret`],
+  ['imul3-32-jno',`imul eax, edi, 1000
+jno t
+mov rax, 1
+ret
+t: mov rax, 2
+ret`],
+  ['imul2-16-jo',`mov rax, rdi
+imul ax, si
+jo t
+mov rax, 1
+ret
+t: mov rax, 2
+ret`],
   ['bts-mem-reg',`mov rax, 0x400800
 bts [rax], rsi
 setc al
@@ -58,7 +99,13 @@ btc dword [rax], esi
 mov rax, [0x400800]
 ret`],
 ];
-const MULV = [0n, 1n, 2n, 63n, 64n, 65n, 100n, 0xFFFFFFFFn, 0x100000000n, 0xFFFFFFFFFFFFFFFFn, 0x8000000000000000n];
+// Values must overflow at EVERY width under test, not just 64: the original
+// list was built for the widening one-operand form and its largest signed
+// 32-bit magnitude was 100, so no pair overflowed 32 bits and a two-operand
+// CF forced to zero still passed. 0x7FFFFFFF/0x40000000 break 32-bit, 0x7FFF
+// and 0x1234 break 16-bit.
+const MULV = [0n, 1n, 2n, 63n, 64n, 65n, 100n, 0x1234n, 0x7FFFn, 0x8000n, 0x40000000n, 0x7FFFFFFFn,
+              0xFFFFFFFFn, 0x100000000n, 0xFFFFFFFFFFFFFFFFn, 0x8000000000000000n];
 // memory-bt offsets must stay inside the 4KB test image (bit-string
 // addressing walks words away from the base): include negatives via wraparound
 const BTV = [0n, 1n, 37n, 63n, 64n, 65n, 100n, 127n, 0xFFFFFFFFFFFFFFFFn, 0xFFFFFFFFFFFFFFC0n];
