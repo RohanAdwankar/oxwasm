@@ -1987,7 +1987,14 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       case 'add': case 'xadd': return { kind:'add', size:S };
       case 'adc': return { kind:'adc', size:S };
       case 'sbb': return { kind:'sbb', size:S };
-      case 'or': case 'and': case 'xor': case 'test':
+      // CF and OF are CLEARED by these, which is what 'logic' means. This
+      // return is not decoration: the case list used to share one return with
+      // the shift line below, and splitting the shifts off left and/or/xor/test
+      // falling through into them - so the ANALYSIS called an `and` a shift
+      // while the emitter called it logic. Single-block consumers read the
+      // emitter's state and looked correct; a cross-block consumer took the
+      // analysis's kind and read $fa/$fb that no `and` had written.
+      case 'or': case 'and': case 'xor': case 'test': return { kind:'logic', size:S };
       // 'logic' means CF and OF are CLEARED, which is true of and/or/xor/test
       // and NOT of a shift (CF is the last bit shifted out) or bsf/bsr (CF
       // undefined). Sharing one kind made `shr rax,1; adc rbx,0` compile with
