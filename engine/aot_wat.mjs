@@ -1980,9 +1980,9 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       // undefined). Sharing one kind made `shr rax,1; adc rbx,0` compile with
       // CF=0 and return the wrong answer, so they get a kind of their own that
       // carries only the result-derived conditions.
-      case 'shl': case 'shr': case 'sar':
-        // must agree with the emit above: a count of 1 also defines OF
-        return { kind: (insn.src.kind === 'imm' && Number(insn.src.v & BigInt(S === 8 ? 63 : 31)) === 1) ? 'shiftf' : 'shift', size:S };
+      // an immediate count materializes CF and OF both ('shiftf'); a register
+      // count is not a modeled producer at all, so it never reaches a consumer
+      case 'shl': case 'shr': case 'sar': return { kind: insn.src.kind === 'imm' ? 'shiftf' : 'shift', size:S };
       // bsf/bsr define ZF and nothing else - SF, CF and OF are architecturally
       // undefined - and $fr holds the SOURCE, so reading a sign off it is
       // reading the operand, not a result.
@@ -2443,13 +2443,17 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           const cf = insn.mnem === 'shl'
             ? `(i64.and (i64.shr_u ${O} (i64.const ${W - cImm})) (i64.const 1))`
             : `(i64.and (i64.shr_u ${O} (i64.const ${cImm - 1})) (i64.const 1))`;
-          if (cImm !== 1) { setFlags('shift', S, null, cf, res); break; }
-          // count 1: OF too. shl -> MSB(result) xor CF; shr -> MSB(original); sar -> 0.
-          const sgnc = SIGNl[S];
+          // OF, for EVERY count, not just 1. The interpreter used to leave it
+          // untouched past a count of 1 and now computes it, because that is
+          // what the hardware does (engine/diff/shiftoftest.mjs asks the CPU).
+          // The rule is the count-1 rule applied to the ORIGINAL operand and
+          // is independent of the count: shl -> top two bits differ, shr ->
+          // top bit, sar -> 0. Note this is NOT `MSB(result) xor CF`, which
+          // uses the shifted result and only coincides at a count of 1.
           const of = insn.mnem === 'shl'
-            ? `(i64.xor (i64.shr_u (i64.and ${res} (i64.const ${sgnc})) (i64.const ${W - 1})) ${cf})`
+            ? `(i64.and (i64.xor (i64.shr_u ${O} (i64.const ${W - 1})) (i64.shr_u ${O} (i64.const ${W - 2}))) (i64.const 1))`
             : insn.mnem === 'shr'
-            ? `(i64.shr_u (i64.and ${O} (i64.const ${sgnc})) (i64.const ${W - 1}))`
+            ? `(i64.and (i64.shr_u ${O} (i64.const ${W - 1})) (i64.const 1))`
             : `(i64.const 0)`;
           setFlags('shiftf', S, of, cf, res);
           break; }
