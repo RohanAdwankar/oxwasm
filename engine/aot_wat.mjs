@@ -2171,13 +2171,25 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     // regfile's flag slot for syncIn to apply; kinds whose CF the lazy model
     // does not carry (inc/dec/adc/sbb/cf/fcmp) hand nothing over.
     const eflagsStore = (fs) => {
-      if (!fs || !['sub', 'add', 'logic'].includes(fs.kind)) return '';
+      // 'shiftf' and 'zf' belong here because shifts and bsf/bsr USED to be
+      // the 'logic' kind and so handed flags over. Splitting them out without
+      // adding them here made a unit hand over NOTHING at an escape, and the
+      // interpreter then resumed on whatever flags it had last computed
+      // itself - which is the exact bug the flag slot exists to prevent. It
+      // cost javac: the JVM escapes constantly (cpuid, x87, fxsave), and it
+      // died with an AbstractMethodError while every differential still
+      // passed, because the differentials never escape.
+      if (!fs || !['sub', 'add', 'logic', 'shiftf', 'zf'].includes(fs.kind)) return '';
       const S = fs.size, sgn = SIGNl[S], m = MASK[S];
       const a = '(local.get $fa)', b = '(local.get $fb)', r = '(local.get $fr)';
       const zf = `(i64.extend_i32_u (i64.eqz ${r}))`, sf = `(i64.extend_i32_u (i64.ne (i64.and ${r} (i64.const ${sgn})) (i64.const 0)))`;
       let cf = '(i64.const 0)', of = '(i64.const 0)';
       if (fs.kind === 'sub') { cf = `(i64.extend_i32_u (i64.lt_u ${a} ${b}))`; of = `(i64.extend_i32_u (i64.ne (i64.and (i64.and (i64.xor ${a} ${b}) (i64.xor ${a} ${r})) (i64.const ${sgn})) (i64.const 0)))`; }
       else if (fs.kind === 'add') { cf = `(i64.extend_i32_u (i64.lt_u ${r} (i64.and ${a} (i64.const ${m}))))`; of = `(i64.extend_i32_u (i64.ne (i64.and (i64.and (i64.xor ${a} ${r}) (i64.xor ${b} ${r})) (i64.const ${sgn})) (i64.const 0)))`; }
+      // a shift materialized both: CF is the last bit out ($fb), OF the
+      // count-independent rule ($fa). 'logic' and 'zf' keep CF=OF=0, which is
+      // exact for and/or/xor/test and is what bsf/bsr handed over before.
+      else if (fs.kind === 'shiftf') { cf = `(i64.and ${b} (i64.const 1))`; of = `(i64.and ${a} (i64.const 1))`; }
       return `(i64.store (i32.const ${EFLAGS_SLOT}) (i64.or (i64.const -9223372036854775296) (i64.or ${cf} (i64.or (i64.shl ${zf} (i64.const 6)) (i64.or (i64.shl ${sf} (i64.const 7)) (i64.shl ${of} (i64.const 11)))))))`;   // marker | 0x202 | CF | ZF<<6 | SF<<7 | OF<<11
     };
     const setFlags = (kind, size, aE, bE, rE) => {
