@@ -69,6 +69,11 @@ const run = (allow) => {          // allow: null = compile all, else a Set of en
   const eng = new LinuxEngine(new Uint8Array(readFileSync(bin)),
     { argv: [bin, ...args], env: ['PATH=/usr/bin:/bin', 'LANG=C', 'HOME=/root'],
       files, mtimes, memMB: Number(process.env.MEMMB || 1024), assembleWat });
+  // EXECANON=1: anonymous PROT_EXEC mappings count as code, which is what the
+  // breadth cases for JIT guests pass. Without it this tool could not
+  // reproduce a javac failure that the sweep saw, and reported the uncapped
+  // run as good - a bisect that cannot reproduce the bug is worse than none.
+  if (process.env.EXECANON === '1') eng.execAnon = true;
   if (process.env.SHADOW) eng.shadowLib = process.env.SHADOW;
   if (process.env.SHADOWMAX) eng.shadowMax = Number(process.env.SHADOWMAX);
   // SYSLOG=<file> - record every syscall (nr and the four register arguments)
