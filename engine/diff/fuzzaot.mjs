@@ -38,6 +38,18 @@ const R64 = ['rax', 'rbx', 'rdx', 'rsi', 'rdi', 'r8', 'r9', 'r10', 'r11', 'r13',
 const R32 = ['eax', 'ebx', 'edx', 'esi', 'edi', 'r8d', 'r9d', 'r10d', 'r11d', 'r13d'];
 const R8 = ['al', 'bl', 'dl', 'sil', 'dil', 'r8b', 'r9b', 'r10b'];
 const CC = ['e', 'ne', 'l', 'ge', 'le', 'g', 'b', 'ae', 'be', 'a', 's', 'ns', 'o', 'no'];
+const XR = ['xmm0', 'xmm1', 'xmm2', 'xmm3', 'xmm4', 'xmm5'];
+// The SSE surface is large and only DIRECTED-tested: every vector case in this
+// suite covers one instruction someone thought of. These are the integer and
+// float forms the emitter claims, generated against each other so a lane or a
+// saturation rule that is wrong in combination shows up.
+const SSE_INT = ['paddb','paddw','paddd','paddq','psubb','psubw','psubd','psubq',
+                 'pand','pandn','por','pxor','pcmpeqb','pcmpeqw','pcmpeqd',
+                 'pcmpgtb','pcmpgtw','pcmpgtd','pminub','pmaxub','pavgb','pavgw',
+                 'paddusb','paddusw','psubusb','psubusw','paddsb','psubsb',
+                 'punpcklbw','punpckhbw','punpcklwd','punpckldq','punpcklqdq','pmullw','pmulhw'];
+const SSE_FLT = ['addps','subps','mulps','minps','maxps','addpd','subpd','mulpd','minpd','maxpd',
+                 'andps','orps','xorps','unpcklps','unpckhps','cvtps2pd','cvtpd2ps','cvtdq2ps'];
 
 // a flag producer the lazy model carries: sub/add/logic kinds over full or
 // narrow widths, which is the set cond() knows how to read
@@ -50,10 +62,12 @@ const prod = () => pick([
 
 function program(id) {
   const L = [`mov r12, 0x${BUF.toString(16)}`];
+  // both engines start their vector registers from the same buffer bytes
+  XR.forEach((x, i) => L.push(`movdqu ${x}, [r12+${16 * i}]`));
   let lab = 0;
   const n = 10 + rnd(14);
   for (let i = 0; i < n; i++) {
-    switch (rnd(16)) {
+    switch (rnd(22)) {
       case 0: L.push(`mov ${pick(R64)}, ${(rnd(2) ? -1 : 1) * rnd(0x7fffffff)}`); break;
       case 1: L.push(`${pick(['add','sub','and','or','xor','cmp','test'])} ${pick(R64)}, ${pick(R64)}`); break;
       case 2: L.push(`${pick(['add','sub','and','or','xor','cmp'])} ${pick(R32)}, ${pick(R32)}`); break;
@@ -82,13 +96,23 @@ function program(id) {
                `dec rcx`, `jnz ${t}`); break; }   // dec/jnz IS the producer here
       // string ops with pointers that may OVERLAP, in either direction, which
       // is the shape that was wrong and that nothing else generates
+      // vector work: the registers are seeded from the scratch buffer, so both
+      // engines start from the same 128 bits, and written back at the end
+      case 16: L.push(`movdqu ${pick(XR)}, [r12+${rnd(SPAN - 16)}]`); break;
+      case 17: L.push(`${pick(SSE_INT)} ${pick(XR)}, ${pick(XR)}`); break;
+      case 18: L.push(`${pick(SSE_FLT)} ${pick(XR)}, ${pick(XR)}`); break;
+      case 19: L.push(`pshufd ${pick(XR)}, ${pick(XR)}, ${rnd(256)}`); break;
+      case 20: L.push(`${pick(['psllw','pslld','psllq','psrlw','psrld','psrlq','psraw','psrad'])} ${pick(XR)}, ${rnd(20)}`); break;
+      case 21: L.push(`movdqu [r12+${rnd(SPAN - 16)}], ${pick(XR)}`); break;
       case 15: { const off = rnd(SPAN - 96), d = rnd(33) - 16;
         L.push(`lea rsi, [r12+${off}]`, `lea rdi, [r12+${Math.max(0, off + d)}]`, `mov rcx, ${rnd(12)}`,
                `cld`, pick(['rep movsb', 'rep stosb', 'rep movsq', 'repe cmpsb', 'repne scasb'])); break; }
     }
   }
-  // observe the flags one last time through defined means
+  // observe the flags one last time through defined means, and spill every
+  // vector register so a wrong lane lands in the compared buffer
   L.push(`set${pick(CC)} r15b`);
+  XR.forEach((x, i) => L.push(`movdqu [r12+${SPAN - 16 * (i + 1)}], ${x}`));
   return L.join('\n') + '\nret';
 }
 
