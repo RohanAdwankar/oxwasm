@@ -61,6 +61,18 @@ def build_initramfs(busybox_path, init_script, extra_files=None, compress=True):
     with open(busybox_path, "rb") as f:
         w.file("bin/busybox", f.read(), mode=0o100755)
     w.file("init", init_script.encode(), mode=0o100755)
+    # An extra under a directory the fixed list above does not contain needs
+    # that directory in the archive first: the kernel's unpacker creates
+    # nothing implicitly, so the file is silently dropped and the guest reports
+    # the program as "not found". Emit each missing parent, outermost first,
+    # and only once.
+    made = {"bin", "sbin", "dev", "proc", "sys", "tmp", "root", "etc"}
     for path, (data, mode) in (extra_files or {}).items():
+        parts = path.split("/")[:-1]
+        for i in range(len(parts)):
+            d = "/".join(parts[:i + 1])
+            if d and d not in made:
+                w.dir(d)
+                made.add(d)
         w.file(path, data, mode)
     return w.bytes(compress=compress)
