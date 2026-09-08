@@ -72,7 +72,7 @@ function program(id) {
   let lab = 0;
   const n = 10 + rnd(14);
   for (let i = 0; i < n; i++) {
-    switch (rnd(30)) {
+    switch (rnd(32)) {
       case 0: L.push(`mov ${pick(R64)}, ${(rnd(2) ? -1 : 1) * rnd(0x7fffffff)}`); break;
       case 1: L.push(`${pick(['add','sub','and','or','xor','cmp','test'])} ${pick(R64)}, ${pick(R64)}`); break;
       case 2: L.push(`${pick(['add','sub','and','or','xor','cmp'])} ${pick(R32)}, ${pick(R32)}`); break;
@@ -157,7 +157,26 @@ function program(id) {
                             `lock xadd [r12+${rnd(SPAN-8)}], ${pick(R64)}`])); break;
       case 15: { const off = rnd(SPAN - 96), d = rnd(33) - 16;
         L.push(`lea rsi, [r12+${off}]`, `lea rdi, [r12+${Math.max(0, off + d)}]`, `mov rcx, ${rnd(12)}`,
-               `cld`, pick(['rep movsb', 'rep stosb', 'rep movsq', 'repe cmpsb', 'repne scasb'])); break; }
+               `cld`, pick(['rep movsb', 'rep stosb', 'rep movsq', 'repe cmpsb', 'repne scasb',
+                            'rep movsw', 'rep movsd', 'rep stosw', 'rep stosd', 'rep stosq',
+                            'repe cmpsw', 'repe cmpsd', 'repne scasw', 'repne scasd', 'repne scasq',
+                            'movsb', 'stosb', 'cmpsb', 'scasb'])); break; }
+      // cmpxchg, whose flag and register effects depend on whether it matched
+      case 30: L.push(`mov rax, [r12+${rnd(SPAN-8)}]`,
+                      pick([`cmpxchg [r12+${rnd(SPAN-8)}], ${pick(R64)}`,
+                            `lock cmpxchg [r12+${rnd(SPAN-8)}], ${pick(R64)}`,
+                            `cmpxchg ${pick(R64)}, ${pick(R64)}`])); break;
+      // vector loads and stores at MISALIGNED addresses, including ones that
+      // straddle a 4K boundary - a different path in the address arithmetic
+      case 31: { const near = 4096 - 8 + rnd(16);
+        L.push(`lea rbx, [r12+${Math.min(near, SPAN - 16)}]`,
+               pick([`movdqu ${pick(XR)}, [r12+${rnd(SPAN-16)+1}]`,
+                     `movdqu [r12+${rnd(SPAN-16)+1}], ${pick(XR)}`,
+                     `movups ${pick(XR)}, [r12+${rnd(SPAN-16)+3}]`,
+                     `movq ${pick(XR)}, [r12+${rnd(SPAN-8)+1}]`,
+                     `movd ${pick(XR)}, dword [r12+${rnd(SPAN-4)+1}]`,
+                     `movhps ${pick(XR)}, [r12+${rnd(SPAN-8)+1}]`,
+                     `movlps ${pick(XR)}, [r12+${rnd(SPAN-8)+1}]`])); break; }
     }
   }
   // observe the flags one last time through defined means, and spill every
