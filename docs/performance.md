@@ -664,3 +664,43 @@ against. Changing that mechanism made the same change worth 20%.
 page size against startup, and it scales with the program: a large application
 whose default-threshold manifest is already thousands of units will grow more
 than these do.
+
+
+## How much of the guest run is the dynamic linker
+
+With the manifest landing first and trained permissively, sha256sum's page
+interprets 9,667 instructions and spends ~243 ms in the guest. Almost none of
+that is interpretation and almost none is the hashing: the two-size subtraction
+puts ~250 ms of steady state on 41 MB of input, so 138 kB of it is about a
+millisecond. What is left is startup - and for this binary startup means
+ld.so mapping and relocating libc and libcrypto.
+
+Measured against a STATIC guest doing the same job on the same input - busybox
+`sha256sum`, four alternating runs each:
+
+| | page | wall (median) | engine (median) | interpreted |
+|---|---|---|---|---|
+| coreutils sha256sum (dynamic) | 6.19 MB | 812 ms | 243 ms | 9,667 |
+| busybox sha256sum (static) | 3.24 MB | 593 ms | **95 ms** | 3,928 |
+
+**~150 ms of the dynamic page's guest run is the dynamic linker**, and the
+page is nearly twice the size because it has to carry ld.so, libc and
+libcrypto. The 219 ms wall difference is that 148 ms plus ~70 ms of page load
+for the extra 3 MB.
+
+The caveat is that these are two implementations of sha256sum, not one binary
+linked two ways - busybox's is its own code and coreutils' goes through
+libcrypto. At 138 kB the compute is about a millisecond either way, so the
+comparison is dominated by startup, but it is not a controlled A/B and should
+not be read as one.
+
+Nothing here is the engine's to fix: the linking work is real guest
+instructions, already compiled, and the program chose to be dynamic. What
+COULD skip it is resuming from a settled state rather than re-running startup.
+`engine/snapshot.mjs` already captures one - guest memory, thread contexts, fd
+table, layout scalars - and `snapshot_core.mjs` is deliberately browser-safe
+restore with no node imports. A page that ships a post-linking snapshot instead
+of the libraries would trade its 4.13 MB of compressed .so files for a
+compressed image of the memory they were loaded into, which is a different
+size rather than obviously a smaller one, and skip the ~150 ms. That is
+measured as worth doing and not yet done.
