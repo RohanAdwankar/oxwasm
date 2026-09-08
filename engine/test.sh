@@ -58,6 +58,7 @@ node fcmptest.mjs
 node cmppstest.mjs
 node cvtpdtest.mjs
 node sseshifttest.mjs
+node ssevarshifttest.mjs
 node packedfloattest.mjs
 node dotconvtest.mjs
 node cvtintest.mjs
