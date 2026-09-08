@@ -461,8 +461,13 @@ export class CPU {
             this.xmm[insn.xr] = out; break; }
           case 0x51: case 0x58: case 0x59: case 0x5C: case 0x5D: case 0x5E: case 0x5F: {
             // sqrt/add/mul/sub/min/max/div — scalar (F3 ss / F2 sd) or packed (ps / 66 pd)
+            // min/max are NOT Math.min/Math.max. x86 returns the SECOND source
+            // whenever either operand is NaN or the two compare equal, so
+            // min(1.0, NaN) is NaN with the source's payload and min(+0,-0) is
+            // whichever the source holds. Math.min gives a canonical NaN and
+            // prefers -0, and was wrong on both against hardware.
             const OP = { 0x51:(a,b)=>Math.sqrt(b), 0x58:(a,b)=>a+b, 0x59:(a,b)=>a*b,
-                         0x5C:(a,b)=>a-b, 0x5D:(a,b)=>Math.min(a,b), 0x5E:(a,b)=>a/b, 0x5F:(a,b)=>Math.max(a,b) }[insn.op];
+                         0x5C:(a,b)=>a-b, 0x5D:(a,b)=>(a < b ? a : b), 0x5E:(a,b)=>a/b, 0x5F:(a,b)=>(a > b ? a : b) }[insn.op];
             const dbl = insn.pF2 || insn.p66, scalar = insn.pF3 || insn.pF2;
             const lanes = scalar ? 1 : (dbl ? 2 : 4), eb = dbl ? 64n : 32n;
             const src = insn.rm.kind === 'xmm' ? this.xmm[insn.rm.r]

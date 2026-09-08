@@ -1982,16 +1982,35 @@ function emitUnitFunction(a0, fnAddr, ctx) {
         L.push(insn.W ? wr({kind:'reg',r:xr,size:8},8,`(${trunc} ${fr})`,next) : wr32reg(xr, `(${trunc} ${fr})`));
         break; }
       case 0x51: case 0x58: case 0x59: case 0x5C: case 0x5D: case 0x5E: case 0x5F: {   // sqrt/add/mul/sub/min/max/div
+        // Which prefix means "double" depends on whether the form is scalar or
+        // packed, and one variable was doing both jobs. F2 is scalar double
+        // (mulsd); 66 is PACKED double (mulpd). Selecting the lane type from
+        // F2 alone meant every packed-double op - addpd, subpd, mulpd, divpd,
+        // minpd, maxpd, sqrtpd - was emitted as f32x4 and computed four
+        // single-precision lanes where the guest asked for two doubles.
         const F = insn.pF2 ? 'f64' : 'f32', LN = insn.pF2 ? 'f64x2' : 'f32x4';
         const ext = (v) => `(${LN}.extract_lane 0 ${v})`;
         const a = ext(dst), b = ext(xv(rm, next));
         const scalar = insn.pF3 || insn.pF2;
         if (!scalar) {  // packed
+          const LN = insn.p66 ? 'f64x2' : 'f32x4';
           const P = { 0x51:`${LN}.sqrt`, 0x58:`${LN}.add`, 0x59:`${LN}.mul`, 0x5C:`${LN}.sub`, 0x5D:`${LN}.pmin`, 0x5E:`${LN}.div`, 0x5F:`${LN}.pmax` }[op];
-          put(op===0x51 ? `(${P} ${xv(rm,next)})` : `(${P} ${dst} ${xv(rm,next)})`); break;
+          // pmin/pmax take their operands the other way round from the rest.
+          // wasm's pmin(x,y) is `y < x ? y : x`, so on a NaN or a tie it yields
+          // x - and x86's MIN/MAX yield the SECOND source there. Passing
+          // (src, dst) rather than (dst, src) makes the tie go the guest's way
+          // and carries the source's NaN payload through unchanged.
+          const swap = op === 0x5D || op === 0x5F;
+          put(op===0x51 ? `(${P} ${xv(rm,next)})`
+                        : swap ? `(${P} ${xv(rm,next)} ${dst})` : `(${P} ${dst} ${xv(rm,next)})`); break;
         }
+        // the scalar pair has the same rule, and wasm's f64.min/max cannot
+        // express it: they return a canonical NaN and prefer -0. A select on
+        // the ordered comparison is exact - false on a NaN or a tie, which
+        // lands on the second source, operand bits and all.
         const e = op===0x51 ? `(${F}.sqrt ${b})` : op===0x58 ? `(${F}.add ${a} ${b})` : op===0x59 ? `(${F}.mul ${a} ${b})`
-                : op===0x5C ? `(${F}.sub ${a} ${b})` : op===0x5D ? `(${F}.min ${a} ${b})` : op===0x5E ? `(${F}.div ${a} ${b})` : `(${F}.max ${a} ${b})`;
+                : op===0x5C ? `(${F}.sub ${a} ${b})` : op===0x5D ? `(select ${a} ${b} (${F}.lt ${a} ${b}))`
+                : op===0x5E ? `(${F}.div ${a} ${b})` : `(select ${a} ${b} (${F}.gt ${a} ${b}))`;
         put(`(${LN}.replace_lane 0 ${dst} ${e})`); break; }
       case 0x5A: {                                            // cvtss2sd / cvtsd2ss / cvtps2pd / cvtpd2ps
         if (insn.pF3) put(`(f64x2.replace_lane 0 ${dst} (f64.promote_f32 (f32x4.extract_lane 0 ${xv(rm,next)})))`);
@@ -2017,10 +2036,22 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     const EB = insn.op === 0x71 ? 2 : insn.op === 0x72 ? 4 : 8;
     const LN = { 2:'i16x8', 4:'i32x4', 8:'i64x2' }[EB];
     const x = `(local.get ${xreg(insn.xrm)})`, c = insn.imm8 & 0xff;
+    // A count AT OR BEYOND the lane width is where the two machines part.
+    // x86 saturates: the logical shifts give zero and the arithmetic one gives
+    // each lane's sign bit repeated. wasm MASKS the count modulo the lane
+    // width, so `psrld xmm, 32` became a shift by 0 and returned the operand
+    // unchanged, and `psraw xmm, 17` became a shift by 1.
+    //
+    // 46 of 104 immediate-shift results were wrong across the eight forms and
+    // thirteen counts - every count from the lane width up. The interpreter
+    // had it right the whole time, which is what makes it a translator bug
+    // rather than a modelling gap, and what kept it invisible: no directed
+    // test shifted past a lane.
+    const W = EB * 8, over = c >= W;
     let e;
-    if (insn.sub === 2) e = `(${LN}.shr_u ${x} (i32.const ${c}))`;            // psrl
-    else if (insn.sub === 6) e = `(${LN}.shl ${x} (i32.const ${c}))`;         // psll
-    else if (insn.sub === 4) e = `(${LN==='i64x2'?'i64x2.shr_s':LN+'.shr_s'} ${x} (i32.const ${c}))`;  // psra
+    if (insn.sub === 2) e = over ? ZERO : `(${LN}.shr_u ${x} (i32.const ${c}))`;   // psrl
+    else if (insn.sub === 6) e = over ? ZERO : `(${LN}.shl ${x} (i32.const ${c}))`; // psll
+    else if (insn.sub === 4) e = `(${LN}.shr_s ${x} (i32.const ${over ? W - 1 : c}))`;  // psra: saturates to the sign
     else if (insn.sub === 3) {                                               // psrldq: whole-reg byte shift right
       const idx = []; for (let k=0;k<16;k++){ const s=k+c; idx.push(s<16?s:16); }  // 16 -> zero lane
       e = `(i8x16.shuffle ${idx.join(' ')} ${x} ${ZERO})`;
