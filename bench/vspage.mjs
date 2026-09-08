@@ -49,12 +49,16 @@ const nativeOnce = (input) => {
   if (existsSync(GUEST_IN)) { console.log(`refusing: ${GUEST_IN} already exists on the host`); process.exit(1); }
   mkdirSync(dirname(GUEST_IN), { recursive: true }); copyFileSync(input, GUEST_IN);
   const t0 = process.hrtime.bigint();
-  let code = 0, bytes = 0;
-  try { bytes = execFileSync(bin, args.map(a => a.replace('{IN}', GUEST_IN)), { stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 1 << 28 }).length; }
-  catch (e) { code = e.status ?? -1; bytes = (e.stdout ?? '').length; }
+  let code = 0, bytes = 0, hash = '';
+  const digest = (b) => { let h1 = 0x811c9dc5, h2 = 0x01000193;
+    for (let i = 0; i < b.length; i++) { h1 = Math.imul(h1 ^ b[i], 0x01000193) >>> 0; h2 = Math.imul(h2 + b[i], 0x85ebca6b) >>> 0; }
+    return h1.toString(16).padStart(8, '0') + h2.toString(16).padStart(8, '0'); };
+  try { const out = execFileSync(bin, args.map(a => a.replace('{IN}', GUEST_IN)), { stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 1 << 28 });
+        bytes = out.length; hash = digest(out); }
+  catch (e) { code = e.status ?? -1; const out = e.stdout ?? Buffer.alloc(0); bytes = out.length; hash = digest(out); }
   const ms = Number(process.hrtime.bigint() - t0) / 1e6;
   try { unlinkSync(GUEST_IN); } catch {}
-  return { ms, code, bytes };
+  return { ms, code, bytes, hash };
 };
 
 // Browser side: pack once per input size (the input is inlined in the page),
@@ -84,16 +88,25 @@ try {
     const code = await waitForExit(br.q, TIMEOUT_S);
     if (code === null) { console.log(`FAIL: ${name} did not exit within ${TIMEOUT_S}s`); stop(1); }
     if (code !== 0) console.log(`  note: ${name} exited ${code}`);
-    return await br.q('window.__oxMs');
+    return { ms: await br.q('window.__oxMs'), hash: await br.q('window.__oxOutHash') };
   };
   const out = {};
   for (const which of ['small', 'big']) {
     const page = [], nat = [];
     const input = which === 'big' ? BIG : SMALL;
     let natCode = 0, natBytes = 0;
+    // A benchmark that never checks the answer can be timing anything at all.
+    // The page reports a digest over its raw stdout and the native side takes
+    // the same one, so a ratio is only printed when both produced the same
+    // bytes.
     for (let i = 0; i < REPS; i++) {
-      page.push(await pageOnce(pages[which]));
+      const p = await pageOnce(pages[which]);
+      page.push(p.ms);
       const r = nativeOnce(input); nat.push(r.ms); natCode = r.code; natBytes = r.bytes;
+      if (p.hash !== r.hash) {
+        console.log(`FAIL: ${which} output differs from native (page ${p.hash} vs native ${r.hash}) — timing a wrong answer`);
+        stop(1);
+      }
     }
     // A program that exits nonzero has usually stopped early and timed nothing
     // worth comparing: `sort -c` on unsorted input quits at the second line, so
