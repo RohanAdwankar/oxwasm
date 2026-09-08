@@ -57,6 +57,7 @@ node atomictest.mjs
 node fcmptest.mjs
 node cmppstest.mjs
 node cvtpdtest.mjs
+node fuzzaot.mjs 200 1
 node bsrtest.mjs
 node narrowtest.mjs
 node implicittest.mjs
