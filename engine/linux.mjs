@@ -262,12 +262,21 @@ export class LinuxEngine {
     if (n >= this.aotCallThreshold && n >= (this._sizeDefer?.get(k) ?? 0)) { this._gateCalls = true; try { this.tierUpAot(t); } finally { this._gateCalls = false; } }
   }
 
+  // Why a translation was refused, kept so the diagnostic is self-sufficient:
+  // grep's `unmodeled flag producer imul3` only existed because I attached a
+  // hook by hand, and the reason is what turns "some function is slow" into a
+  // one-instruction fix.
+  noteAotFail(entry, why) {
+    (this._aotWhy ??= new Map()).set(entry, why);
+    if (this.onAotFail) this.onAotFail(entry, why);
+  }
+
   // Functions whose translation was refused and which then ran anyway, worst
   // first. `min` filters the ones nobody would notice: a stub called twice is
   // not a performance defect, a matcher called 47,875 times is.
   hotFailures(min = 1000) {
     const out = [];
-    for (const a of this.aotFailed) { const n = this.aotCalls.get(a) || 0; if (n >= min) out.push({ addr: a, calls: n }); }
+    for (const a of this.aotFailed) { const n = this.aotCalls.get(a) || 0; if (n >= min) out.push({ addr: a, calls: n, why: this._aotWhy?.get(a) || 'no reason recorded' }); }
     return out.sort((x, y) => y.calls - x.calls);
   }
 
@@ -511,7 +520,7 @@ export class LinuxEngine {
         };
         if (!this.asyncCompile && typeof process !== 'undefined') {
           try { registerAll(new WebAssembly.Instance(new WebAssembly.Module(bytes), this.aotImports())); }
-          catch (e) { this.aotFailed.add(k); if (this.onAotFail) this.onAotFail(entry, e.message); }
+          catch (e) { this.aotFailed.add(k); this.noteAotFail(entry, e.message); }
           return;
         }
         this.aotFns.set(k, null); this._entryAdd(k);   // placeholder: profiling stops re-triggering
@@ -526,10 +535,10 @@ export class LinuxEngine {
             this.stats.tiers.aot = (this.stats.tiers.aot || 0) + 1;
           })
           .catch((e) => { this.aotFns.delete(k); this.aotFailed.add(k);
-                          if (this.onAotFail) this.onAotFail(entry, e.message); });
+                          this.noteAotFail(entry, e.message); });
         return;
       }
-      if (this.cacheOnly) { this.aotFailed.add(k); return; }   // no assembler here: skip translation too
+      if (this.cacheOnly) { this.aotFailed.add(k); this.noteAotFail(entry, 'cacheOnly: no assembler in this host'); return; }
     }
     // Deferral must be CHEAP: once a hot entry crosses the profile threshold,
     // every subsequent call re-enters here until something registers. With the
@@ -546,7 +555,7 @@ export class LinuxEngine {
       // of the resulting mixed-allocator pointers (leafpad, via dlerror's
       // check_free).
       const gotAddr = this.trampolineGotAddr(entry);
-      if (gotAddr === null) { this.aotFailed.add(k); return; }
+      if (gotAddr === null) { this.aotFailed.add(k); this.noteAotFail(entry, 'trampoline with no static GOT address'); return; }
       const tgt0 = this.trampolineTarget(entry);
       if (tgt0 !== null) this.profileTarget(tgt0);   // push the real callee toward tiering
       // Preferred form: a WASM stub (see pltStubWat) that reads the GOT slot
@@ -599,7 +608,7 @@ export class LinuxEngine {
     // pump and deferred entries re-trigger on their next call
     const t0c = (this.tierMsMax !== undefined) ? performance.now() : 0;
     const un = (this._unitN = (this._unitN || 0) + 1);   // bisect aid: veto unit N -> stays interpreted
-    if (this.unitFilter && !this.unitFilter(un, entry)) { this.aotFailed.add(k); return; }
+    if (this.unitFilter && !this.unitFilter(un, entry)) { this.aotFailed.add(k); this.noteAotFail(entry, 'vetoed by unitFilter (bisect)'); return; }
     try {
       const unit = compileUnitWat(this.mem, entry, { guestBase: this.base, ramBase: this.RAMOFF,
         // prune the closure at functions already in the dispatch map: calls
@@ -663,7 +672,7 @@ export class LinuxEngine {
           })
           .then(({ instance }) => this.finishAotUnit(unit, instance))
           .catch((e) => { this.aotFns.delete(k); this.aotFailed.add(k);
-                          if (this.onAotFail) this.onAotFail(entry, e.message); });
+                          this.noteAotFail(entry, e.message); });
         return;
       }
       // Deferred assembly (node): hand the text to the broker and keep
@@ -682,14 +691,14 @@ export class LinuxEngine {
           for (const a of unit.funcs) this._pendingFns.delete(a.toString());
           this._inflight.delete(unit);
           if (unit.cancelled) return;                    // its code was recycled while it assembled
-          if (err) { this.aotFns.delete(k); this.aotFailed.add(k); if (this.onAotFail) this.onAotFail(entry, err.message); return; }
+          if (err) { this.aotFns.delete(k); this.aotFailed.add(k); this.noteAotFail(entry, err.message); return; }
           try {
             if (this.onUnitBytes) this.onUnitBytes(k, bytes);
             const inst = new WebAssembly.Instance(new WebAssembly.Module(bytes), this.aotImports());
             this.aotFns.delete(k);                       // the placeholder; finishAotUnit registers the real export
             this.finishAotUnit(unit, inst);
             if (!this.aotFns.has(k)) throw new Error('entry missing from unit');
-          } catch (e) { if (globalThis.__asmTrace) console.error(e.stack); this.aotFns.delete(k); this.aotFailed.add(k); if (this.onAotFail) this.onAotFail(entry, e.message); }
+          } catch (e) { if (globalThis.__asmTrace) console.error(e.stack); this.aotFns.delete(k); this.aotFailed.add(k); this.noteAotFail(entry, e.message); }
         });
         return;
       }
@@ -706,7 +715,7 @@ export class LinuxEngine {
         WebAssembly.instantiate(bytes, this.aotImports())
           .then(({ instance }) => this.finishAotUnit(unit, instance))
           .catch((e) => { this.aotFns.delete(k); this.aotFailed.add(k);
-                          if (this.onAotFail) this.onAotFail(entry, e.message); });
+                          this.noteAotFail(entry, e.message); });
         return;
       }
       const inst = new WebAssembly.Instance(new WebAssembly.Module(bytes), this.aotImports());
@@ -720,7 +729,7 @@ export class LinuxEngine {
     } catch (e) { if (e.deferred) { this.stats.sizeDeferred = (this.stats.sizeDeferred || 0) + 1; return; }   // size gate: not a failure, re-tiers at the count it named
       if (globalThis.__asmTrace) console.error(e.stack);
       this.aotFailed.add(k);
-      if (this.onAotFail) this.onAotFail(entry, e.message);
+      this.noteAotFail(entry, e.message);
     } finally { if (t0c) this.tierMs += performance.now() - t0c; }
   }
 
@@ -785,7 +794,7 @@ export class LinuxEngine {
           this._entryDeopts.set(entry, n);
           if (n >= 32 && this.aotFns.has(entry)) {
             this.aotFns.delete(entry); this.aotFailed.add(entry);
-            if (this.onAotFail) this.onAotFail(entry, 'entry-deopt churn (blacklisted)');
+            this.noteAotFail(entry, 'entry-deopt churn (blacklisted)');
           }
         }
         return BigInt.asUintN(64, e.rip); }
