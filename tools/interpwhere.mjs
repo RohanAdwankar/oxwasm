@@ -82,8 +82,12 @@ globalThis.__ihist = new Map();
 // binary and in ld.so is attributed to "anonymous", which is the one bucket
 // this tool exists to distinguish, so the first version of it reported gzip
 // as 88% generated code.
+// A STATIC binary has no interpreter and aux.base is 0, which made every
+// range compare >= it: busybox came out as "100% dynamic linker" when it does
+// not have one.
+const LDBASE = eng.aux?.base > 0n ? eng.aux.base : null;
 const IMAGES = (eng.execRangesStatic ?? []).map(([lo, hi]) =>
-  [lo, hi, lo >= (eng.aux?.base ?? (1n << 63n)) ? 'ld.so (dynamic linker)' : bin]);
+  [lo, hi, LDBASE !== null && lo >= LDBASE ? 'ld.so (dynamic linker)' : bin]);
 const where = (rip) => {
   for (const m of eng.maps ?? []) if (rip >= m.at && rip < m.at + BigInt(m.len)) return m.path;
   for (const [lo, hi, name] of IMAGES) if (rip >= lo && rip < hi) return name;
@@ -110,9 +114,12 @@ const total = eng.stats.interpreted || 0;
 console.log(`\n${bin} ${args.join(' ')}${err ? '  [' + err + ']' : ''}  exit=${eng.exitCode}`);
 console.log(`interpreted ${total} instructions, ${sampled} sampled (1 in ${EVERY}), aot dispatches ${eng.stats.aotRuns ?? 0}`);
 
+// Counts are the SHARE of the real total, not sample*64: the two differ by a
+// few percent and printing a number larger than the total the same report
+// prints invites the reader to distrust both.
 console.log('\nwhere the interpreted instructions are:');
 for (const [k, v] of [...byMap].sort((a, b) => b[1] - a[1]).slice(0, 12))
-  console.log(`  ${(100 * v / Math.max(1, sampled)).toFixed(1).padStart(5)}%  ${Math.round(v * EVERY).toString().padStart(11)}  ${k}`);
+  console.log(`  ${(100 * v / Math.max(1, sampled)).toFixed(1).padStart(5)}%  ${Math.round(total * v / Math.max(1, sampled)).toString().padStart(11)}  ${k}`);
 
 // The addresses themselves, so a bucket can be turned into a function. A rip
 // that the engine offered to the translator and refused prints the reason;
@@ -122,7 +129,7 @@ console.log('\nhottest interpreted addresses:');
 const why = eng._aotWhy ?? new Map();
 for (const [rip, v] of [...byRip].sort((a, b) => b[1] - a[1]).slice(0, 15)) {
   const w = why.get(rip);
-  console.log(`  ${Math.round(v * EVERY).toString().padStart(10)}  0x${rip.toString(16).padStart(12)}  ${where(rip).split('/').pop()}` +
+  console.log(`  ${Math.round(total * v / Math.max(1, sampled)).toString().padStart(10)}  0x${rip.toString(16).padStart(12)}  ${where(rip).split('/').pop()}` +
               (w ? `  REFUSED: ${w}` : ''));
 }
 const hot = eng.hotFailures ? eng.hotFailures(1000) : [];
