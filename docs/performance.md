@@ -332,7 +332,7 @@ sha256sum over 41.4 MB against 138 kB, five paired runs each, medians:
 |---|---|---|
 | native amd64 | 33.9 ms | 1x |
 | **oxwasm M3 page** | **265 +- 83 ms** | **7.8x** |
-| v86 (this project's M1 engine) | 7,326 +- 396 ms | 232x |
+| v86 (this project's M1 engine) | 7,326 +- 396 ms | 216x |
 
 **oxwasm is 28x faster than v86 on this workload** (19.9-42.4x at one standard
 error). Both run in headless Chromium on the same machine; both produce the
