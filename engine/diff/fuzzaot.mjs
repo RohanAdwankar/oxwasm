@@ -111,7 +111,15 @@ function program(id) {
       case 18: L.push(rnd(3) ? `${pick(SSE_FLT)} ${pick(XR)}, ${pick(XR)}`
                              : `${pick(SSE_FLT)} ${pick(XR)}, [r12+${rnd(SPAN - 16)}]`); break;
       case 19: L.push(`pshufd ${pick(XR)}, ${pick(XR)}, ${rnd(256)}`); break;
-      case 20: L.push(`${pick(['psllw','pslld','psllq','psrlw','psrld','psrlq','psraw','psrad'])} ${pick(XR)}, ${rnd(20)}`); break;
+      // packed shifts, by an immediate and by an OPERAND. The second form has
+      // its own rule - the count is the whole low quadword and a count at or
+      // past the lane width wipes the register, where wasm would take it
+      // modulo the width - and the vector registers are seeded from buffer
+      // bytes, so the counts these produce are mostly enormous, which is the
+      // half of the rule an immediate can never reach.
+      case 20: { const sh = pick(['psllw','pslld','psllq','psrlw','psrld','psrlq','psraw','psrad']);
+        L.push(rnd(2) ? `${sh} ${pick(XR)}, ${rnd(20)}`
+                      : `${sh} ${pick(XR)}, ${rnd(2) ? pick(XR) : `[r12+${rnd(SPAN - 16)}]`}`); break; }
       case 21: L.push(`movdqu [r12+${rnd(SPAN - 16)}], ${pick(XR)}`); break;
       case 22: L.push(`${pick(SSE_WIDE)} ${pick(XR)}, ${pick(XR)}`); break;
       case 23: L.push(`${pick(['pshuflw','pshufhw'])} ${pick(XR)}, ${pick(XR)}, ${rnd(256)}`); break;
