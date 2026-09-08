@@ -72,7 +72,7 @@ function program(id) {
   let lab = 0;
   const n = 10 + rnd(14);
   for (let i = 0; i < n; i++) {
-    switch (rnd(25)) {
+    switch (rnd(30)) {
       case 0: L.push(`mov ${pick(R64)}, ${(rnd(2) ? -1 : 1) * rnd(0x7fffffff)}`); break;
       case 1: L.push(`${pick(['add','sub','and','or','xor','cmp','test'])} ${pick(R64)}, ${pick(R64)}`); break;
       case 2: L.push(`${pick(['add','sub','and','or','xor','cmp'])} ${pick(R32)}, ${pick(R32)}`); break;
@@ -121,6 +121,40 @@ function program(id) {
                             `pmovmskb ${pick(R32)}, ${pick(XR)}`,
                             `pinsrw ${pick(XR)}, ${pick(R32)}, ${rnd(8)}`,
                             `pextrw ${pick(R32)}, ${pick(XR)}, ${rnd(8)}`])); break;
+      // Addressing beyond [base+disp]: an index register, a scale, and a
+      // negative displacement, which is a different path through wasmAddr
+      // than anything above generated.
+      case 25: { const sc = pick([1,2,4,8]), d = rnd(64);
+        L.push(`mov rbx, ${rnd(16)}`, rnd(2) ? `mov ${pick(R64)}, [r12+rbx*${sc}+${d}]`
+                                            : `mov [r12+rbx*${sc}+${d}], ${pick(R64)}`); break; }
+      // narrow memory traffic: byte and word loads and stores, where the
+      // emitter's masking is separate code from the 32/64-bit forms
+      case 26: L.push(pick([`mov ${pick(R8)}, [r12+${rnd(SPAN-1)}]`, `mov [r12+${rnd(SPAN-1)}], ${pick(R8)}`,
+                            `mov ${pick(R32)}, [r12+${rnd(SPAN-4)}]`, `mov [r12+${rnd(SPAN-4)}], ${pick(R32)}`,
+                            `movzx ${pick(R64)}, word [r12+${rnd(SPAN-2)}]`,
+                            `movsx ${pick(R64)}, word [r12+${rnd(SPAN-2)}]`,
+                            `movsxd ${pick(R64)}, dword [r12+${rnd(SPAN-4)}]`])); break;
+      // bit tests, double-precision shifts, byte swaps and exchanges
+      case 27: L.push(pick([`bt ${pick(R64)}, ${rnd(64)}`, `bts ${pick(R64)}, ${rnd(64)}`,
+                            `btr ${pick(R64)}, ${rnd(64)}`, `btc ${pick(R64)}, ${rnd(64)}`,
+                            `bswap ${pick(R64)}`, `bswap ${pick(R32)}`,
+                            `xchg ${pick(R64)}, ${pick(R64)}`,
+                            `shld ${pick(R64)}, ${pick(R64)}, ${rnd(63)+1}`,
+                            `shrd ${pick(R64)}, ${pick(R64)}, ${rnd(63)+1}`,
+                            `bsf ${pick(R64)}, ${pick(R64)}`, `bsr ${pick(R64)}, ${pick(R64)}`,
+                            `popcnt ${pick(R64)}, ${pick(R64)}`, `tzcnt ${pick(R64)}, ${pick(R64)}`,
+                            `lzcnt ${pick(R64)}, ${pick(R64)}`])); break;
+      // the widening multiply and the sign-extension pair. div is left out:
+      // a random divisor faults more often than it computes, and a fault is
+      // the interpreter's answer rather than a comparison.
+      case 28: L.push(pick([`imul ${pick(R64)}`, `mul ${pick(R64)}`, `cqo`, `cdq`, `cwde`, `cdqe`,
+                            `imul ${pick(R64)}, ${pick(R64)}, ${(rnd(2)?-1:1)*rnd(4096)}`])); break;
+      // read-modify-write to memory, and the atomics
+      case 29: L.push(pick([`${pick(['add','sub','and','or','xor'])} [r12+${rnd(SPAN-8)}], ${pick(R64)}`,
+                            `${pick(['add','sub','and','or','xor'])} ${pick(R64)}, [r12+${rnd(SPAN-8)}]`,
+                            `inc qword [r12+${rnd(SPAN-8)}]`, `dec qword [r12+${rnd(SPAN-8)}]`,
+                            `xadd [r12+${rnd(SPAN-8)}], ${pick(R64)}`,
+                            `lock xadd [r12+${rnd(SPAN-8)}], ${pick(R64)}`])); break;
       case 15: { const off = rnd(SPAN - 96), d = rnd(33) - 16;
         L.push(`lea rsi, [r12+${off}]`, `lea rdi, [r12+${Math.max(0, off + d)}]`, `mov rcx, ${rnd(12)}`,
                `cld`, pick(['rep movsb', 'rep stosb', 'rep movsq', 'repe cmpsb', 'repne scasb'])); break; }
