@@ -167,24 +167,45 @@ if (train) {
   };
   const tfiles = {}, tmtimes = {};
   for (const [g, h] of Object.entries(files)) { tfiles[g] = new Uint8Array(readFileSync(h)); tmtimes[g] = Math.floor(statSync(h).mtimeMs / 1000); }
+  // Training has to ITERATE, because the manifest changes what it is training
+  // for. A run with units already registered interprets less, so its loop
+  // back-edge counters reach the tier-up threshold at different places, and it
+  // asks for entries the previous round never saw. One round left 23 of the
+  // page's 106 units still being translated in the browser. Feed each round's
+  // manifest into the next and stop when a round adds nothing: that fixed
+  // point is the set the page will actually ask for.
   const cap = new Map();
-  const eng = new LinuxEngine(new Uint8Array(readFileSync(elfPath)),
-    { argv, env, files: tfiles, mtimes: tmtimes, memMB: 512, assembleWat: trainAsm });
-  eng.onUnitBytes = (k, b) => { if (!cap.has(k)) cap.set(k, Buffer.from(b)); };
   const t0 = Date.now();
-  while (eng.exitCode === null && Date.now() - t0 < 600000) { eng.run(5e7); if (eng.blocked) eng.wake(); }
+  let round = 0, lastExit = null;
+  for (; round < 5; round++) {
+    const before = cap.size;
+    const eng = new LinuxEngine(new Uint8Array(readFileSync(elfPath)),
+      { argv, env, files: tfiles, mtimes: tmtimes, memMB: 512, assembleWat: trainAsm });
+    eng.unitBytes = (k) => cap.get(k);
+    eng.onUnitBytes = (k, b) => { if (!cap.has(k)) cap.set(k, Buffer.from(b)); };
+    const r0 = Date.now();
+    // 3e6 is the PAGE's slice, not a round number: slice boundaries move the
+    // preemption and pump points, which move which loop heads reach their
+    // back-edge threshold, which changes the unit set. Training at 5e7 reached
+    // a fixed point in one round here and still left the page translating 23
+    // units, because it was a fixed point of a different schedule.
+    while (eng.exitCode === null && Date.now() - r0 < 600000) { eng.run(3e6); if (eng.blocked) eng.wake(); }
+    lastExit = eng.exitCode;
+    console.log(`m3pack: training round ${round + 1}: ${cap.size - before} new units (${cap.size} total), exit ${eng.exitCode}`);
+    if (cap.size === before) break;
+  }
   // A training run that did not finish the program is not a reason to fail the
   // pack - the page still works - but it IS a reason to say so, because a
   // half-covered manifest looks like a working one.
-  if (eng.exitCode !== 0)
-    console.log(`m3pack: WARNING training run exited ${eng.exitCode}; the manifest covers only what ran before that`);
+  if (lastExit !== 0)
+    console.log(`m3pack: WARNING training run exited ${lastExit}; the manifest covers only what ran before that`);
   // one blob rather than per-unit base64: entry u64le, length u32le, bytes
   let total = 0; for (const v of cap.values()) total += 12 + v.length;
   const blob = Buffer.alloc(total); let o = 0;
   for (const [k, v] of cap) { blob.writeBigUInt64LE(BigInt(k), o); blob.writeUInt32LE(v.length, o + 8); v.copy(blob, o + 12); o += 12 + v.length; }
   manifestB64 = gzb64(blob);
-  console.log(`m3pack: trained ${cap.size} units, ${(blob.length / 1e6).toFixed(2)} MB wasm -> ` +
-              `${(manifestB64.length / 1e6).toFixed(2)} MB base64 in the page (exit ${eng.exitCode}, ${((Date.now() - t0) / 1000).toFixed(0)}s)`);
+  console.log(`m3pack: trained ${cap.size} units over ${round + 1} rounds, ${(blob.length / 1e6).toFixed(2)} MB wasm -> ` +
+              `${(manifestB64.length / 1e6).toFixed(2)} MB base64 in the page (${((Date.now() - t0) / 1000).toFixed(0)}s)`);
 }
 
 const html = `<!doctype html>

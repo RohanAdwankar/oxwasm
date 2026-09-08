@@ -474,10 +474,29 @@ identical (`e75d8b475e0554e1`). The page grows 5.80 MB to 6.13 MB - 116 units,
 1.89 MB of wasm, 0.33 MB once gzipped and base64'd.
 
 Two things this does NOT do. It does not help the steady state, which is
-already compiled code either way. And 23 units still translate in the page:
-the training run and the page do not tier up on identical schedules, so
-coverage is 83 of 106 rather than all of it. The remainder is the next thing
-to look at, not a rounding error.
+already compiled code either way. And the page still translates 23 units,
+which is an open gap rather than a rounding error.
+
+**What the gap is, and what it is not.** The page asks the manifest for **163
+distinct entries**; 116 hit and **47 miss**. All 116 training units are in the
+page's set, so the page is not asking for different code - it is asking for
+MORE, and the extra 47 sit in the dynamic linker and the mmapped libraries.
+
+Training now iterates, because the manifest changes what it is training for: a
+run with units registered interprets less, so its loop back-edge counters
+reach the tier-up threshold in different places and it wants entries the
+previous round never saw. Rounds continue until one adds nothing. On this
+binary it converges after a single round - and the page still misses 47, so
+iteration was not the cause.
+
+Ruled out, each by measurement rather than argument: the load addresses (both
+put ld.so at 140c000-1436195, and the 116 hits prove the bases agree), the
+slice size (the training runs the page's 3e6 chunks; 5e7 gave the same 116),
+the tier-up budget (`tierMsMax` is unset in the page), and the depth-refused
+units (the page's 12 "too deep to assemble" are a consequence of the misses,
+not their cause - they are units it had to attempt because the manifest did
+not carry them). Why a browser run tiers up 47 entries a node run does not is
+not yet known, and the honest state is that it is open.
 
 **The manifest is a correctness surface, so it carries a fingerprint.** Handed
 units trained against a different binary the engine registers code whose
