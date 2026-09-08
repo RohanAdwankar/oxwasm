@@ -39,14 +39,22 @@ const median = (a) => a.slice().sort((x, y) => x - y)[a.length >> 1];
 // Native side: plant the input at the guest path so argv matches, time the
 // run, remove it. A guest path that already exists on the host is refused
 // rather than clobbered.
+//
+// stdout is CAPTURED, not sent to /dev/null, because discarding it changes
+// what the program does: GNU grep short-circuits when its output goes nowhere,
+// and `grep -c` over 41 MB measured 2.2 ms discarded against 34 ms captured.
+// The page collects the guest's stdout, so the native side has to produce it
+// too or the two are not doing the same work.
 const nativeOnce = (input) => {
   if (existsSync(GUEST_IN)) { console.log(`refusing: ${GUEST_IN} already exists on the host`); process.exit(1); }
   mkdirSync(dirname(GUEST_IN), { recursive: true }); copyFileSync(input, GUEST_IN);
   const t0 = process.hrtime.bigint();
-  try { execFileSync(bin, args.map(a => a.replace('{IN}', GUEST_IN)), { stdio: ['ignore', 'ignore', 'ignore'], maxBuffer: 1 << 28 }); } catch {}
+  let code = 0, bytes = 0;
+  try { bytes = execFileSync(bin, args.map(a => a.replace('{IN}', GUEST_IN)), { stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 1 << 28 }).length; }
+  catch (e) { code = e.status ?? -1; bytes = (e.stdout ?? '').length; }
   const ms = Number(process.hrtime.bigint() - t0) / 1e6;
   try { unlinkSync(GUEST_IN); } catch {}
-  return ms;
+  return { ms, code, bytes };
 };
 
 // Browser side: pack once per input size (the input is inlined in the page),
@@ -82,7 +90,15 @@ try {
   for (const which of ['small', 'big']) {
     const page = [], nat = [];
     const input = which === 'big' ? BIG : SMALL;
-    for (let i = 0; i < REPS; i++) { page.push(await pageOnce(pages[which])); nat.push(nativeOnce(input)); }
+    let natCode = 0, natBytes = 0;
+    for (let i = 0; i < REPS; i++) {
+      page.push(await pageOnce(pages[which]));
+      const r = nativeOnce(input); nat.push(r.ms); natCode = r.code; natBytes = r.bytes;
+    }
+    // A program that exits nonzero has usually stopped early and timed nothing
+    // worth comparing: `sort -c` on unsorted input quits at the second line, so
+    // both sizes read the same few milliseconds of process spawn.
+    if (natCode !== 0) { console.log(`  ${which}: native exited ${natCode} — it did not run to completion, so there is nothing to time`); stop(1); }
     // standard error, not max-minus-min: the range is a biased noise estimate
     // that grows with the number of samples, so more reps would make a good
     // measurement look worse. The error on a median of n falls as sqrt(n),
