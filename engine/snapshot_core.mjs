@@ -194,6 +194,15 @@ export function restoreEngineCore(eng, xs, assets, CPUctor, inflate) {
       continue;
     }
   }
+  // Re-attach each mapping's file handle now the fd table exists. Prefer the
+  // live descriptor for the same path, so `m.h === h` identity checks (msync
+  // on a MAP_SHARED view) still hold; otherwise a handle over the engine's own
+  // copy of the file, which is what _writeBackMap reads and writes anyway.
+  for (const m of eng.maps ?? []) {
+    let h = null;
+    for (const fh of eng.fds.values()) if (fh.path === m.path && fh.bytes !== undefined) { h = fh; break; }
+    m.h = h ?? { path: m.path, bytes: eng.files[m.path] };
+  }
   eng.stats.interpreted = state.stats.interpreted;
   eng.stats.aotRuns = state.stats.aotRuns ?? 0;
   return pending ? pending.then(() => state) : state;

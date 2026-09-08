@@ -107,7 +107,15 @@ export function snapshotEngine(eng, xs, path) {
   const state = {
     v: 1, now,
     base: eng.base, brk: eng.brk, mmapNext: eng.mmapNext, _mmapBase: eng._mmapBase, stackTop: eng.stackTop,
-    execRanges: eng.execRanges, execRangesStatic: eng.execRangesStatic ?? null, maps: eng.maps ?? [],
+    execRanges: eng.execRanges, execRangesStatic: eng.execRangesStatic ?? null,
+    // maps WITHOUT their file handle. `h` is the open-file object and it holds
+    // the whole file's bytes, which JSON.stringify turns into an index-keyed
+    // object: eight mappings of libc and libcrypto serialized to 382 MB
+    // against 3.4 MB for the entire guest memory beside them. The bytes are
+    // already in the memory image, and restore re-attaches a live handle by
+    // path - which also fixes what came back before, a plain object whose
+    // `bytes` was not a typed array at all.
+    maps: (eng.maps ?? []).map(({ at, len, path, fileOff, shared }) => ({ at, len, path, fileOff, shared })),
     ti: eng.ti, nextTid: eng.nextTid,
     blocked: eng.blocked, _deadline: eng._deadline,
     _futexAddr: eng._futexAddr ?? null,
