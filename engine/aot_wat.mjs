@@ -39,6 +39,7 @@ export const FTHBYTES = FTSLOTS * 16;
 // registered entries, capped to keep the load factor (here 61%) low enough
 // that linear probing stays short
 export const FTMAP_MAX = 20000;
+export const MXCSR_SLOT = 144;   // regfile slot: the SSE control word, kept inert (see the stmxcsr/ldmxcsr emit)
 export const EFLAGS_SLOT = 136;   // regfile slot: EFLAGS handed to the interpreter at an escape (bit 63 = valid; syncIn applies and clears it)
 export const FNPROF_BASE = 0x20000, FNPROF_SLOTS = 1 << 14;   // OXWASM_FNPROF counters: 16384 x i64, in the dead space below FTHASH
 export const fnprofSlot = (a) => FNPROF_BASE + ((Number((BigInt(a) >> 4n) & 0x3fffn)) * 8);
@@ -423,7 +424,7 @@ export function analyze(mem, entry, { maxInsns = 20000, noJtab = false, entries 
     //    CPU state, which syncOut/syncIn do not touch, so escaping at every
     //    x87 instruction keeps that state exact while the integer/SSE parts
     //    of the same function still compile (strtod, printf float paths).
-    if (['hlt','ud2','int3','int','cpuid','fxsave','fxrstor','stmxcsr','ldmxcsr','x87','rcl','rcr','emms','pushf','popf'].includes(insn.mnem)) {   // rcl/rcr: rare, interpreter-only
+    if (['hlt','ud2','int3','int','cpuid','fxsave','fxrstor','x87','rcl','rcr','emms','pushf','popf'].includes(insn.mnem)) {   // rcl/rcr: rare, interpreter-only
       insnAt.set(key, { mnem: 'udec', rip, next: rip + BigInt(insn.len), len: insn.len });
       continue;
     }
@@ -2883,6 +2884,15 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           else
             L.push(wr(insn.dst,8,`(i64.load ${wasmAddr({base:4,index:-1,disp:0n},next)})`,next),`(local.set $r4 (i64.add (local.get $r4) (i64.const 8)))`);
           break; }
+        // MXCSR is inert in this engine: the interpreter stores and loads it
+        // and no arithmetic anywhere consults it, so translating the round
+        // trip is exactly interpreter-equivalent and not an approximation.
+        // Deopting instead cost more than it looks: a unit whose ENTRY is a
+        // deopt is refused outright, and glibc's libm opens several math
+        // functions with `stmxcsr`, so one of them ran 31,307 times
+        // interpreted in the ffprobe case while the sweep called it exact.
+        case 'stmxcsr': L.push(wr(insn.dst, 4, `(i64.extend_i32_u (i32.load (i32.const ${MXCSR_SLOT})))`, next)); break;
+        case 'ldmxcsr': L.push(`(i32.store (i32.const ${MXCSR_SLOT}) (i32.wrap_i64 ${rd(insn.dst, 4, next)}))`); break;
         case 'sse':          emitSSE(insn, next, L, setFlags); break;
         case 'ssegrpshift':  emitSSEShift(insn, L); break;
         case 'jmp': case 'jcc': case 'ret': case 'retn': case 'jmpind': case 'udec': break;  // terminator handled below

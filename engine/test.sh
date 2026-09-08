@@ -35,6 +35,7 @@ node leatest.mjs
 node mulbtftest.mjs
 node flagkindtest.mjs
 node shiftoftest.mjs
+node mxcsrtest.mjs
 node hintnoptest.mjs
 node entryflagtest.mjs
 node addflagtest.mjs
