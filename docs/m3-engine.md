@@ -5944,3 +5944,61 @@ where the engine keeps its chain-depth and fuel counters. The unit incremented
 its own counter and the test read that as a memory mismatch. Moving the buffer
 above FTMAP collapsed the failures to precisely the twelve forward overlaps,
 and it was that collapse, not the redness, that made the diagnosis believable.
+
+### Batch 31: the flags a unit hands back, and pushf
+
+`eflagsStore` builds the word a unit leaves in `EFLAGS_SLOT` when it escapes,
+and `syncIn` assigns cpu.f from it. The word carried CF, ZF, SF and OF. PF and
+AF were not in it - and syncIn assigns all six unconditionally, so omitting
+them did not leave them alone. It forced them to zero. The interpreter then ran
+`pushf`, `jp` or `lahf` on a flag the unit had silently cleared.
+
+**Nothing in the suite could see this, and the reason is structural.** Every
+bare-unit differential instantiates a module whose `deopt` import throws, so
+none of them ever escapes - the escape path has no coverage by construction.
+The interpreter on its own has always had PF and AF right, so a fully
+interpreted run agrees with hardware whatever the handover does. Only a real
+guest, tiered hot enough that the function actually compiles and then escaping
+on each iteration, can tell the two apart.
+
+`diff/eflagstest.mjs` builds one: a static `-nostdlib` binary whose hot
+functions are `cmp`/`and`/`add`/`shl` followed by `pushf`, folded into a digest
+over 300,000 iterations. It runs under the engine and natively on the host, so
+hardware is the oracle rather than the interpreter.
+
+**Before: `14b210de735b7cc2`. Hardware: `e7a9965b29c40c56`.** After the fix,
+exact. PF is the parity of the result's low byte, which is what the
+interpreter's `szp()` computes; AF is a carry across bit 3 for add and sub and
+zero for logic. After a shift or bsf/bsr the architecture leaves AF undefined
+and the interpreter leaves it stale, which the lazy model cannot reproduce, so
+it stays zero there and the shift probe masks it off rather than claiming an
+answer.
+
+**Then pushf itself.** It was on the deopt list because the word could not be
+built. With PF and AF in the model, DF in `DF_SLOT`, and a new `ESTICKY_SLOT`
+for the AC/ID bits a `popf` stored, it can be - so it comes off the list. The
+cost was never the instruction: repscan's `repnz scas; pushf` escaped on every
+call and ran the rest of that function interpreted from the pushf on, and the
+resume point appeared in the sweep as an `entry undecodable` hot refusal, since
+a unit whose first instruction is a deopt has nothing to compile. Both gone.
+Where the incoming kind is not one `eflagsStore` can build, pushf still deopts.
+
+**A near-miss.** Taking pushf off the deopt list orphaned its registration as a
+flag consumer. It always was one, but only by accident: as a deopt it ended its
+block, and the deopt TERMINATOR was what the analysis registered. The first
+build read `$fa`/`$fb`/`$fr` that no producer had written - the exact shape of
+the batch 29 javac miscompile. This time a test caught it on the first run.
+
+**Two instrument failures, both in the same test, both of the kind that pass.**
+The first version gated on `aotRuns`, read zero, and reported "nothing tiered"
+while the mismatch it was written to find sat one line below, unevaluated -
+these probes run one instruction and escape, so they never complete an AOT run.
+Then, once pushf compiled inline, the probes went to zero deopts and the test
+would have stopped covering the handover entirely while still printing green;
+it now carries a separate `cmp; cpuid; pushf` escape probe, cpuid being a deopt
+that does not touch flags.
+
+Every component is checked by mutation rather than assumed: neutering PF, AF,
+DF or the sticky bit each changes the digest on its own. Before the DF and ID
+probes existed the emitter could have hardcoded both bits to zero and every
+digest would still have matched.
