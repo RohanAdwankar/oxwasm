@@ -1,0 +1,170 @@
+// Random programs, translated and interpreted, compared.
+//
+// Every AOT test in this suite is DIRECTED: someone thought of an instruction
+// and wrote a case for it. `cases.mjs` fuzzes too, but it compares the
+// interpreter against hardware - it validates the oracle, not the translator.
+// Nothing generated random programs and asked whether the two engines agree.
+//
+// Both correctness bugs this session found live in that gap. Overlapping
+// `rep movsb` was wrong for a year because no test copied overlapping ranges;
+// the dropped PF and AF at an escape were wrong because no bare-unit test ever
+// escapes. Both were found by reading code, which does not scale.
+//
+// Flags are checked THROUGH BEHAVIOUR rather than by inspection. Comparing
+// EFLAGS directly means knowing which bits each instruction leaves undefined,
+// which is where a mask quietly hides a real difference - `cases.mjs` masks AF
+// out entirely, which is one reason the AF bug survived. Instead the generated
+// programs BRANCH on their flags, so a wrong CF or OF takes a different path
+// and lands in the registers, where an unmasked comparison sees it.
+//
+//   node fuzzaot.mjs [N] [firstSeed]
+import { compileFunctionWat } from '../aot_wat.mjs';
+import { CPU, Memory } from '../interp.mjs';
+import { execFileSync } from 'node:child_process';
+import { readFileSync, writeFileSync } from 'node:fs';
+
+const N = Number(process.argv[2] || 300);
+const SEED0 = Number(process.argv[3] || 1);
+const CODE = 0x400000n, BUF = 0x420000n, SENT = 0xdeadbee0n, SPAN = 512;
+
+let seed = 0n;
+const rnd = (n) => { seed ^= (seed << 13n) & 0xFFFFFFFFn; seed ^= seed >> 17n;
+                     seed ^= (seed << 5n) & 0xFFFFFFFFn; return Number(seed % BigInt(n)); };
+const pick = (a) => a[rnd(a.length)];
+
+// r12 holds the scratch base and is never a destination; rsp is left alone.
+// rcx/rsi/rdi are used by the string ops, so they are written before each one.
+const R64 = ['rax', 'rbx', 'rdx', 'rsi', 'rdi', 'r8', 'r9', 'r10', 'r11', 'r13', 'r14', 'r15'];
+const R32 = ['eax', 'ebx', 'edx', 'esi', 'edi', 'r8d', 'r9d', 'r10d', 'r11d', 'r13d'];
+const R8 = ['al', 'bl', 'dl', 'sil', 'dil', 'r8b', 'r9b', 'r10b'];
+const CC = ['e', 'ne', 'l', 'ge', 'le', 'g', 'b', 'ae', 'be', 'a', 's', 'ns', 'o', 'no'];
+
+// a flag producer the lazy model carries: sub/add/logic kinds over full or
+// narrow widths, which is the set cond() knows how to read
+const prod = () => pick([
+  () => `${pick(['add','sub','and','or','xor','cmp','test'])} ${pick(R64)}, ${pick(R64)}`,
+  () => `${pick(['add','sub','and','or','xor','cmp'])} ${pick(R32)}, ${pick(R32)}`,
+  () => `${pick(['add','sub','and','or','xor','cmp'])} ${pick(R8)}, ${pick(R8)}`,
+  () => `cmp ${pick(R64)}, ${(rnd(2) ? -1 : 1) * rnd(4096)}`,
+])();
+
+function program(id) {
+  const L = [`mov r12, 0x${BUF.toString(16)}`];
+  let lab = 0;
+  const n = 10 + rnd(14);
+  for (let i = 0; i < n; i++) {
+    switch (rnd(16)) {
+      case 0: L.push(`mov ${pick(R64)}, ${(rnd(2) ? -1 : 1) * rnd(0x7fffffff)}`); break;
+      case 1: L.push(`${pick(['add','sub','and','or','xor','cmp','test'])} ${pick(R64)}, ${pick(R64)}`); break;
+      case 2: L.push(`${pick(['add','sub','and','or','xor','cmp'])} ${pick(R32)}, ${pick(R32)}`); break;
+      case 3: L.push(`${pick(['add','sub','and','or','xor','cmp'])} ${pick(R8)}, ${pick(R8)}`); break;
+      case 4: L.push(`mov ${pick(R64)}, [r12+${rnd(SPAN - 8)}]`); break;
+      case 5: L.push(`mov [r12+${rnd(SPAN - 8)}], ${pick(R64)}`); break;
+      case 6: L.push(`lea ${pick(R64)}, [r12+${rnd(SPAN - 8)}]`); break;
+      case 7: L.push(`${pick(['movzx','movsx'])} ${pick(R64)}, byte [r12+${rnd(SPAN - 1)}]`); break;
+      case 8: L.push(`${pick(['shl','shr','sar','rol','ror'])} ${pick(R64)}, ${rnd(63) + 1}`); break;
+      case 9: L.push(`${pick(['inc','dec','neg','not'])} ${pick(R64)}`); break;
+      // Flag CONSUMERS, each preceded by a MODELLED producer in the same
+      // block. Without that, 48 of 60 generated programs were refused for
+      // "cross-block flags" - the translator declining safely, and a fuzzer
+      // that gets refused is testing nothing. The refusal path is worth
+      // exercising, but not with four fifths of the budget.
+      case 10: L.push(prod(), `${pick(['adc','sbb'])} ${pick(R64)}, ${pick(R64)}`); break;
+      case 11: L.push(prod(), `set${pick(CC)} ${pick(R8)}`); break;
+      case 12: L.push(prod(), `cmov${pick(CC)} ${pick(R64)}, ${pick(R64)}`); break;
+      // a branch on the flags: this is how a wrong flag becomes a wrong
+      // register, which an unmasked comparison can see
+      case 13: { const t = `L${id}_${lab++}`;
+        L.push(prod(), `j${pick(CC)} ${t}`, `${pick(['add','xor'])} ${pick(R64)}, ${pick(R64)}`, `${t}:`); break; }
+      // a bounded backward loop, so the CFG is not a straight line
+      case 14: { const t = `B${id}_${lab++}`;
+        L.push(`mov rcx, ${1 + rnd(6)}`, `${t}:`, `${pick(['add','xor','sub'])} ${pick(R64)}, ${pick(R64)}`,
+               `dec rcx`, `jnz ${t}`); break; }   // dec/jnz IS the producer here
+      // string ops with pointers that may OVERLAP, in either direction, which
+      // is the shape that was wrong and that nothing else generates
+      case 15: { const off = rnd(SPAN - 96), d = rnd(33) - 16;
+        L.push(`lea rsi, [r12+${off}]`, `lea rdi, [r12+${Math.max(0, off + d)}]`, `mov rcx, ${rnd(12)}`,
+               `cld`, pick(['rep movsb', 'rep stosb', 'rep movsq', 'repe cmpsb', 'repne scasb'])); break; }
+    }
+  }
+  // observe the flags one last time through defined means
+  L.push(`set${pick(CC)} r15b`);
+  return L.join('\n') + '\nret';
+}
+
+const asmOf = (body) => {
+  writeFileSync('/tmp/fz.asm', 'BITS 64\n' + body);
+  execFileSync('nasm', ['-f', 'bin', '-o', '/tmp/fz.bin', '/tmp/fz.asm']);
+  const b = readFileSync('/tmp/fz.bin'); const c = new Uint8Array(0x30000); c.set(b); return c;
+};
+const seedByte = (i) => (i * 31 + 7) & 0xFF;
+
+let pass = 0, fail = 0, refused = 0, escaped = 0;
+// Why the generator's programs get refused. A fuzzer that refuses most of what
+// it makes is testing almost nothing, and without this line that looks
+// identical to a fuzzer that is passing.
+const why = new Map();
+for (let k = 0; k < N; k++) {
+  seed = BigInt(SEED0 + k) * 2654435761n % 0xFFFFFFFFn || 1n;
+  const body = program(k);
+  let code;
+  try { code = asmOf(body); } catch { continue; }        // a shape nasm rejects is not the engine's problem
+
+  let r;
+  try { r = compileFunctionWat(new Memory([{ base: CODE, bytes: code }]), CODE, { guestBase: CODE, ramBase: 0 }); }
+  catch (e) {                                             // refusing is always allowed; answering wrongly is not
+    refused++;
+    const k = e.message.replace(/@.*/, '').replace(/0x[0-9a-f]+/gi, '').trim();
+    why.set(k, (why.get(k) || 0) + 1);
+    continue;
+  }
+  writeFileSync('/tmp/fz.wat', r.wat);
+  try { execFileSync('wat2wasm', ['--enable-tail-call', '/tmp/fz.wat', '-o', '/tmp/fz.wasm']); }
+  catch (e) { fail++; console.log(`  ASSEMBLY FAILED for case ${k}: ${String(e.message).slice(0, 120)}\n${body}\n`); continue; }
+  const mod = new WebAssembly.Module(readFileSync('/tmp/fz.wasm'));
+
+  // oracle
+  const m = new Memory([{ base: CODE, bytes: code.slice() }]);
+  for (let i = 0; i < SPAN; i++) m.write(BUF + BigInt(i), 1n, BigInt(seedByte(i)));
+  const cpu = new CPU(m);
+  for (let q = 0; q < 16; q++) cpu.regs[q] = 0x0101010101010100n + BigInt(q);
+  cpu.regs[4] = CODE + 0x1000n; m.write(cpu.regs[4], 8n, SENT); cpu.rip = CODE;
+  let g = 0, ran = true;
+  try { while (cpu.rip !== SENT) { cpu.step(); if (++g > 20000) { ran = false; break; } } }
+  catch { ran = false; }
+  if (!ran) continue;                                     // a runaway or a fault is this generator's fault
+  const wantR = []; for (let q = 0; q < 16; q++) wantR.push(BigInt.asUintN(64, cpu.regs[q]));
+  const wantM = []; for (let i = 0; i < SPAN; i++) wantM.push(Number(m.read(BUF + BigInt(i), 1n)));
+
+  // translated
+  const mem = new WebAssembly.Memory({ initial: 4096 });
+  const stub = () => { const e = new Error('escape'); e.escape = true; throw e; };
+  const inst = new WebAssembly.Instance(mod, { js: { mem, ftab: new WebAssembly.Table({ initial: 0, element: 'anyfunc' }) },
+                                               env: { syscall: stub, callout: stub, deopt: stub, loophot: stub } });
+  const rv = new BigInt64Array(mem.buffer, 0, 16), dv = new DataView(mem.buffer), u8 = new Uint8Array(mem.buffer);
+  u8.set(code, 0);
+  const bufOff = Number(BUF - CODE);
+  for (let i = 0; i < SPAN; i++) u8[bufOff + i] = seedByte(i);
+  for (let q = 0; q < 16; q++) rv[q] = BigInt.asIntN(64, 0x0101010101010100n + BigInt(q));
+  rv[4] = BigInt.asIntN(64, CODE + 0x1000n);
+  dv.setBigUint64(0x1000, SENT, true);
+  try { inst.exports[r.entryName](); }
+  catch (e) { if (e.escape) { escaped++; continue; } throw e; }   // a unit may escape mid-way; that is the interpreter's answer, not a wrong one
+
+  const gotR = []; for (let q = 0; q < 16; q++) gotR.push(BigInt.asUintN(64, rv[q]));
+  const gotM = []; for (let i = 0; i < SPAN; i++) gotM.push(u8[bufOff + i]);
+  const RN = ['rax','rcx','rdx','rbx','rsp','rbp','rsi','rdi','r8','r9','r10','r11','r12','r13','r14','r15'];
+  const rBad = gotR.findIndex((v, i) => v !== wantR[i]);
+  const mBad = gotM.findIndex((v, i) => v !== wantM[i]);
+  if (rBad < 0 && mBad < 0) { pass++; continue; }
+  fail++;
+  const what = rBad >= 0 ? `${RN[rBad]}: oracle ${wantR[rBad].toString(16)} aot ${gotR[rBad].toString(16)}`
+                         : `buffer byte ${mBad}: oracle ${wantM[mBad]} aot ${gotM[mBad]}`;
+  console.log(`  MISMATCH case ${k} (seed ${SEED0 + k}) ${what}\n${body}\n`);
+  if (fail >= 3) break;
+}
+console.log(`\n${pass}/${pass + fail} random programs agree (AOT vs interpreter), ` +
+            `${refused} refused, ${escaped} escaped mid-unit`);
+for (const [k, v] of [...why].sort((a, b) => b[1] - a[1]).slice(0, 8))
+  console.log(`  refused ${String(v).padStart(4)}  ${k}`);
+if (fail) process.exit(1);
