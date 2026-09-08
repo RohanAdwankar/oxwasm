@@ -9,6 +9,9 @@ import { compileLoop } from './jit2.mjs';
 import { compileVectorLoop } from './jitsimd.mjs';
 import { compileUnitWat, pltStubWat, FTMAP, FTMAP_MAX, FTDLIMIT, FTFUEL, FTLOOP, FTNEST, LOOPYIELD_N,
          FTHASH, FTHBITS, FTHMASK, FTHBYTES } from './aot_wat.mjs';
+// OXWASM_DISPSTAT=1: count the rips that HAD a compiled unit and were not
+// dispatched anyway. Off by default - it costs a map lookup per instruction.
+const DISPSTAT = typeof process !== 'undefined' && process.env?.OXWASM_DISPSTAT === '1';
 import { decode } from './decode.mjs';
 
 const PAGE = 4096n;
@@ -940,7 +943,7 @@ export class LinuxEngine {
       // stack budget: this interpreter can be nested deep under live wasm
       // frames (contained deopt/callout) — don't dispatch further fat wasm
       // frames when the shared budget word says the stack is near its edge
-      if (f && (this._ftdv ??= new DataView(this.wmem.buffer)).getUint32(FTMAP + 8, true) >= FTDLIMIT) f = null;
+      if (f && (this._ftdv ??= new DataView(this.wmem.buffer)).getUint32(FTMAP + 8, true) >= FTDLIMIT) { f = null; this.stats.dispDeep = (this.stats.dispDeep || 0) + 1; }
       if (f) { this.cpu.rip = this.dispatchMaybeShadow(f);
                if (this.blocked) throw new BlockUnwind(this.cpu.rip);
                continue; }
@@ -4982,7 +4985,12 @@ export class LinuxEngine {
         const key = this.cpu.rip;
         let f = branched ? this.aotFns.get(key) : undefined;
         if (globalThis.__dbgRip !== undefined && key === globalThis.__dbgRip && ((this._dbgN = (this._dbgN | 0) + 1) & 0xFFFFF) === 1) console.error(`<dbgrip ${key.toString(16)} branched=${branched} f=${typeof f} has=${this.aotFns.has(key)} budget=${this.aotBudget} n=${this._dbgN}>`);
-        if (f && this.aotBudget !== undefined && --this.aotBudget < 0) f = null;
+        // OXWASM_DISPSTAT: why an rip with a compiled unit was NOT dispatched.
+        // A hot loop head can hold a real export and still run interpreted,
+        // and no existing counter separates "no unit" from "unit, but the
+        // lookup was skipped" or "unit, but the budget refused it".
+        if (DISPSTAT) { if (!branched && this.aotFns.get(key)) this.stats.noLook = (this.stats.noLook || 0) + 1; }
+        if (f && this.aotBudget !== undefined && --this.aotBudget < 0) { f = null; this.stats.dispBudget = (this.stats.dispBudget || 0) + 1; }
         if (f) { if (this.ripTrace !== undefined) { this.ripTrace[this.ripTraceI++ & 1023] = -key; }   // negative = AOT entry
                  this.cpu.rip = this.dispatchMaybeShadow(f);
                  if (this.ripTrace !== undefined) { this.ripTrace[this.ripTraceI++ & 1023] = -this.cpu.rip; }  // AOT exit
