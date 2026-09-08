@@ -48,8 +48,13 @@ const SSE_INT = ['paddb','paddw','paddd','paddq','psubb','psubw','psubd','psubq'
                  'pcmpgtb','pcmpgtw','pcmpgtd','pminub','pmaxub','pavgb','pavgw',
                  'paddusb','paddusw','psubusb','psubusw','paddsb','psubsb',
                  'punpcklbw','punpckhbw','punpcklwd','punpckldq','punpcklqdq','pmullw','pmulhw'];
-const SSE_FLT = ['addps','subps','mulps','minps','maxps','addpd','subpd','mulpd','minpd','maxpd',
-                 'andps','orps','xorps','unpcklps','unpckhps','cvtps2pd','cvtpd2ps','cvtdq2ps'];
+const SSE_FLT = ['addps','subps','mulps','minps','maxps','divps','sqrtps',
+                 'addpd','subpd','mulpd','minpd','maxpd','divpd','sqrtpd',
+                 'andps','orps','xorps','unpcklps','unpckhps','cvtps2pd','cvtpd2ps','cvtdq2ps','cvttps2dq'];
+// the wide and cross-lane forms, where a lane index or a widening rule is easy
+// to get wrong and impossible to notice from a narrow test
+const SSE_WIDE = ['pmuludq','psadbw','pmaddwd','packsswb','packuswb','packssdw',
+                  'pmulhuw','punpckhwd','punpckhdq','punpckhqdq','pavgb','pavgw'];
 
 // a flag producer the lazy model carries: sub/add/logic kinds over full or
 // narrow widths, which is the set cond() knows how to read
@@ -67,7 +72,7 @@ function program(id) {
   let lab = 0;
   const n = 10 + rnd(14);
   for (let i = 0; i < n; i++) {
-    switch (rnd(22)) {
+    switch (rnd(25)) {
       case 0: L.push(`mov ${pick(R64)}, ${(rnd(2) ? -1 : 1) * rnd(0x7fffffff)}`); break;
       case 1: L.push(`${pick(['add','sub','and','or','xor','cmp','test'])} ${pick(R64)}, ${pick(R64)}`); break;
       case 2: L.push(`${pick(['add','sub','and','or','xor','cmp'])} ${pick(R32)}, ${pick(R32)}`); break;
@@ -99,11 +104,23 @@ function program(id) {
       // vector work: the registers are seeded from the scratch buffer, so both
       // engines start from the same 128 bits, and written back at the end
       case 16: L.push(`movdqu ${pick(XR)}, [r12+${rnd(SPAN - 16)}]`); break;
-      case 17: L.push(`${pick(SSE_INT)} ${pick(XR)}, ${pick(XR)}`); break;
-      case 18: L.push(`${pick(SSE_FLT)} ${pick(XR)}, ${pick(XR)}`); break;
+      // register and MEMORY source forms: the emitter reads a memory operand
+      // through a different path (a v128 load) and nothing generated that
+      case 17: L.push(rnd(3) ? `${pick(SSE_INT)} ${pick(XR)}, ${pick(XR)}`
+                             : `${pick(SSE_INT)} ${pick(XR)}, [r12+${rnd(SPAN - 16)}]`); break;
+      case 18: L.push(rnd(3) ? `${pick(SSE_FLT)} ${pick(XR)}, ${pick(XR)}`
+                             : `${pick(SSE_FLT)} ${pick(XR)}, [r12+${rnd(SPAN - 16)}]`); break;
       case 19: L.push(`pshufd ${pick(XR)}, ${pick(XR)}, ${rnd(256)}`); break;
       case 20: L.push(`${pick(['psllw','pslld','psllq','psrlw','psrld','psrlq','psraw','psrad'])} ${pick(XR)}, ${rnd(20)}`); break;
       case 21: L.push(`movdqu [r12+${rnd(SPAN - 16)}], ${pick(XR)}`); break;
+      case 22: L.push(`${pick(SSE_WIDE)} ${pick(XR)}, ${pick(XR)}`); break;
+      case 23: L.push(`${pick(['pshuflw','pshufhw'])} ${pick(XR)}, ${pick(XR)}, ${rnd(256)}`); break;
+      // the GPR<->xmm moves, and the mask extract, which cross the two files
+      case 24: L.push(pick([`movd ${pick(XR)}, ${pick(R32)}`, `movq ${pick(XR)}, ${pick(R64)}`,
+                            `movd ${pick(R32)}, ${pick(XR)}`, `movq ${pick(R64)}, ${pick(XR)}`,
+                            `pmovmskb ${pick(R32)}, ${pick(XR)}`,
+                            `pinsrw ${pick(XR)}, ${pick(R32)}, ${rnd(8)}`,
+                            `pextrw ${pick(R32)}, ${pick(XR)}, ${rnd(8)}`])); break;
       case 15: { const off = rnd(SPAN - 96), d = rnd(33) - 16;
         L.push(`lea rsi, [r12+${off}]`, `lea rdi, [r12+${Math.max(0, off + d)}]`, `mov rcx, ${rnd(12)}`,
                `cld`, pick(['rep movsb', 'rep stosb', 'rep movsq', 'repe cmpsb', 'repne scasb'])); break; }

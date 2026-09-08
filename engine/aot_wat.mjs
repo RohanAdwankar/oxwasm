@@ -2012,6 +2012,18 @@ function emitUnitFunction(a0, fnAddr, ctx) {
                 : op===0x5C ? `(${F}.sub ${a} ${b})` : op===0x5D ? `(select ${a} ${b} (${F}.lt ${a} ${b}))`
                 : op===0x5E ? `(${F}.div ${a} ${b})` : `(select ${a} ${b} (${F}.gt ${a} ${b}))`;
         put(`(${LN}.replace_lane 0 ${dst} ${e})`); break; }
+      // pmaddwd: multiply signed 16-bit lanes and add adjacent pairs into
+      // 32-bit lanes. wasm has exactly this instruction and the emitter did
+      // not use it - i32x4.dot_i16x8_s IS pmaddwd, wrapping included.
+      case 0xF5: put(`(i32x4.dot_i16x8_s ${dst} ${xv(rm, next)})`); break;
+      // cvtdq2ps, the unprefixed form of 0F 5B: four signed i32 lanes to f32,
+      // which is one wasm instruction. The 66 and F3 forms go the other way
+      // and are NOT this - x86 hands back 0x80000000 for anything out of range
+      // or NaN, where wasm's trunc_sat saturates to INT_MAX or gives 0, so
+      // they stay refused rather than be lowered to something close.
+      case 0x5B:
+        if (insn.p66 || insn.pF3) throw new Error('AOT sse op 5b to-integer @ ' + insn.rip.toString(16));
+        put(`(f32x4.convert_i32x4_s ${xv(rm, next)})`); break;
       case 0x5A: {                                            // cvtss2sd / cvtsd2ss / cvtps2pd / cvtpd2ps
         if (insn.pF3) put(`(f64x2.replace_lane 0 ${dst} (f64.promote_f32 (f32x4.extract_lane 0 ${xv(rm,next)})))`);
         else if (insn.pF2) put(`(f32x4.replace_lane 0 ${dst} (f32.demote_f64 (f64x2.extract_lane 0 ${xv(rm,next)})))`);
