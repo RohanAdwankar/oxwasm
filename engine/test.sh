@@ -42,6 +42,7 @@ node eflagstest.mjs
 node manifesttest.mjs
 node snaptest.mjs
 node fcwtest.mjs
+node x87test.mjs
 node shiftoftest.mjs
 node mxcsrtest.mjs
 node poptest.mjs

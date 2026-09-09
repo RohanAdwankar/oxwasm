@@ -644,12 +644,18 @@ export class CPU {
         const fpush = (v) => { this.ftop = (this.ftop - 1) & 7; this.fst[this.ftop] = v; };
         const fpop = () => { const v = this.fst[this.ftop]; this.ftop = (this.ftop + 1) & 7; return v; };
         const rnd = (x) => {                     // per RC field of the control word
+          // A zero result keeps the SIGN of the operand: frndint of -0.5 to
+          // nearest is -0.0 on hardware, and the tie-to-even arithmetic below
+          // arrives at +0.0 by way of Math.floor(-0.5) = -1. Only that path
+          // gets it wrong - JS trunc and ceil already answer -0 - but the
+          // rule belongs on the result rather than in one branch.
+          const nz = (r) => (r === 0 && (x < 0 || Object.is(x, -0)) ? -0 : r);
           switch ((this.fcw >> 10) & 3) {
             case 0: { const f = Math.floor(x), d = x - f;      // nearest, ties to even
-                      return d < 0.5 ? f : d > 0.5 ? f + 1 : (f % 2 === 0 ? f : f + 1); }
-            case 1: return Math.floor(x);
-            case 2: return Math.ceil(x);
-            default: return Math.trunc(x);
+                      return nz(d < 0.5 ? f : d > 0.5 ? f + 1 : (f % 2 === 0 ? f : f + 1)); }
+            case 1: return nz(Math.floor(x));
+            case 2: return nz(Math.ceil(x));
+            default: return nz(Math.trunc(x));
           }
         };
         const ldM = (bytes) => {                 // load float from memory operand
