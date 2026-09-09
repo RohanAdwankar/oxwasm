@@ -737,6 +737,7 @@ export class CPU {
           else if (mb === 0xEE) fpush(0);
           else if (mb === 0xF0) setST(0, 2 ** ST(0) - 1);
           else if (mb === 0xF1) { const y = ST(1); setST(1, y * Math.log2(ST(0))); fpop(); }
+          else if (mb === 0xF2) { setST(0, Math.tan(ST(0))); fpush(1); }   // fptan: tangent, then the 1.0 the ABI expects on top
           else if (mb === 0xF3) { const y = ST(1); setST(1, Math.atan2(y, ST(0))); fpop(); }
           else if (mb === 0xF4) {                  // fxtract: ST(0) -> exponent, then significand on top
             // The significand is in [1, 2) with the operand's sign and the

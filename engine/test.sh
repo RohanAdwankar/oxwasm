@@ -43,6 +43,7 @@ node manifesttest.mjs
 node snaptest.mjs
 node fcwtest.mjs
 node x87test.mjs
+node x87gap.mjs
 node shiftoftest.mjs
 node mxcsrtest.mjs
 node poptest.mjs
