@@ -44,7 +44,7 @@ for (const a of V) for (const b of V) for (const c of [0x77n, 0xabcdn]) {
 
   const mem = new WebAssembly.Memory({ initial: 4096 });
   const stub = () => { throw new Error('escape'); };
-  const inst = new WebAssembly.Instance(mod, { js: { mem, ftab: new WebAssembly.Table({ initial: 0, element: 'anyfunc' }) }, env: { syscall: stub, callout: stub, deopt: stub, loophot: stub } });
+  const inst = new WebAssembly.Instance(mod, { js: { mem, ftab: new WebAssembly.Table({ initial: 0, element: 'anyfunc' }) }, env: { syscall: stub, callout: stub, deopt: stub, loophot: stub, codewrite: stub } });
   const rv = new BigInt64Array(mem.buffer, 0, 16);
   for (let i = 0; i < 16; i++) rv[i] = 0n;
   rv[7] = BigInt.asIntN(64, a); rv[6] = BigInt.asIntN(64, b); rv[2] = BigInt.asIntN(64, c);

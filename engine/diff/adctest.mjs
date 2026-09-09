@@ -43,7 +43,7 @@ for (const [lo, hi] of [['add','adc'], ['sub','sbb']]) {
 
       const mem = new WebAssembly.Memory({ initial: 4096 });
       const stub = () => { throw new Error('escape'); };
-      const inst = new WebAssembly.Instance(mod, { js: { mem, ftab: new WebAssembly.Table({ initial: 0, element: 'anyfunc' }) }, env: { syscall: stub, callout: stub, deopt: stub, loophot: stub } });
+      const inst = new WebAssembly.Instance(mod, { js: { mem, ftab: new WebAssembly.Table({ initial: 0, element: 'anyfunc' }) }, env: { syscall: stub, callout: stub, deopt: stub, loophot: stub, codewrite: stub } });
       const rv = new BigInt64Array(mem.buffer, 0, 16);
       for (let r = 0; r < 16; r++) rv[r] = 0n;
       rv[7] = BigInt.asIntN(64, aLo); rv[6] = BigInt.asIntN(64, bLo); rv[2] = BigInt.asIntN(64, aHi); rv[1] = BigInt.asIntN(64, bHi); rv[4] = BigInt.asIntN(64, CODE + 0x800n);

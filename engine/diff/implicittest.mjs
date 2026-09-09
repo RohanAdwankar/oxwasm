@@ -68,7 +68,7 @@ for (const [name, asm, cmpRegs] of CASES) {
 
   const wmem = new WebAssembly.Memory({ initial: 4096 });
   const stub = () => { throw new Error('escape'); };
-  const inst = new WebAssembly.Instance(mod, { js: { mem: wmem, ftab: new WebAssembly.Table({ initial: 0, element: 'anyfunc' }) }, env: { syscall: stub, callout: stub, deopt: stub, loophot: stub } });
+  const inst = new WebAssembly.Instance(mod, { js: { mem: wmem, ftab: new WebAssembly.Table({ initial: 0, element: 'anyfunc' }) }, env: { syscall: stub, callout: stub, deopt: stub, loophot: stub, codewrite: stub } });
   const rv = new BigInt64Array(wmem.buffer, 0, 16);
   for (let i = 0; i < 16; i++) rv[i] = 0n;
   const regs = new Array(16).fill(0n); seed(regs);

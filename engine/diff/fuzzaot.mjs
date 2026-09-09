@@ -18,7 +18,7 @@
 // and lands in the registers, where an unmasked comparison sees it.
 //
 //   node fuzzaot.mjs [N] [firstSeed]
-import { compileFunctionWat } from '../aot_wat.mjs';
+import { compileFunctionWat, CWLO_SLOT, CWLEN_SLOT } from '../aot_wat.mjs';
 import { CPU, Memory } from '../interp.mjs';
 import { execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync } from 'node:fs';
@@ -285,7 +285,7 @@ for (let k = 0; k < N; k++) {
   const mem = new WebAssembly.Memory({ initial: 4096 });
   const stub = () => { const e = new Error('escape'); e.escape = true; throw e; };
   const inst = new WebAssembly.Instance(mod, { js: { mem, ftab: new WebAssembly.Table({ initial: 0, element: 'anyfunc' }) },
-                                               env: { syscall: stub, callout: stub, deopt: stub, loophot: stub } });
+                                               env: { syscall: stub, callout: stub, deopt: stub, loophot: stub, codewrite: stub } });
   const rv = new BigInt64Array(mem.buffer, 0, 16), dv = new DataView(mem.buffer), u8 = new Uint8Array(mem.buffer);
   u8.set(code, 0);
   const bufOff = Number(BUF - CODE);
@@ -296,6 +296,12 @@ for (let k = 0; k < N; k++) {
   // It holds the GUEST base: the emitter folds the guest->wasm correction into
   // the displacement constant, so the raw guest value is what belongs here.
   dv.setBigUint64(128, BUF, true);
+  // The code image is loaded at offset 0, so it lands on the regfile slots
+  // too. Under OXWASM_STOREGUARD the store guard reads its window from two of
+  // them, and program bytes there make it a random window: 22 of 120 programs
+  // "escaped" on a callout that should never have fired. Zero it - an empty
+  // window is what a bare unit means.
+  dv.setUint32(CWLO_SLOT, 0, true); dv.setUint32(CWLEN_SLOT, 0, true);
   dv.setBigUint64(0x1000, SENT, true);
   try { inst.exports[r.entryName](); }
   catch (e) { if (e.escape) { escaped++; continue; } throw e; }   // a unit may escape mid-way; that is the interpreter's answer, not a wrong one

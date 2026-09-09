@@ -74,7 +74,7 @@ for (const [name, wantPoison, body] of CASES) {
     const oracle = BigInt.asUintN(64, cpu.regs[0]);
     const mem = new WebAssembly.Memory({ initial: 4096 });
     const stub = () => { throw new Error('escape'); };
-    const inst = new WebAssembly.Instance(mod, { js: { mem, ftab: new WebAssembly.Table({ initial: 0, element: 'anyfunc' }) }, env: { syscall: stub, callout: stub, deopt: stub, loophot: stub } });
+    const inst = new WebAssembly.Instance(mod, { js: { mem, ftab: new WebAssembly.Table({ initial: 0, element: 'anyfunc' }) }, env: { syscall: stub, callout: stub, deopt: stub, loophot: stub, codewrite: stub } });
     const rv = new BigInt64Array(mem.buffer, 0, 16);
     for (let q = 0; q < 16; q++) rv[q] = 0n;
     rv[0] = BigInt.asIntN(64, a); rv[6] = BigInt.asIntN(64, s); rv[2] = BigInt.asIntN(64, d);
