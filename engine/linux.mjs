@@ -19,6 +19,13 @@ const DISPSTAT = typeof process !== 'undefined' && process.env?.OXWASM_DISPSTAT 
 const STOREGUARD = typeof process !== 'undefined' && process.env?.OXWASM_STOREGUARD === '1';
 // Rewrites of one page before it is declared volatile and left interpreted.
 const CW_VOLATILE = Number(process.env?.OXWASM_CW_VOLATILE || 8);
+// OXWASM_ANON_HEAT: calls required before GENERATED code is translated, as
+// against a program's own text. A JIT's output has a different life
+// expectancy from a binary's .text - it may be replaced before it is worth
+// translating - and the engine has always tiered both on the same heat.
+// 0 (the default) means "same as everything else", so this changes nothing
+// unless it is asked for.
+const ANON_HEAT = Number(process.env?.OXWASM_ANON_HEAT || 0);
 import { decode } from './decode.mjs';
 
 const PAGE = 4096n;
@@ -273,7 +280,22 @@ export class LinuxEngine {
     if (this.aotFailed.has(k)) return;
     this._entryAdd(k);
     if (n === 1) (this._callTargets ??= new Set()).add(k.toString());   // the string view compileUnitWat takes; rebuilt per tier-up it was 5 s of clang -S
-    if (n >= this.aotCallThreshold && n >= (this._sizeDefer?.get(k) ?? 0)) { this._gateCalls = true; try { this.tierUpAot(t); } finally { this._gateCalls = false; } }
+    if (n >= (ANON_HEAT ? this._heatFor(t) : this.aotCallThreshold) && n >= (this._sizeDefer?.get(k) ?? 0)) { this._gateCalls = true; try { this.tierUpAot(t); } finally { this._gateCalls = false; } }
+  }
+
+  // Calls needed before this address is translated. Generated code can be
+  // asked for more (see ANON_HEAT); everything else uses the one threshold.
+  // Cached per page - this runs on every profiled call.
+  _heatFor(t) {
+    if (!ANON_HEAT || !(this.execAnon ?? EXEC_ANON)) return this.aotCallThreshold;
+    const page = t & ~4095n;
+    let g = (this._genCache ??= new Map()).get(page);
+    if (g === undefined) {
+      const stat = this.execRangesStatic ?? [];
+      g = this.execRanges.some(([x, y]) => t >= x && t < y && !stat.some(([p, q]) => p === x && q === y));
+      this._genCache.set(page, g);
+    }
+    return g ? ANON_HEAT : this.aotCallThreshold;
   }
 
   // Why a translation was refused, kept so the diagnostic is self-sufficient:
@@ -480,7 +502,7 @@ export class LinuxEngine {
     if (this._failMemo) for (const k of this._failMemo.keys()) if (inR(BigInt(k))) this._failMemo.delete(k);
     if (this._sizeDefer) for (const k of this._sizeDefer.keys()) if (inR(k)) this._sizeDefer.delete(k);
     if (this._sizeMemo) for (const k of this._sizeMemo.keys()) if (inR(BigInt(k))) this._sizeMemo.delete(k);
-    if (this.execAnon ?? EXEC_ANON) { const n = this.execRanges.length; this.execRanges = this.execRanges.filter(([a, b]) => !(a >= lo && b <= hi)); if (this.execRanges.length !== n) { this._ieCache = undefined; this._updateCodeWindow(); } }
+    if (this.execAnon ?? EXEC_ANON) { const n = this.execRanges.length; this.execRanges = this.execRanges.filter(([a, b]) => !(a >= lo && b <= hi)); if (this.execRanges.length !== n) { this._ieCache = undefined; this._genCache = undefined; this._updateCodeWindow(); } }
     if (this._tinyMemo) for (const k of this._tinyMemo.keys()) if (inR(BigInt(k))) this._tinyMemo.delete(k);
     if (this._inflight) for (const u of this._inflight) if (u.funcs.some(inR)) {
       u.cancelled = true;
@@ -2120,14 +2142,14 @@ export class LinuxEngine {
           // lazily; here they are copied out at msync, munmap and exit.
           const shared = !!(flags & 0x1n) && !!(a3 & 0x2n) && h.bytes !== undefined && !!h.writable;
           (this.maps ??= []).push({ at, len, path: h.path ?? '?', fileOff: fo, h, shared });
-          this.execRanges.push([at, at + len]); this._updateCodeWindow();   // library text: profiling must see it (prot untracked)
+          this.execRanges.push([at, at + len]); this._genCache = undefined; this._updateCodeWindow();   // library text: profiling must see it (prot untracked)
         } else if ((this.execAnon ?? EXEC_ANON) && (a3 & 4n)) {
           // Anonymous PROT_EXEC memory is a JIT's code cache (the JVM's
           // template interpreter lives in one). Without this the profiler
           // never sees it and javac interpreted 1.9M steps/s forever.
           // Opt-in: code written there can change without an munmap, and
           // the engine invalidates translations only on munmap/mremap.
-          this.execRanges.push([at, at + len]); this._updateCodeWindow();
+          this.execRanges.push([at, at + len]); this._genCache = undefined; this._updateCodeWindow();
         }
         ret(at); break; }
       case 11: {                                             // munmap
@@ -2152,7 +2174,7 @@ export class LinuxEngine {
         // RWX code caches that rewrite in place stay the reason it is opt-in.
         if (this.execAnon ?? EXEC_ANON) {
           const lo = a1, hi = a1 + align(a2, PAGE);
-          if (a3 & 4n) { if (!this.execRanges.some(([a, b]) => a <= lo && hi <= b)) { this.execRanges.push([lo, hi]); this._ieCache = undefined; this._updateCodeWindow(); } }
+          if (a3 & 4n) { if (!this.execRanges.some(([a, b]) => a <= lo && hi <= b)) { this.execRanges.push([lo, hi]); this._ieCache = undefined; this._genCache = undefined; this._updateCodeWindow(); } }
           else if ((a3 & 2n) && this.execRanges.some(([a, b]) => a < hi && b > lo)) this._invalidateCode(lo, hi);
         }
         ret(0n); break; }
