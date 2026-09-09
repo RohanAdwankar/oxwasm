@@ -94,9 +94,16 @@ const where = (rip) => {
   return 'anonymous (generated code)';
 };
 
+// MAXMS caps the run and reports what it has. A configuration that does not
+// finish reports nothing at all otherwise, which is the least useful outcome
+// available: "it did not finish" is a fact about the wall clock and says
+// nothing about where the time went.
+const MAXMS = Number(process.env.MAXMS || 0), t0 = performance.now();
 let err = null;
-try { let g = 0; while (eng.exitCode === null) { eng.run(5e6); if (eng.blocked) eng.wake();
-        if (++g > 40000) { err = 'no exit'; break; } } }
+const QUANTUM = MAXMS ? 2e5 : 5e6;   // a smaller slice when capped, so the cap is checked often enough to hold
+try { let g = 0; while (eng.exitCode === null) { eng.run(QUANTUM); if (eng.blocked) eng.wake();
+        if (MAXMS && performance.now() - t0 > MAXMS) { err = 'TRUNCATED at ' + MAXMS + 'ms'; break; }
+        if (++g > (MAXMS ? 4e6 : 40000)) { err = 'no exit'; break; } } }
 catch (e) { err = e.message; }
 
 // The rips come back as whatever the engine held; normalise and attribute
@@ -112,7 +119,10 @@ for (const [k, v] of globalThis.__ihist) {
 
 const total = eng.stats.interpreted || 0;
 console.log(`\n${bin} ${args.join(' ')}${err ? '  [' + err + ']' : ''}  exit=${eng.exitCode}`);
-console.log(`interpreted ${total} instructions, ${sampled} sampled (1 in ${EVERY}), aot dispatches ${eng.stats.aotRuns ?? 0}`);
+console.log(`interpreted ${total} instructions, ${sampled} sampled (1 in ${EVERY}), aot dispatches ${eng.stats.aotRuns ?? 0}` +
+            ` in ${Math.round(performance.now() - t0)}ms`);
+console.log(`units compiled ${eng._unitN ?? 0}, functions registered ${eng.aotFns?.size ?? 0}, refused ${eng.aotFailed?.size ?? 0}, deopts ${eng.stats.deopts ?? 0}`);
+if (eng.stats.codeWrites) console.log(`code writes seen ${eng.stats.codeWrites}, volatile pages ${eng.stats.volatilePages ?? 0}`);
 
 // Counts are the SHARE of the real total, not sample*64: the two differ by a
 // few percent and printing a number larger than the total the same report
