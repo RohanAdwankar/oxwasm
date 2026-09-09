@@ -738,6 +738,25 @@ export class CPU {
           else if (mb === 0xF0) setST(0, 2 ** ST(0) - 1);
           else if (mb === 0xF1) { const y = ST(1); setST(1, y * Math.log2(ST(0))); fpop(); }
           else if (mb === 0xF3) { const y = ST(1); setST(1, Math.atan2(y, ST(0))); fpop(); }
+          else if (mb === 0xF4) {                  // fxtract: ST(0) -> exponent, then significand on top
+            // The significand is in [1, 2) with the operand's sign and the
+            // exponent is the unbiased power of two, so that ST(0) * 2**ST(1)
+            // reconstructs the operand exactly. Scaling in two steps because
+            // 2**-e overflows to Infinity for a denormal's exponent and the
+            // reconstruction would come back NaN.
+            const x = ST(0);
+            let e, sig;
+            if (x === 0) { e = -Infinity; sig = x; }                      // hardware: -inf and a signed zero
+            else if (!Number.isFinite(x)) { e = Infinity; sig = x; }      // inf and NaN keep the value
+            else {
+              e = Math.floor(Math.log2(Math.abs(x)));
+              sig = e > 512 ? (x * 2 ** -512) * 2 ** (512 - e)
+                  : e < -512 ? (x * 2 ** 512) * 2 ** (-512 - e)
+                  : x * 2 ** -e;
+              if (Math.abs(sig) >= 2) { e++; sig /= 2; }                  // log2 rounding at a power of two
+              else if (Math.abs(sig) < 1) { e--; sig *= 2; }
+            }
+            setST(0, e); fpush(sig); }
           else if (mb === 0xF8) { const r = ST(0) % ST(1); setST(0, r); setC(0, 0, 0); }
           else if (mb === 0xF9) { const y = ST(1); setST(1, y * Math.log2(ST(0) + 1)); fpop(); }
           else if (mb === 0xFA) setST(0, Math.sqrt(ST(0)));

@@ -78,6 +78,51 @@ for (let i = 0; i < V.length; i++) {
   cases.push([`fnstsw-${i}`, `${push(f64(a), 0)}\n${push(f64(b), 8)}\nfxch st1\nfucom st1\nfnstsw ax\nmovzx rax, ax`]);
 }
 
+// the NARROW memory forms, which are their own conversion path: a 32-bit
+// float on the way in and out, and 16- and 32-bit integers both ways
+const f32 = (x) => { const b = new DataView(new ArrayBuffer(4)); b.setFloat32(0, x, true); return BigInt(b.getUint32(0, true)); };
+for (const v of [1.0, -2.5, 0.5, 1024.0, -0.0, 3.5]) {
+  cases.push([`fld32-${v}`, `mov eax, 0x${f32(v).toString(16)}\nmov [${S}], eax\nfld dword [${S}]\n${pop}`]);
+  cases.push([`fst32-${v}`, `${push(f64(v), 0)}\nfstp dword [${S}+64]\nmov eax, [${S}+64]\nmov rax, rax`]);
+}
+for (const n of [0n, 1n, -1n, 32767n, -32768n]) {
+  cases.push([`fild16-${n}`, `mov ax, ${n}\nmov [${S}], ax\nfild word [${S}]\n${pop}`]);
+}
+for (const n of [0n, 1n, -1n, 2147483647n, -2147483648n]) {
+  cases.push([`fild32-${n}`, `mov eax, ${n}\nmov [${S}], eax\nfild dword [${S}]\n${pop}`]);
+}
+for (const v of [1.5, -1.5, 2.5, 1024.0, -7.0]) {
+  cases.push([`fistp32-${v}`, `${push(f64(v), 0)}\nfistp dword [${S}+64]\nmov eax, [${S}+64]\nmovsx rax, eax`]);
+  cases.push([`fisttp-${v}`, `${push(f64(v), 0)}\nfisttp qword [${S}+64]\nmov rax, [${S}+64]`]);
+}
+
+// fscale and fxtract are exact on powers of two; fprem is exact whenever the
+// remainder is representable, which for these operands it is
+for (const [a, e] of [[1.0, 3n], [3.5, -2n], [1024.0, -10n], [-2.0, 5n]])
+  cases.push([`fscale-${a}-${e}`, `mov rax, ${e}\nmov [${S}+16], rax\nfild qword [${S}+16]\n` +
+                                  `${push(f64(a), 0)}\nfscale\n${pop}`]);
+for (const v of [8.0, 3.5, -0.125, 1024.0, 1.0, -0.0, 5e-324]) {
+  cases.push([`fxtract-sig-${v}`, `${push(f64(v), 0)}\nfxtract\n${pop}`]);      // significand on top
+  // ... and the EXPONENT underneath it, which a test that only pops the top
+  // never sees: half of fxtract's answer would have been unchecked.
+  cases.push([`fxtract-exp-${v}`, `${push(f64(v), 0)}\nfxtract\nfstp st0\n${pop}`]);
+}
+for (const [a, b] of [[7.0, 2.0], [-7.0, 2.0], [1024.0, 3.0], [0.5, 0.25]])
+  cases.push([`fprem-${a}-${b}`, `${push(f64(b), 0)}\n${push(f64(a), 8)}\nfprem\n${pop}`]);
+
+// The ROUNDING MODE, which nothing has checked against hardware: the control
+// word's RC field steers frndint and fistp, and the interpreter reads the
+// same two bits from its own copy of the word.
+for (const [rc, name] of [[0, 'near'], [1, 'down'], [2, 'up'], [3, 'trunc']]) {
+  const cw = 0x037F | (rc << 10);
+  for (const v of [1.5, -1.5, 2.5, -2.5, 0.5, -0.5, 3.49, -3.49]) {
+    cases.push([`rc-${name}-rnd-${v}`,
+      `mov ax, 0x${cw.toString(16)}\nmov [${S}+32], ax\nfldcw [${S}+32]\n${push(f64(v), 0)}\nfrndint\n${pop}`]);
+    cases.push([`rc-${name}-fistp-${v}`,
+      `mov ax, 0x${cw.toString(16)}\nmov [${S}+32], ax\nfldcw [${S}+32]\n${push(f64(v), 0)}\n${popi}`]);
+  }
+}
+
 let pass = 0, fail = 0, steps = 0;
 const bad = [];
 for (const [name, asm] of cases) {
