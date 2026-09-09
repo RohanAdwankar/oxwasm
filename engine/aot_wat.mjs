@@ -51,6 +51,11 @@ export const FCW_SLOT = 164;      // regfile slot: the x87 control word, so fnst
 // nothing else, so the price can be measured before the mechanism is designed.
 // Slots: the guarded window's base and length, and where a hit is recorded.
 export const CWLO_SLOT = 168, CWLEN_SLOT = 172;
+// One byte per 4K page of the guarded window, in the dead space between the
+// dispatch hash and guest RAM. A single interval could not say "this page is
+// volatile, stop watching it" without dropping its neighbours too, and a page
+// that is patched over and over is exactly what has to leave the set.
+export const CWMAP = 0xE0000, CWMAP_PAGES = 0x20000;   // 128KB: 512MB of window span
 const STOREGUARD = typeof process !== 'undefined' && process.env?.OXWASM_STOREGUARD === '1';
 // Largest wat text this emitter will hand the runtime for ONE function; see
 // the refusal at the end of the function emitter for the two measurements
@@ -1796,9 +1801,13 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     // it, which keeps the evaluation order the unguarded form already has:
     // address first, then the value.
     usesGa = true;
+    // Outer test first and alone: with an empty window the page index would
+    // be enormous and the byte load would trap rather than answer false.
     return `(local.set $ga ${wasmAddr(op, next)}) ` +
-           `(if (i32.lt_u (i32.sub (local.get $ga) (i32.load (i32.const ${CWLO_SLOT}))) (i32.load (i32.const ${CWLEN_SLOT}))) ` +
-           `(then (call $x_cw (local.get $ga)))) ` +
+           `(local.set $gp (i32.sub (local.get $ga) (i32.load (i32.const ${CWLO_SLOT})))) ` +
+           `(if (i32.lt_u (local.get $gp) (i32.load (i32.const ${CWLEN_SLOT}))) ` +
+           `(then (if (i32.load8_u (i32.add (i32.const ${CWMAP}) (i32.shr_u (local.get $gp) (i32.const 12)))) ` +
+           `(then (call $x_cw (local.get $ga)))))) ` +
            `(${ST[size]} (local.get $ga) ${expr})`;
   };
   const ALU = { add:'i64.add', sub:'i64.sub', and:'i64.and', or:'i64.or', xor:'i64.xor' };
@@ -3715,7 +3724,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   if (DISP || hasJtab) wat += '    (local $pc i32)\n';
   if (usesFtr) wat += '    (local $fti i32)\n';
   if (usesFts) wat += '    (local $fts i32)\n';
-  if (usesGa) wat += '    (local $ga i32)\n';
+  if (usesGa) wat += '    (local $ga i32) (local $gp i32)\n';
   if (usesIcp) wat += '    (local $icp i32)\n';
   for (const r of xUsed) wat += `    (local ${xreg(r)} v128)\n`;
   for (const t of tmps) wat += `    (local ${t} i64)\n`;

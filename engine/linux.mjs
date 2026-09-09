@@ -8,7 +8,7 @@ import { CPU, Memory } from './interp.mjs';
 import { compileLoop } from './jit2.mjs';
 import { compileVectorLoop } from './jitsimd.mjs';
 import { compileUnitWat, pltStubWat, FTMAP, FTMAP_MAX, FTDLIMIT, FTFUEL, FTLOOP, FTNEST, LOOPYIELD_N,
-         FTHASH, FTHBITS, FTHMASK, FTHBYTES, CWLO_SLOT, CWLEN_SLOT } from './aot_wat.mjs';
+         FTHASH, FTHBITS, FTHMASK, FTHBYTES, CWLO_SLOT, CWLEN_SLOT, CWMAP, CWMAP_PAGES } from './aot_wat.mjs';
 // OXWASM_DISPSTAT=1: count the rips that HAD a compiled unit and were not
 // dispatched anyway. Off by default - it costs a map lookup per instruction.
 const DISPSTAT = typeof process !== 'undefined' && process.env?.OXWASM_DISPSTAT === '1';
@@ -17,6 +17,8 @@ const DISPSTAT = typeof process !== 'undefined' && process.env?.OXWASM_DISPSTAT 
 // half only arms when the emitter half is on - a watch on the interpreter's
 // writes is not free, and neither is the window bookkeeping.
 const STOREGUARD = typeof process !== 'undefined' && process.env?.OXWASM_STOREGUARD === '1';
+// Rewrites of one page before it is declared volatile and left interpreted.
+const CW_VOLATILE = Number(process.env?.OXWASM_CW_VOLATILE || 8);
 import { decode } from './decode.mjs';
 
 const PAGE = 4096n;
@@ -621,6 +623,10 @@ export class LinuxEngine {
     const t0c = (this.tierMsMax !== undefined) ? performance.now() : 0;
     const un = (this._unitN = (this._unitN || 0) + 1);   // bisect aid: veto unit N -> stays interpreted
     if (this.unitFilter && !this.unitFilter(un, entry)) { this.aotFailed.add(k); this.noteAotFail(entry, 'vetoed by unitFilter (bisect)'); return; }
+    // Generated code the guest keeps rewriting is left to the interpreter (see
+    // _codeWrite). This also marks the region's pages as watched, so a write
+    // to one is seen before the translation it invalidates is ever used.
+    if (this._cwCover(entry)) { this.aotFailed.add(k); this.noteAotFail(entry, 'volatile code page'); return; }
     try {
       const unit = compileUnitWat(this.mem, entry, { guestBase: this.base, ramBase: this.RAMOFF,
         // prune the closure at functions already in the dispatch map: calls
@@ -1021,6 +1027,47 @@ export class LinuxEngine {
     const lo = g & ~4095n;
     this.stats.codeWrites = (this.stats.codeWrites || 0) + 1;
     this._invalidateCode(lo, lo + 4096n);
+    // A page that keeps being rewritten is VOLATILE: the guest is using it as
+    // a scratchpad for code, and re-translating it on every patch costs more
+    // than interpreting it ever will. HotSpot with C1/C2 on does exactly this,
+    // and invalidate-on-every-write alone did not finish a case that takes 110
+    // seconds interpreted. Past the limit the page stops being watched and
+    // stops being translated, and the rest of the region carries on.
+    const n = (this._cwCount ??= new Map()).get(lo) ?? 0;
+    this._cwCount.set(lo, n + 1);
+    if (n + 1 >= CW_VOLATILE) {
+      (this._volatilePages ??= new Set()).add(lo);
+      this._cwMark(lo, 0);
+      this.stats.volatilePages = this._volatilePages.size;
+    }
+  }
+  // The per-page byte the guard reads. Out-of-window pages are simply not
+  // representable, which is the same as not watched.
+  _cwMark(page, on) {
+    if (!STOREGUARD || !this.wmem) return;
+    const dv = new DataView(this.wmem.buffer);
+    const lo = dv.getUint32(CWLO_SLOT, true), len = dv.getUint32(CWLEN_SLOT, true);
+    const off = this.RAMOFF + Number(page - this.base) - lo;
+    if (off < 0 || off >= len) return;
+    const idx = off >>> 12;
+    if (idx >= CWMAP_PAGES) return;
+    new Uint8Array(this.wmem.buffer)[CWMAP + idx] = on;
+  }
+  // Mark every page of the anonymous executable region holding `a`, because a
+  // translated function's extent is not recorded anywhere and a patch lands in
+  // the middle of one as readily as at its entry. Volatile pages stay clear.
+  _cwCover(a) {
+    if (!STOREGUARD) return false;
+    const stat = this.execRangesStatic ?? [];
+    for (const [x, y] of this.execRanges) {
+      if (!(a >= x && a < y)) continue;
+      if (stat.some(([p, q]) => p === x && q === y)) return false;      // a file image, not generated code
+      if (this._volatilePages?.has(a & ~4095n)) return true;            // caller must not translate it
+      for (let p = x & ~4095n; p < y; p += 4096n)
+        if (!this._volatilePages?.has(p)) this._cwMark(p, 1);
+      return false;
+    }
+    return false;
   }
   // The window the guard compares against: the anonymous executable ranges,
   // as one interval in WASM offsets. The interpreter watches the same span,
@@ -1038,6 +1085,12 @@ export class LinuxEngine {
     if (lo === null) { dv.setUint32(CWLO_SLOT, 0, true); dv.setUint32(CWLEN_SLOT, 0, true); this.mem.watch = null; return; }
     dv.setUint32(CWLO_SLOT, this.RAMOFF + Number(lo - this.base), true);
     dv.setUint32(CWLEN_SLOT, Number(hi - lo), true);
+    // The window moved, so every page index in the map moved with it. Clear
+    // and re-mark from what is actually translated rather than trying to shift
+    // the bytes: a stale map watches the wrong pages, which is worse than
+    // watching none.
+    new Uint8Array(this.wmem.buffer).fill(0, CWMAP, CWMAP + CWMAP_PAGES);
+    for (const a of this.aotFns.keys()) this._cwCover(a);
     this.mem.watchLo = lo; this.mem.watchHi = hi;
     this.mem.watch = (addr) => { const p = addr & ~4095n; this._invalidateCode(p, p + 4096n); };
   }
