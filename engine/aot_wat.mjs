@@ -50,7 +50,7 @@ export const FCW_SLOT = 164;      // regfile slot: the x87 control word, so fnst
 // engine to see a store that compiled code makes. This emits the check and
 // nothing else, so the price can be measured before the mechanism is designed.
 // Slots: the guarded window's base and length, and where a hit is recorded.
-const CWLO_SLOT = 168, CWLEN_SLOT = 172, CWHIT_SLOT = 176;
+export const CWLO_SLOT = 168, CWLEN_SLOT = 172;
 const STOREGUARD = typeof process !== 'undefined' && process.env?.OXWASM_STOREGUARD === '1';
 // Largest wat text this emitter will hand the runtime for ONE function; see
 // the refusal at the end of the function emitter for the two measurements
@@ -1798,7 +1798,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     usesGa = true;
     return `(local.set $ga ${wasmAddr(op, next)}) ` +
            `(if (i32.lt_u (i32.sub (local.get $ga) (i32.load (i32.const ${CWLO_SLOT}))) (i32.load (i32.const ${CWLEN_SLOT}))) ` +
-           `(then (i32.store (i32.const ${CWHIT_SLOT}) (local.get $ga)))) ` +
+           `(then (call $x_cw (local.get $ga)))) ` +
            `(${ST[size]} (local.get $ga) ${expr})`;
   };
   const ALU = { add:'i64.add', sub:'i64.sub', and:'i64.and', or:'i64.or', xor:'i64.xor' };
@@ -4056,6 +4056,9 @@ export function compileUnitWat(mem, entry, opts = {}) {
   wat += '  (import "env" "callout" (func $x_callout (param i64) (result i64)))\n';
   wat += '  (import "env" "deopt" (func $x_deopt (param i64 i64) (result i64)))\n';
   wat += '  (import "env" "loophot" (func $x_loophot (param i64)))\n';   // a loop head that ran long without a unit of its own (see FTLOOP)
+  // Only when the guard is on, so a module built without it keeps exactly the
+  // imports every existing consumer supplies.
+  if (STOREGUARD) wat += '  (import "env" "codewrite" (func $x_cw (param i32)))\n';
   // the global dispatch table + its in-wasm resolver, iff some site chains
   // through it (indirect call, out-of-unit static call, indirect tail jump)
   const tf0 = PHASE ? performance.now() : 0;

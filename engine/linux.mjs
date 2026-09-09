@@ -8,10 +8,15 @@ import { CPU, Memory } from './interp.mjs';
 import { compileLoop } from './jit2.mjs';
 import { compileVectorLoop } from './jitsimd.mjs';
 import { compileUnitWat, pltStubWat, FTMAP, FTMAP_MAX, FTDLIMIT, FTFUEL, FTLOOP, FTNEST, LOOPYIELD_N,
-         FTHASH, FTHBITS, FTHMASK, FTHBYTES } from './aot_wat.mjs';
+         FTHASH, FTHBITS, FTHMASK, FTHBYTES, CWLO_SLOT, CWLEN_SLOT } from './aot_wat.mjs';
 // OXWASM_DISPSTAT=1: count the rips that HAD a compiled unit and were not
 // dispatched anyway. Off by default - it costs a map lookup per instruction.
 const DISPSTAT = typeof process !== 'undefined' && process.env?.OXWASM_DISPSTAT === '1';
+// OXWASM_STOREGUARD=1 (measurement): compiled code checks every store against
+// a window of translated generated code and calls back on a hit. The engine
+// half only arms when the emitter half is on - a watch on the interpreter's
+// writes is not free, and neither is the window bookkeeping.
+const STOREGUARD = typeof process !== 'undefined' && process.env?.OXWASM_STOREGUARD === '1';
 import { decode } from './decode.mjs';
 
 const PAGE = 4096n;
@@ -473,7 +478,7 @@ export class LinuxEngine {
     if (this._failMemo) for (const k of this._failMemo.keys()) if (inR(BigInt(k))) this._failMemo.delete(k);
     if (this._sizeDefer) for (const k of this._sizeDefer.keys()) if (inR(k)) this._sizeDefer.delete(k);
     if (this._sizeMemo) for (const k of this._sizeMemo.keys()) if (inR(BigInt(k))) this._sizeMemo.delete(k);
-    if (this.execAnon ?? EXEC_ANON) { const n = this.execRanges.length; this.execRanges = this.execRanges.filter(([a, b]) => !(a >= lo && b <= hi)); if (this.execRanges.length !== n) this._ieCache = undefined; }
+    if (this.execAnon ?? EXEC_ANON) { const n = this.execRanges.length; this.execRanges = this.execRanges.filter(([a, b]) => !(a >= lo && b <= hi)); if (this.execRanges.length !== n) { this._ieCache = undefined; this._updateCodeWindow(); } }
     if (this._tinyMemo) for (const k of this._tinyMemo.keys()) if (inR(BigInt(k))) this._tinyMemo.delete(k);
     if (this._inflight) for (const u of this._inflight) if (u.funcs.some(inR)) {
       u.cancelled = true;
@@ -1006,8 +1011,40 @@ export class LinuxEngine {
     if (!this.aotFns.has(a) && !this.aotFailed.has(a)) this.tierUpAot(a);
     if (globalThis.__loopTrace) console.error(`<loophot ${a.toString(16)} -> aotFns=${this.aotFns.has(a)} failed=${this.aotFailed.has(a)}>`);
   }
+  // MEASUREMENT (OXWASM_STOREGUARD=1): a store from compiled code landed in
+  // the window that holds translated GENERATED code. Drop the translations
+  // covering that page - the guest is patching its own code, which is the
+  // thing the engine could not see and the reason anonymous executable memory
+  // is not translatable by default.
+  _codeWrite(waddr) {
+    const g = this.base + BigInt((waddr >>> 0) - this.RAMOFF);
+    const lo = g & ~4095n;
+    this.stats.codeWrites = (this.stats.codeWrites || 0) + 1;
+    this._invalidateCode(lo, lo + 4096n);
+  }
+  // The window the guard compares against: the anonymous executable ranges,
+  // as one interval in WASM offsets. The interpreter watches the same span,
+  // because its own stores are just as capable of patching code and it is
+  // only compiled code that was ever the blind spot.
+  _updateCodeWindow() {
+    if (!STOREGUARD || !this.wmem) return;
+    const stat = this.execRangesStatic ?? [];
+    const isStatic = (a, b) => stat.some(([x, y]) => x === a && y === b);
+    let lo = null, hi = null;
+    for (const [a, b] of this.execRanges) if (!isStatic(a, b)) {
+      if (lo === null || a < lo) lo = a;
+      if (hi === null || b > hi) hi = b; }
+    const dv = new DataView(this.wmem.buffer);
+    if (lo === null) { dv.setUint32(CWLO_SLOT, 0, true); dv.setUint32(CWLEN_SLOT, 0, true); this.mem.watch = null; return; }
+    dv.setUint32(CWLO_SLOT, this.RAMOFF + Number(lo - this.base), true);
+    dv.setUint32(CWLEN_SLOT, Number(hi - lo), true);
+    this.mem.watchLo = lo; this.mem.watchHi = hi;
+    this.mem.watch = (addr) => { const p = addr & ~4095n; this._invalidateCode(p, p + 4096n); };
+  }
+
   aotEnv() {
     return {
+      codewrite: (a) => this._codeWrite(a),
       loophot: (a) => this._loopHot(BigInt.asUintN(64, a)),
       // rip = guest address of the syscall instruction (an emit-time constant)
       // so a blocking syscall can suspend: state is spilled, frames unwind,
@@ -2030,14 +2067,14 @@ export class LinuxEngine {
           // lazily; here they are copied out at msync, munmap and exit.
           const shared = !!(flags & 0x1n) && !!(a3 & 0x2n) && h.bytes !== undefined && !!h.writable;
           (this.maps ??= []).push({ at, len, path: h.path ?? '?', fileOff: fo, h, shared });
-          this.execRanges.push([at, at + len]);   // library text: profiling must see it (prot untracked)
+          this.execRanges.push([at, at + len]); this._updateCodeWindow();   // library text: profiling must see it (prot untracked)
         } else if ((this.execAnon ?? EXEC_ANON) && (a3 & 4n)) {
           // Anonymous PROT_EXEC memory is a JIT's code cache (the JVM's
           // template interpreter lives in one). Without this the profiler
           // never sees it and javac interpreted 1.9M steps/s forever.
           // Opt-in: code written there can change without an munmap, and
           // the engine invalidates translations only on munmap/mremap.
-          this.execRanges.push([at, at + len]);
+          this.execRanges.push([at, at + len]); this._updateCodeWindow();
         }
         ret(at); break; }
       case 11: {                                             // munmap
@@ -2062,7 +2099,7 @@ export class LinuxEngine {
         // RWX code caches that rewrite in place stay the reason it is opt-in.
         if (this.execAnon ?? EXEC_ANON) {
           const lo = a1, hi = a1 + align(a2, PAGE);
-          if (a3 & 4n) { if (!this.execRanges.some(([a, b]) => a <= lo && hi <= b)) { this.execRanges.push([lo, hi]); this._ieCache = undefined; } }
+          if (a3 & 4n) { if (!this.execRanges.some(([a, b]) => a <= lo && hi <= b)) { this.execRanges.push([lo, hi]); this._ieCache = undefined; this._updateCodeWindow(); } }
           else if ((a3 & 2n) && this.execRanges.some(([a, b]) => a < hi && b > lo)) this._invalidateCode(lo, hi);
         }
         ret(0n); break; }

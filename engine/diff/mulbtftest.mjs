@@ -131,7 +131,7 @@ for (const [name, body] of CASES) {
     const oracleMem = m.read(DATA, 8n);
     const mem = new WebAssembly.Memory({ initial: 4096 });
     const stub = () => { throw new Error('escape'); };
-    const inst = new WebAssembly.Instance(mod, { js: { mem, ftab: new WebAssembly.Table({ initial: 0, element: 'anyfunc' }) }, env: { syscall: stub, callout: stub, deopt: stub, loophot: stub } });
+    const inst = new WebAssembly.Instance(mod, { js: { mem, ftab: new WebAssembly.Table({ initial: 0, element: 'anyfunc' }) }, env: { syscall: stub, callout: stub, deopt: stub, loophot: stub, codewrite: stub } });
     const rv = new BigInt64Array(mem.buffer, 0, 16);
     const dv = new DataView(mem.buffer);
     // code+data image lives at wasm offset (guest-CODE), ramBase 0
