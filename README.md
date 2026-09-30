@@ -72,17 +72,17 @@ languages other than Python. Those throw `NotSupportedError`.
 
 ## What it is and is not
 
-| | oxwasm | hosted microVM sandboxes | WebAssembly-Python sandboxes | in-process JS/Wasm runtimes |
+| | oxwasm | E2B | Pyodide-based (e.g. LocalSandbox) | Rivet agentOS |
 |---|---|---|---|---|
-| Where code runs | a worker thread in your process | a vendor's cloud, or microVMs you run | in your process | in your process (V8 isolates + Wasm) |
+| Where code runs | a worker thread in your process | their cloud, or microVMs you run yourself | in your process | in your process (V8 isolates + Wasm) |
 | Infrastructure | none | an account and API key, or run the stack yourself | none | none |
 | What the guest is | a real Linux userland | a real Linux VM | Python compiled to Wasm | JS on V8, plus tools compiled to Wasm |
-| Native Python packages | **ordinary x86-64 wheels**, mounted from the host | anything you can `pip install` | only those rebuilt for Wasm | only what has been compiled for Wasm |
+| Native Python packages | **ordinary x86-64 wheels**, mounted from the host | anything you can `pip install` | only those rebuilt for Wasm | not documented; tools ship from their registry |
 | Shell and CLI tools | a provisioned set of coreutils | everything | none | a provisioned set |
 | Outbound network | none | yes | varies | opt-in |
-| Cold start | ~2 s (restore); ~50 s first time on a machine | not measured here | not measured here | not measured here |
+| Cold start | ~2 s (restore); ~50 s first time on a machine | not measured here | not measured here | ~6 ms (their figure) |
 | Compute speed | several times slower than native | native | slower than native | not measured here |
-| Scales out | your CPU, one core per busy sandbox | the vendor's pool | your CPU | your CPU |
+| Scales out | your CPU, one core per busy sandbox | their pool | your CPU | your CPU |
 
 The row that is the reason this exists is native packages. Wasm-based
 sandboxes can only run C extensions someone rebuilt for WebAssembly, so the
