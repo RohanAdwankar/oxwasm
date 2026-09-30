@@ -80,8 +80,8 @@ languages other than Python. Those throw `NotSupportedError`.
 | Native Python packages | **ordinary x86-64 wheels**, mounted from the host | anything you can `pip install` | only those rebuilt for Wasm | not documented; tools ship from their registry |
 | Shell and CLI tools | a provisioned set of coreutils | everything | none | a provisioned set |
 | Outbound network | none | yes | varies | opt-in |
-| Cold start | ~2 s (restore); ~50 s first time on a machine | not measured here | not measured here | ~6 ms (their figure) |
-| Compute speed | several times slower than native | native | slower than native | not measured here |
+| Create a sandbox | ~1.9 s (snapshot restore); ~50 s the first time on a machine | network round trip; not measured (needs an account) | ~5.7 s (measured, node `loadPyodide`) | ~6 ms (their figure, not measured here) |
+| Compute speed | 10-45x slower than Pyodide on pure-Python loops (measured, below) | native | fastest of the in-process options | not measured here |
 | Scales out | your CPU, one core per busy sandbox | their pool | your CPU | your CPU |
 
 The row that is the reason this exists is native packages. Wasm-based
@@ -91,22 +91,30 @@ CPython for your host, so a manylinux wheel is an x86-64 shared object its own
 dynamic loader loads. `msgpack`'s compiled extension imports and round-trips
 today with nothing recompiled.
 
+**Measured (`node bench/sdk/vs-pyodide.mjs`, same machine, warm cache):**
+
+| workload | oxwasm | Pyodide |
+|---|---|---|
+| create sandbox | 1.9 s | 5.7 s |
+| trivial cell, steady state | ~15-20 ms | ~1 ms |
+| 2M-iteration Python loop | 6.9 s | 0.64 s |
+| 200k dict inserts | 2.2 s | 0.19 s |
+| sort 300k floats | 7.7 s | 0.17 s |
+
 **Where it loses, plainly:**
 
-- **It is not fast.** It is x86 emulation. Tight CPython loops run roughly
-  6-15x slower than native in this repo's own benchmarks (`bench/README.md`).
-  Light scripting and glue code is fine; heavy numeric work is not what this
-  is for.
+- **It is not fast.** It is x86 emulation on top of Wasm, so compute-heavy
+  pure Python runs 10-45x slower than Pyodide, which runs CPython natively as
+  Wasm. Light scripting and glue code is fine; heavy compute is not what this
+  is for. What you buy is compatibility (real Linux, real wheels), not speed.
 - **The first cells after a restore are slow** (0.5-2 s each) while the compiled
-  tier re-warms; steady state is ~15-60 ms per cell after about ten cells.
-- **No network in the guest.** `apt install` and `pip install` at runtime do
-  not work. Software is provisioned from the host: `packages: ['/path/to/site-packages']`.
-- **numpy does not run yet.** It loads and then reaches SSE4.1 instructions the
-  decoder does not implement (fourteen opcodes, counted). A bounded gap, but open.
-- **Spawning many subprocesses is broken today.** `commands.run` starts
-  failing after about eight calls: a fault in the engine's compiled-code path
-  for CPython's process spawn, reproducible and not yet fixed
-  (`engine/diff/sandboxtest.mjs` reaches it).
+  tier re-warms.
+- **No network in the guest yet.** `apt install` and `pip install` at runtime
+  do not work; runtime networking and an interactive shell are the next
+  milestone. For now software is provisioned from the host:
+  `packages: ['/path/to/site-packages']`.
+- **numpy runs** (2.4 checked against native for matmul, fft, sort), but slowly:
+  its SSE4 code is interpreted rather than compiled.
 - **It saves you the per-second bill, not the compute.** The CPU is yours. It
   is cheaper when sandboxes are many and light; it is not when they are few
   and heavy.
