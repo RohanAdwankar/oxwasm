@@ -192,7 +192,7 @@ export class Sandbox {
   static async _start(opts) {
     const worker = new Worker(WORKER_URL, {
       workerData: { python: opts.python, packages: opts.packages, memMB: opts.memMB, cache: opts.cache,
-                    commands: opts.commands, bootTimeoutMs: opts.bootTimeoutMs, network: opts.network },
+                    commands: opts.commands, bootTimeoutMs: opts.bootTimeoutMs, network: opts.network, rootfs: opts.rootfs },
       resourceLimits: { maxOldGenerationSizeMb: 4096, maxYoungGenerationSizeMb: 128 },
     });
     const sbx = new Sandbox(worker, opts);

@@ -7,6 +7,7 @@
 // in compiled code never returns from a slice, and only a separate thread can
 // be abandoned when that happens.
 import { makeNet } from './net.mjs';
+import { loadRootfs, resolveIn } from './rootfs.mjs';
 import { readFileSync, statSync, existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
@@ -25,14 +26,15 @@ const sha = (...parts) => { const h = createHash('sha256'); for (const p of part
 // A snapshot is only valid for the exact machine it was taken on: the same
 // interpreter, the same mounted packages, the same tools, the same driver and
 // the same engine. Anything else must miss.
-function cacheKey({ python, packages, commands, memMB, network }, guestSrc) {
+function cacheKey({ python, packages, commands, memMB, network, rootfs }, guestSrc) {
   const engine = [...['linux.mjs', 'aot_wat.mjs', 'interp.mjs', 'decode.mjs', 'snapshot.mjs', 'snapshot_core.mjs']
     .map((f) => sha(readFileSync(join(HERE, '..', 'engine', f)))),
     // the SDK's own code decides what goes into a snapshot (the warm-up, the unit capture)
     ...['host.mjs', 'image.mjs', 'net.mjs'].map((f) => sha(readFileSync(join(HERE, f))))];
   const stamp = (p) => { try { const s = readFileSync(p).length; return `${p}:${s}`; } catch { return p; } };
+  const rootHash = rootfs ? sha(readFileSync(rootfs)) : null;
   return sha(JSON.stringify({ python: stamp(python), tree: findPythonTree(python), memMB,
-                              packages: [...packages].sort(), commands: [...commands].sort(), network, engine }), guestSrc);
+                              packages: [...packages].sort(), commands: [...commands].sort(), network, rootHash, engine }), guestSrc);
 }
 
 // units.bin: one JSON line [[entryHex, byteLength], ...] then the wasm modules back to back.
@@ -75,8 +77,24 @@ export class EngineHost {
 
     const t0 = performance.now();
     const netp = o.network ? makeNet(o.network) : null;
-    const image = buildImage({ python, packages, commands, extraFiles: { [GUEST_PATH]: new Uint8Array(guestSrc) },
-                               network: netp ? { resolvers: netp.resolvers } : null });
+    let image, pythonPath = python;
+    if (o.rootfs) {
+      // the filesystem is the tarball: its own python, its own libraries, a real dpkg database
+      const r = loadRootfs(o.rootfs);
+      const enc = (t) => new TextEncoder().encode(t);
+      r.files[GUEST_PATH] = new Uint8Array(guestSrc);
+      if (netp) {
+        r.files['/etc/resolv.conf'] = enc(netp.resolvers.map((x) => `nameserver ${x}\n`).join('') + 'options timeout:3 attempts:2\n');
+        r.files['/etc/hosts'] = enc('127.0.0.1 localhost\n::1 localhost\n');
+      }
+      pythonPath = resolveIn(r, o.python || '/usr/bin/python3');
+      // the engine reads the ELF interpreter straight out of `files`, before any symlink table exists
+      { const ld = '/lib64/ld-linux-x86-64.so.2', real = resolveIn(r, ld); if (!r.files[ld] && r.files[real]) r.files[ld] = r.files[real]; }
+      image = { files: r.files, mtimes: r.mtimes, meta: r, stats: { files: Object.keys(r.files).length, rootfs: o.rootfs } };
+    } else {
+      image = buildImage({ python, packages, commands, extraFiles: { [GUEST_PATH]: new Uint8Array(guestSrc) },
+                           network: netp ? { resolvers: netp.resolvers } : null });
+    }
     const tImage = performance.now() - t0;
 
     let asm = null;
@@ -104,9 +122,9 @@ export class EngineHost {
     };
 
     const make = () => {
-      const eng = new LinuxEngine(image.files[python], {
+      const eng = new LinuxEngine(image.files[pythonPath], {
         argv: [python, '-S', '-B', GUEST_PATH],
-        env: ['PATH=/usr/bin:/bin', 'HOME=/root', 'LANG=C.UTF-8', 'PYTHONDONTWRITEBYTECODE=1', 'PYTHONUNBUFFERED=1',
+        env: [o.rootfs ? 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' : 'PATH=/usr/bin:/bin', 'HOME=/root', 'LANG=C.UTF-8', 'PYTHONDONTWRITEBYTECODE=1', 'PYTHONUNBUFFERED=1',
               ...(packages.length ? [`PYTHONPATH=${packages.join(':')}`] : []),
               // glibc would otherwise pick its SSSE3/SSE4.2 string routines on a v2 CPU
               ...(netp ? ['SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt', 'REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt', 'CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt'] : []),
@@ -114,6 +132,13 @@ export class EngineHost {
         files: image.files, mtimes: image.mtimes, memMB, assembleWat, net: netp,
       });
       eng.assembleWatDeferred = assembleWatDeferred;
+      if (image.meta) {                             // a rootfs carries symlinks, empty directories and file modes
+        const m = eng._fsMeta();
+        for (const [k, v] of image.meta.links) m.links.set(k, v);
+        for (const d of image.meta.dirs) m.dirs.add(d);
+        m.modes = new Map(image.meta.modes);
+        m.v++;
+      }
       eng.mem.cpuV2 = packages.length > 0;              // compiled extension packages (numpy) are built for x86-64-v2
       eng.pumpAsm = () => asm.pump();
       // Compiled code runs as a wasm-to-wasm chain that only re-checks the
@@ -124,7 +149,7 @@ export class EngineHost {
       return eng;
     };
 
-    const key = cacheKey({ python, packages, commands, memMB, network: netp ? netp.resolvers : null }, guestSrc);
+    const key = cacheKey({ python, packages, commands, memMB, network: netp ? netp.resolvers : null, rootfs: o.rootfs }, guestSrc);
     const snap = join(CACHE_DIR, 'snapshots', key, 'snap');
     host.snapPath = snap;
     host._asm = asm;
