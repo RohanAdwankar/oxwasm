@@ -82,7 +82,8 @@ export class LinuxEngine {
   constructor(elfBytes, { argv = ['prog'], env = [], memMB = 256, threshold = Infinity, files = {},
                           assembleWat = null, aotCallThreshold = 4, aotLoopThreshold = 12,
                           xserver = null, mtimes = {}, tty = false, ttyRows = 24, ttyCols = 80,
-                          stdin = null, net = null } = {}) {
+                          stdin = null, net = null, diskMB = 0 } = {}) {
+    this._diskQuota = diskMB * 1048576;       // 0 = unlimited
     this._netProvider = net;                  // host-side network bridge (see sdk/net.mjs); null = no network
     this.files = files;                       // path -> Uint8Array (read-only)
     // kept for fork materialisation: a blocked vfork-window child becomes a
@@ -4806,8 +4807,24 @@ export class LinuxEngine {
   // reallocation was O(n^2) - vim writing 14MB in 8KB chunks spent 3.4s of
   // a 6s run copying 12GB. Every consumer takes the view's length and
   // byteOffset (parseElf, DataView, Buffer.from), so the capacity is invisible.
+  // A guest that writes without limit would be spending the HOST's memory:
+  // files live in this process. Growth is charged against a quota and refused
+  // with ENOSPC past it. The running count only ever over-estimates (it does
+  // not credit deletes), so when it crosses the quota the true size of what
+  // the guest has written is recomputed before refusing.
+  _chargeDisk(added) {
+    const root = this._netRoot(), q = root._diskQuota;
+    if (!q || added <= 0) return;
+    root._diskUsed = (root._diskUsed ?? 0) + added;
+    if (root._diskUsed <= q) return;
+    let real = 0;
+    for (const p of root.dirtyFiles ?? []) real += root.files[p]?.length ?? 0;
+    root._diskUsed = real;
+    if (real > q) throw new PathErr(28);                     // ENOSPC
+  }
   _growFile(h, end) {
     const old = h.bytes;
+    this._chargeDisk(end - old.length);
     const nb = (old.byteOffset + end <= old.buffer.byteLength)
       ? new Uint8Array(old.buffer, old.byteOffset, end)
       : (() => { const b = new Uint8Array(Math.max(end, old.length * 2, 4096)); b.set(old); return b.subarray(0, end); })();

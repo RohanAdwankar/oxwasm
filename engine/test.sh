@@ -74,3 +74,4 @@ node strtest.mjs
 node decodetest.mjs
 node sse4test.mjs
 node loopxtest.mjs
+node isolationtest.mjs

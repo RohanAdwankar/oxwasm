@@ -18,7 +18,7 @@ const inCidr = (ip, cidr) => {
   const n = BigInt(bits), mask = n === 0n ? 0n : ((1n << 32n) - 1n) ^ ((1n << (32n - n)) - 1n);
   return (ip4(ip) & mask) === (ip4(base) & mask);
 };
-const PRIVATE = ['10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '169.254.0.0/16', '100.64.0.0/10', '127.0.0.0/8', '0.0.0.0/8', '224.0.0.0/3'];
+const PRIVATE = ['10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '169.254.0.0/16', '100.64.0.0/10', '127.0.0.0/8', '0.0.0.0/8', '224.0.0.0/3', '192.0.2.0/24', '198.51.100.0/24', '203.0.113.0/24', '198.18.0.0/15'];
 
 /** Nameservers the host uses, as the guest's resolv.conf should list them. */
 export function hostResolvers() {

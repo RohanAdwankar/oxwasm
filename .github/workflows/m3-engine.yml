@@ -36,7 +36,9 @@ jobs:
       - name: install wabt
         run: sudo apt-get update && sudo apt-get install -y wabt
       - name: sandbox suite
-        run: node engine/diff/sandboxtest.mjs
+        run: |
+          node engine/diff/sandboxtest.mjs
+          node engine/diff/isolationtest.mjs
 
   # The packer had no check at all, and stayed broken on every machine but one
   # for as long as it took someone to run it somewhere else: it read wabt.js

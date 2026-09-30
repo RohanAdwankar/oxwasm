@@ -182,7 +182,7 @@ is('isRunning', await sbx.isRunning(), true);
     is('without network the guest cannot connect', offRes.text, "'ConnectionRefusedError'");
     await off.kill();
     const priv = await Sandbox.create({ network: true });
-    const blocked = await priv.runCode(`import socket\ntry:\n  socket.create_connection(("${ip}",${port}),timeout=5)\n  r="connected"\nexcept OSError as e:\n  r=e.errno\nr`);
+    const blocked = await priv.runCode(`import socket\ntry:\n  socket.create_connection(("10.255.255.1",80),timeout=5)\n  r="connected"\nexcept OSError as e:\n  r=e.errno\nr`);
     is('network: true refuses a private address by default (ENETUNREACH)', blocked.text, '101');
     await priv.kill();
     const net = await Sandbox.create({ network: { allowPrivate: true } });

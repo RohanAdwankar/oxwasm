@@ -132,7 +132,7 @@ export class EngineHost {
               // glibc would otherwise pick its SSSE3/SSE4.2 string routines on a v2 CPU
               ...(netp ? ['SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt', 'REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt', 'CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt'] : []),
               ...(packages.length ? ['GLIBC_TUNABLES=glibc.cpu.hwcaps=-SSSE3,-SSE4_1,-SSE4_2,-POPCNT'] : []), ...(o.env || [])],
-        files: image.files, mtimes: image.mtimes, memMB, assembleWat, net: netp,
+        files: image.files, mtimes: image.mtimes, memMB, assembleWat, net: netp, diskMB: o.diskMB ?? 1024,
       });
       eng.assembleWatDeferred = assembleWatDeferred;
       if (image.meta) {                             // a rootfs carries symlinks, empty directories and file modes
