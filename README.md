@@ -101,6 +101,22 @@ today with nothing recompiled.
 | 200k dict inserts | 2.2 s | 0.19 s |
 | sort 300k floats | 7.7 s | 0.17 s |
 
+**Memory and concurrency** (`node bench/sdk/concurrency.mjs`, 4 cores, 16 GB):
+
+| sandboxes alive | create all | one cell each | memory per sandbox |
+|---|---|---|---|
+| 4 | 3.0 s | 4.1 s | ~775 MB |
+| 8 | 8.8 s | 7.0 s | ~557 MB |
+| 16 | 36.8 s | 14.4 s | ~460 MB |
+
+A sandbox is roughly 450-550 MB resident, not a few MB: it is a whole Linux
+process image plus its compiled code. Sixteen at once fit in about 7 GB, and
+throughput is bounded by your cores (each busy sandbox uses one). The very
+first build on a machine peaks near 2.4 GB. After sandboxes close, the glibc
+allocator keeps memory it has already mapped; run the host with
+`MALLOC_ARENA_MAX=1` (it then settles near 1.1 GB across repeated
+create/close cycles instead of growing to about 2.2 GB).
+
 **Where it loses, plainly:**
 
 - **It is not fast.** It is x86 emulation on top of Wasm, so compute-heavy

@@ -187,7 +187,7 @@ export class EngineHost {
       try { await host._warm(); } catch (e) { o.log?.(`warm-up failed: ${e.message}`); }
       try {
         const dir = join(CACHE_DIR, 'snapshots', key);
-        const tmp = dir + '.tmp' + process.pid;
+        const tmp = dir + '.tmp' + process.pid + '_' + Math.random().toString(36).slice(2);
         mkdirSync(tmp, { recursive: true });
         await snapshotEngine(host.eng, null, join(tmp, 'snap'));
         saveUnits(join(tmp, 'units.bin'), units);

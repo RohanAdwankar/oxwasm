@@ -7,6 +7,8 @@
 // BEFORE the engine grows does the spawning instead; requests are a path per
 // line over one FIFO, answers an exit status per line over another, both
 // synchronous from the engine's point of view (a blocking readSync on a FIFO).
+import { threadId } from 'node:worker_threads';
+import { randomBytes } from 'node:crypto';
 import { spawn, execFileSync, execSync } from 'node:child_process';
 import { mkdtempSync, openSync, writeSync, readSync, writeFileSync, readFileSync, unlinkSync, existsSync, rmSync, constants as FSC } from 'node:fs';
 
@@ -18,8 +20,11 @@ import { mkdtempSync, openSync, writeSync, readSync, writeFileSync, readFileSync
 // case. So prove the assembler works before the first unit is ever emitted:
 // build a one-instruction module with the same flags the run will use, which
 // catches a missing binary and a wabt too old for --enable-tail-call alike.
+// Worker threads share a pid, and every sandbox builds its own assembler: names keyed on the pid alone collide.
+const UID = () => `${process.pid}_${threadId}_${randomBytes(4).toString('hex')}`;
+
 function preflight(flags, tag) {
-  const w = `/tmp/${tag}_pre_${process.pid}`;
+  const w = `/tmp/${tag}_pre_${UID()}`;
   try {
     writeFileSync(w + '.wat', '(module (func (export "f") (result i32) (i32.const 1)))');
     execFileSync('wat2wasm', [...flags, w + '.wat', '-o', w + '.wasm'], { stdio: ['ignore', 'ignore', 'pipe'] });
@@ -34,13 +39,14 @@ function preflight(flags, tag) {
 export function makeAssembler({ debugNames = false, tag = 'oxasm', workers = +(process.env.OXWASM_ASM_WORKERS || 1) } = {}) {
   const flags = ['--enable-tail-call', ...(debugNames ? ['--debug-names'] : [])];
   let n = 0;
+  const uid = UID();
   preflight(flags, tag);
   // workers > 1: extra broker shells, each with its own fifo pair and queue;
   // deferred submissions go to the least loaded one, so several wat2wasm run
   // at once while the guest continues. The synchronous path uses shell 0.
   const extra = [];
   const direct = (wat) => {                        // fallback: spawn from here
-    const w = `/tmp/${tag}_${process.pid}_${n++}`; writeFileSync(w + '.wat', wat);
+    const w = `/tmp/${tag}_${uid}_${n++}`; writeFileSync(w + '.wat', wat);
     try { execFileSync('wat2wasm', [...flags, w + '.wat', '-o', w + '.wasm']); return new Uint8Array(readFileSync(w + '.wasm')); }
     finally { for (const s of ['.wat', '.wasm']) { try { unlinkSync(w + s); } catch {} } }
   };
