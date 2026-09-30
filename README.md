@@ -26,29 +26,45 @@ writes never exists on your disk.
 
 ## The API
 
-Two calls cover most use: `run` for Python and `sh` for a shell. Underneath is
-a fuller interface for when you want more control over results and streaming:
+Everything hangs off the sandbox, `s`. Each job has a **simple call** that
+returns the answer, and a **detailed twin** that returns a result object, for
+when you want to stream output, keep results separate, or handle errors
+yourself. They run the same code.
+
+| To do this | Simple | Detailed |
+|---|---|---|
+| Run Python | `await s.run(code)` | `await s.runCode(code)` |
+| Run a shell command | `await s.sh(cmd)` | `await s.commands.run(cmd)` |
+| Read / write files | `s.files.read(path)`, `s.files.write(path, data)` | (same) |
+| Stop | `await s.close()` | `await s.kill()` |
 
 ```js
-const sbx = await Sandbox.create()
-const exec = await sbx.runCode('x = 1; x + 1')
-exec.text                       // '2'      the cell's last expression
-exec.logs.stdout                // lines the cell printed, newline included
-exec.error                      // { name, value, traceback } - reported, not thrown
+const s = await Sandbox.create()
 
-await sbx.files.write('/a.txt', 'hi')
-await sbx.files.read('/a.txt')
-await sbx.commands.run('cat /a.txt')     // throws CommandExitError on a nonzero exit
-await sbx.kill()
+// Simple: you get text back. A Python error throws.
+await s.run('x = 10')
+await s.run('print(x * 5)')          // "50\n"   what it printed, then its last expression
+await s.sh('ls /')                    // { stdout, stderr, exitCode } - never throws on a nonzero exit
+
+// Detailed: you get a result object. A Python error is a field, not an exception.
+const r = await s.runCode('x = 1; x + 1')
+r.text                                // '2'      the last expression only
+r.logs.stdout                         // ['...\n']  lines it printed, newline included
+r.error                               // undefined, or { name, value, traceback }
+
+await s.commands.run('cat /a.txt')    // throws CommandExitError on a nonzero exit
 ```
 
-It also has separate code contexts (`createCodeContext`), streaming callbacks
-(`onStdout`, `onStderr`, `onResult`, `onError`), per-call `envs` and
-`timeoutMs`, background commands, and `Sandbox.connect(id)` within the same
-process. Errors are typed (`TimeoutError`, `CommandExitError`,
-`FileNotFoundError`, ...). One detail that trips people: `execution.text` is
-the cell's **last expression only**; what it `print`s is in
-`execution.logs.stdout`.
+Use the simple calls to get going. Reach for `runCode` when you are wiring
+this into an agent and need output, results and errors kept apart. One detail
+that trips people: in the detailed form, `r.text` is the **last expression
+only**; what the cell `print`s is in `r.logs.stdout`.
+
+The detailed form also has separate code contexts (`createCodeContext`),
+streaming callbacks (`onStdout`, `onStderr`, `onResult`, `onError`), per-call
+`envs` and `timeoutMs`, background commands, and `Sandbox.connect(id)` within
+the same process. Errors are typed (`TimeoutError`, `CommandExitError`,
+`FileNotFoundError`, ...).
 
 **Not implemented, and they say so instead of pretending:** `pty`, `git`,
 `getHost` and any inbound network, `watchDir`, pause/snapshot/fork, and
