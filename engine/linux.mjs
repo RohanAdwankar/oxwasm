@@ -2403,14 +2403,28 @@ export class LinuxEngine {
         // the old image of a tail-exec'd main process re-steps its execve on
         // every blocked-rewind resume: keep it parked, never exec twice
         if (this._execed) { this.block(null); break; }
-        const path = this.readPath(a1);
+        let path = this.readPath(a1);
         const readVec = (p) => { const out = [];
           for (let i = 0n; ; i += 8n) { const sp = this.mem.read(p + i, 8n); if (sp === 0n) break;
             out.push(this.readPath(sp)); } return out; };
-        const argv = a2 ? readVec(a2) : [path];
+        let argv = a2 ? readVec(a2) : [path];
         const envp = a3 ? readVec(a3) : [];
-        const bytes = this.lookup(path);
+        let bytes = this.lookup(path);
         if (!bytes) { ret(-2n); break; }                     // ENOENT
+        // `#!interpreter [arg]` scripts: the kernel re-executes the interpreter
+        // with the script's path and the original arguments. Up to 5 levels.
+        for (let depth = 0; bytes[0] === 0x23 && bytes[1] === 0x21; depth++) {
+          if (depth >= 5) { ret(-40n); break; }              // ELOOP
+          let eol = 2; while (eol < Math.min(bytes.length, 256) && bytes[eol] !== 10) eol++;
+          const line = new TextDecoder().decode(bytes.subarray(2, eol)).trim();
+          const sp = line.search(/\s/), interp = sp < 0 ? line : line.slice(0, sp), iarg = sp < 0 ? '' : line.slice(sp).trim();
+          if (!interp) { ret(-8n); break; }                  // ENOEXEC
+          const ib = this.lookup(interp);
+          if (!ib) { ret(-2n); bytes = null; break; }
+          argv = [interp, ...(iarg ? [iarg] : []), path, ...argv.slice(1)];
+          path = interp; bytes = ib;
+        }
+        if (!bytes) break;
         // The child becomes its own engine: fresh memory image for the new
         // binary, the vfork-window fd table carried over so the wire pipes
         // the parent set up (dup2 before exec) connect the two engines.
