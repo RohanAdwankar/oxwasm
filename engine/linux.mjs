@@ -524,6 +524,22 @@ export class LinuxEngine {
     this.stats.tiers.aot = (this.stats.tiers.aot || 0) + 1;
   }
 
+  /** True if the code at `a` is a vfork stub: `mov eax, 58; syscall` within its first bytes (glibc's vfork). */
+  _isVforkStub(a) {
+    const memo = (this._vforkMemo ??= new Map());
+    let r = memo.get(a);
+    if (r !== undefined) return r;
+    r = false;
+    try {
+      const b = [];
+      for (let i = 0n; i < 40n; i++) b.push(Number(this.mem.read(a + i, 1n)));
+      for (let i = 0; i + 7 <= b.length; i++)
+        if (b[i] === 0xb8 && b[i + 1] === 0x3a && !b[i + 2] && !b[i + 3] && !b[i + 4] && b[i + 5] === 0x0f && b[i + 6] === 0x05) { r = true; break; }
+    } catch { /* unmapped: not a stub */ }
+    memo.set(a, r);
+    return r;
+  }
+
   tierUpAot(entry) {
     const k = entry;
     if (this.pumpAsm) this.pumpAsm();                       // deferred units whose bytes are back register first
@@ -645,6 +661,13 @@ export class LinuxEngine {
     const t0c = (this.tierMsMax !== undefined) ? performance.now() : 0;
     const un = (this._unitN = (this._unitN || 0) + 1);   // bisect aid: veto unit N -> stays interpreted
     if (this.unitFilter && !this.unitFilter(un, entry)) { this.aotFailed.add(k); this.noteAotFail(entry, 'vetoed by unitFilter (bisect)'); return; }
+    // vfork stays interpreted. Its child runs on the parent's stack and returns
+    // through the parent's frame, which only works when the interpreter owns
+    // both. Compiled, glibc's vfork left the parent corrupt: it worked for the
+    // first seven or eight calls, then the function got hot, was translated, and
+    // the next spawn faulted in the child right after execve. Found with a
+    // long-lived CPython spawning shells; bisected to this one unit.
+    if (this._isVforkStub(entry)) { this.aotFailed.add(k); this.noteAotFail(entry, 'vfork stays interpreted'); return; }
     // Generated code the guest keeps rewriting is left to the interpreter (see
     // _codeWrite). This also marks the region's pages as watched, so a write
     // to one is seen before the translation it invalidates is ever used.
@@ -667,7 +690,7 @@ export class LinuxEngine {
         skip: (c) => ((this._ftSeen.has(BigInt(c)) || (this._pendingFns !== undefined && this._pendingFns.has(c))) && !UNPRUNE.has(c))
                   || (!CLOSURE_ALL && (this.aotCalls.get(BigInt(c)) || 0) < CLOSURE_MIN),
         // bisect aids: fnVeto never compiles these; fnAllow compiles only these (roots and closure members)
-        veto: (this.fnVeto || this.fnAllow) ? (c) => (this.fnVeto?.has(c) ?? false) || (this.fnAllow ? !this.fnAllow.has(c) : false) : null,
+        veto: (c) => this._isVforkStub(BigInt(c)) || (this.fnVeto?.has(c) ?? false) || (this.fnAllow ? !this.fnAllow.has(c) : false),   // a vfork stub is never compiled, as a root or inside a closure
         tinyMemo: (this._tinyMemo ??= new Map()),
         failMemo: (this._failMemo ??= new Map()),
         sizeMemo: (this._sizeMemo ??= new Map()),          // sizes of callees the size gate refused (cleared per range by _invalidateCode)
