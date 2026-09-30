@@ -50,7 +50,7 @@ export function snapshotEngine(eng, xs, path) {
     if (h.ev) { fds.push([fd, { ev: { count: h.ev.count, nonblock: h.ev.nonblock, sem: h.ev.sem } }]); continue; }
     if (h.pipe) {
       if (!pipes.has(h.pipe)) pipes.set(h.pipe, pipes.size);
-      fds.push([fd, { pipe: pipes.get(h.pipe), mode: h.mode }]); continue;
+      fds.push([fd, { pipe: pipes.get(h.pipe), mode: h.mode, nonblock: !!h.nonblock }]); continue;
     }
     if (h.sock) { fds.push([fd, { sock: true, conn: h.sock.conn ? conns.indexOf(h.sock.conn) : -1,
                                   nonblock: !!h.sock.nonblock }]); continue;
@@ -59,6 +59,13 @@ export function snapshotEngine(eng, xs, path) {
     fds.push([fd, { unknown: true }]);
   }
   const pipeBufs = [...pipes.keys()].map(p => p.chunks.map(c => bw.add(c)));
+  // What the chunks alone do not say: how far into the first one a reader has
+  // got, how many bytes are buffered, and whether the write side is closed. A
+  // pipe restored without them reads NaN out of `chunks[0].length - off`, and a
+  // guest that was blocked reading one (a long-lived process waiting on its
+  // stdin) cannot be resumed.
+  const pipeMeta = [...pipes.keys()].map(p => ({ off: p.off ?? 0, size: p.size ?? p.chunks.reduce((n, c) => n + c.length, 0),
+                                                 weof: !!p.weof, wtot: p.wtot ?? 0, rtot: p.rtot ?? 0 }));
 
   // ---- dirty guest files ----------------------------------------------------
   const dirty = [];
@@ -121,8 +128,15 @@ export function snapshotEngine(eng, xs, path) {
     _futexAddr: eng._futexAddr ?? null,
     stats: { interpreted: eng.stats.interpreted, aotRuns: eng.stats.aotRuns },
     threads: eng.threads.map(t => ({ id: t.id, state: t.state, dl: t.dl, _dl: t._dl,
-      futex: t.futex, ctid: t.ctid, cpu: cpuState(t.cpu) })),
-    fds, pipeBufs, dirty, x,
+      futex: t.futex, ctid: t.ctid, cpu: cpuState(t.cpu),
+      sigmask: t.sigmask ?? 0n, pending: t.pending ?? 0n, altstack: t.altstack ?? null })),
+    // Process-level state a guest sets up once, early, and never again. Without
+    // it a restored process has default dispositions for every signal - a
+    // Python whose SIGINT handler was installed at startup dies with status 130
+    // on its first Ctrl-C - and loses FD_CLOEXEC on descriptors it marked.
+    sigact: [...(eng.sigact ?? [])], sigign: [...(eng.sigign ?? [])],
+    nocldwait: !!eng.nocldwait, cloexec: [...(eng.cloexec ?? [])],
+    fds, pipeBufs, pipeMeta, dirty, x,
     memLen: eng.wmem.buffer.byteLength,
   };
   writeFileSync(path + '.json', j(state));
