@@ -1285,6 +1285,17 @@ export class CPU {
       case 'push': this.push(this.get(insn.src)); break;
       case 'pop': this.set(insn.dst, this.pop()); break;
       case 'jmp': this.rip = (next + insn.rel) & MASK[8]; break;
+      case 'loopx': {                                         // loopne / loope / loop / jrcxz (flags untouched)
+        const M = insn.a32 ? 0xFFFFFFFFn : 0xFFFFFFFFFFFFFFFFn;
+        let take;
+        if (insn.op === 0xE3) take = (this.regs[1] & M) === 0n;
+        else {
+          const c = ((this.regs[1] & M) - 1n) & M;
+          this.regs[1] = insn.a32 ? c : c;                      // a 32-bit counter zero-extends into rcx
+          take = c !== 0n && (insn.op === 0xE2 || (insn.op === 0xE1 ? !!this.f.zf : !this.f.zf));
+        }
+        if (take) this.rip = (next + insn.rel) & MASK[8];
+        break; }
       case 'jmpind': this.rip = this.get(insn.src); if (this.onJmp) this.onJmp(this.rip); break;
       case 'callind': { const t = this.get(insn.src);   // fetch target BEFORE the push moves rsp (call *0x48(%rsp))
         this.push(next); this.rip = t; if (this.onCall) this.onCall(this.rip); break; }

@@ -291,6 +291,7 @@ def op_fs_info(rid, req):
 
 # ---- commands -------------------------------------------------------------------
 SHELL = next((p for p in ('/bin/sh', '/usr/bin/sh', '/bin/bash') if os.path.exists(p)), None)
+BASH = next((p for p in ('/bin/bash', '/usr/bin/bash') if os.path.exists(p)), None)
 PROCS = {}          # pid -> Popen, for background commands
 
 
@@ -388,6 +389,96 @@ def op_cmd_stdin(rid, req):
 
 def op_cmd_list(rid, req):
     frame({'id': rid, 'ev': 'done', 'value': [{'pid': k} for k in PROCS]})
+
+
+PTYS = {}
+
+
+def op_pty_open(rid, req):
+    """An interactive shell on a pseudo-terminal: the machine's terminal, not a pipe pair."""
+    import fcntl, struct, termios
+    if SHELL is None:
+        raise FileNotFoundError(errno.ENOENT, 'no shell is provisioned in this sandbox', '/bin/sh')
+    master, slave = os.openpty()
+    rows, cols = int(req.get('rows') or 24), int(req.get('cols') or 80)
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', rows, cols, 0, 0))
+    env = dict(os.environ)
+    env.update({'TERM': 'xterm-256color', 'COLUMNS': str(cols), 'LINES': str(rows)})
+    env.update(req.get('envs') or {})
+    cmd = req.get('cmd')
+    argv = [SHELL, '-c', cmd] if cmd else ([BASH, '-i'] if BASH else [SHELL, '-i'])
+
+    def become_controlling():
+        fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+
+    p = subprocess.Popen(argv, cwd=req.get('cwd') or None, env=env, stdin=slave, stdout=slave, stderr=slave,
+                         start_new_session=True, preexec_fn=become_controlling, close_fds=True)
+    os.close(slave)
+    os.set_blocking(master, False)
+    PTYS[p.pid] = (p, master)
+    frame({'id': rid, 'ev': 'done', 'value': {'pid': p.pid}})
+
+
+def op_pty_poll(rid, req):
+    """Everything the terminal has produced since the last poll, and whether the shell is still alive."""
+    ent = PTYS.get(req['pid'])
+    if ent is None:
+        return frame({'id': rid, 'ev': 'error', 'type': 'NotFound', 'message': 'pty %s not found' % req['pid']})
+    p, master = ent
+    out = bytearray()
+    while True:
+        try:
+            b = os.read(master, 65536)
+        except (BlockingIOError, InterruptedError):
+            break
+        except OSError:                      # EIO: the slave side is gone
+            break
+        if not b:
+            break
+        out += b
+    code = p.poll()
+    if code is not None and not out:
+        os.close(master)
+        del PTYS[req['pid']]
+    frame({'id': rid, 'ev': 'done', 'value': {'data': base64.b64encode(bytes(out)).decode(), 'exitCode': code}})
+
+
+def op_pty_write(rid, req):
+    ent = PTYS.get(req['pid'])
+    if ent is None:
+        return frame({'id': rid, 'ev': 'error', 'type': 'NotFound', 'message': 'pty %s not found' % req['pid']})
+    data = base64.b64decode(req['data'])
+    view = memoryview(data)
+    while view:
+        try:
+            n = os.write(ent[1], view)
+            view = view[n:]
+        except (BlockingIOError, InterruptedError):
+            time.sleep(0.005)
+    frame({'id': rid, 'ev': 'done', 'value': None})
+
+
+def op_pty_resize(rid, req):
+    import fcntl, struct, termios
+    ent = PTYS.get(req['pid'])
+    if ent is None:
+        return frame({'id': rid, 'ev': 'error', 'type': 'NotFound', 'message': 'pty %s not found' % req['pid']})
+    fcntl.ioctl(ent[1], termios.TIOCSWINSZ, struct.pack('HHHH', int(req['rows']), int(req['cols']), 0, 0))
+    frame({'id': rid, 'ev': 'done', 'value': None})
+
+
+def op_pty_kill(rid, req):
+    ent = PTYS.pop(req['pid'], None)
+    if ent is None:
+        return frame({'id': rid, 'ev': 'done', 'value': False})
+    p, master = ent
+    try:
+        os.killpg(p.pid, 9)
+    except Exception:
+        p.kill()
+    p.wait()
+    os.close(master)
+    frame({'id': rid, 'ev': 'done', 'value': True})
 
 
 def op_env(rid, req):

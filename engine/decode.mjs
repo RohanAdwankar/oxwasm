@@ -122,6 +122,7 @@ export function decode(fetch, rip) {
   if (op === 0xC2) return fin({ mnem: 'retn', n: immU(2) });
   if (op === 0xC9) return fin({ mnem: 'leave' });
   if (op === 0xE8) return fin({ mnem: 'call', rel: imm(4) });
+  if (op >= 0xE0 && op <= 0xE3) return fin({ mnem: 'loopx', op, rel: imm(1), a32: addr32 });   // loopne/loope/loop/jrcxz
   if (op === 0xE9) return fin({ mnem: 'jmp', rel: imm(4) });
   if (op === 0xEB) return fin({ mnem: 'jmp', rel: imm(1) });
   if (op === 0x90 && !rex) return fin({ mnem: 'nop' });

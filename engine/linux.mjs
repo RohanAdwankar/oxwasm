@@ -2517,7 +2517,11 @@ export class LinuxEngine {
         ret(0n); break; }
       case 135: {                                            // personality(persona): query with 0xffffffff, else set
         const cur = this._personality ?? 0; if (Number(a1 & 0xffffffffn) !== 0xffffffff) this._personality = Number(a1 & 0xffffffffn); ret(BigInt(cur)); break; }
-      case 115: ret(0n); break;                              // getgroups: no supplementary groups
+      case 115: {                                            // getgroups(size, list*)
+        const g = this._credOf().groups, n = Number(a1);
+        if (n === 0) { ret(BigInt(g.length)); break; }
+        if (n < g.length) { ret(-22n); break; }
+        g.forEach((x, i) => { this.jsnap(a2 + BigInt(i * 4), 4); this.mem.write(a2 + BigInt(i * 4), 4n, BigInt(x)); }); ret(BigInt(g.length)); break; }
       case 140: ret(20n); break;                             // getpriority: nice 0 (the kernel's 20 - nice form)
       case 141: ret(0n); break;                              // setpriority
       case 100: {                                            // times(tms*): clock ticks (100 Hz) of wall time as user time
@@ -2701,15 +2705,41 @@ export class LinuxEngine {
           this.raiseSignal(sig, tid <= 1 ? this.threads[0].id : tid, { pid: 1, code: -6 });   // SI_TKILL
         }
         ret(0n); break; }
-      case 102: case 104: case 107: case 108: ret(0n); break; // getuid/getgid/geteuid/getegid
+      // Credentials are tracked per process (inherited by children) so that
+      // programs which drop privileges and then check the result (apt running
+      // its download methods as _apt) see what they set. Nothing is enforced:
+      // file access does not consult them.
+      case 102: case 104: case 107: case 108: { const c = this._credOf(); ret(BigInt(nr === 102 ? c.ruid : nr === 107 ? c.euid : nr === 104 ? c.rgid : c.egid)); break; }
+      case 105: case 106: case 113: case 114: case 117: case 119: {
+        const c = this._credOf(), U = (x) => { const n = Number(x & 0xFFFFFFFFn); return n === 0xFFFFFFFF ? -1 : n; };
+        const u = nr === 105 || nr === 113 || nr === 117, r = u ? 'ruid' : 'rgid', e = u ? 'euid' : 'egid', sv = u ? 'suid' : 'sgid';
+        const root = c.euid === 0;
+        if (nr === 105 || nr === 106) {
+          const v = U(a1); if (v < 0) { ret(-22n); break; }
+          if (root) { c[r] = c[e] = c[sv] = v; } else if (v === c[r] || v === c[sv]) c[e] = v; else { ret(-1n); break; }
+        } else if (nr === 113 || nr === 114) {
+          const rv = U(a1), ev = U(a2), ok = (x) => x < 0 || root || x === c[r] || x === c[e] || x === c[sv];
+          if (!ok(rv) || !ok(ev)) { ret(-1n); break; }
+          if (rv >= 0 || (ev >= 0 && ev !== c[r])) c[sv] = ev >= 0 ? ev : c[e];
+          if (rv >= 0) c[r] = rv; if (ev >= 0) c[e] = ev;
+        } else {
+          const rv = U(a1), ev = U(a2), sx = U(a3), ok = (x) => x < 0 || root || x === c[r] || x === c[e] || x === c[sv];
+          if (!ok(rv) || !ok(ev) || !ok(sx)) { ret(-1n); break; }
+          if (rv >= 0) c[r] = rv; if (ev >= 0) c[e] = ev; if (sx >= 0) c[sv] = sx;
+        }
+        ret(0n); break; }
+      case 118: case 120: {                                   // getresuid / getresgid(r*, e*, s*)
+        const c = this._credOf(), vals = nr === 118 ? [c.ruid, c.euid, c.suid] : [c.rgid, c.egid, c.sgid];
+        [a1, a2, a3].forEach((p, i) => { this.jsnap(p, 4); this.mem.write(p, 4n, BigInt(vals[i])); }); ret(0n); break; }
+      case 116: {                                             // setgroups(size, list*)
+        const n = Number(a1); if (n < 0 || n > 65536) { ret(-22n); break; }
+        const c = this._credOf(); c.groups = []; for (let i = 0; i < n; i++) c.groups.push(Number(this.mem.read(a2 + BigInt(i * 4), 4n)));
+        ret(0n); break; }
       // Credentials and ownership are single-user here: everything runs as
       // one uid, so these succeed rather than reporting ENOSYS. xterm calls
       // setegid() (i.e. setresgid) to drop privileges after opening its pty
       // and treats the failure as fatal — "setegid(0): Function not
       // implemented", then "Cannot chown /dev/pts/0".
-      case 105: case 106:                                     // setuid / setgid
-      case 113: case 114:                                     // setreuid / setregid
-      case 117: case 119:                                     // setresuid / setresgid
       case 92: case 93: case 260:                             // chown / fchown / fchownat
         ret(0n); break;
       case 90: case 91: case 268: {                           // chmod / fchmod / fchmodat: the permission bits are remembered per path
@@ -4989,6 +5019,10 @@ export class LinuxEngine {
   }
   _dgramSend(h, addr, len, sa) { this.guardRange(addr, len); return this._dgramSendBytes(h, this.ram.slice(Number(addr - this.base), Number(addr - this.base) + len), sa); }
   _external(ip) { return !!ip && !ip.startsWith('127.') && ip !== '0.0.0.0'; }
+  _credOf() {
+    return this._cred ??= this.parentEng ? { ...this.parentEng._credOf(), groups: [...this.parentEng._credOf().groups] }
+      : { ruid: 0, euid: 0, suid: 0, rgid: 0, egid: 0, sgid: 0, groups: [] };
+  }
   _netRoot() { let r = this; while (r.parentEng) r = r.parentEng; return r; }
   _net() { let r = this; while (r.parentEng) r = r.parentEng; return r._netProvider ?? null; }
   // move bytes between the guest's socket buffers and the host connections.
@@ -5101,7 +5135,7 @@ export class LinuxEngine {
       if (e.contEv && !e._contSeen) { e._contSeen = true; this.raiseSignal(17, null, { pid: c.pid, code: 6, status: 18 }); }         // CLD_CONTINUED
       if (e.exitCode === null && !e.stopped) {
         if (e.blocked) e.wake();
-        try { e.run(3e5); } catch (err) { c.exited = 127; c.error = err.message; c.errorStack = err.stack; }   // errorStack: where in the engine a child died (tooling)
+        try { e.run(3e5); } catch (err) { c.exited = 127; c.error = err.message; c.errorStack = err.stack; if (process.env.OXWASM_CHILD_ERRORS) console.error("[child engine error]", err.message); }   // errorStack: where in the engine a child died (tooling)
       }
       if (c.exited === null && e.exitCode !== null) {
         c.exited = e.exitCode;

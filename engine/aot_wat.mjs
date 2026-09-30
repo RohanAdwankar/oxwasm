@@ -466,7 +466,7 @@ export function analyze(mem, entry, { maxInsns = 20000, noJtab = false, entries 
     // and that fnstcw being an escape made it an `entry undecodable`
     // refusal - mawk ran the whole function interpreted 1,996 times.
     if (insn.mnem === 'x87' && insn.op === 0xD9 && (insn.sub === 5 || insn.sub === 7) && insn.rm) insn.mnem = 'fcw';
-    if (['hlt','ud2','int3','int','cpuid','sse4','popcnt','fxsave','fxrstor','x87','rcl','rcr','emms','popf'].includes(insn.mnem)) {   // rcl/rcr: rare, interpreter-only
+    if (['hlt','ud2','int3','int','cpuid','sse4','popcnt','loopx','fxsave','fxrstor','x87','rcl','rcr','emms','popf'].includes(insn.mnem)) {   // rcl/rcr: rare, interpreter-only
       insnAt.set(key, { mnem: 'udec', rip, next: rip + BigInt(insn.len), len: insn.len });
       continue;
     }

@@ -77,6 +77,7 @@ export class EngineHost {
 
     const t0 = performance.now();
     const netp = o.network ? makeNet(o.network) : null;
+    const caBundle = o.network && typeof o.network === 'object' ? o.network.caBundle : null;
     let image, pythonPath = python;
     if (o.rootfs) {
       // the filesystem is the tarball: its own python, its own libraries, a real dpkg database
@@ -86,6 +87,8 @@ export class EngineHost {
       if (netp) {
         r.files['/etc/resolv.conf'] = enc(netp.resolvers.map((x) => `nameserver ${x}\n`).join('') + 'options timeout:3 attempts:2\n');
         r.files['/etc/hosts'] = enc('127.0.0.1 localhost\n::1 localhost\n');
+        // extra trust: a bundle to use instead of the image's (for hosts behind a TLS-inspecting proxy)
+        if (caBundle) r.files['/etc/ssl/certs/ca-certificates.crt'] = new Uint8Array(readFileSync(caBundle));
       }
       pythonPath = resolveIn(r, o.python || '/usr/bin/python3');
       // the engine reads the ELF interpreter straight out of `files`, before any symlink table exists
@@ -149,7 +152,7 @@ export class EngineHost {
       return eng;
     };
 
-    const key = cacheKey({ python, packages, commands, memMB, network: netp ? netp.resolvers : null, rootfs: o.rootfs }, guestSrc);
+    const key = cacheKey({ python, packages, commands, memMB, network: netp ? [netp.resolvers, caBundle && sha(readFileSync(caBundle))] : null, rootfs: o.rootfs }, guestSrc);
     const snap = join(CACHE_DIR, 'snapshots', key, 'snap');
     host.snapPath = snap;
     host._asm = asm;

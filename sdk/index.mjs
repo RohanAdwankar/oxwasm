@@ -182,6 +182,42 @@ class Commands {
   get supportsStdinClose() { return false; }
 }
 
+/** An interactive terminal session: a shell on a pseudo-terminal inside the sandbox. */
+export class PtyHandle {
+  constructor(sbx, pid, opts) {
+    this._s = sbx; this.pid = pid; this._onData = opts.onData; this._exit = null; this._closed = false;
+    this._done = new Promise((resolve) => { this._resolve = resolve; });
+    this._poll(opts.pollMs ?? 30);
+  }
+  async _poll(ms) {
+    while (!this._closed && !this._s._dead) {
+      let r;
+      try { r = (await this._s._call({ op: 'pty_poll', pid: this.pid }, { timeoutMs: 30000 })).value; }
+      catch { break; }
+      const data = Buffer.from(r.data, 'base64');
+      if (data.length) { try { this._onData?.(new Uint8Array(data)); } catch {} }
+      if (r.exitCode !== null && !data.length) { this._exit = r.exitCode; break; }
+      if (!data.length) await new Promise((res) => setTimeout(res, ms));
+    }
+    this._closed = true; this._resolve({ exitCode: this._exit });
+  }
+  async sendInput(data) { await this._s._call({ op: 'pty_write', pid: this.pid, data: b64(data) }); }
+  async resize({ cols, rows }) { await this._s._call({ op: 'pty_resize', pid: this.pid, cols, rows }); }
+  async kill() { this._closed = true; const ok = (await this._s._call({ op: 'pty_kill', pid: this.pid })).value; if (ok) this._s._noteEnded(this.pid); return ok; }
+  /** Resolves when the shell exits. */
+  wait() { return this._done; }
+}
+
+class Pty {
+  constructor(sbx) { this._s = sbx; }
+  /** Start a shell (or `cmd`) on a pty. `onData` receives the terminal's raw output bytes. */
+  async create(opts = {}) {
+    const f = await this._s._call({ op: 'pty_open', cmd: opts.cmd, cwd: opts.cwd, envs: opts.envs, cols: opts.cols, rows: opts.rows },
+                                  { timeoutMs: opts.requestTimeoutMs ?? DEFAULT_REQUEST_MS });
+    return new PtyHandle(this._s, f.value.pid, opts);
+  }
+}
+
 export class Sandbox {
   /** @param {string|object} [templateOrOpts]  A template name may come first; it is accepted and ignored. */
   static async create(templateOrOpts, maybeOpts) {
@@ -376,9 +412,9 @@ export class Sandbox {
   async restartCodeContext(context) { await this._call({ op: 'ctx_restart', ctx: context.id ?? context }); }
 
   // ---- not built --------------------------------------------------------------------
-  get pty() { throw new NotSupportedError('pty'); }
+  get pty() { return (this._pty ??= new Pty(this)); }
   get git() { throw new NotSupportedError('git'); }
-  getHost() { throw new NotSupportedError('getHost (oxwasm sandboxes have no network)'); }
+  getHost() { throw new NotSupportedError('getHost (guest servers are not reachable from outside the sandbox)'); }
   async pause() { throw new NotSupportedError('pause'); }
   async betaPause() { throw new NotSupportedError('betaPause'); }
   async createSnapshot() { throw new NotSupportedError('createSnapshot'); }
