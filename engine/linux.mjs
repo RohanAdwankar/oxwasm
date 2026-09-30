@@ -82,7 +82,8 @@ export class LinuxEngine {
   constructor(elfBytes, { argv = ['prog'], env = [], memMB = 256, threshold = Infinity, files = {},
                           assembleWat = null, aotCallThreshold = 4, aotLoopThreshold = 12,
                           xserver = null, mtimes = {}, tty = false, ttyRows = 24, ttyCols = 80,
-                          stdin = null } = {}) {
+                          stdin = null, net = null } = {}) {
+    this._netProvider = net;                  // host-side network bridge (see sdk/net.mjs); null = no network
     this.files = files;                       // path -> Uint8Array (read-only)
     // kept for fork materialisation: a blocked vfork-window child becomes a
     // real child engine built from the same image and options
@@ -1968,7 +1969,7 @@ export class LinuxEngine {
         // no read end open anywhere in the process tree: SIGPIPE, and EPIPE
         // if the writer survives it (handler installed or SIG_IGN) — this is
         // what ends `yes | head -1` instead of letting yes fill a dead pipe
-        if (!this._pipeReaderAlive(pb)) { if (!nosig) this.raiseSignal(13, null, { pid: 0, code: 0 }); return -32; }
+        if (!pb.ext && !this._pipeReaderAlive(pb)) { if (!nosig) this.raiseSignal(13, null, { pid: 0, code: 0 }); return -32; }
         if (h.sk?.shutW) { if (!nosig) this.raiseSignal(13, null, { pid: 0, code: 0 }); return -32; }
         // A pipe holds 64KB: a writer that finds it full BLOCKS until a reader
         // drains it (EAGAIN if non-blocking). Without a bound, a compiled
@@ -3201,7 +3202,9 @@ export class LinuxEngine {
           if (it.off) continue;                               // EPOLLONESHOT reported once; MOD re-arms
           let re = 0;
           if ((it.events & 1) && readyR(t)) re |= 1;          // EPOLLIN
-          if (it.events & 4) re |= 4;                         // EPOLLOUT: always writable
+          { const cs = t.sk?.connecting?.conn.state;
+            if ((it.events & 4) && cs !== 'connecting') re |= 4;   // EPOLLOUT: writable unless a connect is in flight
+            if (cs === 'error') re |= 0x1c; }
           if (re && (it.events & 0x80000000)) {               // EPOLLET: only when something arrived since the last report
             const key = t.pipe ? `${t.pipe.wtot ?? 0}:${t.pipe.rtot ?? 0}:${!!t.pipe.weof}` : t.ev ? String(t.ev.count) : t.dsock ? t.dsock.queue.length : t.lsock ? t.lsock.backlog.length : t.ino ? t.ino.queue.length : t.tfd ? t.tfd.fired : Math.random();
             if (key === it.rep) re = 0; else it.rep = key; }
@@ -3676,8 +3679,23 @@ export class LinuxEngine {
         if (sa.fam === 1 && /^\/tmp\/\.X11-unix\/X\d+$/.test(sa.path) && this.xserver && h.sock) {
           h.sock.conn = this.xserver.connect(); ret(0n); break;
         }
-        if (h.dsock) { h.sk.peer = this._sockKey(sa); ret(0n); break; }   // a datagram default destination
+        if (h.dsock) { h.sk.peer = this._sockKey(sa); h.sk.peerSa = sa; ret(0n); break; }   // a datagram default destination
+        if (h.sk?.connecting) {                                 // a connect in flight to a real host: re-executed once woken
+          const c = h.sk.connecting;
+          if (c.conn.state === 'connecting') { if (h.nonblock || h.sock?.nonblock) ret(-114n); else this.block(null); break; }   // EALREADY / wait
+          h.sk.connecting = null;
+          ret(c.conn.state === 'open' ? 0n : BigInt(-(c.conn.err || 111))); break; }
         if (h.pipe || h.sock?.conn) { ret(-106n); break; }    // EISCONN
+        if (sa.fam === 2 && this._external(sa.ip) && this._net()) {   // a real address: bridge to the host's network
+          const nb = !!(h.sock?.nonblock || h.nonblock);
+          const b1 = { chunks: [], pos: 0, off: 0, size: 0 }, b2 = { chunks: [], pos: 0, off: 0, size: 0, ext: true };
+          if (!h.sk.name) h.sk.name = { fam: 2, port: this._ephemeralPort(), ip: this._net().localIp };
+          const conn = this._net().tcp(sa.ip, sa.port);
+          delete h.sock; h.pipe = b1; h.peer = b2; h.mode = 'rw'; h.nonblock = nb; h.sk.peername = { fam: 2, port: sa.port, ip: sa.ip };
+          (this._netRoot()._netConns ??= []).push({ h, b1, b2, conn, ended: false });
+          h.sk.connecting = { conn };
+          if (nb) { ret(-115n); break; }                      // EINPROGRESS: poll for writable, then SO_ERROR
+          this.block(null); break; }
         const key = this._sockKey(sa), reg = this._sockReg(), ent = reg.get(key);
         if (ent && !this._handleAlive(ent.h)) reg.delete(key);   // a listener whose process is gone
         if (!ent || !ent.h.lsock || !this._handleAlive(ent.h)) {
@@ -3850,7 +3868,7 @@ export class LinuxEngine {
       case 55: {                                              // getsockopt(fd, level, opt, val*, len*)
         const h = this.fds.get(Number(a1)); if (!h?.sk && !h?.sock && !h?.pipe) { ret(h ? -88n : -9n); break; }
         const lvl = Number(a2), opt = Number(a3);
-        const val = lvl !== 1 ? 0 : opt === 3 ? (h.sk?.type ?? 1) : opt === 30 ? (h.lsock ? 1 : 0) : (opt === 7 || opt === 8) ? 212992 : 0;   // SO_TYPE, SO_ACCEPTCONN, SO_SNDBUF/RCVBUF; SO_ERROR and the rest read 0
+        const val = lvl !== 1 ? 0 : opt === 4 ? (h.sk?.connecting?.conn.state === 'error' ? (h.sk.connecting.conn.err || 111) : 0) : opt === 3 ? (h.sk?.type ?? 1) : opt === 30 ? (h.lsock ? 1 : 0) : (opt === 7 || opt === 8) ? 212992 : 0;   // SO_TYPE, SO_ACCEPTCONN, SO_SNDBUF/RCVBUF; SO_ERROR and the rest read 0
         const vo = this.RAMOFF + Number(cpu.regs[10] - this.base);
         const lo = this.RAMOFF + Number(cpu.regs[8] - this.base);
         const v = new DataView(this.wmem.buffer);
@@ -4054,7 +4072,9 @@ export class LinuxEngine {
             const h = this.fds.get(fd);
             if (!h && fd > 2) re = 0x20;                      // POLLNVAL
             else { if ((ev & 1) && readyR(h)) re |= 1;        // POLLIN
-                   if (ev & 4) re |= 4; }                     // POLLOUT: always writable
+                   const cs = h?.sk?.connecting?.conn.state;
+                   if ((ev & 4) && cs !== 'connecting') re |= 4;   // POLLOUT: writable unless a connect is in flight
+                   if (cs === 'error') re |= 0x1c; }               // POLLOUT|POLLERR|POLLHUP
           }
           v.setUint16(o + 6, re, true); if (re) ready++;
         }
@@ -4108,7 +4128,7 @@ export class LinuxEngine {
           for (let fd = 0; fd < nfds; fd++) if (v.getUint8(o + (fd >> 3)) & (1 << (fd & 7))) out.push(fd);
           return out; };
         const rd = scan(rp).filter(fd => readyR(this.fds.get(fd)));
-        const wr = scan(wp);                                  // always writable
+        const wr = scan(wp).filter(fd => this.fds.get(fd)?.sk?.connecting?.conn.state !== 'connecting');   // writable unless a connect is in flight
         const now = this.nowMs();
         if (rd.length + wr.length > 0 || timeoutMs === 0 || (this._deadline != null && now >= this._deadline)) {
           this._deadline = null;
@@ -4920,7 +4940,7 @@ export class LinuxEngine {
   _wakeTree() { this.wakeAllBlk(); let root = this; while (root.parentEng) root = root.parentEng; if (root !== this) root.wakeAllBlk(); }
   _readSockaddr(addr, len) {
     const o = Number(addr - this.base), fam = this.ram[o] | (this.ram[o + 1] << 8);
-    if (fam === 2) return { fam, port: (this.ram[o + 2] << 8) | this.ram[o + 3] };
+    if (fam === 2) return { fam, port: (this.ram[o + 2] << 8) | this.ram[o + 3], ip: `${this.ram[o + 4]}.${this.ram[o + 5]}.${this.ram[o + 6]}.${this.ram[o + 7]}` };
     let path = '';                                            // filesystem, or abstract ("\0name")
     for (let i = 2; i < len; i++) { const c = this.ram[o + i]; if (c === 0 && path) break; if (c !== 0) path += String.fromCharCode(c); }
     return { fam, path, abstract: len > 3 && this.ram[o + 2] === 0 };
@@ -4929,7 +4949,7 @@ export class LinuxEngine {
   // truncated to *lenp, and store the full length in *lenp (or via setLen)
   _writeSockaddr(addr, lenp, nm, fam, cap = null, setLen = null) {
     let bytes;
-    if ((nm?.fam ?? fam) === 2) { bytes = new Uint8Array(16); bytes[0] = 2; const port = nm?.port ?? 0; bytes[2] = port >> 8; bytes[3] = port & 255; bytes[4] = 127; bytes[7] = 1; }
+    if ((nm?.fam ?? fam) === 2) { bytes = new Uint8Array(16); bytes[0] = 2; const port = nm?.port ?? 0; bytes[2] = port >> 8; bytes[3] = port & 255; if (nm?.ip) nm.ip.split('.').forEach((x, i) => { bytes[4 + i] = +x; }); else { bytes[4] = 127; bytes[7] = 1; } }
     else { const p = nm?.path ?? ''; bytes = new Uint8Array(2 + (p ? p.length + 1 + (nm?.abstract ? 1 : 0) : 0)); bytes[0] = 1; for (let i = 0; i < p.length; i++) bytes[2 + (nm?.abstract ? 1 : 0) + i] = p.charCodeAt(i); if (nm?.abstract) bytes = bytes.subarray(0, bytes.length - 1); }
     if (cap === null) cap = lenp ? Number(this.mem.read(lenp, 4n)) : 0;
     const n = Math.min(cap, bytes.length);
@@ -4947,7 +4967,36 @@ export class LinuxEngine {
     return out;
   }
   _dgramSend(h, addr, len, sa) { this.guardRange(addr, len); return this._dgramSendBytes(h, this.ram.slice(Number(addr - this.base), Number(addr - this.base) + len), sa); }
+  _external(ip) { return !!ip && !ip.startsWith('127.') && ip !== '0.0.0.0'; }
+  _netRoot() { let r = this; while (r.parentEng) r = r.parentEng; return r; }
+  _net() { let r = this; while (r.parentEng) r = r.parentEng; return r._netProvider ?? null; }
+  // move bytes between the guest's socket buffers and the host connections.
+  // Called by the host between slices; returns true if anything moved.
+  netPump() {
+    let moved = false;
+    for (const c of this._netConns ?? []) {
+      const { conn, b1, b2 } = c;
+      if (conn.state === 'connecting') continue;
+      if (conn.state === 'error') { if (!b1.weof) { b1.weof = true; moved = true; } continue; }
+      while (b2.chunks.length) { const ch = b2.chunks.shift(); b2.off = 0; if (ch.length) conn.write(ch); b2.size = Math.max(0, (b2.size ?? 0) - ch.length); moved = true; }
+      if (b2.weof && !c.ended) { conn.end(); c.ended = true; moved = true; }
+      while (conn.rx.length) { const ch = conn.rx.shift(); b1.chunks.push(ch); b1.size = (b1.size ?? 0) + ch.length; b1.wtot = (b1.wtot ?? 0) + ch.length; moved = true; }
+      if (conn.eof && !b1.weof) { b1.weof = true; moved = true; }
+    }
+    if (this._netConns) this._netConns = this._netConns.filter((c) => !(c.conn.state !== 'connecting' && (c.conn.eof || c.conn.state === 'error') && c.b1.weof && !c.conn.rx.length));
+    for (const u of this._netUdp ?? []) {
+      for (const d of u.sock.queue.splice(0)) { u.h.dsock.queue.push({ bytes: d.bytes, from: { fam: 2, port: d.port, ip: d.ip } }); moved = true; }
+    }
+    if (moved) this.wakeAllBlk();
+    return moved;
+  }
   _dgramSendBytes(h, bytes, sa) {
+    const dst = sa ?? h.sk.peerSa;
+    if (dst?.fam === 2 && this._external(dst.ip) && this._net()) {
+      if (!h.sk.name) h.sk.name = { fam: 2, port: this._ephemeralPort(), ip: this._net().localIp };
+      if (!h.udpBridge) { h.udpBridge = this._net().udp(); (this._netRoot()._netUdp ??= []).push({ h, sock: h.udpBridge }); }
+      h.udpBridge.send(bytes, dst.ip, dst.port); return BigInt(bytes.length);
+    }
     const key = sa ? this._sockKey(sa) : h.sk.peer; if (!key) return -89n;   // EDESTADDRREQ
     const reg = this._sockReg(), ent = reg.get(key);
     if (ent && !this._handleAlive(ent.h)) reg.delete(key);

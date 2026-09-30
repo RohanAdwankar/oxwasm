@@ -6,6 +6,7 @@
 // rest of the SDK safe to put in front of untrusted code: a guest that spins
 // in compiled code never returns from a slice, and only a separate thread can
 // be abandoned when that happens.
+import { makeNet } from './net.mjs';
 import { readFileSync, statSync, existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
@@ -24,14 +25,14 @@ const sha = (...parts) => { const h = createHash('sha256'); for (const p of part
 // A snapshot is only valid for the exact machine it was taken on: the same
 // interpreter, the same mounted packages, the same tools, the same driver and
 // the same engine. Anything else must miss.
-function cacheKey({ python, packages, commands, memMB }, guestSrc) {
+function cacheKey({ python, packages, commands, memMB, network }, guestSrc) {
   const engine = [...['linux.mjs', 'aot_wat.mjs', 'interp.mjs', 'decode.mjs', 'snapshot.mjs', 'snapshot_core.mjs']
     .map((f) => sha(readFileSync(join(HERE, '..', 'engine', f)))),
     // the SDK's own code decides what goes into a snapshot (the warm-up, the unit capture)
-    ...['host.mjs', 'image.mjs'].map((f) => sha(readFileSync(join(HERE, f))))];
+    ...['host.mjs', 'image.mjs', 'net.mjs'].map((f) => sha(readFileSync(join(HERE, f))))];
   const stamp = (p) => { try { const s = readFileSync(p).length; return `${p}:${s}`; } catch { return p; } };
   return sha(JSON.stringify({ python: stamp(python), tree: findPythonTree(python), memMB,
-                              packages: [...packages].sort(), commands: [...commands].sort(), engine }), guestSrc);
+                              packages: [...packages].sort(), commands: [...commands].sort(), network, engine }), guestSrc);
 }
 
 // units.bin: one JSON line [[entryHex, byteLength], ...] then the wasm modules back to back.
@@ -73,7 +74,9 @@ export class EngineHost {
     const guestSrc = readFileSync(join(HERE, 'guest.py'));
 
     const t0 = performance.now();
-    const image = buildImage({ python, packages, commands, extraFiles: { [GUEST_PATH]: new Uint8Array(guestSrc) } });
+    const netp = o.network ? makeNet(o.network) : null;
+    const image = buildImage({ python, packages, commands, extraFiles: { [GUEST_PATH]: new Uint8Array(guestSrc) },
+                               network: netp ? { resolvers: netp.resolvers } : null });
     const tImage = performance.now() - t0;
 
     let asm = null;
@@ -107,7 +110,7 @@ export class EngineHost {
               ...(packages.length ? [`PYTHONPATH=${packages.join(':')}`] : []),
               // glibc would otherwise pick its SSSE3/SSE4.2 string routines on a v2 CPU
               ...(packages.length ? ['GLIBC_TUNABLES=glibc.cpu.hwcaps=-SSSE3,-SSE4_1,-SSE4_2,-POPCNT'] : []), ...(o.env || [])],
-        files: image.files, mtimes: image.mtimes, memMB, assembleWat,
+        files: image.files, mtimes: image.mtimes, memMB, assembleWat, net: netp,
       });
       eng.assembleWatDeferred = assembleWatDeferred;
       eng.mem.cpuV2 = packages.length > 0;              // compiled extension packages (numpy) are built for x86-64-v2
@@ -120,7 +123,7 @@ export class EngineHost {
       return eng;
     };
 
-    const key = cacheKey({ python, packages, commands, memMB }, guestSrc);
+    const key = cacheKey({ python, packages, commands, memMB, network: netp ? netp.resolvers : null }, guestSrc);
     const snap = join(CACHE_DIR, 'snapshots', key, 'snap');
     host.snapPath = snap;
     host._asm = asm;
@@ -233,8 +236,10 @@ export class EngineHost {
   /** One bounded slice. Returns { exit } or { waitMs } - how long to sleep before waking the guest. */
   step() {
     const eng = this.eng;
+    eng.netPump?.();
     eng.sliceDeadline = performance.now() + SLICE_MS;
     eng.run(5e7);
+    eng.netPump?.();
     eng.sliceDeadline = null;
     this._ingest();
     if (eng.exitCode !== null) return { exit: eng.exitCode };

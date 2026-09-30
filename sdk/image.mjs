@@ -114,7 +114,7 @@ function which(name) {
 /**
  * @returns {{files: Record<string, Uint8Array>, mtimes: Record<string, number>, stats: object}}
  */
-export function buildImage({ python = '/usr/bin/python3', packages = [], commands = DEFAULT_COMMANDS, extraFiles = {} } = {}) {
+export function buildImage({ python = '/usr/bin/python3', packages = [], commands = DEFAULT_COMMANDS, extraFiles = {}, network = null } = {}) {
   if (!existsSync(python)) throw new Error(`${python} not found on this host`);
   const files = {}, mtimes = {};
   const elfs = new Set();                        // real paths whose library closure is needed
@@ -157,6 +157,24 @@ export function buildImage({ python = '/usr/bin/python3', packages = [], command
       const real = realpathSync(host);
       if (isElf(real)) elfs.add(real);
     }
+  }
+
+  // name resolution: glibc loads its NSS modules with dlopen, so ldd never lists them
+  if (network) {
+    for (const dir of ['/lib/x86_64-linux-gnu', '/usr/lib/x86_64-linux-gnu', '/lib64']) {
+      for (const m of ['libnss_files.so.2', 'libnss_dns.so.2', 'libresolv.so.2']) {
+        const p = join(dir, m);
+        if (existsSync(p) && put(p, p)) { elfs.add(realpathSync(p)); }
+      }
+    }
+    for (const f of ['/etc/ssl/certs/ca-certificates.crt', '/etc/protocols', '/etc/services']) put(f, f);
+    const enc = (t) => new TextEncoder().encode(t);
+    extraFiles = {
+      ...extraFiles,
+      '/etc/resolv.conf': enc(network.resolvers.map((r) => `nameserver ${r}\n`).join('') + 'options timeout:3 attempts:2\n'),
+      '/etc/hosts': enc('127.0.0.1 localhost\n::1 localhost\n'),
+      '/etc/nsswitch.conf': enc('passwd: files\ngroup: files\nhosts: files dns\nnetworks: files\nprotocols: files\nservices: files\n'),
+    };
   }
 
   // the shared libraries all of that loads
