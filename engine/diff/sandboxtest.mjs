@@ -1,8 +1,6 @@
-// The E2B-compatible SDK, checked against the behaviour E2B's published
-// packages define (types read from @e2b/code-interpreter 2.8 / e2b 2.51), and
-// against the properties the sandbox exists for: state that persists, a guest
-// that cannot reach the host, and a runaway cell that cannot take the host down.
-// Skips on a machine with no python3.
+// The sandbox SDK: state that persists, a guest that cannot reach the host, and
+// a runaway cell that cannot take the host down. Skips on a machine with no
+// python3.
 import { existsSync, writeFileSync, unlinkSync } from 'node:fs';
 import {
   Sandbox, Execution, TimeoutError, CommandExitError, FileNotFoundError, SandboxNotFoundError,
@@ -28,7 +26,7 @@ let sbx;
 try { sbx = await Sandbox.create(); }
 catch (e) { console.log(`sandboxtest SKIPPED: ${e.message}`); process.exit(0); }
 
-// ---- E2B's execution semantics ---------------------------------------------
+// ---- execution semantics ----------------------------------------------------
 yes('runCode returns an Execution', (await sbx.runCode('x = 10')) instanceof Execution);
 const pr = await sbx.runCode('print(x * 5)');
 is('print goes to logs.stdout, a line at a time', pr.logs.stdout, ['50\n']);
@@ -160,5 +158,5 @@ is('killed sandbox is not running', await sbx.isRunning(), false);
 await rejects('a killed sandbox refuses work', sbx.runCode('1'), SandboxNotFoundError);
 is('Sandbox.kill on an unknown id', await Sandbox.kill('nope'), false);
 
-console.log(`\n${pass}/${pass + fail} SDK checks (E2B-compatible surface, persistent state, isolation, containment)`);
+console.log(`\n${pass}/${pass + fail} SDK checks (persistent state, isolation, containment)`);
 process.exit(fail ? 1 : 0);

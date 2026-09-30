@@ -1,14 +1,12 @@
-// oxwasm's E2B-compatible SDK.
+// oxwasm's sandbox SDK.
 //
-//   - import { Sandbox } from '@e2b/code-interpreter'
-//   + import { Sandbox } from 'oxwasm'
+//   const s = await Sandbox.create()
+//   await s.run('x = 10')            // python, with state
+//   await s.sh('ls /')               // a shell
 //
-// Same class, same method names, same option names, same result shapes, same
-// error classes - taken from the published @e2b/code-interpreter 2.8 and e2b
-// 2.51 type definitions, not from memory. What differs is where the code runs:
-// on an unmodified CPython inside a worker thread of YOUR process, not on
-// someone else's machine. Where a feature is not built, the call throws
-// `NotSupportedError` saying so; nothing is a silent no-op.
+// The code runs on an unmodified CPython inside a worker thread of YOUR
+// process, not on someone else's machine. Where a feature is not built, the
+// call throws `NotSupportedError` saying so; nothing is a silent no-op.
 import { Worker } from 'node:worker_threads';
 import { randomBytes } from 'node:crypto';
 import { Execution, Result, OutputMessage, ExecutionError } from './messaging.mjs';
@@ -27,8 +25,8 @@ export class NotSupportedError extends SandboxError {
 export const FileType = { FILE: 'file', DIR: 'dir', SYMLINK: 'symlink' };
 
 const WORKER_URL = new URL('./worker.mjs', import.meta.url);
-const DEFAULT_LIFETIME_MS = 300_000;     // E2B's default sandbox timeout
-const DEFAULT_REQUEST_MS = 60_000;       // E2B's default for runCode and commands.run
+const DEFAULT_LIFETIME_MS = 300_000;     // default sandbox lifetime
+const DEFAULT_REQUEST_MS = 60_000;       // default for runCode and commands.run
 const SIGINT_GRACE_MS = 5_000;           // how long a cell gets to unwind after SIGINT before the sandbox is abandoned
 
 const REGISTRY = new Map();              // sandboxId -> Sandbox, for connect() and list()
@@ -185,7 +183,7 @@ class Commands {
 }
 
 export class Sandbox {
-  /** @param {string|object} [templateOrOpts]  E2B allows a template name first; it is accepted and ignored. */
+  /** @param {string|object} [templateOrOpts]  A template name may come first; it is accepted and ignored. */
   static async create(templateOrOpts, maybeOpts) {
     const opts = (typeof templateOrOpts === 'string' ? maybeOpts : templateOrOpts) || {};
     return Sandbox._start(opts);
@@ -322,7 +320,7 @@ export class Sandbox {
   }
 
   // ---- the short form ---------------------------------------------------------------
-  // The E2B-shaped methods below are the compatible surface. These two are the
+  // The fuller methods below give control over results and streaming. These two are the
   // ones the docs lead with: one call to run python, one call to run a shell
   // command, and neither makes you unpack a result object to get the answer.
 

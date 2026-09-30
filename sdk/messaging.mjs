@@ -1,6 +1,5 @@
-// Result types with the same names, fields and behaviour as @e2b/code-interpreter,
-// so code that reads `execution.text`, `execution.logs.stdout` or
-// `execution.error.traceback` does not change when the import does.
+// Result types for a cell's execution: `execution.text` (the last expression),
+// `execution.logs.stdout`, `execution.error.traceback`, rich `results`.
 
 export class OutputMessage {
   constructor(line, timestamp, error) { this.line = line; this.timestamp = timestamp; this.error = error; }

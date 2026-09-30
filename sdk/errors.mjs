@@ -1,6 +1,4 @@
-// The error classes @e2b/code-interpreter re-exports from `e2b`, same names and
-// same inheritance, so `catch (e) { if (e instanceof TimeoutError) ... }` keeps
-// working across the swap.
+// Typed errors, so `catch (e) { if (e instanceof TimeoutError) ... }` works.
 
 export class SandboxError extends Error {
   constructor(message) { super(message); this.name = 'SandboxError'; }

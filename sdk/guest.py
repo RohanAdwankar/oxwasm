@@ -51,7 +51,7 @@ def drain_fds(rid):
 
 class Stream(io.TextIOBase):
     """sys.stdout / sys.stderr for a cell. Output is delivered a LINE at a time,
-    newline included, the way E2B's logs are - print() makes two writes (the text
+    newline included, the way a log is - print() makes two writes (the text
     and then the newline) and a consumer should not have to stitch them."""
     def __init__(self, rid, ev):
         self.rid, self.ev, self.pending = rid, ev, ''
