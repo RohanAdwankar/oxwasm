@@ -5,9 +5,9 @@ name: m3-engine
 # browser check of what the packer actually produces.
 on:
   push:
-    paths: ['engine/**', 'tools/**', '.github/workflows/m3-engine.yml']
+    paths: ['engine/**', 'tools/**', 'sdk/**', '.github/workflows/m3-engine.yml']
   pull_request:
-    paths: ['engine/**', 'tools/**', '.github/workflows/m3-engine.yml']
+    paths: ['engine/**', 'tools/**', 'sdk/**', '.github/workflows/m3-engine.yml']
 
 jobs:
   suite:
@@ -22,6 +22,21 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y nasm wabt busybox-static
       - name: run verification suite
         run: ./engine/test.sh 300
+
+  # The in-process sandbox SDK, end to end: state, files, commands, timeouts,
+  # isolation, and a runaway loop that has to be contained by its worker.
+  sdk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: install wabt
+        run: sudo apt-get update && sudo apt-get install -y wabt
+      - name: sandbox suite
+        run: node engine/diff/sandboxtest.mjs
 
   # The packer had no check at all, and stayed broken on every machine but one
   # for as long as it took someone to run it somewhere else: it read wabt.js
