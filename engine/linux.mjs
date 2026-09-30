@@ -2623,7 +2623,7 @@ export class LinuxEngine {
         v.setBigUint64(o, BigInt(Math.floor(ms / 1000)), true);
         v.setBigUint64(o + 8, BigInt(Math.floor((ms % 1000) * 1e6)), true);
         ret(0n); break; }
-      case 201: ret(BigInt(Math.floor(Date.now() / 1000))); break;   // time
+      case 201: { const now = BigInt(Math.floor(Date.now() / 1000)); if (a1) { this.jsnap(a1, 8); this.mem.write(a1, 8n, now); } ret(now); break; }   // time(time_t*): the kernel stores through the pointer too
       case 309: {                                             // getcpu(cpu*, node*, tcache): one CPU, one node
         if (a1) this.mem.write(a1, 4n, 0n); if (a2) this.mem.write(a2, 4n, 0n); ret(0n); break; }
       case 188: case 189: case 190:                           // setxattr / lsetxattr / fsetxattr(path|fd, name, value, size, flags)
@@ -3761,6 +3761,27 @@ export class LinuxEngine {
                  if (r !== undefined && r < 0) { ret(BigInt(r)); total = -1; break; } }
                if (total < 0) break; }
         ret(BigInt(total)); break; }
+      case 307: {                                             // sendmmsg(fd, mmsghdr*, vlen, flags): glibc's resolver sends A and AAAA together
+        const h = this.fds.get(Number(a1));
+        if (!h?.dsock) { ret(h ? -38n : -9n); break; }
+        const v = new DataView(this.wmem.buffer), vlen = Math.min(Number(a3), 1024);
+        let sent = 0, err = 0n;
+        for (let k = 0; k < vlen; k++) {
+          const mh = a2 + BigInt(k * 64), mo = this.RAMOFF + Number(mh - this.base);
+          const iovp = v.getBigUint64(mo + 16, true), iovn = Number(v.getBigUint64(mo + 24, true));
+          const parts = []; let total = 0;
+          for (let i = 0; i < iovn; i++) {
+            const o = this.RAMOFF + Number(iovp - this.base) + i * 16;
+            const p = v.getBigUint64(o, true), l = Number(v.getBigUint64(o + 8, true));
+            parts.push(this.ram.slice(Number(p - this.base), Number(p - this.base) + l)); total += l;
+          }
+          const all = new Uint8Array(total); { let off = 0; for (const b of parts) { all.set(b, off); off += b.length; } }
+          const np = v.getBigUint64(mo, true), nl = v.getUint32(mo + 8, true);
+          const r = this._dgramSendBytes(h, all, np ? this._readSockaddr(np, nl) : null);
+          if (r < 0n) { err = r; break; }
+          this.jsnap(mh + 56n, 4); this.mem.write(mh + 56n, 4n, BigInt(total)); sent++;
+        }
+        ret(sent ? BigInt(sent) : err); break; }
       case 47: {                                              // recvmsg(fd, msghdr*, flags)
         const h = this.fds.get(Number(a1)), fl = Number(a3);
         if (!h?.sock && !h?.pipe && !h?.dsock) { ret(h ? -88n : -9n); break; }

@@ -109,6 +109,7 @@ export class EngineHost {
         env: ['PATH=/usr/bin:/bin', 'HOME=/root', 'LANG=C.UTF-8', 'PYTHONDONTWRITEBYTECODE=1', 'PYTHONUNBUFFERED=1',
               ...(packages.length ? [`PYTHONPATH=${packages.join(':')}`] : []),
               // glibc would otherwise pick its SSSE3/SSE4.2 string routines on a v2 CPU
+              ...(netp ? ['SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt', 'REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt', 'CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt'] : []),
               ...(packages.length ? ['GLIBC_TUNABLES=glibc.cpu.hwcaps=-SSSE3,-SSE4_1,-SSE4_2,-POPCNT'] : []), ...(o.env || [])],
         files: image.files, mtimes: image.mtimes, memMB, assembleWat, net: netp,
       });

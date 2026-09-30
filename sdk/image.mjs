@@ -167,7 +167,10 @@ export function buildImage({ python = '/usr/bin/python3', packages = [], command
         if (existsSync(p) && put(p, p)) { elfs.add(realpathSync(p)); }
       }
     }
-    for (const f of ['/etc/ssl/certs/ca-certificates.crt', '/etc/protocols', '/etc/services']) put(f, f);
+    // trust what the host trusts: its bundle, which on a host behind a TLS-inspecting proxy includes the proxy's CA
+    const bundle = [process.env.SSL_CERT_FILE, '/etc/ssl/certs/ca-certificates.crt'].find((f) => f && existsSync(f));
+    if (bundle) put('/etc/ssl/certs/ca-certificates.crt', bundle);
+    for (const f of ['/etc/protocols', '/etc/services']) put(f, f);
     const enc = (t) => new TextEncoder().encode(t);
     extraFiles = {
       ...extraFiles,
