@@ -151,7 +151,48 @@ is('an unrelated sandbox is untouched', (await sbx.runCode('x')).text, '11');
 // ---- lifecycle and honesty ------------------------------------------------------------------
 yes('sandboxId is a string', typeof sbx.sandboxId === 'string' && sbx.sandboxId.length > 8);
 is('isRunning', await sbx.isRunning(), true);
-try { sbx.pty; is('pty is not silently faked', true, false); } catch (e) { yes('pty throws NotSupportedError', e instanceof NotSupportedError); }
+// ---- an interactive terminal -----------------------------------------------------------------------------
+{
+  let term = '';
+  const pty = await sbx.pty.create({ cols: 90, rows: 20, onData: (b) => { term += Buffer.from(b).toString(); } });
+  const until = async (re, ms = 20000) => { const t = Date.now(); while (!re.test(term) && Date.now() - t < ms) await new Promise((r) => setTimeout(r, 50)); return re.test(term); };
+  yes('a pty shell shows a prompt', await until(/[#$] $/));
+  term = ''; await pty.sendInput('echo pty-$((6*7))\n');
+  yes('it runs what is typed and echoes it', await until(/pty-42\r\n/));
+  is('it exits with the shell\'s status', (await (async () => { await pty.sendInput('exit 3\n'); return pty.wait(); })()).exitCode, 3);
+}
+
+// ---- the network: off by default, bridged and policed when asked for ----------------------------------------------
+{
+  const { createServer } = await import('node:http');
+  const { createSocket } = await import('node:dgram');
+  const { networkInterfaces } = await import('node:os');
+  const ip = Object.values(networkInterfaces()).flat().find((i) => i && i.family === 'IPv4' && !i.internal)?.address;
+  if (!ip) console.log('  (no non-loopback address: network checks skipped)');
+  else {
+    const srv = createServer((q, r) => r.end('from-host')).listen(0, '0.0.0.0');
+    await new Promise((r) => srv.once('listening', r));
+    const port = srv.address().port;
+    const udp = createSocket('udp4'); udp.on('message', (m, r) => udp.send(Buffer.concat([Buffer.from('echo:'), m]), r.port, r.address));
+    await new Promise((r) => udp.bind(0, '0.0.0.0', r));
+    const uport = udp.address().port;
+    const GET = `import socket\nc=socket.create_connection(("${ip}",${port}),timeout=30)\nc.sendall(b"GET / HTTP/1.0\\r\\n\\r\\n")\nd=b""\nwhile True:\n  x=c.recv(4096)\n  if not x: break\n  d+=x\nd.split(b"\\r\\n\\r\\n")[1].decode()`;
+    const off = await Sandbox.create();
+    const offRes = await off.runCode(`import socket\ntry:\n  socket.create_connection(("${ip}",${port}),timeout=5)\n  r="connected"\nexcept OSError as e:\n  r=type(e).__name__\nr`);
+    is('without network the guest cannot connect', offRes.text, "'ConnectionRefusedError'");
+    await off.kill();
+    const priv = await Sandbox.create({ network: true });
+    const blocked = await priv.runCode(`import socket\ntry:\n  socket.create_connection(("${ip}",${port}),timeout=5)\n  r="connected"\nexcept OSError as e:\n  r=e.errno\nr`);
+    is('network: true refuses a private address by default (ENETUNREACH)', blocked.text, '101');
+    await priv.kill();
+    const net = await Sandbox.create({ network: { allowPrivate: true } });
+    is('TCP to a host server', (await net.runCode(GET)).text, "'from-host'");
+    is('...a closed port is ECONNREFUSED', (await net.runCode(`import socket\ntry:\n  socket.create_connection(("${ip}",1),timeout=10)\n  r="connected"\nexcept OSError as e:\n  r=e.errno\nr`)).text, '111');
+    is('UDP round trip', (await net.runCode(`import socket\nu=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)\nu.settimeout(20)\nu.sendto(b"x",("${ip}",${uport}))\nu.recvfrom(100)[0]`)).text, "b'echo:x'");
+    await net.kill(); srv.close(); udp.close();
+  }
+}
+
 await rejects('an unsupported language says so', sbx.runCode('1', { language: 'r' }), SandboxError);
 is('kill', await sbx.kill(), true);
 is('killed sandbox is not running', await sbx.isRunning(), false);

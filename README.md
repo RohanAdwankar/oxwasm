@@ -81,7 +81,8 @@ languages other than Python. Those throw `NotSupportedError`.
 | Shell and CLI tools | a provisioned set of coreutils | everything | none | a provisioned set |
 | Outbound network | none | yes | varies | opt-in |
 | Create a sandbox | ~1.9 s (snapshot restore); ~50 s the first time on a machine | network round trip; not measured (needs an account) | ~5.7 s (measured, node `loadPyodide`) | ~6 ms (their figure, not measured here) |
-| Compute speed | 10-45x slower than Pyodide on pure-Python loops (measured, below) | native | fastest of the in-process options | not measured here |
+| 2M-iteration Python loop | 6.9 s | not measured (needs an account) | 0.64 s | not measured here |
+| Sort 300k floats | 7.7 s | not measured (needs an account) | 0.17 s | not measured here |
 | Scales out | your CPU, one core per busy sandbox | their pool | your CPU | your CPU |
 
 The row that is the reason this exists is native packages. Wasm-based
