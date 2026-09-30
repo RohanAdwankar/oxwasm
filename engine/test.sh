@@ -72,3 +72,4 @@ node implicittest.mjs
 node rottest.mjs
 node strtest.mjs
 node decodetest.mjs
+node sse4test.mjs

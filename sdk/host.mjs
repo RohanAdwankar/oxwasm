@@ -104,14 +104,18 @@ export class EngineHost {
       const eng = new LinuxEngine(image.files[python], {
         argv: [python, '-S', '-B', GUEST_PATH],
         env: ['PATH=/usr/bin:/bin', 'HOME=/root', 'LANG=C.UTF-8', 'PYTHONDONTWRITEBYTECODE=1', 'PYTHONUNBUFFERED=1',
-              ...(packages.length ? [`PYTHONPATH=${packages.join(':')}`] : []), ...(o.env || [])],
+              ...(packages.length ? [`PYTHONPATH=${packages.join(':')}`] : []),
+              // glibc would otherwise pick its SSSE3/SSE4.2 string routines on a v2 CPU
+              ...(packages.length ? ['GLIBC_TUNABLES=glibc.cpu.hwcaps=-SSSE3,-SSE4_1,-SSE4_2,-POPCNT'] : []), ...(o.env || [])],
         files: image.files, mtimes: image.mtimes, memMB, assembleWat,
       });
       eng.assembleWatDeferred = assembleWatDeferred;
+      eng.mem.cpuV2 = packages.length > 0;              // compiled extension packages (numpy) are built for x86-64-v2
       eng.pumpAsm = () => asm.pump();
       // Compiled code runs as a wasm-to-wasm chain that only re-checks the
       // clock when its fuel runs out; bottomless fuel means one run() can hold
       // the thread indefinitely. The packed browser page sets the same pair.
+      if (process.env.OXWASM_NOAOT) { eng.aotCallThreshold = 1e15; eng.aotLoopThreshold = 1e15; }
       eng.chainFuel = 2048; eng.loopYield = 20000;
       return eng;
     };

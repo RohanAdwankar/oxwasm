@@ -259,10 +259,33 @@ export class CPU {
           // gcc used movhlps to unpack a pair returned in one xmm - in CPython
           // that pair is two object pointers about to be increfed, so one incref
           // landed on the wrong address and a live object was freed early.
-          case 0x12: this.xmm[insn.xr] = (this.xmm[insn.xr] & ~0xFFFFFFFFFFFFFFFFn) |
+          case 0x12: if (insn.pF2 || insn.pF3) {                                 // movddup / movsldup (SSE3)
+            const v = rdRm(insn.pF2 ? 8 : 16), M32 = 0xFFFFFFFFn;
+            this.xmm[insn.xr] = insn.pF2 ? (v & 0xFFFFFFFFFFFFFFFFn) | ((v & 0xFFFFFFFFFFFFFFFFn) << 64n)
+              : (v & M32) | ((v & M32) << 32n) | (((v >> 64n) & M32) << 64n) | (((v >> 64n) & M32) << 96n);
+            break; }
+            this.xmm[insn.xr] = (this.xmm[insn.xr] & ~0xFFFFFFFFFFFFFFFFn) |
             (insn.rm.kind === 'xmm' ? (this.xmm[insn.rm.r] >> 64n) : rdRm(8)); break;   // movhlps / movlps
           case 0x13: wrRm(8, this.xmm[insn.xr] & 0xFFFFFFFFFFFFFFFFn); break;                             // movlps store
-          case 0x16: this.xmm[insn.xr] = (this.xmm[insn.xr] & 0xFFFFFFFFFFFFFFFFn) | (rdRm(8) << 64n); break; // movhps load high
+          case 0xD0: case 0x7C: case 0x7D: {                                                              // addsub / hadd / hsub (SSE3), ps and pd
+            const dbl = insn.p66, eb = dbl ? 64 : 32, n = 128 / eb, a = this.xmm[insn.xr], b2 = rdRm(16);
+            const g = (v, i) => dbl ? FP.getF64((v >> BigInt(i * 64)) & 0xFFFFFFFFFFFFFFFFn) : FP.getF32((v >> BigInt(i * 32)) & 0xFFFFFFFFn);
+            const put = (x) => dbl ? FP.putF64(x) : FP.putF32(x);
+            let r = 0n;
+            for (let i = 0; i < n; i++) {
+              let x;
+              if (insn.op === 0xD0) x = i % 2 === 0 ? g(a, i) - g(b2, i) : g(a, i) + g(b2, i);
+              else { const h = n / 2, src = i < h ? a : b2, j = 2 * (i % h); x = insn.op === 0x7C ? g(src, j) + g(src, j + 1) : g(src, j) - g(src, j + 1); }
+              if (!dbl) x = Math.fround(x);
+              r |= put(x) << BigInt(i * eb);
+            }
+            this.xmm[insn.xr] = r; break; }
+          case 0xF0: this.xmm[insn.xr] = rdRm(16); break;                                                 // lddqu
+          case 0x16: if (insn.pF3) {                                                                      // movshdup (SSE3)
+            const v = rdRm(16), M32 = 0xFFFFFFFFn;
+            this.xmm[insn.xr] = ((v >> 32n) & M32) | (((v >> 32n) & M32) << 32n) | (((v >> 96n) & M32) << 64n) | (((v >> 96n) & M32) << 96n);
+            break; }
+            this.xmm[insn.xr] = (this.xmm[insn.xr] & 0xFFFFFFFFFFFFFFFFn) | (rdRm(8) << 64n); break; // movhps load high
           case 0x17: wrRm(8, this.xmm[insn.xr] >> 64n); break;                                            // movhps store
           case 0x14: {   // unpcklps/pd
             const a = this.xmm[insn.xr], b2 = rdRm(16);
@@ -610,15 +633,120 @@ export class CPU {
           const s = (e ^ (1n << (eb-1n))) - (1n << (eb-1n)); return (s >> (c >= eb ? eb-1n : c)); });
         else throw new Error('sse shift sub ' + insn.sub);
         break; }
+      case 'popcnt': {
+        let v = this.get(insn.src), n = 0n;
+        while (v) { n += v & 1n; v >>= 1n; }
+        this.f.zf = n === 0n ? 1 : 0; this.f.cf = 0; this.f.of = 0; this.f.sf = 0; this.f.pf = 0; this.f.af = 0;
+        this.setReg(insn.dst, n); break; }
+      case 'sse4': {                                // SSSE3 / SSE4.1 packed ops the numpy family compiles to
+        const M128 = (1n << 128n) - 1n;
+        const key = (insn.map === 0x38 ? 0x3800 : 0x3a00) | insn.op;
+        const dstv = this.xmm[insn.xr];
+        const memBytes = { 0x3820: 8, 0x3821: 4, 0x3822: 2, 0x3823: 8, 0x3824: 4, 0x3825: 8,
+                           0x3830: 8, 0x3831: 4, 0x3832: 2, 0x3833: 8, 0x3834: 4, 0x3835: 8 }[key] ?? 16;
+        const isGpr = insn.map === 0x3a && (insn.op >= 0x14 && insn.op <= 0x17 || insn.op === 0x20 || insn.op === 0x22);
+        const src = () => insn.rm.kind === 'xmm' ? this.xmm[insn.rm.r] & ((1n << BigInt(memBytes * 8)) - 1n)
+                        : this.mem.read(this.ea(insn.rm), BigInt(memBytes));
+        const L = (v, i, eb) => (v >> BigInt(i * eb)) & ((1n << BigInt(eb)) - 1n);
+        const SL = (v, i, eb) => BigInt.asIntN(eb, L(v, i, eb));
+        const build = (n, eb, f) => { let r = 0n; for (let i = 0; i < n; i++) r |= BigInt.asUintN(eb, f(i)) << BigInt(i * eb); return r; };
+        const sat = (x, bits, uns) => { const lo = uns ? 0n : -(1n << BigInt(bits - 1)), hi = uns ? (1n << BigInt(bits)) - 1n : (1n << BigInt(bits - 1)) - 1n; return x < lo ? lo : x > hi ? hi : x; };
+        const setX = (v) => { this.xmm[insn.xr] = v & M128; };
+        const roundF = (x, mode) => {
+          if (!Number.isFinite(x)) return x;
+          if (mode === 1) return Math.floor(x); if (mode === 2) return Math.ceil(x); if (mode === 3) return Math.trunc(x);
+          const f = Math.floor(x), d = x - f;
+          const r = d < 0.5 ? f : d > 0.5 ? f + 1 : (f % 2 === 0 ? f : f + 1);
+          return r === 0 && (x < 0 || Object.is(x, -0)) ? -0 : r;
+        };
+        const gprOut = (v, bytes) => {
+          if (insn.rm.kind === 'xmm') this.regs[insn.rm.r] = v & ((1n << BigInt(bytes * 8)) - 1n);
+          else this.mem.write(this.ea(insn.rm), BigInt(bytes), v);
+        };
+        const gprIn = (bytes) => insn.rm.kind === 'xmm' ? this.regs[insn.rm.r] & ((1n << BigInt(bytes * 8)) - 1n)
+                               : this.mem.read(this.ea(insn.rm), BigInt(bytes));
+        const minmax = { 0x38: [true, 8, true], 0x39: [true, 32, true], 0x3a: [false, 16, true], 0x3b: [false, 32, true],
+                         0x3c: [true, 8, false], 0x3d: [true, 32, false], 0x3e: [false, 16, false], 0x3f: [false, 32, false] };
+        if (insn.map === 0x38) {
+          const o = insn.op;
+          if (o >= 0x20 && o <= 0x25 || o >= 0x30 && o <= 0x35) {   // pmovsx / pmovzx
+            const sx = o < 0x30, k = o & 7;
+            const [eb, ob, n] = [[8, 16, 8], [8, 32, 4], [8, 64, 2], [16, 32, 4], [16, 64, 2], [32, 64, 2]][k];
+            const v = src();
+            setX(build(n, ob, (i) => sx ? SL(v, i, eb) : L(v, i, eb)));
+          } else if (minmax[o]) {
+            const [sg, eb, isMin] = minmax[o]; const b2 = src();
+            setX(build(128 / eb, eb, (i) => { const a = sg ? SL(dstv, i, eb) : L(dstv, i, eb), c = sg ? SL(b2, i, eb) : L(b2, i, eb); return (isMin ? a < c : a > c) ? a : c; }));
+          } else switch (o) {
+            case 0x00: { const b2 = src(); setX(build(16, 8, (i) => { const ix = Number(L(b2, i, 8)); return ix & 0x80 ? 0n : L(dstv, ix & 15, 8); })); break; }
+            case 0x01: case 0x02: case 0x03: case 0x05: case 0x06: case 0x07: {   // phadd / phsub (w, d, sw)
+              const eb = (o & 3) === 2 ? 32 : 16, sub = o >= 5, satd = (o & 3) === 3; const b2 = src(); const h = 64 / eb;
+              const f = (v, i) => { const a = SL(v, 2 * i, eb), c = SL(v, 2 * i + 1, eb); const r = sub ? a - c : a + c; return satd ? sat(r, 16, false) : r; };
+              setX(build(h, eb, (i) => f(dstv, i)) | (build(h, eb, (i) => f(b2, i)) << 64n)); break; }
+            case 0x04: { const b2 = src();   // pmaddubsw: unsigned dst bytes * signed src bytes, pairs added, saturated
+              setX(build(8, 16, (i) => sat(L(dstv, 2 * i, 8) * SL(b2, 2 * i, 8) + L(dstv, 2 * i + 1, 8) * SL(b2, 2 * i + 1, 8), 16, false))); break; }
+            case 0x08: case 0x09: case 0x0a: { const eb = 8 << (o - 8), b2 = src();
+              setX(build(128 / eb, eb, (i) => { const c = SL(b2, i, eb); return c < 0n ? -SL(dstv, i, eb) : c === 0n ? 0n : SL(dstv, i, eb); })); break; }
+            case 0x0b: { const b2 = src(); setX(build(8, 16, (i) => (((SL(dstv, i, 16) * SL(b2, i, 16)) >> 14n) + 1n) >> 1n)); break; }
+            case 0x10: case 0x14: case 0x15: {           // pblendvb / blendvps / blendvpd: mask is xmm0
+              const eb = o === 0x10 ? 8 : o === 0x14 ? 32 : 64, b2 = src(), m = this.xmm[0];
+              setX(build(128 / eb, eb, (i) => (L(m, i, eb) >> BigInt(eb - 1)) & 1n ? L(b2, i, eb) : L(dstv, i, eb))); break; }
+            case 0x17: { const b2 = src(); this.f.zf = (dstv & b2) === 0n ? 1 : 0; this.f.cf = (~dstv & M128 & b2) === 0n ? 1 : 0;
+              this.f.of = 0; this.f.sf = 0; this.f.pf = 0; this.f.af = 0; break; }
+            case 0x1c: case 0x1d: case 0x1e: { const eb = 8 << (o - 0x1c), b2 = src();
+              setX(build(128 / eb, eb, (i) => { const a = SL(b2, i, eb); return a < 0n ? -a : a; })); break; }
+            case 0x28: { const b2 = src(); setX(build(2, 64, (i) => SL(dstv, 2 * i, 32) * SL(b2, 2 * i, 32))); break; }
+            case 0x29: { const b2 = src(); setX(build(2, 64, (i) => L(dstv, i, 64) === L(b2, i, 64) ? -1n : 0n)); break; }
+            case 0x37: { const b2 = src(); setX(build(2, 64, (i) => SL(dstv, i, 64) > SL(b2, i, 64) ? -1n : 0n)); break; }
+            case 0x2a: setX(src()); break;               // movntdqa
+            case 0x2b: { const b2 = src(); setX(build(8, 16, (i) => sat(SL(i < 4 ? dstv : b2, i & 3, 32), 16, true))); break; }
+            case 0x40: { const b2 = src(); setX(build(4, 32, (i) => L(dstv, i, 32) * L(b2, i, 32))); break; }
+            case 0x41: { const b2 = src(); let best = 0, bv = L(b2, 0, 16);
+              for (let i = 1; i < 8; i++) { const w = L(b2, i, 16); if (w < bv) { bv = w; best = i; } }
+              setX(bv | (BigInt(best) << 16n)); break; }
+            default: throw new Error(`unsupported 0f 38 ${o.toString(16)}`);
+          }
+        } else {
+          const o = insn.op, im = insn.imm8;
+          switch (o) {
+            case 0x08: case 0x09: case 0x0a: case 0x0b: {   // roundps/pd/ss/sd
+              const dbl = o & 1, scalar = o >= 0x0a, mode = im & 4 ? 0 : im & 3;
+              const b2 = src(); const eb = dbl ? 64 : 32, n = scalar ? 1 : 128 / eb;
+              const get = (v, i) => dbl ? FP.getF64(L(v, i, 64)) : FP.getF32(L(v, i, 32));
+              const put = (x) => dbl ? FP.putF64(x) : FP.putF32(x);
+              let r = scalar ? dstv : 0n;
+              for (let i = 0; i < n; i++) { r = (r & ~(((1n << BigInt(eb)) - 1n) << BigInt(i * eb))) | (put(roundF(get(b2, i), mode)) << BigInt(i * eb)); }
+              setX(r); break; }
+            case 0x0c: case 0x0d: case 0x0e: {               // blendps / blendpd / pblendw
+              const eb = o === 0x0c ? 32 : o === 0x0d ? 64 : 16, b2 = src();
+              setX(build(128 / eb, eb, (i) => (im >> i) & 1 ? L(b2, i, eb) : L(dstv, i, eb))); break; }
+            case 0x0f: { const b2 = src(); setX(im >= 32 ? 0n : ((dstv << 128n) | b2) >> BigInt(im * 8)); break; }
+            case 0x14: gprOut(L(dstv, im & 15, 8), 1); break;
+            case 0x15: gprOut(L(dstv, im & 7, 16), 2); break;
+            case 0x16: insn.W ? gprOut(L(dstv, im & 1, 64), 8) : gprOut(L(dstv, im & 3, 32), 4); break;
+            case 0x17: gprOut(L(dstv, im & 3, 32), 4); break;
+            case 0x20: { const v = gprIn(1); setX((dstv & ~(0xFFn << BigInt((im & 15) * 8))) | (v << BigInt((im & 15) * 8))); break; }
+            case 0x22: { const eb = insn.W ? 64 : 32, k = im & (insn.W ? 1 : 3), v = gprIn(eb / 8);
+              setX((dstv & ~(((1n << BigInt(eb)) - 1n) << BigInt(k * eb))) | (v << BigInt(k * eb))); break; }
+            case 0x21: {                                      // insertps
+              const cs = insn.rm.kind === 'xmm' ? (im >> 6) & 3 : 0, cd = (im >> 4) & 3;
+              const v = insn.rm.kind === 'xmm' ? L(this.xmm[insn.rm.r], cs, 32) : this.mem.read(this.ea(insn.rm), 4n);
+              let r = (dstv & ~(0xFFFFFFFFn << BigInt(cd * 32))) | (v << BigInt(cd * 32));
+              for (let i = 0; i < 4; i++) if ((im >> i) & 1) r &= ~(0xFFFFFFFFn << BigInt(i * 32));
+              setX(r); break; }
+            default: throw new Error(`unsupported 0f 3a ${o.toString(16)}`);
+          }
+        }
+        break; }
       case 'cpuid': {
-        // claim exactly baseline x86-64 (v1): fpu..cmov, mmx, fxsr, sse, sse2.
+        // claim exactly baseline x86-64 (v1) unless mem.cpuV2 asks for x86-64-v2 (numpy 2.x is built for it): fpu..cmov, mmx, fxsr, sse, sse2.
         // No sse3+ — glibc then selects the generic/SSE2 string functions,
         // which is precisely the instruction set this engine implements.
         const leaf = Number(this.regs[0] & 0xFFFFFFFFn);
         let a = 0n, b2 = 0n, c = 0n, d = 0n;
         if (leaf === 0) { a = 7n; b2 = 0x756e6547n; d = 0x49656e69n; c = 0x6c65746en; }   // "GenuineIntel"
         else if (leaf === 1) { a = 0x000306a0n; b2 = 0x00010800n; c = 0x80000001n /* hypervisor|sse3? no: bit0 sse3 OFF -> 0x80000000|1? */ , d = 0x178bfbffn;
-          c = 0x80000000n; }                          // ecx: only the hypervisor bit; edx: baseline incl. sse2
+          c = this.mem.cpuV2 ? 0x80982201n : 0x80000000n; }   // ecx: hypervisor bit (plus, for cpuV2: sse3 ssse3 cx16 sse4.1 sse4.2 popcnt); edx: baseline incl. sse2
         else if (leaf === 7) { a = 0n; b2 = 0n; c = 0n; d = 0n; }
         else if (leaf === 0x80000000) { a = 0x80000008n; }
         else if (leaf === 0x80000001) { c = 1n; d = 0x28100800n; }   // lahf_lm; syscall+nx+rdtscp+lm

@@ -184,6 +184,16 @@ export function decode(fetch, rip) {
     const o2 = b();
     if (o2 >= 0x80 && o2 <= 0x8F) return fin({ mnem: 'jcc', cond: COND[o2 - 0x80], rel: imm(4) });
     if (o2 === 0x05) return fin({ mnem: 'syscall' });
+    if (o2 === 0x38 || o2 === 0x3A) {                     // SSSE3 / SSE4.1 / SSE4.2 three-byte maps
+      const o3 = b();
+      const m = b(), mod = m >> 6, xr = ((m >> 3) & 7) | (R << 3);
+      let rm;
+      if (mod === 3) rm = { kind: 'xmm', r: (m & 7) | (B << 3) };
+      else { i--; const [, mem] = modrm(16); rm = mem; }
+      const imm8 = o2 === 0x3A ? Number(immU(1)) : undefined;
+      return fin({ mnem: 'sse4', map: o2, op: o3, p66: opsize === 2, pF3: !!rep, pF2: !!rep2, W, xr, rm, imm8 });
+    }
+    if (o2 === 0xB8 && rep) { const [r, rm] = modrm(osz); return fin({ mnem: 'popcnt', dst: r, src: rm, size: osz }); }
     const SSE_OPS = { 0x6E:1, 0x7E:1, 0xD6:1, 0x6F:1, 0x7F:1, 0x10:1, 0x11:1,
                       0x28:1, 0x29:1, 0x6C:1, 0xEF:1, 0x74:1, 0xD7:1, 0xDB:1, 0xEB:1,
                       0x60:1, 0x61:1, 0x62:1, 0x68:1, 0x69:1, 0x6A:1, 0x6D:1,
@@ -191,7 +201,7 @@ export function decode(fetch, rip) {
                       0xDA:1, 0xDE:1, 0xEA:1, 0xEE:1, 0xD8:1, 0xD9:1, 0xDC:1, 0xDD:1,
                       0xE8:1, 0xE9:1, 0xEC:1, 0xED:1, 0xE0:1, 0xE3:1, 0xD5:1, 0xE5:1, 0xE4:1,
                       0xF4:1, 0xF6:1, 0x63:1, 0x67:1, 0x6B:1, 0xC5:1, 0xC4:1,
-                      0xDF:1, 0xF5:1, 0xE7:1,                                  // pandn, pmaddwd, movntdq
+                      0xDF:1, 0xF5:1, 0xE7:1, 0xF0:1, 0xD0:1, 0x7C:1, 0x7D:1,                                  // pandn, pmaddwd, movntdq
                       0xD1:1, 0xD2:1, 0xD3:1, 0xE1:1, 0xE2:1, 0xF1:1, 0xF2:1, 0xF3:1,  // p{sll,srl,sra}{w,d,q} by-reg
                       0x54:1, 0x55:1, 0x56:1, 0x57:1, 0x2A:1, 0x2C:1, 0x2D:1, 0x2E:1, 0x2F:1,
                       0x50:1, 0x51:1, 0x58:1, 0x59:1, 0x5A:1, 0x5B:1, 0x5C:1, 0x5D:1, 0x5E:1, 0x5F:1, 0x2B:1, 0xC6:1 };
@@ -261,7 +271,7 @@ export function decode(fetch, rip) {
       if (!M2) throw new Error('0f ae /' + (g & 7));
       return fin({ mnem: M2, dst: rm, src: rm, size: osz });
     }
-    throw new Error(`unsupported 0f ${o2.toString(16)}`);
+    throw new Error(`unsupported 0f ${o2.toString(16)} at ${rip.toString(16)}`);
   }
   throw new Error(`unsupported opcode ${op.toString(16)} at ${rip.toString(16)}`);
 }

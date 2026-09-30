@@ -30,7 +30,9 @@ async function pump() {
       else await sleep(0);
     }
   } catch (e) {
-    post({ t: 'fatal', message: `engine error: ${e.message}` });
+    let where = '';
+    if (process.env.OXWASM_DEBUG_MAPS) where = '\n' + (host?.eng?.maps ?? []).map((m) => `${m.at.toString(16)}+${m.len.toString(16)} ${m.path}`).join('\n');
+    post({ t: 'fatal', message: `engine error: ${e.message}${where}` });
     host = null;
   } finally { pumping = false; }
 }
