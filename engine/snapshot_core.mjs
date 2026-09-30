@@ -116,9 +116,27 @@ export function restoreEngineCore(eng, xs, assets, CPUctor, inflate) {
     const cpu = i === 0 ? eng.cpu : new CPUctor(eng.mem);
     if (i !== 0) cpu.onSyscall = (c) => eng.syscall(c);
     loadCpu(cpu, t.cpu);
-    return { id: t.id, state: t.state, dl: rebase(t.dl), _dl: rebase(t._dl),
-             futex: t.futex, ctid: t.ctid, cpu };
+    const th = { id: t.id, state: t.state, dl: rebase(t.dl), _dl: rebase(t._dl),
+                 futex: t.futex, ctid: t.ctid, cpu };
+    // The signal fields are one group: the engine initialises them together
+    // (_ts) and only when sigmask is undefined, so restoring the mask alone
+    // leaves `pending` undefined and the first signal raised dies with
+    // "Cannot mix BigInt and other types". Absent in a snapshot taken before
+    // they were saved - then _ts fills them in as it always did.
+    if (t.sigmask !== undefined) {
+      th.sigmask = BigInt(t.sigmask); th.pending = BigInt(t.pending ?? 0);
+      th.eintr = false; th.suspendOld = null;
+    }
+    if (t.altstack) th.altstack = { sp: BigInt(t.altstack.sp), size: BigInt(t.altstack.size) };
+    return th;
   });
+  if (state.sigact) {
+    eng.sigact = new Map(state.sigact.map(([sig, a]) => [sig, { handler: BigInt(a.handler), flags: BigInt(a.flags),
+                                                              restorer: BigInt(a.restorer), mask: BigInt(a.mask) }]));
+    eng.sigign = new Set(state.sigign ?? []);
+    eng.nocldwait = !!state.nocldwait;
+    eng.cloexec = new Set(state.cloexec ?? []);
+  }
   eng.ti = state.ti;
   eng.cpu = eng.threads[eng.ti].cpu;
 
@@ -180,13 +198,21 @@ export function restoreEngineCore(eng, xs, assets, CPUctor, inflate) {
   }
 
   // ---- fd table -------------------------------------------------------------
-  const pipeObjs = state.pipeBufs.map(bufs => ({ chunks: bufs.map(r => new Uint8Array(blob(r)).slice()) }));
+  const pipeObjs = state.pipeBufs.map((bufs, i) => {
+    const chunks = bufs.map(r => new Uint8Array(blob(r)).slice());
+    const m = state.pipeMeta?.[i];                       // absent in a snapshot taken before it was recorded
+    const o = { chunks, pos: 0, off: m?.off ?? 0, size: m?.size ?? chunks.reduce((n, c) => n + c.length, 0) };
+    if (m?.weof) o.weof = true;
+    if (m?.wtot) o.wtot = m.wtot;
+    if (m?.rtot) o.rtot = m.rtot;
+    return o;
+  });
   eng.fds = new Map();
   for (const [fd, h] of state.fds) {
     if (h.sink) { eng.fds.set(fd, { sink: h.sink }); continue; }
     if (h.isdir) { eng.fds.set(fd, { isdir: true, path: h.path, pos: h.pos }); continue; }
     if (h.ev) { eng.fds.set(fd, { ev: { count: BigInt(h.ev.count), nonblock: h.ev.nonblock, sem: h.ev.sem } }); continue; }
-    if (h.pipe !== undefined) { eng.fds.set(fd, { pipe: pipeObjs[h.pipe], mode: h.mode }); continue; }
+    if (h.pipe !== undefined) { eng.fds.set(fd, { pipe: pipeObjs[h.pipe], mode: h.mode, nonblock: !!h.nonblock }); continue; }
     if (h.sock) { eng.fds.set(fd, { sock: { conn: h.conn >= 0 ? conns[h.conn] : null, nonblock: h.nonblock } }); continue; }
     if (h.file !== undefined) {
       const f = eng.files[h.file];
