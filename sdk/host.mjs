@@ -6,7 +6,7 @@
 // rest of the SDK safe to put in front of untrusted code: a guest that spins
 // in compiled code never returns from a slice, and only a separate thread can
 // be abandoned when that happens.
-import { readFileSync, existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { readFileSync, statSync, existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { LinuxEngine } from '../engine/linux.mjs';
@@ -129,6 +129,24 @@ export class EngineHost {
     const units = new Map();
     const unitsFile = join(CACHE_DIR, 'snapshots', key, 'units.bin');
 
+    // Several sandboxes started together on a cold cache would each spend a full
+    // cold boot building the same snapshot. One builds it under a lock; the
+    // others wait for it to appear and restore from it. A lock whose owner died
+    // is taken over once it is stale.
+    const lockDir = join(CACHE_DIR, 'snapshots', key + '.lock');
+    let haveLock = false;
+    if (useCache && !existsSync(snap + '.mem')) {
+      mkdirSync(join(CACHE_DIR, 'snapshots'), { recursive: true });
+      const giveUp = Date.now() + (o.bootTimeoutMs || 300000);
+      while (!existsSync(snap + '.mem')) {
+        try { mkdirSync(lockDir); haveLock = true; break; } catch {}
+        try { if (Date.now() - statSync(lockDir).mtimeMs > 600000) rmSync(lockDir, { recursive: true, force: true }); } catch {}
+        if (Date.now() > giveUp) break;
+        await new Promise((r) => setTimeout(r, 500));
+      }
+    }
+    const unlock = () => { if (haveLock) { haveLock = false; try { rmSync(lockDir, { recursive: true, force: true }); } catch {} } };
+
     let restored = false;
     host.eng = make();
     host.eng.onUnitBytes = (k, b) => { if (!units.has(k)) units.set(k, new Uint8Array(b)); };
@@ -157,7 +175,10 @@ export class EngineHost {
     // A cold guest announces itself. A restored one already did, before the
     // snapshot was taken, so it is asked instead: a round trip proves the
     // restored process is alive and reading its stdin.
-    const hello = restored ? await host._ping(30000) : await host._untilReady(o.bootTimeoutMs || 300000);
+    let hello;
+    try {
+      hello = restored ? await host._ping(30000) : await host._untilReady(o.bootTimeoutMs || 300000);
+    } catch (e) { unlock(); throw e; }
     if (!restored && useCache) {
       try { await host._warm(); } catch (e) { o.log?.(`warm-up failed: ${e.message}`); }
       try {
@@ -170,6 +191,7 @@ export class EngineHost {
         renameSync(tmp, dir);
       } catch (e) { o.log?.(`could not save snapshot: ${e.message}`); }
     }
+    unlock();
     host.bootInfo = { restored, imageMs: tImage, bootMs: performance.now() - tBoot, totalMs: performance.now() - t0,
                       python: hello.python, image: image.stats, key, units: host.unitsLoaded || units.size };
     return host;
