@@ -321,6 +321,34 @@ export class Sandbox {
     e.resolve(f);
   }
 
+  // ---- the short form ---------------------------------------------------------------
+  // The E2B-shaped methods below are the compatible surface. These two are the
+  // ones the docs lead with: one call to run python, one call to run a shell
+  // command, and neither makes you unpack a result object to get the answer.
+
+  /** Run python. Returns what the cell printed plus its last expression, as a string. Throws on a python error. */
+  async run(code, opts = {}) {
+    const ex = await this.runCode(code, opts);
+    if (ex.error) {
+      const e = new SandboxError(ex.error.value);
+      e.name = ex.error.name; e.traceback = ex.error.traceback; e.execution = ex;
+      throw e;
+    }
+    const out = ex.logs.stdout.join('') + ex.logs.stderr.join('');
+    return out + (ex.text !== undefined ? ex.text + '\n' : '');
+  }
+
+  /** Run a shell command. Never throws on a nonzero exit: returns { stdout, stderr, exitCode }. */
+  async sh(cmd, opts = {}) {
+    try { return await this.commands.run(cmd, opts); }
+    catch (e) {
+      if (e instanceof CommandExitError) return { stdout: e.stdout, stderr: e.stderr, exitCode: e.exitCode };
+      throw e;
+    }
+  }
+
+  async close() { return this.kill(); }
+
   // ---- code interpreter ------------------------------------------------------------
   async runCode(code, opts = {}) {
     const results = [], logs = { stdout: [], stderr: [] };

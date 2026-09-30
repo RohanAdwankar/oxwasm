@@ -1,0 +1,11 @@
+{
+  "name": "oxwasm",
+  "version": "0.1.0",
+  "description": "Run unmodified Linux programs in WebAssembly. A code sandbox for AI agents that runs inside your process.",
+  "type": "module",
+  "main": "./sdk/index.mjs",
+  "exports": { ".": "./sdk/index.mjs" },
+  "engines": { "node": ">=22" },
+  "license": "MIT",
+  "repository": "github:RohanAdwankar/oxwasm"
+}

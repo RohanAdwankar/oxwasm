@@ -1,5 +1,137 @@
 # oxwasm
 
+**A code sandbox for AI agents that runs inside your process.** No VM to boot, no
+container to manage, no cloud account, no per-second bill. `npm install`, then:
+
+```js
+import { Sandbox } from 'oxwasm'
+
+const s = await Sandbox.create()          // ~2 s, from a snapshot
+
+await s.run('x = 10')                     // real CPython, and it remembers
+await s.run('print(x * 5)')               // -> "50\n"
+await s.sh('ls /')                        // a shell, when you want one
+
+await s.files.write('/work/data.csv', csv)
+await s.run('import csv; ...')            // read it back from python
+
+await s.close()
+```
+
+The guest is an **unmodified x86-64 Linux CPython** executing inside a
+WebAssembly engine, in a worker thread of your own Node process. It has no
+route to your machine: it makes syscalls, the engine answers them, and nothing
+reaches the real kernel. Its filesystem is a JavaScript object; a file it
+writes never exists on your disk.
+
+## Coming from E2B
+
+The API follows the published `@e2b/code-interpreter` types (2.8) and `e2b`
+(2.51): same class, same method and option names, same result and error
+shapes. For most code, migrating is the import:
+
+```diff
+- import { Sandbox } from '@e2b/code-interpreter'
++ import { Sandbox } from 'oxwasm'
+```
+
+```js
+const sbx = await Sandbox.create()
+const exec = await sbx.runCode('x = 1; x + 1')
+exec.text                       // '2'      the last expression, as in E2B
+exec.logs.stdout                // lines printed, newline included
+exec.error                      // { name, value, traceback } - not thrown
+await sbx.files.write('/a.txt', 'hi')
+await sbx.commands.run('cat /a.txt')     // throws CommandExitError on nonzero exit
+await sbx.kill()
+```
+
+Also implemented: code contexts (`createCodeContext` and friends),
+`onStdout` / `onStderr` / `onResult` / `onError` streaming, `envs`,
+`timeoutMs` (with E2B's defaults), background commands, `Sandbox.connect(id)`,
+and E2B's error classes (`TimeoutError`, `CommandExitError`,
+`FileNotFoundError`, ...). One detail worth knowing because it trips people:
+`execution.text` is the cell's **last expression only**. What a cell `print`s
+is in `execution.logs.stdout`, exactly as in E2B.
+
+**Not implemented, and they say so instead of pretending:** `pty`, `git`,
+`getHost` and any inbound network, `watchDir`, pause/snapshot/fork,
+languages other than Python. Those throw `NotSupportedError`.
+
+## What it is and is not
+
+| | oxwasm | E2B | WebAssembly-Python sandboxes (Pyodide-based) | Rivet agentOS |
+|---|---|---|---|---|
+| Where code runs | a worker thread in your process | their cloud (or self-hosted microVMs) | in your process | in your process (V8 isolates + Wasm) |
+| Infrastructure | none | account and API key, or run the stack yourself | none | none |
+| What the guest is | a real Linux userland | a real Linux VM | Python compiled to Wasm | JS on V8, plus tools compiled to Wasm |
+| Native Python packages | **ordinary x86-64 wheels**, mounted from the host | anything you can `pip install` | only those rebuilt for Wasm | not documented; tools ship from their registry |
+| Shell and CLI tools | a provisioned set of coreutils | everything | none | a provisioned set |
+| Outbound network | none | yes | varies | opt-in |
+| Cold start | ~2 s (restore); ~50 s first time on a machine | not measured here | not measured here | ~6 ms (their figure) |
+| Compute speed | several times slower than native | native | slower than native | not measured here |
+| Scales out | your CPU, one core per busy sandbox | their pool | your CPU | your CPU |
+
+The row that is the reason this exists is native packages. Wasm-based
+sandboxes can only run C extensions someone rebuilt for WebAssembly, so the
+long tail of `pip install` does not work there. Here the guest is the real
+CPython for your host, so a manylinux wheel is an x86-64 shared object its own
+dynamic loader loads. `msgpack`'s compiled extension imports and round-trips
+today with nothing recompiled.
+
+**Where it loses, plainly:**
+
+- **It is not fast.** It is x86 emulation. Tight CPython loops run roughly
+  6-15x slower than native in this repo's own benchmarks (`bench/README.md`).
+  Light scripting and glue code is fine; heavy numeric work is not what this
+  is for.
+- **The first cells after a restore are slow** (0.5-2 s each) while the compiled
+  tier re-warms; steady state is ~15-60 ms per cell after about ten cells.
+- **No network in the guest.** `apt install` and `pip install` at runtime do
+  not work. Software is provisioned from the host: `packages: ['/path/to/site-packages']`.
+- **numpy does not run yet.** It loads and then reaches SSE4.1 instructions the
+  decoder does not implement (fourteen opcodes, counted). A bounded gap, but open.
+- **Spawning many subprocesses is broken today.** `commands.run` starts
+  failing after about eight calls: a fault in the engine's compiled-code path
+  for CPython's process spawn, reproducible and not yet fixed
+  (`engine/diff/sandboxtest.mjs` reaches it).
+- **It saves you the per-second bill, not the compute.** The CPU is yours. It
+  is cheaper when sandboxes are many and light; it is not when they are few
+  and heavy.
+
+## Install
+
+```
+npm install github:RohanAdwankar/oxwasm
+```
+
+Node 22+, Linux x86-64, and `wat2wasm` (`apt install wabt`) on the host: the
+engine assembles the WebAssembly it generates with it. A missing `wat2wasm`
+is an error at startup, not a silent slowdown. The first `Sandbox.create()`
+on a machine takes about a minute to boot and warm CPython and saves a
+snapshot under `~/.cache/oxwasm` (override with `OXWASM_CACHE`); every create
+after that restores it.
+
+```js
+Sandbox.create({
+  packages: ['/path/to/site-packages'],  // mounted, and put on PYTHONPATH
+  timeoutMs: 300_000,                    // sandbox lifetime (E2B's default)
+  envs: { KEY: 'value' },
+  memMB: 512,
+})
+```
+
+A cell that runs past its `timeoutMs` gets a SIGINT (Python raises
+`KeyboardInterrupt`; the sandbox survives with its state) and, if it does not
+answer within five seconds, its worker thread is terminated. A `while True:
+pass` therefore costs you that sandbox, never the host.
+
+---
+
+## Also: any Linux program as one HTML file
+
+The engine underneath is general, and this is what it was built for.
+
 Turn **any** unmodified Linux program into **a single static HTML file** that
 runs it in the browser — no server, no install, no network.
 
@@ -152,6 +284,7 @@ make-demo.sh     reproduce the barebones M1 guest and linux.html
 demo-init.sh     the M1 guest's /init; guest/oxinit is the generic graphical init
 tools/m3pack.mjs        M3 packer: ELF/AppImage -> single HTML with in-page JIT
 tools/appimage-extract.py  type-2 AppImage unpack without FUSE (pure python)
+sdk/             the code-sandbox SDK: index.mjs (API), worker.mjs, host.mjs (engine + snapshots), image.mjs, guest.py
 platform/        M4 — syscall ABI, processes-as-workers, pipe demo
 engine/          M3 — decoder, hardware-verified interpreter, runtime AOT x86-64 -> wasm
 docs/m3-engine.md  M3 — the x86-64 -> WASM JIT design
