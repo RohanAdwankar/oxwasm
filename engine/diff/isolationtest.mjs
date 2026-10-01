@@ -128,6 +128,13 @@ is('...including a kill aimed at its pid', (() => { try { process.kill(process.p
   await W.kill().catch(() => {});
 }
 {
+  // unnamed files are in no path table; they must still be charged
+  const U = await Sandbox.create({ diskMB: 64 });
+  const r = await py(U, `import os\nfd = os.memfd_create("m")\ntry:\n    for i in range(200):\n        os.write(fd, b"x" * (1 << 20))\n    r = "wrote"\nexcept OSError as e:\n    r = type(e).__name__\nr`, { timeoutMs: 60000 });
+  is('an unnamed (memfd) file is charged against diskMB too', text(r), 'OSError');
+  await U.kill().catch(() => {});
+}
+{
   const X = await Sandbox.create();
   const r = await py(X, `import ctypes\nctypes.memmove(0, b"x" * 64, 64)`, { timeoutMs: 30000 });
   is('a guest write to the null page kills that guest, not the host', typeof (r.threw ?? r.error?.name ?? 'fine') === 'string', true);

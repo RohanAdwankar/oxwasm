@@ -135,6 +135,7 @@ export class EngineHost {
         files: image.files, mtimes: image.mtimes, memMB, assembleWat, net: netp, diskMB: o.diskMB ?? 1024,
       });
       eng.assembleWatDeferred = assembleWatDeferred;
+      if (process.env.OXWASM_STRACE) eng.strace = [];     // debugging: syscall ring, printed on tgkill/kill when OXWASM_STRACE_SIGNAL is set
       if (image.meta) {                             // a rootfs carries symlinks, empty directories and file modes
         const m = eng._fsMeta();
         for (const [k, v] of image.meta.links) m.links.set(k, v);

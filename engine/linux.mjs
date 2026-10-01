@@ -1938,6 +1938,7 @@ export class LinuxEngine {
     // its syscall history, not a fault address
     const ret = this.strace
       ? (v) => { cpu.regs[0] = BigInt.asUintN(64, v);
+                 if (process.env.OXWASM_STRACE_SIGNAL && (nr === 234 || nr === 200 || nr === 62)) console.error(`[signal syscall nr=${nr} args=${a1.toString(16)},${a2.toString(16)}] argv0=${this._ctor?.argv?.[0]} last:\n  ` + this.strace.slice(-3).join('\n  ') + '\n  rbpchain:' + (() => { const out = []; try { let bp = cpu.regs[5]; for (let i = 0; i < 16 && bp; i++) { out.push('0x' + this.mem.read(bp + 8n, 8n).toString(16)); bp = this.mem.read(bp, 8n); } } catch {} return out.join(' '); })() + '\n  stack:' + (() => { const out = []; try { const sp = cpu.regs[4]; for (let i = 0n; i < 200n; i++) { const w = this.mem.read(sp + i * 8n, 8n); const m = (this.maps ?? []).find((x) => w >= x.at && w < x.at + BigInt(x.len)); if (m) out.push(`${m.path}+0x${(w - m.at + BigInt(m.fileOff ?? 0)).toString(16)}`); else if (w >= 0x400000n && w < 0x520000n) out.push('exe 0x' + w.toString(16)); } } catch {} return '\n    ' + out.slice(0, 24).join('\n    '); })());
                  if (process.env.OXWASM_DBG_ERR && BigInt.asIntN(64, v) === BigInt(-process.env.OXWASM_DBG_ERR)) console.error(`[errno ${process.env.OXWASM_DBG_ERR}] tid=${this.threads[this.ti]?.id} nr=${nr} args=${a1.toString(16)},${a2.toString(16)},${a3.toString(16)} argv0=${this._ctor?.argv?.[0]}`);
                  let ps = '';   // decode the path argument of the fs family
                  try { if (nr === 257 || nr === 262) ps = ' "' + this.readPath(a2) + '"';
@@ -4861,6 +4862,16 @@ export class LinuxEngine {
     if (root._diskUsed <= q) return;
     let real = 0;
     for (const p of root.dirtyFiles ?? []) real += root.files[p]?.length ?? 0;
+    // unnamed files (memfd, O_TMPFILE) live only in descriptor tables
+    const seen = new Set(), eseen = new Set();
+    const scan = (e) => {
+      if (eseen.has(e)) return; eseen.add(e);
+      const tables = [e.fds]; if (e._mainFds) tables.push(e._mainFds);
+      for (const t of e.threads ?? []) if (t.proc?.fds) tables.push(t.proc.fds);
+      for (const tb of tables) for (const [, h] of tb) if (h?.memfd !== undefined && !seen.has(h)) { seen.add(h); real += h.bytes?.length ?? 0; }
+      for (const c of e.children ?? []) if (c.eng) scan(c.eng);
+    };
+    scan(root);
     root._diskUsed = real;
     if (real > q) throw new PathErr(28);                     // ENOSPC
   }
@@ -4871,8 +4882,10 @@ export class LinuxEngine {
       ? new Uint8Array(old.buffer, old.byteOffset, end)
       : (() => { const b = new Uint8Array(Math.max(end, old.length * 2, 4096)); b.set(old); return b.subarray(0, end); })();
     h.bytes = nb;
-    this.files[h.path] = nb;                                 // growable buffer: refresh the map ref
-    this._hardRefresh(h.path, nb);                           // ... and every hard-link alias
+    if (h.path !== undefined) {                              // an unnamed file (memfd, O_TMPFILE) is in no table
+      this.files[h.path] = nb;                               // growable buffer: refresh the map ref
+      this._hardRefresh(h.path, nb);                         // ... and every hard-link alias
+    }
   }
   // every function entry the engine knows of, kept incrementally: rebuilding
   // it from the three maps per unit translation was 2.6% of a clang run
