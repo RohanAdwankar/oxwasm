@@ -34,16 +34,6 @@ $CH $APT update
 $CH $APT install -y --no-install-recommends python3 ca-certificates curl less
 $CH $APT clean
 rm -rf "$ROOT"/var/lib/apt/lists/* "$ROOT"/etc/resolv.conf
-# The emulated guest aborts while ldconfig writes its cache (open issue); a
-# package trigger that runs ldconfig must not fail for it. Fall back to a run
-# that leaves the cache alone - the loader searches the standard directories
-# without it.
-python3 - "$ROOT/sbin/ldconfig" <<'PY'
-import sys
-p = sys.argv[1]; s = open(p).read()
-s = s.replace('exec /sbin/ldconfig.real "$@"', '/sbin/ldconfig.real "$@" && exit 0\nexec /sbin/ldconfig.real -N -X "$@"')
-open(p, 'w').write(s)
-PY
 umount "$ROOT/proc"; trap - EXIT
 rm -rf "$ROOT"/proc/* "$ROOT"/tmp/*
 tar --numeric-owner -C "$ROOT" -czf "$OUT" .

@@ -1550,6 +1550,23 @@ export class LinuxEngine {
     }
     throw new PathErr(40);                       // ELOOP: forty hops and still a link
   }
+  // d_type for a directory entry: a symlink says so, which is how ldconfig
+  // (and find, ls, rsync) decide whether to stat or lstat it
+  _dtype(dir, name, isdir) {
+    const links = this._fsMeta().links;
+    if (links.size) { const d = this.resolve(this.norm(dir)); if (links.has((d === '/' ? '' : d) + '/' + name)) return 10; }
+    return isdir ? 4 : 8;
+  }
+  // The path with every symlink resolved except a final one: what lstat and
+  // readlink name when a directory above the file is itself a link (/lib ->
+  // usr/lib), so the link table, keyed by the real directory, finds the file.
+  resolveParent(p) {
+    p = this.norm(p);
+    const i = p.lastIndexOf('/');
+    if (i <= 0 || !this._fsMeta().links.size) return p;
+    const dir = this.resolve(p.slice(0, i));
+    return (dir === '/' ? '' : dir) + p.slice(i);
+  }
   lookup(p) { p = this.resolve(this.norm(p)); return this.files[p] ?? this._synth(p); }
   // readlink's answer for a normalised path: the link's target, a /proc/self
   // form (exe, cwd, root, fd/N naming the descriptor's file or its anonymous
@@ -1817,7 +1834,7 @@ export class LinuxEngine {
   // (st_dev, st_ino), so size-derived inodes made same-sized modules alias
   // to one link_map — dlopen returned the WRONG module and dlsym missed
   // (babl extensions, gegl ops). Anonymous fds get their own counter.
-  inoOf(p) { p = this.norm(p); this._inos ??= new Map(); let n = this._inos.get(p);
+  inoOf(p) { p = this.resolveParent(p); this._inos ??= new Map(); let n = this._inos.get(p);
     if (n === undefined) { n = this._inos.size + 1000; this._inos.set(p, n); }
     return BigInt(n); }
 
@@ -2239,7 +2256,7 @@ export class LinuxEngine {
         v.setBigUint64(off + 8, max, true);
         ret(0n); break; }
       case 89: case 267: {                                    // readlink(path, buf, sz) / readlinkat(dirfd, path, buf, sz)
-        const lp = this.norm(nr === 89 ? this.readPath(a1) : this.atPath(a1, a2)), buf = nr === 89 ? a2 : a3, sz = Number(nr === 89 ? a3 : cpu.regs[10]);
+        const lp = this.resolveParent(nr === 89 ? this.readPath(a1) : this.atPath(a1, a2)), buf = nr === 89 ? a2 : a3, sz = Number(nr === 89 ? a3 : cpu.regs[10]);
         const t = this._readlinkTarget(lp);
         if (typeof t === 'number') { ret(BigInt(t)); break; }
         const b = new TextEncoder().encode(t), n = Math.min(b.length, sz);
@@ -3030,8 +3047,8 @@ export class LinuxEngine {
           if (a2 === 0n) { ret(-14n); break; }                // EFAULT: NULL path without AT_EMPTY_PATH (Rust's std probes this)
           const p = this.atPath(a1, a2);
           if ((cpu.regs[10] & 0x100n) && !p.endsWith('/') &&   // AT_SYMLINK_NOFOLLOW
-                     this._fsMeta().links.has(this.norm(p))) {
-            statPath = this.norm(p);
+                     this._fsMeta().links.has(this.resolveParent(p))) {
+            statPath = this.resolveParent(p);
             size = this._fsMeta().links.get(statPath).length; mode = 0o120777;
           } else if (this._ptyStat(this.norm(p))) {
             const ps = this._ptyStat(this.norm(p)); this.writeStat(cpu.regs[2], this.norm(p), 0, ps.mode, ps.rdev, ps.ino); ret(0n); break;
@@ -3044,7 +3061,7 @@ export class LinuxEngine {
             else if (this._fifoAt(p)) { size = 0; mode = 0o010644; }
             else if (this._sockAt(p)) { size = 0; mode = 0o140755; }
             else { ret(-2n); break; }                         // ENOENT
-            statPath = p;
+            statPath = this.resolve(this.norm(p));
           }
         } else {
           const h = this.fds.get(Number(a1));
@@ -3054,7 +3071,7 @@ export class LinuxEngine {
           if (h?.pts || h?.ptm) { const ps = this._ptyStat(h.pts ? '/dev/pts/' + h.pts.n : '/dev/ptmx'); if (ps) { this.writeStat(a2, h.path, 0, ps.mode, ps.rdev, ps.ino); ret(0n); break; } }   // a pty end: the same numbers stat(path) gives
           if (h?.gen) { size = 0; mode = 0o020666; }                        // /dev/zero, /dev/urandom
           else if (h?.tfd || h?.sfd) { size = 0; mode = 0o0100600; }       // anon inode
-          else if (h?.bytes) { size = h.bytes.length; mode = this.fileMode(h.bytes, h.path); statPath = h.path ?? null; }  // regular file
+          else if (h?.bytes) { size = h.bytes.length; mode = this.fileMode(h.bytes, h.path); statPath = h.path ? this.resolve(this.norm(h.path)) : null; }  // regular file
           else if (h?.pipe) { size = 0; mode = h.fifo ? 0o010644 : 0o010600; statPath = h.fifo ? h.path : null; }   // FIFO / pipe
           else if (h?.sock) { size = 0; mode = 0o140777; }                 // socket
           else if (h?.isdir) { size = 4096; mode = 0o040755; statPath = h.path; }
@@ -3087,8 +3104,8 @@ export class LinuxEngine {
         // lstat does NOT follow a link — unless the path ends in '/', which
         // POSIX says forces the target (find walks "dir/" that way)
         if (nr === 6 && !p.endsWith('/')) {
-          const t = this._fsMeta().links.get(this.norm(p));
-          if (t !== undefined) { this.writeStat(a2, this.norm(p), t.length, 0o120777); ret(0n); break; }
+          const lp = this.resolveParent(p), t = this._fsMeta().links.get(lp);
+          if (t !== undefined) { this.writeStat(a2, lp, t.length, 0o120777); ret(0n); break; }
         }
         if (this.debugPollAfter != null && this.nowMs() > this.debugPollAfter) {
           if (this.nowMs() - (this._dbgStatLast ?? 0) > 5000) { this._dbgStatLast = this.nowMs();
@@ -3101,7 +3118,7 @@ export class LinuxEngine {
           if (this._fifoAt(p)) { this.writeStat(a2, p, 0, 0o010644); ret(0n); break; }
           if (this._sockAt(p)) { this.writeStat(a2, p, 0, 0o140755); ret(0n); break; }
           ret(-2n); break; }                                  // ENOENT
-        this.writeStat(a2, p, f ? f.length : 4096, f ? this.fileMode(f, p) : 0o040755);
+        { const rp = this.resolve(this.norm(p)); this.writeStat(a2, rp, f ? f.length : 4096, f ? this.fileMode(f, rp) : 0o040755); }
         ret(0n); break; }
       case 17: {                                              // pread64(fd, buf, count, off)
         { const hh = this.fds.get(Number(a1)); if (hh?.bytes !== undefined) for (const m of this.maps ?? []) if (m.shared && m.h === hh) this._writeBackMap(m); }   // a MAP_SHARED view of this file (memfd): absorb its pages first
@@ -3484,7 +3501,7 @@ export class LinuxEngine {
           v.setBigUint64(base + off, BigInt(h.pos + 100), true);        // d_ino
           v.setBigUint64(base + off + 8, BigInt(h.pos + 1), true);      // d_off
           v.setUint16(base + off + 16, reclen, true);
-          v.setUint8(base + off + 18, isdir ? 4 : 8);                   // DT_DIR / DT_REG
+          v.setUint8(base + off + 18, this._dtype(h.path, name, isdir));  // DT_DIR / DT_LNK / DT_REG
           new Uint8Array(this.wmem.buffer, base + off + 19, nb.length + 1).fill(0);
           new Uint8Array(this.wmem.buffer, base + off + 19, nb.length).set(nb);
           off += reclen; h.pos++;
@@ -3508,7 +3525,7 @@ export class LinuxEngine {
           v.setUint16(base + off + 16, reclen, true);
           new Uint8Array(this.wmem.buffer, base + off + 18, reclen - 18).fill(0);
           new Uint8Array(this.wmem.buffer, base + off + 18, nb.length).set(nb);
-          v.setUint8(base + off + reclen - 1, isdir ? 4 : 8);           // DT_DIR / DT_REG
+          v.setUint8(base + off + reclen - 1, this._dtype(h.path, name, isdir));   // DT_DIR / DT_LNK / DT_REG
           off += reclen; h.pos++;
         }
         ret(BigInt(off)); break; }

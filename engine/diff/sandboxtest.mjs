@@ -243,6 +243,19 @@ threading.Thread(target=serve, daemon=True).start()
   }
 }
 
+// symlinks seen through a directory that is itself a link (/lib -> usr/lib in every merged-usr image)
+{
+  const r = await sbx.runCode(`import os
+os.makedirs('/tmp/real/d')
+open('/tmp/real/d/f.so.1.0','w').write('x')
+os.symlink('f.so.1.0','/tmp/real/d/f.so.1')
+os.symlink('real','/tmp/alias')
+a='/tmp/alias/d/f.so.1'; t='/tmp/alias/d/f.so.1.0'
+ents={e.name:(e.is_symlink(),e.is_file(follow_symlinks=False)) for e in os.scandir('/tmp/alias/d')}
+print(os.path.islink(a), os.readlink(a), os.lstat(a).st_ino != os.lstat(t).st_ino, os.stat(a).st_ino == os.lstat(t).st_ino, ents['f.so.1'], ents['f.so.1.0'])`);
+  is('a symlink is a symlink through a linked directory, with a stable inode and d_type', (r.logs?.stdout ?? []).join('').trim(), "True f.so.1.0 True True (True, False) (False, True)");
+}
+
 await rejects('an unsupported language says so', sbx.runCode('1', { language: 'r' }), SandboxError);
 is('kill', await sbx.kill(), true);
 is('killed sandbox is not running', await sbx.isRunning(), false);
