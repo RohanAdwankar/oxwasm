@@ -1,12 +1,12 @@
-// Drives site/index.html in headless Chromium: types commands, reads the terminal.
-// Needs playwright-core (npm i -D playwright-core) and a Chromium (OXWASM_CHROME or /opt/pw-browsers/chromium).
-//   node tools/shellpage-test.mjs $PWD/site/index.html
+// Drives the built shell page in headless Chromium: types commands, reads the terminal.
+// Needs playwright-core and a Chromium (OXWASM_CHROME or /opt/pw-browsers/chromium).
+//   node tools/shellpage-test.mjs http://localhost:8123/shell/   (or a file path)
 import { chromium } from 'playwright-core';
 const page_path = process.argv[2];
 const browser = await chromium.launch({ executablePath: process.env.OXWASM_CHROME || '/opt/pw-browsers/chromium', args: ['--no-sandbox'] });
 const page = await browser.newPage({ viewport: { width: 1100, height: 700 } });
-const errs = []; page.on('pageerror', (e) => errs.push(e.message)); page.on('console', (m) => { if (m.type() === 'error') errs.push(m.text()); });
-await page.goto('file://' + page_path);
+const errs = []; page.on('pageerror', (e) => errs.push(e.message)); page.on('console', (m) => { if (m.type() === 'error') if (!/404/.test(m.text())) errs.push(m.text()); });
+await page.goto(page_path.startsWith('http') ? page_path : 'file://' + page_path);
 const screen = () => page.evaluate(() => { const t = document.querySelector('.xterm-rows'); return t ? t.innerText : ''; });
 const until = async (re, ms = 60000) => { const t = Date.now(); while (Date.now() - t < ms) { const s = await screen(); if (re.test(s)) return s; await page.waitForTimeout(150); } return await screen(); };
 let s = await until(/oxwasm:~# /);

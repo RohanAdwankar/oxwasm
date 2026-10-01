@@ -70,20 +70,10 @@ const html = `<!doctype html>
 <title>oxwasm shell</title>
 <style>
 ${V('xterm.css')}
-  :root { color-scheme: dark; }
-  html, body { margin: 0; height: 100%; background: #0b0e14; color: #c8ccd4; font: 13px/1.4 ui-monospace, Menlo, Consolas, monospace; }
-  body { display: flex; flex-direction: column; }
-  header { padding: 10px 16px; display: flex; gap: 12px; align-items: baseline; border-bottom: 1px solid #1d2330; }
-  header b { color: #7aa2f7; font-size: 15px; }
-  header span { color: #7d8590; font-size: 12px; }
-  #status { margin-left: auto; }
-  #term { flex: 1; min-height: 0; padding: 8px 12px; }
-  #term .xterm { height: 100%; }
-  .xterm-viewport { background: #000 !important; }
+  html, body, #term { height: 100%; margin: 0; background: #000; }
 </style>
 </head>
 <body>
-<header><b>oxwasm</b><span>a Linux shell running in this tab: x86-64 busybox on a WebAssembly engine, no server</span><span id="status">loading</span></header>
 <div id="term"></div>
 <script>${V('xterm.js')}</script>
 <script>${V('addon-fit.js')}</script>
@@ -93,27 +83,22 @@ import { startShell } from 'ox/shell';
 const BUSYBOX = ${JSON.stringify(gzb64(bbBytes))};
 const APPLETS = ${JSON.stringify(applets)};
 const FILES = ${JSON.stringify(fileEntries)};
-const status = document.getElementById('status');
 async function inflate(b64) {
   const bin = atob(b64), u = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
   return new Uint8Array(await new Response(new Blob([u]).stream().pipeThrough(new DecompressionStream('gzip'))).arrayBuffer());
 }
-const term = new Terminal({ cursorBlink: true, fontSize: 14, fontFamily: 'ui-monospace, Menlo, Consolas, monospace',
-                            theme: { background: '#000000' }, convertEol: false, scrollback: 5000 });
+const term = new Terminal({ cursorBlink: true });
 const fit = new FitAddon.FitAddon();
 term.loadAddon(fit);
 term.open(document.getElementById('term'));
 fit.fit();
-term.write('starting...\\r\\n');
-const t0 = performance.now();
 const busybox = await inflate(BUSYBOX);
 const shell = startShell({
   busybox, applets: APPLETS, files: Object.fromEntries(FILES), cols: term.cols, rows: term.rows,
   onOutput: (bytes) => term.write(bytes),
 });
 term.reset();
-status.textContent = 'ready in ' + Math.round(performance.now() - t0) + ' ms';
 term.onData((d) => shell.input(d));
 term.onResize(({ cols, rows }) => shell.resize(cols, rows));
 addEventListener('resize', () => fit.fit());
@@ -125,7 +110,7 @@ slice.port1.onmessage = () => {
   if (!running) return;
   try { running = shell.step(6); } catch (e) { term.write('\\r\\n[engine error: ' + e.message + ']\\r\\n'); running = false; }
   if (running) slice.port2.postMessage(0);
-  else { status.textContent = 'shell exited (' + shell.exitCode + ') - reload to start again'; term.write('\\r\\n[shell exited with status ' + shell.exitCode + ']\\r\\n'); }
+  else term.write('\\r\\n[shell exited with status ' + shell.exitCode + ' - reload to start again]\\r\\n');
 };
 slice.port2.postMessage(0);
 </script>
