@@ -5101,6 +5101,27 @@ export class LinuxEngine {
     return out;
   }
   _dgramSend(h, addr, len, sa) { this.guardRange(addr, len); return this._dgramSendBytes(h, this.ram.slice(Number(addr - this.base), Number(addr - this.base) + len), sa); }
+  // A connection from OUTSIDE the guest into one of its listening sockets: the host side of
+  // getHost(). The guest sees an ordinary accepted connection (a crossed pipe pair, exactly
+  // what connect() builds between two guest sockets); the host holds the other ends.
+  //   returns { write(bytes), end(), onData, onEnd } or null if nothing listens on `port`
+  openInbound(port) {
+    const ent = this._sockReg().get(`inet:${port}`);
+    if (!ent || !ent.h.lsock || !this._handleAlive(ent.h)) return null;
+    const b1 = { chunks: [], pos: 0, off: 0, size: 0, ext: true }, b2 = { chunks: [], pos: 0, off: 0, size: 0 };
+    const root = this._netRoot();
+    const conn = {
+      onData: null, onEnd: null, closed: false,
+      write: (bytes) => { b2.chunks.push(bytes.slice()); b2.size = (b2.size ?? 0) + bytes.length; root.wakeAllBlk(); },
+      end: () => { b2.weof = true; root.wakeAllBlk(); },
+      _b1: b1,
+    };
+    ent.h.lsock.backlog.push({ pipe: b2, peer: b1, mode: 'rw', nonblock: false,
+      sk: { fam: 2, type: 1, name: ent.h.sk.name, peername: { fam: 2, port: this._ephemeralPort(), ip: '10.0.2.2' } } });
+    (root._inbound ??= []).push(conn);
+    this._wakeTree();
+    return conn;
+  }
   _external(ip) { return !!ip && !ip.startsWith('127.') && ip !== '0.0.0.0'; }
   _credOf() {
     return this._cred ??= this.parentEng ? { ...this.parentEng._credOf(), groups: [...this.parentEng._credOf().groups] }
@@ -5122,6 +5143,12 @@ export class LinuxEngine {
       if (conn.eof && !b1.weof) { b1.weof = true; moved = true; }
     }
     if (this._netConns) this._netConns = this._netConns.filter((c) => !(c.conn.state !== 'connecting' && (c.conn.eof || c.conn.state === 'error') && c.b1.weof && !c.conn.rx.length));
+    for (const c of this._inbound ?? []) {
+      const b1 = c._b1;
+      while (b1.chunks.length) { const ch = b1.chunks.shift(); b1.off = 0; b1.size = Math.max(0, (b1.size ?? 0) - ch.length); if (ch.length) c.onData?.(ch); moved = true; }
+      if (b1.weof && !c.closed) { c.closed = true; c.onEnd?.(); moved = true; }
+    }
+    if (this._inbound) this._inbound = this._inbound.filter((c) => !c.closed);
     for (const u of this._netUdp ?? []) {
       for (const d of u.sock.queue.splice(0)) { u.h.dsock.queue.push({ bytes: d.bytes, from: { fam: 2, port: d.port, ip: d.ip } }); moved = true; }
     }

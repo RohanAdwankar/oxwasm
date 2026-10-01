@@ -162,6 +162,29 @@ is('isRunning', await sbx.isRunning(), true);
   is('it exits with the shell\'s status', (await (async () => { await pty.sendInput('exit 3\n'); return pty.wait(); })()).exitCode, 3);
 }
 
+// ---- a server inside the sandbox, reached from the host (getHost) ------------------------------
+{
+  const H = await Sandbox.create();
+  await H.runCode(`import socket, threading
+L = socket.socket()
+L.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+L.bind(("0.0.0.0", 7000)); L.listen(5)
+def serve():
+    while True:
+        c, _ = L.accept()
+        c.sendall(b"hello from guest\\n"); c.close()
+threading.Thread(target=serve, daemon=True).start()
+`);
+  const host = await H.getHost(7000);
+  const net = await import('node:net');
+  const got = await new Promise((res) => { const k = net.connect(+host.split(':')[1], '127.0.0.1'); let d = ''; k.on('data', (b) => { d += b; }); k.on('close', () => res(d)); setTimeout(() => res('timeout:' + d), 30000).unref(); });
+  is('getHost: a guest listener answers a host client', got, 'hello from guest\n');
+  const deadPort = +(await H.getHost(7001)).split(':')[1];
+  const refused = await new Promise((res) => { const k = net.connect(deadPort, '127.0.0.1'); k.on('close', () => res('closed')); k.on('data', () => res('data')); k.on('error', () => {}); setTimeout(() => res('hung'), 15000).unref(); });
+  is('...a port nothing listens on is closed straight away', refused, 'closed');
+  await H.kill();
+}
+
 // ---- the network: off by default, bridged and policed when asked for ----------------------------------------------
 {
   const { createServer } = await import('node:http');

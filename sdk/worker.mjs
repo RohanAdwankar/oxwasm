@@ -12,6 +12,7 @@ let host = null;
 let outstanding = 0;          // requests sent to the guest and not yet closed by a done/error frame
 let pumping = false;
 const background = new Set(); // pids of background commands: they only run while the guest is stepped
+const inbound = new Map();    // cid -> connection from the host into a guest listener (getHost)
 
 const post = (m) => parentPort.postMessage(m);
 const sleep = (ms) => new Promise((r) => (ms > 0 ? setTimeout(r, ms) : setImmediate(r)));
@@ -20,7 +21,7 @@ async function pump() {
   if (pumping) return;
   pumping = true;
   try {
-    while (host && (outstanding > 0 || background.size > 0)) {
+    while (host && (outstanding > 0 || background.size > 0 || inbound.size > 0)) {
       const r = host.step();
       if (r.exit !== undefined) {
         post({ t: 'fatal', message: `the guest exited (${r.exit}): ${host._stderr()}` });
@@ -58,6 +59,18 @@ parentPort.on('message', (m) => {
   } else if (m.t === 'sigint') {
     host.sigint(); outstanding++; pump();     // keep stepping so the signal is delivered even if idle
     setTimeout(() => { outstanding = Math.max(0, outstanding - 1); }, 2000).unref();
+  } else if (m.t === 'inb-open') {              // a client of getHost(port) connected on the host
+    const c = host.eng.openInbound(m.port);
+    if (!c) { post({ t: 'inb-refused', cid: m.cid }); return; }
+    c.onData = (b) => { const u = new Uint8Array(b); post({ t: 'inb-data', cid: m.cid, data: u }); };
+    c.onEnd = () => { inbound.delete(m.cid); post({ t: 'inb-end', cid: m.cid }); };
+    inbound.set(m.cid, c);
+    post({ t: 'inb-ok', cid: m.cid });
+    pump();
+  } else if (m.t === 'inb-data') {
+    inbound.get(m.cid)?.write(new Uint8Array(m.data)); pump();
+  } else if (m.t === 'inb-end') {
+    inbound.get(m.cid)?.end(); pump();
   } else if (m.t === 'close') {
     host.close(); host = null; process.exit(0);
   }

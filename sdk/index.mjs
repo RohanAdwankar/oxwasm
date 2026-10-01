@@ -256,6 +256,7 @@ export class Sandbox {
         if (m.t === 'ready') { this.boot = m.info; resolve(); }
         else if (m.t === 'fatal') { const e = new SandboxError(m.message); if (!this.boot) reject(e); this._destroy(m.message); }
         else if (m.t === 'frame') this._onFrame(m.frame);
+        else if (m.t && m.t.startsWith('inb-')) this._onInbound(m);
       });
       worker.on('error', (e) => { if (!this.boot) reject(e); this._destroy(`worker error: ${e.message}`); });
       worker.on('exit', () => { if (!this.boot) reject(new SandboxError('worker exited during boot')); this._destroy('worker exited'); });
@@ -305,6 +306,8 @@ export class Sandbox {
     if (this._dead) return Promise.resolve();
     this._dead = true; this._deadReason = reason;
     clearTimeout(this._lifetimeTimer);
+    for (const h of this._hostServers?.values() ?? []) { try { h.server.close(); } catch {} }
+    for (const c of this._inbound?.values() ?? []) { try { c.sock.destroy(); } catch {} }
     REGISTRY.delete(this.sandboxId);
     const err = reason === 'killed' || reason === 'worker exited' || reason === 'sandbox timeout reached'
       ? new SandboxNotFoundError(`sandbox ${this.sandboxId} is not running (${reason})`)
@@ -414,7 +417,46 @@ export class Sandbox {
   // ---- not built --------------------------------------------------------------------
   get pty() { return (this._pty ??= new Pty(this)); }
   get git() { throw new NotSupportedError('git'); }
-  getHost() { throw new NotSupportedError('getHost (guest servers are not reachable from outside the sandbox)'); }
+  /**
+   * Reach a server listening inside the sandbox. Opens (once per port) a TCP listener on this
+   * machine and tunnels each connection into the guest's socket; returns "host:port" to connect to.
+   * The listener binds 127.0.0.1 unless `listen` says otherwise. Putting it on the public
+   * internet is a decision for whatever sits in front of it (a tunnel, a reverse proxy): this
+   * does not authenticate anyone.
+   */
+  async getHost(port, opts = {}) {
+    if (this._dead) throw new SandboxNotFoundError(`sandbox ${this.sandboxId} is not running (${this._deadReason})`);
+    const key = `${opts.listen || '127.0.0.1'}:${port}`;
+    let h = (this._hostServers ??= new Map()).get(key);
+    if (!h) {
+      const { createServer } = await import('node:net');
+      const server = createServer((sock) => this._inboundSocket(sock, port));
+      await new Promise((res, rej) => { server.once('error', rej); server.listen(opts.hostPort || 0, opts.listen || '127.0.0.1', res); });
+      server.unref?.();
+      h = { server, addr: server.address() };
+      this._hostServers.set(key, h);
+    }
+    return `${opts.listen && opts.listen !== '0.0.0.0' ? opts.listen : '127.0.0.1'}:${h.addr.port}`;
+  }
+  _inboundSocket(sock, port) {
+    const cid = (this._cid = (this._cid ?? 0) + 1);
+    const conns = (this._inbound ??= new Map());
+    conns.set(cid, { sock, ready: false });
+    sock.pause();
+    sock.on('data', (b) => { try { this._w.postMessage({ t: 'inb-data', cid, data: new Uint8Array(b) }); } catch {} });
+    sock.on('end', () => { try { this._w.postMessage({ t: 'inb-end', cid }); } catch {} });
+    sock.on('close', () => { conns.delete(cid); });
+    sock.on('error', () => {});
+    try { this._w.postMessage({ t: 'inb-open', cid, port }); } catch { sock.destroy(); }
+  }
+  _onInbound(m) {
+    const c = this._inbound?.get(m.cid);
+    if (!c) return;
+    if (m.t === 'inb-ok') c.sock.resume();
+    else if (m.t === 'inb-refused') c.sock.destroy();
+    else if (m.t === 'inb-data') c.sock.write(Buffer.from(m.data));
+    else if (m.t === 'inb-end') c.sock.end();
+  }
   async pause() { throw new NotSupportedError('pause'); }
   async betaPause() { throw new NotSupportedError('betaPause'); }
   async createSnapshot() { throw new NotSupportedError('createSnapshot'); }
