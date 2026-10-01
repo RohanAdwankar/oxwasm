@@ -29,10 +29,11 @@ So the claims below are claims about those handlers, not about a kernel.
 | The guest cannot use the host's network unless asked | No socket reaches the host without `network` set | connect with network off |
 | With `network` on, the guest cannot reach the host's private space by default | `sdk/net.mjs` refuses RFC1918, link-local (cloud metadata), CGNAT, documentation, multicast and loopback ranges unless `allowPrivate`/`allow` says otherwise | metadata, 10/8, 172.16/12, 192.168/16, 100.64/10, 127.x, 0.0.0.0 |
 | The guest's `127.0.0.1` is its own | Loopback connects are answered inside the engine | host service on loopback is unreachable |
-| A guest cannot spend unbounded host memory | RAM is capped by `memMB`; file writes are charged against `diskMB` (default 1024) and refused with ENOSPC | allocation past `memMB`, 6 GB write |
+| A guest cannot spend unbounded host memory | RAM is capped by `memMB`; file writes by any process in the guest, and unnamed files (memfd, O_TMPFILE), are charged against `diskMB` (default 1024) and refused with ENOSPC | allocation past `memMB`, a 6 GB write, the same write from a spawned process, a memfd |
 | A guest that never yields cannot hang the host | The sandbox runs in a worker thread that the parent terminates on timeout | busy-loop containment in `sandboxtest.mjs` |
 | Hostile system calls do not affect the host | Handlers take guest pointers through bounds-checked guest-memory accessors | 19 syscalls with wild pointers and dangerous numbers |
 | A fork bomb is contained | It ends in an error or a timeout; the host is unaffected | fork-bomb check |
+| With `isolation: 'process'`, an engine bug that gives a guest JavaScript execution still cannot read host files outside a short allow-list, write outside the cache and directories you name, or start a process | The sandbox runs in a child process under Node's `--permission` model, with no child-process permission | a self-test run inside that process: reads of `/etc/passwd`, `/proc/self/environ` and `$HOME`, a write to `/tmp`, and a spawn are all denied (needs `OXWASM_TEST_ROOTFS`) |
 
 ## What is not claimed
 
@@ -40,8 +41,15 @@ So the claims below are claims about those handlers, not about a kernel.
   engine's syscall handlers or in the Wasm code generator is the realistic way
   out. JavaScript and Wasm make the classic memory-corruption routes hard, but
   the engine is about 14,000 lines (5,300 of them syscall handlers), differentially tested against hardware
-  for correctness, not for security. If you run hostile code, also run the
-  host process with OS-level confinement (a container, a low-privilege user).
+  for correctness, not for security. If you run hostile code, use
+  `isolation: 'process'` (below) and also run the host with OS-level
+  confinement (a container, a low-privilege user).
+- **`isolation: 'process'` is not a sandbox on its own.** It narrows what an
+  escaped guest can reach (files, new processes). Node 22's permission model
+  does not restrict the network or the process's memory and CPU, and an escaped
+  guest keeps whatever the allow-list grants: the cache directory, the rootfs
+  image, and the directories named in `allowWrite`. It needs a rootfs image,
+  because assembling the host-borrowed Python image runs host tools.
 - **Not a side-channel defense.** Timing, cache and speculative-execution
   channels are not addressed. The guest can read the clock.
 - **Not CPU fairness.** A busy sandbox uses one core until it times out. Many
@@ -57,6 +65,12 @@ So the claims below are claims about those handlers, not about a kernel.
   files; it does not account for every in-engine structure (pipe buffers,
   the path table) and a guest that creates millions of tiny files spends memory
   beyond `diskMB`.
+- **`getHost` opens a host port.** It listens on 127.0.0.1 unless told
+  otherwise and does not authenticate anyone. Anything that can reach that port
+  reaches the guest's server, and the guest's server can do whatever the guest
+  can.
+- **Snapshots contain the guest's whole state.** Memory, files, anything it
+  read or was given. Treat a snapshot directory like the data it came from.
 - **The host's file contents are not secret from code you pass in.** Anything
   you write into the sandbox with `files.write`, or mount with `packages`, or
   put in `envs`, is readable by the guest.

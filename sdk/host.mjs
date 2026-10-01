@@ -15,6 +15,7 @@ import { LinuxEngine } from '../engine/linux.mjs';
 import { CPU } from '../engine/interp.mjs';
 import { snapshotEngine, restoreEngine } from '../engine/snapshot.mjs';
 import { makeAssembler } from '../tools/assemble.mjs';
+import { makeInProcessAssembler } from './wabt-asm.mjs';
 import { buildImage, findPythonTree, CACHE_DIR, DEFAULT_COMMANDS } from './image.mjs';
 
 const HERE = new URL('.', import.meta.url).pathname;
@@ -33,7 +34,8 @@ function cacheKey({ python, packages, commands, memMB, network, rootfs }, guestS
     ...['host.mjs', 'image.mjs', 'net.mjs'].map((f) => sha(readFileSync(join(HERE, f))))];
   const stamp = (p) => { try { const s = readFileSync(p).length; return `${p}:${s}`; } catch { return p; } };
   const rootHash = rootfs ? sha(readFileSync(rootfs)) : null;
-  return sha(JSON.stringify({ python: stamp(python), tree: findPythonTree(python), memMB,
+  // a rootfs image brings its own Python: nothing about the host's belongs in the key
+  return sha(JSON.stringify({ python: rootfs ? null : stamp(python), tree: rootfs ? null : findPythonTree(python), memMB,
                               packages: [...packages].sort(), commands: [...commands].sort(), network, rootHash, engine }), guestSrc);
 }
 
@@ -100,9 +102,17 @@ export class EngineHost {
     }
     const tImage = performance.now() - t0;
 
+    // The compiled tier needs an assembler. wabt in this thread by default: no binary on PATH, no
+    // child process. `assembler: 'wat2wasm'` keeps the native tool and its broker processes.
     let asm = null;
-    try { asm = makeAssembler({ tag: 'oxsb' }); }
-    catch (e) { throw new Error(`sandbox: ${e.message}`); }
+    if (o.assembler !== 'wat2wasm') {
+      try { asm = await makeInProcessAssembler(); }
+      catch (e) { o.log?.(`in-process assembler unavailable (${e.message}); using wat2wasm`); }
+    }
+    if (!asm) {
+      try { asm = makeAssembler({ tag: 'oxsb' }); }
+      catch (e) { throw new Error(`sandbox: ${e.message}`); }
+    }
 
     // Assembled units are cached by content hash across runs. A restored
     // snapshot drops the compiled tier and re-heats it, and without this each

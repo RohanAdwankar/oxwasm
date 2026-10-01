@@ -8,6 +8,8 @@
 // process, not on someone else's machine. Where a feature is not built, the
 // call throws `NotSupportedError` saying so; nothing is a silent no-op.
 import { Worker } from 'node:worker_threads';
+import { ProcessWorker } from './isolated.mjs';
+import { CACHE_DIR } from './image.mjs';
 import { randomBytes } from 'node:crypto';
 import { Execution, Result, OutputMessage, ExecutionError } from './messaging.mjs';
 import {
@@ -226,11 +228,13 @@ export class Sandbox {
   }
 
   static async _start(opts) {
-    const worker = new Worker(WORKER_URL, {
-      workerData: { python: opts.python, packages: opts.packages, memMB: opts.memMB, cache: opts.cache,
-                    commands: opts.commands, bootTimeoutMs: opts.bootTimeoutMs, network: opts.network, rootfs: opts.rootfs, diskMB: opts.diskMB, restoreFrom: opts.restore },
-      resourceLimits: { maxOldGenerationSizeMb: 4096, maxYoungGenerationSizeMb: 128 },
-    });
+    const workerData = { python: opts.python, packages: opts.packages, memMB: opts.memMB, cache: opts.cache,
+                         commands: opts.commands, bootTimeoutMs: opts.bootTimeoutMs, network: opts.network, rootfs: opts.rootfs, diskMB: opts.diskMB, restoreFrom: opts.restore, assembler: opts.assembler };
+    // isolation: 'process' puts the whole sandbox in a child process that Node's permission model has
+    // shut down (no host files outside an allow-list, no child processes). See sdk/isolated.mjs.
+    const worker = opts.isolation === 'process'
+      ? new ProcessWorker(workerData, opts, CACHE_DIR)
+      : new Worker(WORKER_URL, { workerData, resourceLimits: { maxOldGenerationSizeMb: 4096, maxYoungGenerationSizeMb: 128 } });
     const sbx = new Sandbox(worker, opts);
     try { await sbx._booted; }
     catch (e) { try { await worker.terminate(); } catch {} throw e; }
@@ -317,6 +321,15 @@ export class Sandbox {
     for (const [, p] of this._pending) p.reject(p.timedOut ? new TimeoutError(`request timed out (${reason})`) : err);
     this._pending.clear();
     return this._w.terminate().catch(() => {});
+  }
+
+  /** Test hook: what the isolation process can and cannot do. Only meaningful with isolation: 'process'. */
+  _isolationSelfTest() {
+    return new Promise((resolve, reject) => {
+      if (!(this._w instanceof ProcessWorker)) return reject(new SandboxError("not an isolation: 'process' sandbox"));
+      const h = (m) => { if (m.t === 'selftest-done') { this._w.off('message', h); resolve(m.tried); } };
+      this._w.on('message', h); this._w.postMessage({ t: 'selftest' });
+    });
   }
 
   _noteEnded(pid) { try { this._w.postMessage({ t: 'note', pid }); } catch {} }

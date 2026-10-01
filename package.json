@@ -14,5 +14,8 @@
   "repository": "github:RohanAdwankar/oxwasm",
   "bin": {
     "oxwasm": "./bin/oxwasm.mjs"
+  },
+  "dependencies": {
+    "wabt": "^1.0.39"
   }
 }

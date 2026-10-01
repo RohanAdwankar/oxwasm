@@ -19,6 +19,7 @@ const is = (name, got, want) => {
   if (ok) { pass++; if (process.env.SBT_VERBOSE) console.log(`  ok  ${name}`); }
   else { fail++; console.log(`FAIL ${name}: got ${JSON.stringify(got)}, want ${JSON.stringify(want)}`); }
 };
+const rejects = async (name, p) => { try { await p; is(name, 'resolved', 'rejected'); } catch { is(name, 'rejected', 'rejected'); } };
 const py = async (s, code, o = {}) => { try { return (await s.runCode(code, { timeoutMs: 60000, ...o })); } catch (e) { return { threw: e.name + ': ' + e.message }; } };
 const text = (r) => (r.threw ? r.threw : (r.error ? 'ERR ' + r.error.name : (r.text ?? '').replace(/^'|'$/g, '')));
 
@@ -149,6 +150,16 @@ is('...including a kill aimed at its pid', (() => { try { process.kill(process.p
   is('a guest write to the null page kills that guest, not the host', typeof (r.threw ?? r.error?.name ?? 'fine') === 'string', true);
   await X.kill().catch(() => {});
 }
+
+// ---- the second wall: the sandbox in a permission-restricted process ----------------------------------------
+if (process.env.OXWASM_TEST_ROOTFS) {
+  const R = await Sandbox.create({ isolation: 'process', rootfs: process.env.OXWASM_TEST_ROOTFS, memMB: 1024 });
+  const tried = await R._isolationSelfTest();
+  for (const [what, outcome] of Object.entries(tried)) is(`isolation: 'process' denies: ${what}`, outcome, 'ERR_ACCESS_DENIED');
+  is('...and the sandbox inside still works', text(await py(R, '1 + 1')), '2');
+  await rejects('...a snapshot outside the allowed directories is refused', R.snapshot('/tmp/oxwasm-iso-outside'));
+  await R.kill();
+} else console.log("  (isolation: 'process' checks skipped: set OXWASM_TEST_ROOTFS to a rootfs image)");
 
 // ---- after all of it, an untouched sandbox and the host are fine ------------------------------------------------
 is('an unrelated sandbox still works', text(await py(B, '1 + 1')), '2');
