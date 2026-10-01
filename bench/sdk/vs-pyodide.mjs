@@ -21,8 +21,8 @@ const out = {};
 }
 { // pyodide
   const require = createRequire(import.meta.url);
-  const dir = process.argv[2] || '/tmp/scratch';
-  const { loadPyodide } = await import(dir + '/pyodide.mjs');
+  const dir = process.argv[2];                    // a path to the pyodide package, or resolve 'pyodide' from node_modules
+  const { loadPyodide } = dir ? await import(dir + '/pyodide.mjs') : await import('pyodide');
   const t0 = performance.now();
   const py = await loadPyodide();
   out.pyodide = { 'create (cache warm)': ms(t0) };
