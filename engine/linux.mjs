@@ -534,9 +534,15 @@ export class LinuxEngine {
     r = false;
     try {
       const b = [];
-      for (let i = 0n; i < 40n; i++) b.push(Number(this.mem.read(a + i, 1n)));
-      for (let i = 0; i + 7 <= b.length; i++)
-        if (b[i] === 0xb8 && b[i + 1] === 0x3a && !b[i + 2] && !b[i + 3] && !b[i + 4] && b[i + 5] === 0x0f && b[i + 6] === 0x05) { r = true; break; }
+      for (let i = 0n; i < 96n; i++) b.push(Number(this.mem.read(a + i, 1n)));
+      // `mov eax, N ; ... ; syscall` with N = clone (56), fork (57) or vfork (58), near the
+      // start of the function: libc's vfork stub, and fork() (its _Fork/arch_fork inlines
+      // clone(SIGCHLD|CLONE_CHILD_SETTID|CLONE_CHILD_CLEARTID) a few instructions in).
+      for (let i = 0; i + 5 <= b.length; i++) {
+        if (b[i] !== 0xb8 || b[i + 1] < 0x38 || b[i + 1] > 0x3a || b[i + 2] || b[i + 3] || b[i + 4]) continue;
+        for (let j = i + 5; j + 2 <= Math.min(b.length, i + 45); j++) if (b[j] === 0x0f && b[j + 1] === 0x05) { r = true; break; }
+        if (r) break;
+      }
     } catch { /* unmapped: not a stub */ }
     memo.set(a, r);
     return r;
@@ -1932,6 +1938,7 @@ export class LinuxEngine {
     // its syscall history, not a fault address
     const ret = this.strace
       ? (v) => { cpu.regs[0] = BigInt.asUintN(64, v);
+                 if (process.env.OXWASM_DBG_ERR && BigInt.asIntN(64, v) === BigInt(-process.env.OXWASM_DBG_ERR)) console.error(`[errno ${process.env.OXWASM_DBG_ERR}] tid=${this.threads[this.ti]?.id} nr=${nr} args=${a1.toString(16)},${a2.toString(16)},${a3.toString(16)} argv0=${this._ctor?.argv?.[0]}`);
                  let ps = '';   // decode the path argument of the fs family
                  try { if (nr === 257 || nr === 262) ps = ' "' + this.readPath(a2) + '"';
                        else if (nr === 2 || nr === 21 || nr === 89 || nr === 4 || nr === 6 || nr === 87 || nr === 82 || nr === 83 || nr === 59) ps = ' "' + this.readPath(a1) + '"';
@@ -2755,7 +2762,7 @@ export class LinuxEngine {
       // setegid() (i.e. setresgid) to drop privileges after opening its pty
       // and treats the failure as fatal — "setegid(0): Function not
       // implemented", then "Cannot chown /dev/pts/0".
-      case 92: case 93: case 260:                             // chown / fchown / fchownat
+      case 92: case 93: case 94: case 260:                             // chown / fchown / fchownat
         ret(0n); break;
       case 90: case 91: case 268: {                           // chmod / fchmod / fchmodat: the permission bits are remembered per path
         let p, mode; if (nr === 91) { const h = this.fds.get(Number(a1)); p = h?.path; mode = Number(a2); } else { p = this.norm(nr === 90 ? this.readPath(a1) : this.atPath(a1, a2)); mode = Number(nr === 90 ? a2 : a3); }
@@ -2781,6 +2788,15 @@ export class LinuxEngine {
           if (dfd !== -100 && this.readPath(a2).charCodeAt(0) !== 47) { const dh = this.fds.get(dfd); if (!dh) { ret(-9n); break; } if (!dh.isdir) { ret(-20n); break; } } }   // EBADF / ENOTDIR
         const p = nr === 257 ? this.atPath(a1, a2) : this.readPath(a1);
         const flags = Number(nr === 257 ? a3 : a2);
+        // O_TMPFILE (O_DIRECTORY|0x400000): an unnamed regular file in that directory.
+        // apt writes the signed text it hands to gpgv through one; without this the
+        // open "succeeded" as a directory and the first write failed with EBADF.
+        if ((flags & 0x410000) === 0x410000 && this.isDir(p)) {
+          const fd = this.allocFd();
+          this.fds.set(fd, { bytes: new Uint8Array(0), pos: 0, writable: true, memfd: '(tmpfile)' });
+          if (flags & 0x80000) this.cloexec.add(fd);
+          ret(BigInt(fd)); break;
+        }
         // the controlling terminal: a shell opens it to test for job control
         // and `tty` reports its name. Only present in terminal mode.
         {
@@ -3657,6 +3673,18 @@ export class LinuxEngine {
         if (newLen <= oldLen) {                               // shrink (or same) in place
           if (newLen < oldLen) this._unmapRange(a1 + newLen, a1 + oldLen);
           ret(a1); break;
+        }
+        // The arena is a bump allocator: the topmost mapping can simply grow in place.
+        // Without this a doubling allocator (apt's package cache) moved - and so
+        // abandoned - its whole old copy at every step and ran the arena out.
+        if (a1 + oldLen === this.mmapNext) {
+          const o0 = Number(a1 - this.base);
+          if (o0 >= 0 && o0 + Number(newLen) <= this.ram.length) {
+            this.ram.fill(0, o0 + Number(oldLen), o0 + Number(newLen));
+            this.mmapNext = a1 + newLen;
+            for (const m of this.maps ?? []) if (m.at === a1) m.len = newLen;
+            ret(a1); break;
+          }
         }
         if (!(flags & 1)) { ret(-12n); break; }                // no MREMAP_MAYMOVE: cannot grow here (ENOMEM)
         const at = this.mmapNext; this.mmapNext += newLen;
@@ -5166,7 +5194,11 @@ export class LinuxEngine {
       if (e.contEv && !e._contSeen) { e._contSeen = true; this.raiseSignal(17, null, { pid: c.pid, code: 6, status: 18 }); }         // CLD_CONTINUED
       if (e.exitCode === null && !e.stopped) {
         if (e.blocked) e.wake();
-        try { e.run(3e5); } catch (err) { c.exited = 127; c.error = err.message; c.errorStack = err.stack; if (process.env.OXWASM_CHILD_ERRORS) console.error("[child engine error]", err.message); }   // errorStack: where in the engine a child died (tooling)
+        try { e.run(3e5); } catch (err) { c.exited = 127; c.error = err.message; c.errorStack = err.stack; if (process.env.OXWASM_CHILD_ERRORS) {
+          const rip = e.cpu?.rip ?? e.threads?.[e.ti]?.cpu?.rip;
+          const m = (e.maps ?? []).find((x) => rip !== undefined && rip >= x.at && rip < x.at + BigInt(x.len));
+          console.error("[child engine error]", err.message, "argv0=" + (e._ctor?.argv?.slice(0, 3).join(" ")), "rip=" + rip?.toString(16), e.strace ? "\n  last syscalls: " + e.strace.slice(-70).join(" ") : "", m ? `in ${m.path}+${(rip - m.at + BigInt(m.fileOff ?? 0)).toString(16)}` : "");
+        } }   // errorStack: where in the engine a child died (tooling)
       }
       if (c.exited === null && e.exitCode !== null) {
         c.exited = e.exitCode;
