@@ -128,6 +128,15 @@ is('...including a kill aimed at its pid', (() => { try { process.kill(process.p
   await W.kill().catch(() => {});
 }
 {
+  // the same quota when the writer is a spawned process, not the driver
+  const P = await Sandbox.create({ diskMB: 64 });
+  const r = await P.commands.run('head -c 300000000 /dev/zero > /tmp/big; echo rc=$?; ls -l /tmp/big | cut -d" " -f5', { timeoutMs: 120000 }).catch((e) => e);
+  const out = (r.stdout ?? '') + (r.stderr ?? '');
+  const size = +((/\n(\d+)\s*$/.exec(out) || [])[1] ?? 0);
+  is('a spawned process cannot write past diskMB either (wrote ' + Math.round(size / 1048576) + ' MB of a 64 MB quota)', size <= 64 * 1048576 + (1 << 20), true);
+  await P.kill().catch(() => {});
+}
+{
   // unnamed files are in no path table; they must still be charged
   const U = await Sandbox.create({ diskMB: 64 });
   const r = await py(U, `import os\nfd = os.memfd_create("m")\ntry:\n    for i in range(200):\n        os.write(fd, b"x" * (1 << 20))\n    r = "wrote"\nexcept OSError as e:\n    r = type(e).__name__\nr`, { timeoutMs: 60000 });

@@ -1682,6 +1682,10 @@ export class LinuxEngine {
     return m;
   }
   fsBump() { this._fsMeta().v++; }
+  // Paths a guest has written, shared by every process in the tree: a write by a spawned
+  // child must count for the disk quota and reach a snapshot, not vanish with the child.
+  get dirtyFiles() { return (this._fsMeta().dirty ??= new Set()); }
+  set dirtyFiles(v) { this._fsMeta().dirty = v; }
   // rename(2) for a file, a symlink or a DIRECTORY. Directories exist here
   // only as prefixes of file paths plus the mkdir set, so a directory rename
   // moves every entry under the old prefix. rustc finalises an incremental
