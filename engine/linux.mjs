@@ -11,21 +11,23 @@ import { compileUnitWat, pltStubWat, FTMAP, FTMAP_MAX, FTDLIMIT, FTFUEL, FTLOOP,
          FTHASH, FTHBITS, FTHMASK, FTHBYTES, CWLO_SLOT, CWLEN_SLOT, CWMAP, CWMAP_PAGES } from './aot_wat.mjs';
 // OXWASM_DISPSTAT=1: count the rips that HAD a compiled unit and were not
 // dispatched anyway. Off by default - it costs a map lookup per instruction.
-const DISPSTAT = typeof process !== 'undefined' && process.env?.OXWASM_DISPSTAT === '1';
+// the environment, where there is one: the engine also runs in a browser tab, which has no `process`
+const ENV = typeof process !== 'undefined' && process.env ? process.env : {};
+const DISPSTAT = typeof process !== 'undefined' && ENV.OXWASM_DISPSTAT === '1';
 // OXWASM_STOREGUARD=1 (measurement): compiled code checks every store against
 // a window of translated generated code and calls back on a hit. The engine
 // half only arms when the emitter half is on - a watch on the interpreter's
 // writes is not free, and neither is the window bookkeeping.
-const STOREGUARD = typeof process !== 'undefined' && process.env?.OXWASM_STOREGUARD === '1';
+const STOREGUARD = typeof process !== 'undefined' && ENV.OXWASM_STOREGUARD === '1';
 // Rewrites of one page before it is declared volatile and left interpreted.
-const CW_VOLATILE = Number(process.env?.OXWASM_CW_VOLATILE || 8);
+const CW_VOLATILE = Number(ENV.OXWASM_CW_VOLATILE || 8);
 // OXWASM_ANON_HEAT: calls required before GENERATED code is translated, as
 // against a program's own text. A JIT's output has a different life
 // expectancy from a binary's .text - it may be replaced before it is worth
 // translating - and the engine has always tiered both on the same heat.
 // 0 (the default) means "same as everything else", so this changes nothing
 // unless it is asked for.
-const ANON_HEAT = Number(process.env?.OXWASM_ANON_HEAT || 0);
+const ANON_HEAT = Number(ENV.OXWASM_ANON_HEAT || 0);
 import { decode } from './decode.mjs';
 
 const PAGE = 4096n;
@@ -59,20 +61,20 @@ class PathErr { constructor(errno) { this.errno = errno; } }   // ENAMETOOLONG /
 // (rax still holds the syscall number) and either completes or blocks again.
 class BlockUnwind { constructor(rip) { this.rip = rip; } }
 
-const CLOSURE_ALL = typeof process !== 'undefined' && process.env?.OXWASM_CLOSURE_ALL === '1';
-const CLOSURE_MIN = Number((typeof process !== 'undefined' && process.env?.OXWASM_CLOSURE_MIN) || 3);   // observed calls a callee needs to join a closure; 3 priced against m4 steady state (not worse) and clang -S (50 s -> 45 s)
+const CLOSURE_ALL = typeof process !== 'undefined' && ENV.OXWASM_CLOSURE_ALL === '1';
+const CLOSURE_MIN = Number((typeof process !== 'undefined' && ENV.OXWASM_CLOSURE_MIN) || 3);   // observed calls a callee needs to join a closure; 3 priced against m4 steady state (not worse) and clang -S (50 s -> 45 s)
 // Size gate for tier-up by call count: a function of n instructions needs
 // max(threshold, n >> SIZEGATE_SHIFT) observed calls, capped at 256, before it
 // is emitted (2,000 insns -> 31 calls, 13,000 -> 203). OXWASM_SIZEGATE=0 off.
-const SIZEGATE = !(typeof process !== 'undefined' && process.env?.OXWASM_SIZEGATE === '0');
-const SIZEGATE_SHIFT = Number((typeof process !== 'undefined' && process.env?.OXWASM_SIZEGATE_SHIFT) || 6);
-const EXEC_ANON = typeof process !== 'undefined' && process.env?.OXWASM_EXEC_ANON === '1';   // anonymous PROT_EXEC mmaps count as code for profiling/translation (JIT code caches)
-const UNPRUNE = new Set(((typeof process !== 'undefined' && process.env?.OXWASM_UNPRUNE) || '').split(',').filter(Boolean).map(h => BigInt('0x' + h).toString()));
+const SIZEGATE = !(typeof process !== 'undefined' && ENV.OXWASM_SIZEGATE === '0');
+const SIZEGATE_SHIFT = Number((typeof process !== 'undefined' && ENV.OXWASM_SIZEGATE_SHIFT) || 6);
+const EXEC_ANON = typeof process !== 'undefined' && ENV.OXWASM_EXEC_ANON === '1';   // anonymous PROT_EXEC mmaps count as code for profiling/translation (JIT code caches)
+const UNPRUNE = new Set(((typeof process !== 'undefined' && ENV.OXWASM_UNPRUNE) || '').split(',').filter(Boolean).map(h => BigInt('0x' + h).toString()));
 // Starting size of the shared funcref table, doubled up to FTMAP_MAX on
 // demand. Every instance pays V8 a dispatch table the size of the imported
 // one, so this is memory per unit, not a one-off. OXWASM_FTAB_INIT=20000
 // restores creating it at the ceiling.
-const FTAB_INIT = Number((typeof process !== 'undefined' && process.env?.OXWASM_FTAB_INIT) || 1024);
+const FTAB_INIT = Number((typeof process !== 'undefined' && ENV.OXWASM_FTAB_INIT) || 1024);
 
 export class LinuxEngine {
   // threshold: legacy tier-1.5 loop JIT trigger. Defaults OFF — it miscompiles
@@ -1938,8 +1940,8 @@ export class LinuxEngine {
     // its syscall history, not a fault address
     const ret = this.strace
       ? (v) => { cpu.regs[0] = BigInt.asUintN(64, v);
-                 if (process.env.OXWASM_STRACE_SIGNAL && (nr === 234 || nr === 200 || nr === 62)) console.error(`[signal syscall nr=${nr} args=${a1.toString(16)},${a2.toString(16)}] argv0=${this._ctor?.argv?.[0]} last:\n  ` + this.strace.slice(-3).join('\n  ') + '\n  rbpchain:' + (() => { const out = []; try { let bp = cpu.regs[5]; for (let i = 0; i < 16 && bp; i++) { out.push('0x' + this.mem.read(bp + 8n, 8n).toString(16)); bp = this.mem.read(bp, 8n); } } catch {} return out.join(' '); })() + '\n  stack:' + (() => { const out = []; try { const sp = cpu.regs[4]; for (let i = 0n; i < 200n; i++) { const w = this.mem.read(sp + i * 8n, 8n); const m = (this.maps ?? []).find((x) => w >= x.at && w < x.at + BigInt(x.len)); if (m) out.push(`${m.path}+0x${(w - m.at + BigInt(m.fileOff ?? 0)).toString(16)}`); else if (w >= 0x400000n && w < 0x520000n) out.push('exe 0x' + w.toString(16)); } } catch {} return '\n    ' + out.slice(0, 24).join('\n    '); })());
-                 if (process.env.OXWASM_DBG_ERR && BigInt.asIntN(64, v) === BigInt(-process.env.OXWASM_DBG_ERR)) console.error(`[errno ${process.env.OXWASM_DBG_ERR}] tid=${this.threads[this.ti]?.id} nr=${nr} args=${a1.toString(16)},${a2.toString(16)},${a3.toString(16)} argv0=${this._ctor?.argv?.[0]}`);
+                 if (ENV.OXWASM_STRACE_SIGNAL && (nr === 234 || nr === 200 || nr === 62)) console.error(`[signal syscall nr=${nr} args=${a1.toString(16)},${a2.toString(16)}] argv0=${this._ctor?.argv?.[0]} last:\n  ` + this.strace.slice(-3).join('\n  ') + '\n  rbpchain:' + (() => { const out = []; try { let bp = cpu.regs[5]; for (let i = 0; i < 16 && bp; i++) { out.push('0x' + this.mem.read(bp + 8n, 8n).toString(16)); bp = this.mem.read(bp, 8n); } } catch {} return out.join(' '); })() + '\n  stack:' + (() => { const out = []; try { const sp = cpu.regs[4]; for (let i = 0n; i < 200n; i++) { const w = this.mem.read(sp + i * 8n, 8n); const m = (this.maps ?? []).find((x) => w >= x.at && w < x.at + BigInt(x.len)); if (m) out.push(`${m.path}+0x${(w - m.at + BigInt(m.fileOff ?? 0)).toString(16)}`); else if (w >= 0x400000n && w < 0x520000n) out.push('exe 0x' + w.toString(16)); } } catch {} return '\n    ' + out.slice(0, 24).join('\n    '); })());
+                 if (ENV.OXWASM_DBG_ERR && BigInt.asIntN(64, v) === BigInt(-ENV.OXWASM_DBG_ERR)) console.error(`[errno ${ENV.OXWASM_DBG_ERR}] tid=${this.threads[this.ti]?.id} nr=${nr} args=${a1.toString(16)},${a2.toString(16)},${a3.toString(16)} argv0=${this._ctor?.argv?.[0]}`);
                  let ps = '';   // decode the path argument of the fs family
                  try { if (nr === 257 || nr === 262) ps = ' "' + this.readPath(a2) + '"';
                        else if (nr === 2 || nr === 21 || nr === 89 || nr === 4 || nr === 6 || nr === 87 || nr === 82 || nr === 83 || nr === 59) ps = ' "' + this.readPath(a1) + '"';
@@ -4963,6 +4965,15 @@ export class LinuxEngine {
   }
   _writeBytes(h, bytes, off) {
     if (h.bytes !== undefined) { const p = off ?? h.pos, end = p + bytes.length; if (end > h.bytes.length) this._growFile(h, end); h.bytes.set(bytes, p); if (h.path) this._mapsAbsorb(h.path, p, bytes); if (off === undefined) h.pos = end; return bytes.length; }
+    if (h.wpipe) {                                            // a pty end: the slave writes the screen, the master types - never its own read queue
+      const T = (h.ptm ?? h.pts).termios;
+      if (h.pts) {
+        let out = bytes.slice();
+        if ((T.oflag & 1) && (T.oflag & 4) && out.includes(10)) { const o = []; for (const b of out) { if (b === 10) o.push(13); o.push(b); } out = new Uint8Array(o); }
+        h.wpipe.chunks.push(out); h.wpipe.size = (h.wpipe.size ?? 0) + out.length;
+      } else this.ttyInput(h.ptm, bytes.slice());
+      this.wakeAllBlk(); return bytes.length;
+    }
     if (h.pipe) { const pb = h.peer ?? h.pipe; pb.chunks.push(bytes.slice()); pb.size = (pb.size ?? 0) + bytes.length; this.wakeAllBlk(); return bytes.length; }
     if (h.sink) {                                             // stdout / stderr, on the root engine like writeChunk
       let root = this; while (root.parentEng) root = root.parentEng;
@@ -5207,7 +5218,7 @@ export class LinuxEngine {
       if (e.contEv && !e._contSeen) { e._contSeen = true; this.raiseSignal(17, null, { pid: c.pid, code: 6, status: 18 }); }         // CLD_CONTINUED
       if (e.exitCode === null && !e.stopped) {
         if (e.blocked) e.wake();
-        try { e.run(3e5); } catch (err) { c.exited = 127; c.error = err.message; c.errorStack = err.stack; if (process.env.OXWASM_CHILD_ERRORS) {
+        try { e.run(3e5); } catch (err) { c.exited = 127; c.error = err.message; c.errorStack = err.stack; if (ENV.OXWASM_CHILD_ERRORS) {
           const rip = e.cpu?.rip ?? e.threads?.[e.ti]?.cpu?.rip;
           const m = (e.maps ?? []).find((x) => rip !== undefined && rip >= x.at && rip < x.at + BigInt(x.len));
           console.error("[child engine error]", err.message, "argv0=" + (e._ctor?.argv?.slice(0, 3).join(" ")), "rip=" + rip?.toString(16), e.strace ? "\n  last syscalls: " + e.strace.slice(-70).join(" ") : "", m ? `in ${m.path}+${(rip - m.at + BigInt(m.fileOff ?? 0)).toString(16)}` : "");
