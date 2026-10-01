@@ -59,6 +59,16 @@ parentPort.on('message', (m) => {
   } else if (m.t === 'sigint') {
     host.sigint(); outstanding++; pump();     // keep stepping so the signal is delivered even if idle
     setTimeout(() => { outstanding = Math.max(0, outstanding - 1); }, 2000).unref();
+  } else if (m.t === 'metrics') {
+    const e = performance.eventLoopUtilization();
+    post({ t: 'metrics-done', id: m.id, data: { ...host.metrics(), busyMs: e.active, idleMs: e.idle } });
+  } else if (m.t === 'snapshot') {
+    // only a guest at rest can be captured: nothing running, nothing in flight, no open client
+    if (outstanding > 0 || background.size > 0 || inbound.size > 0) {
+      post({ t: 'snapshot-done', id: m.id, error: 'the sandbox is busy: a request, a background process or an open getHost connection is active' });
+      return;
+    }
+    host.snapshotTo(m.dir).then(() => post({ t: 'snapshot-done', id: m.id }), (e) => post({ t: 'snapshot-done', id: m.id, error: e.message }));
   } else if (m.t === 'inb-open') {              // a client of getHost(port) connected on the host
     const c = host.eng.openInbound(m.port);
     if (!c) { post({ t: 'inb-refused', cid: m.cid }); return; }

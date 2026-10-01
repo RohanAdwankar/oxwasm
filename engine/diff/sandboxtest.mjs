@@ -162,6 +162,33 @@ is('isRunning', await sbx.isRunning(), true);
   is('it exits with the shell\'s status', (await (async () => { await pty.sendInput('exit 3\n'); return pty.wait(); })()).exitCode, 3);
 }
 
+// ---- a sandbox that outlives its process: snapshot, then restore ------------------------------------------
+{
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = join(mkdtempSync(join(tmpdir(), 'oxsnap-')), 's');
+  const A = await Sandbox.create();
+  await A.run('import os\nvalue = 41\nos.makedirs("/work/sub", exist_ok=True)\nopen("/work/data.txt", "w").write("kept")\nos.symlink("/work/data.txt", "/work/link")\nos.remove("/etc/group")\nos.chmod("/work/data.txt", 0o600)');
+  await A.snapshot(dir);
+  await A.kill();
+  const B = await Sandbox.create({ restore: dir });
+  is('restore: a variable survives', (await B.run('value + 1')).trim(), '42');
+  is('...a file the guest wrote', (await B.run('open("/work/data.txt").read()')).trim(), "'kept'");
+  is('...a symlink and what it points at', (await B.run('open("/work/link").read() + str(os.path.islink("/work/link"))')).trim(), "'keptTrue'");
+  is('...a file it deleted stays deleted', (await B.run('os.path.exists("/etc/group")')).trim(), 'False');
+  is('...a mode it set', (await B.run('oct(os.stat("/work/data.txt").st_mode & 0o777)')).trim(), "'0o600'");
+  is('...and it still runs commands', (await B.sh('echo alive')).stdout.trim(), 'alive');
+  await rejects('a snapshot refuses to restore under different options', Sandbox.create({ restore: dir, memMB: 700 }), SandboxError);
+  await rejects('...and a directory that is not a snapshot', Sandbox.create({ restore: tmpdir() }), SandboxError);
+  await B.kill(); rmSync(join(dir, '..'), { recursive: true, force: true });
+  // busy: a background process is live state a snapshot cannot hold
+  const C = await Sandbox.create();
+  const bg = await C.commands.run('sleep 30', { background: true });
+  await rejects('snapshot refuses while a background process runs', C.snapshot(join(tmpdir(), 'oxsnap-busy')), SandboxError);
+  await C.kill();
+}
+
 // ---- a server inside the sandbox, reached from the host (getHost) ------------------------------
 {
   const H = await Sandbox.create();

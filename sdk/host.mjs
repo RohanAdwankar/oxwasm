@@ -135,6 +135,7 @@ export class EngineHost {
         files: image.files, mtimes: image.mtimes, memMB, assembleWat, net: netp, diskMB: o.diskMB ?? 1024,
       });
       eng.assembleWatDeferred = assembleWatDeferred;
+      if (process.env.OXWASM_STRACE) eng.strace = [];     // debugging: keep a ring of syscalls, shown when the guest exits unexpectedly
       if (process.env.OXWASM_STRACE) eng.strace = [];     // debugging: syscall ring, printed on tgkill/kill when OXWASM_STRACE_SIGNAL is set
       if (image.meta) {                             // a rootfs carries symlinks, empty directories and file modes
         const m = eng._fsMeta();
@@ -154,8 +155,18 @@ export class EngineHost {
     };
 
     const key = cacheKey({ python, packages, commands, memMB, network: netp ? [netp.resolvers, caBundle && sha(readFileSync(caBundle))] : null, rootfs: o.rootfs }, guestSrc);
-    const snap = join(CACHE_DIR, 'snapshots', key, 'snap');
+    // A snapshot taken by the caller (Sandbox#snapshot) restores instead of the shared boot cache.
+    const userSnap = o.restoreFrom ? String(o.restoreFrom) : null;
+    let userMeta = null;
+    if (userSnap) {
+      try { userMeta = JSON.parse(readFileSync(join(userSnap, 'fsmeta.json'), 'utf8')); }
+      catch (e) { throw new Error(`sandbox: ${userSnap} is not a sandbox snapshot (${e.message})`); }
+      if (userMeta.key !== key) throw new Error('sandbox: this snapshot was taken on a different image, options or oxwasm version; recreate the sandbox with the same options and the same oxwasm');
+    }
+    const snap = userSnap ? join(userSnap, 'snap') : join(CACHE_DIR, 'snapshots', key, 'snap');
     host.snapPath = snap;
+    host.key = key; host.memMB = memMB;
+    host._baseRefs = new Map(Object.entries(image.files));   // what the filesystem looked like before the guest touched it
     host._asm = asm;
 
     // Compiled units, entry -> wasm bytes. Captured while a snapshot is being
@@ -164,7 +175,8 @@ export class EngineHost {
     // the compiled tier, and without this every unit is translated again from
     // scratch - the JS-side analysis and emit, not wat2wasm, was the cost.
     const units = new Map();
-    const unitsFile = join(CACHE_DIR, 'snapshots', key, 'units.bin');
+    const unitsFile = userSnap ? join(userSnap, 'units.bin') : join(CACHE_DIR, 'snapshots', key, 'units.bin');
+    host._units = units;
 
     // Several sandboxes started together on a cold cache would each spend a full
     // cold boot building the same snapshot. One builds it under a lock; the
@@ -172,7 +184,7 @@ export class EngineHost {
     // is taken over once it is stale.
     const lockDir = join(CACHE_DIR, 'snapshots', key + '.lock');
     let haveLock = false;
-    if (useCache && !existsSync(snap + '.mem')) {
+    if (!userSnap && useCache && !existsSync(snap + '.mem')) {
       mkdirSync(join(CACHE_DIR, 'snapshots'), { recursive: true });
       const giveUp = Date.now() + (o.bootTimeoutMs || 300000);
       while (!existsSync(snap + '.mem')) {
@@ -187,13 +199,16 @@ export class EngineHost {
     let restored = false;
     host.eng = make();
     host.eng.onUnitBytes = (k, b) => { if (!units.has(k)) units.set(k, new Uint8Array(b)); };
-    if (useCache && existsSync(snap + '.mem')) {
+    if ((userSnap || useCache) && existsSync(snap + '.mem')) {
       try {
         restoreEngine(host.eng, null, snap, CPU);
+        if (userMeta) host._applyFsMeta(userMeta);
         host.pipe = host.eng.fds.get(0).pipe;
+        if (process.env.OXWASM_DEBUG_RESTORE) console.error('[restore] stdin weof=' + host.pipe.weof, 'size=' + host.pipe.size, 'threads=' + JSON.stringify(host.eng.threads.map((t) => [t.id, t.state])), 'blocked=' + JSON.stringify(host.eng.blocked && { dl: host.eng.blocked.deadline }), 'exitCode=' + host.eng.exitCode);
         restored = true;
         host.unitsLoaded = loadUnits(unitsFile, host.eng);
       } catch (e) {
+        if (userSnap) throw new Error(`sandbox: could not restore ${userSnap}: ${e.message}`);
         o.log?.(`snapshot unusable (${e.message}); cold boot`);
         try { rmSync(join(CACHE_DIR, 'snapshots', key), { recursive: true, force: true }); } catch {}
         host.eng = make();
@@ -216,7 +231,7 @@ export class EngineHost {
     try {
       hello = restored ? await host._ping(30000) : await host._untilReady(o.bootTimeoutMs || 300000);
     } catch (e) { unlock(); throw e; }
-    if (!restored && useCache) {
+    if (!restored && useCache && !userSnap) {
       try { await host._warm(); } catch (e) { o.log?.(`warm-up failed: ${e.message}`); }
       try {
         const dir = join(CACHE_DIR, 'snapshots', key);
@@ -305,7 +320,7 @@ export class EngineHost {
     const t0 = Date.now();
     while (!end) {
       const r = this.step();
-      if (r.exit !== undefined) throw new Error(`sandbox: the guest exited (${r.exit}): ${this._stderr()}`);
+      if (r.exit !== undefined) throw new Error(`sandbox: the guest exited (${r.exit}): ${this._stderr()}${this.eng.strace ? '\n  last syscalls: ' + this.eng.strace.slice(-25).join(' ') : ''}`);
       if (Date.now() - t0 > timeoutMs) throw new Error(`sandbox: '${body.op}' did not answer within ${timeoutMs} ms`);
       if (r.blocked) { await new Promise((res) => setTimeout(res, r.waitMs)); this.eng.wake(); }
       else await new Promise((res) => setImmediate(res));
@@ -342,6 +357,47 @@ print("ok")
   }
 
   _stderr() { return (this.eng.stderr || []).join('').trim().split('\n').slice(-6).join(' | ').slice(0, 500); }
+
+  /** What this sandbox is using right now, from the engine's own books. */
+  metrics() {
+    const eng = this.eng;
+    let diskBytes = 0, procs = 0;
+    for (const p of eng.dirtyFiles) diskBytes += eng.files[p]?.length ?? 0;
+    const countProcs = (e, seen = new Set()) => { if (seen.has(e)) return 0; seen.add(e); let n = 1; for (const c of e.children ?? []) if (c.eng && c.exited === null && c.eng.exitCode === null) n += countProcs(c.eng, seen); return n; };
+    procs = countProcs(eng);
+    const brkUsed = Number(eng.brk - eng._brk0), mmapUsed = Number(eng.mmapNext - eng._mmapBase);
+    return { diskUsedBytes: diskBytes, diskLimitBytes: eng._diskQuota || null,
+             guestMemUsedBytes: brkUsed + mmapUsed, guestMemLimitBytes: this.memMB * 1048576,
+             processes: procs, filesWritten: eng.dirtyFiles.size };
+  }
+
+  /** Put back the parts of the filesystem a snapshot's engine blob does not carry. */
+  _applyFsMeta(meta) {
+    const eng = this.eng, m = eng._fsMeta();
+    for (const p of meta.deleted) delete eng.files[p];
+    m.links = new Map(meta.links); m.dirs = new Set(meta.dirs); m.modes = new Map(meta.modes);
+    m.v++;
+  }
+
+  /**
+   * Write everything needed to bring this sandbox back in another process: guest memory, the
+   * process's descriptors, every file the guest created, changed or deleted, symlinks, directories
+   * and modes. Only valid while the guest is idle with no background processes.
+   */
+  async snapshotTo(dir) {
+    const eng = this.eng, m = eng._fsMeta();
+    mkdirSync(dir, { recursive: true });
+    // the engine blob carries the dirty set; widen it to everything that differs from the image
+    // (created, renamed, replaced) and remember what was deleted
+    const dirty = eng.dirtyFiles, added = [];
+    for (const p of Object.keys(eng.files)) if (eng.files[p] !== this._baseRefs.get(p) && !dirty.has(p)) { dirty.add(p); added.push(p); }
+    const deleted = []; for (const p of this._baseRefs.keys()) if (eng.files[p] === undefined) deleted.push(p);
+    try { await snapshotEngine(eng, null, join(dir, 'snap')); }
+    finally { for (const p of added) dirty.delete(p); }
+    saveUnits(join(dir, 'units.bin'), this._units);
+    writeFileSync(join(dir, 'fsmeta.json'), JSON.stringify({ key: this.key, deleted, links: [...m.links], dirs: [...m.dirs], modes: [...(m.modes ?? [])], at: Date.now() }));
+    return dir;
+  }
 
   close() {
     try { this.pipe.weof = true; this.eng.wakeAllBlk(); this.eng.run(1e6); } catch {}

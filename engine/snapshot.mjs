@@ -124,11 +124,15 @@ export function snapshotEngine(eng, xs, path) {
     // `bytes` was not a typed array at all.
     maps: (eng.maps ?? []).map(({ at, len, path, fileOff, shared }) => ({ at, len, path, fileOff, shared })),
     ti: eng.ti, nextTid: eng.nextTid,
-    blocked: eng.blocked, _deadline: eng._deadline,
+    blocked: null, _deadline: null,
     _futexAddr: eng._futexAddr ?? null,
     stats: { interpreted: eng.stats.interpreted, aotRuns: eng.stats.aotRuns },
-    threads: eng.threads.map(t => ({ id: t.id, state: t.state, dl: t.dl, _dl: t._dl,
-      futex: t.futex, ctid: t.ctid, cpu: cpuState(t.cpu),
+    // A parked thread is stored as runnable: a blocking syscall re-executes and re-checks its
+    // condition when woken (a spurious wake just re-blocks), so "parked at the syscall" and
+    // "about to execute the syscall" are the same state. Restoring the parked form itself was
+    // unreliable - the interrupted read ran twice and returned the first one's count as EOF.
+    threads: eng.threads.map(t => ({ id: t.id, state: t.state === 'blk' ? 'run' : t.state, dl: t.state === 'blk' ? null : t.dl, _dl: t.state === 'blk' ? null : t._dl,
+      futex: t.state === 'blk' ? null : t.futex, ctid: t.ctid, cpu: cpuState(t.cpu),
       sigmask: t.sigmask ?? 0n, pending: t.pending ?? 0n, altstack: t.altstack ?? null })),
     // Process-level state a guest sets up once, early, and never again. Without
     // it a restored process has default dispositions for every signal - a

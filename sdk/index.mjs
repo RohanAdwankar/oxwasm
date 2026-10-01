@@ -228,7 +228,7 @@ export class Sandbox {
   static async _start(opts) {
     const worker = new Worker(WORKER_URL, {
       workerData: { python: opts.python, packages: opts.packages, memMB: opts.memMB, cache: opts.cache,
-                    commands: opts.commands, bootTimeoutMs: opts.bootTimeoutMs, network: opts.network, rootfs: opts.rootfs, diskMB: opts.diskMB },
+                    commands: opts.commands, bootTimeoutMs: opts.bootTimeoutMs, network: opts.network, rootfs: opts.rootfs, diskMB: opts.diskMB, restoreFrom: opts.restore },
       resourceLimits: { maxOldGenerationSizeMb: 4096, maxYoungGenerationSizeMb: 128 },
     });
     const sbx = new Sandbox(worker, opts);
@@ -254,8 +254,10 @@ export class Sandbox {
     this._booted = new Promise((resolve, reject) => {
       worker.on('message', (m) => {
         if (m.t === 'ready') { this.boot = m.info; resolve(); }
-        else if (m.t === 'fatal') { const e = new SandboxError(m.message); if (!this.boot) reject(e); this._destroy(m.message); }
+        else if (m.t === 'fatal') { if (process.env.OXWASM_DEBUG_FATAL) console.error('[fatal]', this.sandboxId, 'booted=' + !!this.boot, 'dead=' + this._dead, m.message.slice(0, 120)); const e = new SandboxError(m.message); if (!this.boot) reject(e); this._destroy(m.message); }
         else if (m.t === 'frame') this._onFrame(m.frame);
+        else if (m.t === 'metrics-done') { const w = this._snapWait?.get('m' + m.id); if (w) { this._snapWait.delete('m' + m.id); w.resolve(m.data); } }
+        else if (m.t === 'snapshot-done') { const w = this._snapWait?.get(m.id); if (w) { this._snapWait.delete(m.id); m.error ? w.reject(new SandboxError(m.error)) : w.resolve(); } }
         else if (m.t && m.t.startsWith('inb-')) this._onInbound(m);
       });
       worker.on('error', (e) => { if (!this.boot) reject(e); this._destroy(`worker error: ${e.message}`); });
@@ -418,6 +420,26 @@ export class Sandbox {
   get pty() { return (this._pty ??= new Pty(this)); }
   get git() { throw new NotSupportedError('git'); }
   /**
+   * Save the whole sandbox to `dir`: guest memory, files (including everything it created or
+   * deleted), symlinks and modes. Resume it later, in this process or another, with
+   * `Sandbox.create({ ...sameOptions, restore: dir })`. Waits for earlier requests to finish;
+   * refuses while a background process runs or a getHost connection is open, because those are
+   * live state a snapshot cannot hold. The same image, options and oxwasm version must be used to
+   * restore: a mismatch is refused, never guessed at.
+   */
+  async snapshot(dir) {
+    const run = () => new Promise((resolve, reject) => {
+      if (this._dead) return reject(new SandboxNotFoundError(`sandbox ${this.sandboxId} is not running (${this._deadReason})`));
+      const id = (this._snapId = (this._snapId ?? 0) + 1);
+      (this._snapWait ??= new Map()).set(id, { resolve, reject });
+      this._w.postMessage({ t: 'snapshot', id, dir: String(dir) });
+    });
+    const p = this._chain.then(run, run);
+    this._chain = p.catch(() => {});
+    await p;
+    return dir;
+  }
+  /**
    * Reach a server listening inside the sandbox. Opens (once per port) a TCP listener on this
    * machine and tunnels each connection into the guest's socket; returns "host:port" to connect to.
    * The listener binds 127.0.0.1 unless `listen` says otherwise. Putting it on the public
@@ -461,7 +483,16 @@ export class Sandbox {
   async betaPause() { throw new NotSupportedError('betaPause'); }
   async createSnapshot() { throw new NotSupportedError('createSnapshot'); }
   async fork() { throw new NotSupportedError('fork'); }
-  async getMetrics() { throw new NotSupportedError('getMetrics'); }
+  /**
+   * A reading of what this sandbox uses: guest memory and disk against their limits, processes,
+   * the time its thread spent working (busyMs) against waiting (idleMs), and wall-clock uptime.
+   */
+  async getMetrics() {
+    if (this._dead) throw new SandboxNotFoundError(`sandbox ${this.sandboxId} is not running (${this._deadReason})`);
+    const id = (this._metId = (this._metId ?? 0) + 1);
+    const data = await new Promise((resolve, reject) => { (this._snapWait ??= new Map()).set('m' + id, { resolve, reject }); this._w.postMessage({ t: 'metrics', id }); });
+    return { ...data, uptimeMs: Date.now() - this.startedAt.getTime(), sandboxId: this.sandboxId };
+  }
   async uploadUrl() { throw new NotSupportedError('uploadUrl'); }
   async downloadUrl() { throw new NotSupportedError('downloadUrl'); }
 
@@ -469,3 +500,5 @@ export class Sandbox {
 }
 
 export default Sandbox;
+
+export { SandboxPool } from './pool.mjs';
