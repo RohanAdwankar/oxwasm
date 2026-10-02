@@ -145,6 +145,7 @@ export class EngineHost {
         files: image.files, mtimes: image.mtimes, memMB, assembleWat, net: netp, diskMB: o.diskMB ?? 1024,
       });
       eng.assembleWatDeferred = assembleWatDeferred;
+      if (o.childMemMB) eng.childMemMB = o.childMemMB;   // RAM for each exec'd program (default 256 MB): large binaries need more
       if (process.env.OXWASM_STRACE) eng.strace = [];     // debugging: keep a ring of syscalls, shown when the guest exits unexpectedly
       if (process.env.OXWASM_STRACE) eng.strace = [];     // debugging: syscall ring, printed on tgkill/kill when OXWASM_STRACE_SIGNAL is set
       if (image.meta) {                             // a rootfs carries symlinks, empty directories and file modes
