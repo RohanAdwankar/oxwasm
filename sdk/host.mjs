@@ -145,6 +145,9 @@ export class EngineHost {
         files: image.files, mtimes: image.mtimes, memMB, assembleWat, net: netp, diskMB: o.diskMB ?? 1024,
       });
       eng.assembleWatDeferred = assembleWatDeferred;
+      // exec'd programs: the child engines default to browser-sized units (24 functions, 4,000 instructions, for wabt.js);
+      // a Node host assembles in-process or with wat2wasm and can take real hot functions
+      eng.childUnitMaxFuncs = o.unitMaxFuncs ?? 96; eng.childUnitMaxInsns = o.unitMaxInsns ?? 30000;
       if (o.cpus) eng.ncpu = o.cpus;                     // CPUs the guest sees (default 1): runtimes size their thread pools from it
       if (o.childMemMB) eng.childMemMB = o.childMemMB;   // RAM for each exec'd program (default 256 MB): large binaries need more
       if (process.env.OXWASM_STRACE) eng.strace = [];     // debugging: keep a ring of syscalls, shown when the guest exits unexpectedly

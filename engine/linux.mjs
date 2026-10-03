@@ -2004,6 +2004,9 @@ export class LinuxEngine {
     const nr = Number(cpu.regs[0]);
     const [a1, a2, a3] = [cpu.regs[7], cpu.regs[6], cpu.regs[2]];   // rdi rsi rdx
     this.stats.syscalls[nr] = (this.stats.syscalls[nr] || 0) + 1;
+    if (ENV.OXWASM_MMAPTRACE && nr === 9 && a2 >= BigInt('0x' + ENV.OXWASM_MMAPTRACE) && a2 < BigInt('0x' + (ENV.OXWASM_MMAPTRACE_MAX || 'ffffffffffffff')) && this._ctor?.argv?.[0]?.includes('opencode') && (this._mtN = (this._mtN | 0) + 1) <= 3) {   // who asks for a huge mapping: the guest's rbp chain
+      const out = []; try { let bp = cpu.regs[5]; for (let i = 0; i < 24 && bp; i++) { out.push('0x' + this.mem.read(bp + 8n, 8n).toString(16)); bp = this.mem.read(bp, 8n); } } catch {}
+      console.error(`[mmaptrace] len=${a2.toString(16)} prot=${cpu.regs[2].toString(16)} flags=${cpu.regs[10].toString(16)} rbp-chain: ${out.join(' ')}`); }
     // strace ring: the last few hundred (nr, args, ret) tuples, kept only when
     // switched on - reading a silent exit 1 out of a guest needs the tail of
     // its syscall history, not a fault address
@@ -2528,7 +2531,8 @@ export class LinuxEngine {
         if (this.strace) ceng.strace = [];                   // a traced parent traces its children
         if (this.childMemMB !== undefined) ceng.childMemMB = this.childMemMB;
         if (this._ncpu !== undefined) ceng._ncpu = this._ncpu;
-        if (this.mem.cpuV2) ceng.mem.cpuV2 = true;   // grandchildren too (cargo -> rustc -> cc -> collect2 -> ld)
+        if (this.mem.cpuV2) ceng.mem.cpuV2 = true;
+        if (this.childUnitMaxFuncs !== undefined) { ceng.childUnitMaxFuncs = this.childUnitMaxFuncs; ceng.childUnitMaxInsns = this.childUnitMaxInsns; }   // grandchildren too   // grandchildren too (cargo -> rustc -> cc -> collect2 -> ld)
         if (this.assembleWatDeferred) { ceng.assembleWatDeferred = this.assembleWatDeferred; ceng.pumpAsm = this.pumpAsm; }
         ceng.sigign = new Set(t.proc?.sigign ?? this.sigign ?? []);   // exec keeps ignored signals ignored (handlers reset to default)
         if (this.onChildEngine) { ceng.onChildEngine = this.onChildEngine; this.onChildEngine(ceng, argv); }   // tooling: see every execve'd image, grandchildren included, even ones reaped inside one run slice
@@ -4858,6 +4862,7 @@ export class LinuxEngine {
     if (this.childMemMB !== undefined) ceng.childMemMB = this.childMemMB;
         if (this._ncpu !== undefined) ceng._ncpu = this._ncpu;
         if (this.mem.cpuV2) ceng.mem.cpuV2 = true;
+        if (this.childUnitMaxFuncs !== undefined) { ceng.childUnitMaxFuncs = this.childUnitMaxFuncs; ceng.childUnitMaxInsns = this.childUnitMaxInsns; }   // grandchildren too
     if (this.execAnon !== undefined) ceng.execAnon = this.execAnon;
     if (this.assembleWatDeferred) { ceng.assembleWatDeferred = this.assembleWatDeferred; ceng.pumpAsm = this.pumpAsm; }
     if (this.onChildEngine) { ceng.onChildEngine = this.onChildEngine; this.onChildEngine(ceng, o.argv); }
