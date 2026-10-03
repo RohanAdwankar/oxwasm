@@ -39,7 +39,7 @@ export async function makeInProcessAssembler() {
     let m;
     try {
       m = wabt.parseWat('unit.wat', wat, { tail_call: true });
-      return new Uint8Array(m.toBinary({}).buffer);
+      return new Uint8Array(m.toBinary({ write_debug_names: !!process.env.OXWASM_DEBUGNAMES }).buffer);   // OXWASM_DEBUGNAMES=1: function names for the CPU profile
     } catch (e) {
       // a trap leaves the instance dead: replace it before the next unit
       wabt = null;

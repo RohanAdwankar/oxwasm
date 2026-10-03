@@ -375,6 +375,56 @@ export class LinuxEngine {
     try { return a !== null ? this.mem.read(a, 8n) : null; } catch { return null; }
   }
 
+  // A unit from the disk store, under the key of the mappings as they are NOW (the same key a later run computes at
+  // the same point, which is also the key put() uses for a unit requested here).
+  _diskUnit(kk) {
+    if (!this.unitStore) return undefined;
+    const ex = this._unitExeId();
+    return ex ? this.unitStore.get(ex, kk.toString(16)) : undefined;
+  }
+  // A finished unit: hand it to the manifest hook and, when a disk store is attached, persist it - but only
+  // if every function in it lies in code the store key covers: the program's static image (executable and
+  // dynamic linker) or a file mapping that was loaded when the key was computed and is still mapped.
+  // Anonymous and JIT code can differ next run, so a unit that touches it is never stored.
+  _unitBytesDone(k, bytes, unit) {
+    if (this.onUnitBytes) this.onUnitBytes(k, bytes);
+    if (!this.unitStore) return;
+    try {
+      const ex = unit._ex; if (!ex) return;
+      const rs = unit._rs;
+      const covered = (a) => rs.some((r) => a >= r.lo && a < r.hi && (r.map === null || (this.maps ?? []).includes(r.map)));
+      if (!unit.funcs.every(covered)) return;
+      this.unitStore.put(ex, k.toString(16), bytes);
+    } catch {}
+  }
+  // The store key: the static executable ranges as loaded, every file mapping's pristine bytes (what the
+  // file says, not what the process has since written to it) with where it sits, and the guest base the
+  // units were translated against (their address arithmetic is baked into the wasm). It is recomputed
+  // when the set of mappings changes - the first hot code is the dynamic linker, before any library is
+  // mapped - and the per-file and static digests are memoised so that is cheap.
+  _unitExeId() {
+    const nm = (this.maps ?? []).length;
+    if (this._exeIdV !== undefined && this._exeMapsN === nm) return this._exeIdV;
+    let id = null;
+    try {
+      const st = this.unitStore, ranges = [], parts = [];
+      this._staticDigest ??= st.digest((this.execRangesStatic ?? []).map(([lo, hi]) => this.ram.subarray(Number(lo - this.base), Number(hi - this.base))));
+      parts.push('static:' + this._staticDigest);
+      for (const [lo, hi] of (this.execRangesStatic ?? [])) ranges.push({ lo, hi, map: null });
+      const fileDigest = (this._fileDigests ??= new WeakMap());
+      for (const m of (this.maps ?? []).slice().sort((x, y) => (x.at < y.at ? -1 : 1))) {
+        if (!m.h?.bytes) continue;
+        let dg = fileDigest.get(m.h.bytes); if (dg === undefined) { dg = st.digest([m.h.bytes]); fileDigest.set(m.h.bytes, dg); }
+        const fo = Number(m.fileOff ?? 0);
+        parts.push(`${m.at}:${m.len}:${m.path}:${fo}:${dg};`);
+        ranges.push({ lo: m.at, hi: m.at + BigInt(m.len), map: m });
+      }
+      if (ranges.length) { id = st.exeId(parts, this.base.toString(16) + ':' + this.RAMOFF); this._exeRanges = ranges; }
+    } catch { id = null; }
+    this._exeMapsN = nm;
+    return (this._exeIdV = id);
+  }
+
   // Does the code at `a` begin like a function: [endbr64] push %rbp; mov %rsp,%rbp. A function reached
   // only by jmp (a sibling call) is never `call`ed, but a longjmp landing - the case that must not chain -
   // sits mid-function and never starts with a frame-setup prologue.
@@ -584,9 +634,11 @@ export class LinuxEngine {
     // Without this, a "cache" keyed by the generated WAT still pays the whole
     // closure translation on the main thread just to compute the lookup key —
     // measured at 30-second pump slices on GIMP's first menu open.
+    if (this.unitStore && !this.unitBytes) this.unitBytes = (kk) => this._diskUnit(kk);
     if (this.unitBytes) {
       const bytes = this.unitBytes(k);
       if (bytes) {
+        this.stats.unitHits = (this.stats.unitHits || 0) + 1;
         // A synchronous host (node: breadth, runbin, the benches) never
         // returns to the event loop while the guest runs, so an async
         // instantiate's promise stays pending for the whole job: the child
@@ -706,6 +758,8 @@ export class LinuxEngine {
     // _codeWrite). This also marks the region's pages as watched, so a write
     // to one is seen before the translation it invalidates is ever used.
     if (this._cwCover(entry)) { this.aotFailed.add(k); this.noteAotFail(entry, 'volatile code page'); return; }
+    const _tc0 = performance.now();
+    const _unitEx = this.unitStore ? this._unitExeId() : null, _unitRs = this._exeRanges;   // the key at REQUEST time: the lookup used it, so the store must
     try {
       const unit = compileUnitWat(this.mem, entry, { guestBase: this.base, ramBase: this.RAMOFF,
         // prune the closure at functions already in the dispatch map: calls
@@ -764,7 +818,7 @@ export class LinuxEngine {
         (this._inflight ??= new Set()).add(unit);
         this.assembleWatAsync(unit.wat)
           .then((bytes) => {
-            if (this.onUnitBytes) this.onUnitBytes(k, bytes);
+            this._unitBytesDone(k, bytes, unit);
             return WebAssembly.instantiate(bytes, this.aotImports());
           })
           .then(({ instance }) => this.finishAotUnit(unit, instance))
@@ -772,6 +826,8 @@ export class LinuxEngine {
                           this.noteAotFail(entry, e.message); });
         return;
       }
+      unit._ex = _unitEx; unit._rs = _unitRs;
+      this.stats.compiles = (this.stats.compiles || 0) + 1; this.stats.compileMs = (this.stats.compileMs || 0) + (performance.now() - _tc0);
       // Deferred assembly (node): hand the text to the broker and keep
       // running; the unit registers from a later pumpAsm() when the bytes
       // are back. A clang profile had the host blocked a quarter of its run
@@ -790,7 +846,7 @@ export class LinuxEngine {
           if (unit.cancelled) return;                    // its code was recycled while it assembled
           if (err) { this.aotFns.delete(k); this.aotFailed.add(k); this.noteAotFail(entry, err.message); return; }
           try {
-            if (this.onUnitBytes) this.onUnitBytes(k, bytes);
+            this._unitBytesDone(k, bytes, unit);
             const inst = new WebAssembly.Instance(new WebAssembly.Module(bytes), this.aotImports());
             this.aotFns.delete(k);                       // the placeholder; finishAotUnit registers the real export
             this.finishAotUnit(unit, inst);
@@ -800,7 +856,7 @@ export class LinuxEngine {
         return;
       }
       const bytes = this.assembleWat(unit.wat);
-      if (this.onUnitBytes) this.onUnitBytes(k, bytes);   // manifest capture: entry -> compiled wasm
+      this._unitBytesDone(k, bytes, unit);   // manifest capture: entry -> compiled wasm
       // asyncCompile (browser): hand the bytes to the engine's off-thread
       // compiler instead of blocking this slice — execution stays interpreted
       // until the instantiate resolves, then the unit's functions register.
@@ -2532,6 +2588,7 @@ export class LinuxEngine {
         if (this.childMemMB !== undefined) ceng.childMemMB = this.childMemMB;
         if (this._ncpu !== undefined) ceng._ncpu = this._ncpu;
         if (this.mem.cpuV2) ceng.mem.cpuV2 = true;
+        if (this.unitStore) ceng.unitStore = this.unitStore;
         if (this.childUnitMaxFuncs !== undefined) { ceng.childUnitMaxFuncs = this.childUnitMaxFuncs; ceng.childUnitMaxInsns = this.childUnitMaxInsns; }   // grandchildren too   // grandchildren too (cargo -> rustc -> cc -> collect2 -> ld)
         if (this.assembleWatDeferred) { ceng.assembleWatDeferred = this.assembleWatDeferred; ceng.pumpAsm = this.pumpAsm; }
         ceng.sigign = new Set(t.proc?.sigign ?? this.sigign ?? []);   // exec keeps ignored signals ignored (handlers reset to default)
@@ -2559,7 +2616,7 @@ export class LinuxEngine {
         {
           const cache = (this.childUnits ??= new Map()).get(path) ?? new Map();
           this.childUnits.set(path, cache);
-          ceng.unitBytes = (k) => cache.get(k.toString(16));
+          ceng.unitBytes = (k) => cache.get(k.toString(16)) ?? ceng._diskUnit(k);   // this run's units, then the disk store
           ceng.onUnitBytes = (k, bytes) => cache.set(k.toString(16), bytes);
         }
         ceng.cwd = this.cwd;                                 // exec inherits the cwd
@@ -4862,6 +4919,7 @@ export class LinuxEngine {
     if (this.childMemMB !== undefined) ceng.childMemMB = this.childMemMB;
         if (this._ncpu !== undefined) ceng._ncpu = this._ncpu;
         if (this.mem.cpuV2) ceng.mem.cpuV2 = true;
+        if (this.unitStore) ceng.unitStore = this.unitStore;
         if (this.childUnitMaxFuncs !== undefined) { ceng.childUnitMaxFuncs = this.childUnitMaxFuncs; ceng.childUnitMaxInsns = this.childUnitMaxInsns; }   // grandchildren too
     if (this.execAnon !== undefined) ceng.execAnon = this.execAnon;
     if (this.assembleWatDeferred) { ceng.assembleWatDeferred = this.assembleWatDeferred; ceng.pumpAsm = this.pumpAsm; }

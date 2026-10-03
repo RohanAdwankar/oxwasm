@@ -39,6 +39,25 @@ function cacheKey({ python, packages, commands, memMB, network, rootfs, cpuV2, c
                               packages: [...packages].sort(), commands: [...commands].sort(), network, rootHash, engine }), guestSrc);
 }
 
+// A disk store of finished compiled units, shared by every program the sandbox runs and every later run:
+// <cache>/units/<engine hash>/<program id>/<entry hex>.wasm. The engine decides what is safe to put in it (units
+// confined to the program's static image) and keys it by a hash of that image; here it is only files.
+let _engineHash = null;
+const engineHash = () => _engineHash ??= sha(...['linux.mjs', 'aot_wat.mjs', 'interp.mjs', 'decode.mjs'].map((f) => readFileSync(join(HERE, '..', 'engine', f))), process.version);
+function makeUnitStore(cacheDir) {
+  const root = join(cacheDir, 'units', engineHash());
+  return {
+    digest(chunks) { const h = createHash('sha1'); for (const c of chunks) h.update(c); return h.digest('hex').slice(0, 16); },
+    exeId(chunks, extra) { const h = createHash('sha1'); for (const c of chunks) h.update(c); h.update(String(extra)); return h.digest('hex').slice(0, 20); },
+    get(ex, k) { try { const b = readFileSync(join(root, ex, k + '.wasm')); if (process.env.OXWASM_UNITLOG) console.error('[unitstore hit]', ex, k); return new Uint8Array(b.buffer, b.byteOffset, b.length); } catch { if (process.env.OXWASM_UNITLOG) console.error('[unitstore miss]', ex, k); return undefined; } },
+    put(ex, k, bytes) {
+      const d = join(root, ex); mkdirSync(d, { recursive: true });
+      const f = join(d, k + '.wasm'), t = f + '.' + process.pid + '.tmp';
+      writeFileSync(t, bytes); renameSync(t, f);
+    },
+  };
+}
+
 // units.bin: one JSON line [[entryHex, byteLength], ...] then the wasm modules back to back.
 function saveUnits(path, units) {
   const keys = [...units.keys()];
@@ -106,11 +125,11 @@ export class EngineHost {
     // child process. `assembler: 'wat2wasm'` keeps the native tool and its broker processes.
     let asm = null;
     if (o.assembler !== 'wat2wasm') {
-      try { asm = withNativeFallback(await makeInProcessAssembler(), () => makeAssembler({ tag: 'oxsb' })); }
+      try { asm = withNativeFallback(await makeInProcessAssembler(), () => makeAssembler({ tag: 'oxsb', debugNames: !!process.env.OXWASM_DEBUGNAMES })); }
       catch (e) { o.log?.(`in-process assembler unavailable (${e.message}); using wat2wasm`); }
     }
     if (!asm) {
-      try { asm = makeAssembler({ tag: 'oxsb' }); }
+      try { asm = makeAssembler({ tag: 'oxsb', debugNames: !!process.env.OXWASM_DEBUGNAMES }); }
       catch (e) { throw new Error(`sandbox: ${e.message}`); }
     }
 
@@ -134,6 +153,7 @@ export class EngineHost {
       asm.submit(wat, (b, e) => { if (b) try { writeFileSync(cp, b); } catch {} cb(b, e); });
     };
 
+    let unitStore = null;
     const make = () => {
       const eng = new LinuxEngine(image.files[pythonPath], {
         argv: [python, '-S', '-B', GUEST_PATH],
@@ -145,6 +165,7 @@ export class EngineHost {
         files: image.files, mtimes: image.mtimes, memMB, assembleWat, net: netp, diskMB: o.diskMB ?? 1024,
       });
       eng.assembleWatDeferred = assembleWatDeferred;
+      if (o.unitCache !== false) { try { eng.unitStore = unitStore ??= makeUnitStore(CACHE_DIR); } catch {} }   // compiled units persist across runs and programs
       // exec'd programs: the child engines default to browser-sized units (24 functions, 4,000 instructions, for wabt.js);
       // a Node host assembles in-process or with wat2wasm and can take real hot functions
       eng.childUnitMaxFuncs = o.unitMaxFuncs ?? 96; eng.childUnitMaxInsns = o.unitMaxInsns ?? 30000;
