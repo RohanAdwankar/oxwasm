@@ -256,6 +256,27 @@ print(os.path.islink(a), os.readlink(a), os.lstat(a).st_ino != os.lstat(t).st_in
   is('a symlink is a symlink through a linked directory, with a stable inode and d_type', (r.logs?.stdout ?? []).join('').trim(), "True f.so.1.0 True True (True, False) (False, True)");
 }
 
+// a failed mmap must not use up address space: probe far past RAM, then map something that fits
+{
+  const r = await sbx.runCode(`import mmap
+try:
+    mmap.mmap(-1, 1 << 40)
+    ok = 'mapped'
+except (OSError, ValueError, OverflowError) as e:
+    ok = 'refused'
+m = mmap.mmap(-1, 64 << 20)
+m[0] = 7
+print(ok, m[0])`);
+  is('a refused huge mmap leaves the address space usable', (r.logs?.stdout ?? []).join('').trim(), 'refused 7');
+}
+{
+  const c = await Sandbox.create({ cpus: 4 });
+  const r = await c.runCode(`import os
+print(len(os.sched_getaffinity(0)), os.cpu_count(), open('/proc/stat').read().count('\\ncpu'))`);
+  is('cpus: 4 is what the guest sees', (r.logs?.stdout ?? []).join('').trim(), '4 4 4');
+  await c.kill();
+}
+
 await rejects('an unsupported language says so', sbx.runCode('1', { language: 'r' }), SandboxError);
 is('kill', await sbx.kill(), true);
 is('killed sandbox is not running', await sbx.isRunning(), false);

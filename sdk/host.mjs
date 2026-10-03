@@ -27,7 +27,7 @@ const sha = (...parts) => { const h = createHash('sha256'); for (const p of part
 // A snapshot is only valid for the exact machine it was taken on: the same
 // interpreter, the same mounted packages, the same tools, the same driver and
 // the same engine. Anything else must miss.
-function cacheKey({ python, packages, commands, memMB, network, rootfs }, guestSrc) {
+function cacheKey({ python, packages, commands, memMB, network, rootfs, cpuV2, cpus }, guestSrc) {
   const engine = [...['linux.mjs', 'aot_wat.mjs', 'interp.mjs', 'decode.mjs', 'snapshot.mjs', 'snapshot_core.mjs']
     .map((f) => sha(readFileSync(join(HERE, '..', 'engine', f)))),
     // the SDK's own code decides what goes into a snapshot (the warm-up, the unit capture)
@@ -35,7 +35,7 @@ function cacheKey({ python, packages, commands, memMB, network, rootfs }, guestS
   const stamp = (p) => { try { const s = readFileSync(p).length; return `${p}:${s}`; } catch { return p; } };
   const rootHash = rootfs ? sha(readFileSync(rootfs)) : null;
   // a rootfs image brings its own Python: nothing about the host's belongs in the key
-  return sha(JSON.stringify({ python: rootfs ? null : stamp(python), tree: rootfs ? null : findPythonTree(python), memMB,
+  return sha(JSON.stringify({ python: rootfs ? null : stamp(python), tree: rootfs ? null : findPythonTree(python), memMB, cpuV2: !!cpuV2, cpus: cpus || 1,
                               packages: [...packages].sort(), commands: [...commands].sort(), network, rootHash, engine }), guestSrc);
 }
 
@@ -141,10 +141,11 @@ export class EngineHost {
               ...(packages.length ? [`PYTHONPATH=${packages.join(':')}`] : []),
               // glibc would otherwise pick its SSSE3/SSE4.2 string routines on a v2 CPU
               ...(netp ? ['SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt', 'REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt', 'CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt'] : []),
-              ...(packages.length ? ['GLIBC_TUNABLES=glibc.cpu.hwcaps=-SSSE3,-SSE4_1,-SSE4_2,-POPCNT'] : []), ...(o.env || [])],
+              ...(packages.length || o.cpuV2 ? ['GLIBC_TUNABLES=glibc.cpu.hwcaps=-SSSE3,-SSE4_1,-SSE4_2,-POPCNT'] : []), ...(o.env || [])],
         files: image.files, mtimes: image.mtimes, memMB, assembleWat, net: netp, diskMB: o.diskMB ?? 1024,
       });
       eng.assembleWatDeferred = assembleWatDeferred;
+      if (o.cpus) eng.ncpu = o.cpus;                     // CPUs the guest sees (default 1): runtimes size their thread pools from it
       if (o.childMemMB) eng.childMemMB = o.childMemMB;   // RAM for each exec'd program (default 256 MB): large binaries need more
       if (process.env.OXWASM_STRACE) eng.strace = [];     // debugging: keep a ring of syscalls, shown when the guest exits unexpectedly
       if (process.env.OXWASM_STRACE) eng.strace = [];     // debugging: syscall ring, printed on tgkill/kill when OXWASM_STRACE_SIGNAL is set
@@ -155,7 +156,7 @@ export class EngineHost {
         m.modes = new Map(image.meta.modes);
         m.v++;
       }
-      eng.mem.cpuV2 = packages.length > 0;              // compiled extension packages (numpy) are built for x86-64-v2
+      eng.mem.cpuV2 = packages.length > 0 || !!o.cpuV2;              // compiled extension packages (numpy) are built for x86-64-v2
       eng.pumpAsm = () => asm.pump();
       // Compiled code runs as a wasm-to-wasm chain that only re-checks the
       // clock when its fuel runs out; bottomless fuel means one run() can hold
@@ -165,7 +166,7 @@ export class EngineHost {
       return eng;
     };
 
-    const key = cacheKey({ python, packages, commands, memMB, network: netp ? [netp.resolvers, caBundle && sha(readFileSync(caBundle))] : null, rootfs: o.rootfs }, guestSrc);
+    const key = cacheKey({ python, packages, commands, memMB, cpuV2: o.cpuV2, cpus: o.cpus, network: netp ? [netp.resolvers, caBundle && sha(readFileSync(caBundle))] : null, rootfs: o.rootfs }, guestSrc);
     // A snapshot taken by the caller (Sandbox#snapshot) restores instead of the shared boot cache.
     const userSnap = o.restoreFrom ? String(o.restoreFrom) : null;
     let userMeta = null;

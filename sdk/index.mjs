@@ -228,7 +228,7 @@ export class Sandbox {
   }
 
   static async _start(opts) {
-    const workerData = { python: opts.python, packages: opts.packages, memMB: opts.memMB, childMemMB: opts.childMemMB, cache: opts.cache,
+    const workerData = { python: opts.python, packages: opts.packages, memMB: opts.memMB, childMemMB: opts.childMemMB, cpus: opts.cpus, cpuV2: opts.cpuV2, cache: opts.cache,
                          commands: opts.commands, bootTimeoutMs: opts.bootTimeoutMs, network: opts.network, rootfs: opts.rootfs, diskMB: opts.diskMB, restoreFrom: opts.restore, assembler: opts.assembler };
     // isolation: 'process' puts the whole sandbox in a child process that Node's permission model has
     // shut down (no host files outside an allow-list, no child processes). See sdk/isolated.mjs.

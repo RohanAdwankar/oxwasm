@@ -550,6 +550,21 @@ export class CPU {
                 const v = (!Number.isFinite(g) || g >= 2**31 || g < -(2**31)) ? 0x80000000n : BigInt.asUintN(32, BigInt(g));
                 out |= v << (32n*k); } }
             this.xmm[insn.xr] = out; break; }
+          case 0xE6: {                                 // cvtdq2pd (F3) / cvttpd2dq (66) / cvtpd2dq (F2)
+            if (insn.pF3) {
+              const src = insn.rm.kind === 'xmm' ? this.xmm[insn.rm.r] : this.mem.read(this.ea(insn.rm), 8n);
+              this.xmm[insn.xr] = FP.putF64(Number(BigInt.asIntN(32, src & 0xFFFFFFFFn))) | (FP.putF64(Number(BigInt.asIntN(32, (src >> 32n) & 0xFFFFFFFFn))) << 64n);
+              break; }
+            const src = insn.rm.kind === 'xmm' ? this.xmm[insn.rm.r] : this.mem.read(this.ea(insn.rm), 16n);
+            const rne = (x) => { const fl = Math.floor(x), d = x - fl;
+              return d < 0.5 ? fl : d > 0.5 ? fl + 1 : (fl % 2 === 0 ? fl : fl + 1); };
+            let out = 0n;
+            for (let k = 0n; k < 2n; k++) {
+              const f = FP.getF64((src >> (64n * k)) & 0xFFFFFFFFFFFFFFFFn);
+              const g = insn.p66 ? Math.trunc(f) : (Number.isFinite(f) ? rne(f) : f);
+              const v = (!Number.isFinite(g) || g >= 2 ** 31 || g < -(2 ** 31)) ? 0x80000000n : BigInt.asUintN(32, BigInt(g));
+              out |= v << (32n * k); }
+            this.xmm[insn.xr] = out; break; }
           case 0x2B: wrRm(16, this.xmm[insn.xr]); break;   // movntps/pd: plain store
           case 0x50: {                                     // movmskps / movmskpd (66) -> GPR
             const src = this.xmm[insn.rm.kind === 'xmm' ? insn.rm.r : 0];
@@ -728,6 +743,11 @@ export class CPU {
             case 0x20: { const v = gprIn(1); setX((dstv & ~(0xFFn << BigInt((im & 15) * 8))) | (v << BigInt((im & 15) * 8))); break; }
             case 0x22: { const eb = insn.W ? 64 : 32, k = im & (insn.W ? 1 : 3), v = gprIn(eb / 8);
               setX((dstv & ~(((1n << BigInt(eb)) - 1n) << BigInt(k * eb))) | (v << BigInt(k * eb))); break; }
+            case 0x44: {                                      // pclmulqdq: carry-less multiply of the qwords imm8 selects
+              const x = L(dstv, im & 1, 64), y = L(src(), (im >> 4) & 1, 64);
+              let r = 0n;
+              for (let k = 0n; k < 64n; k++) if ((y >> k) & 1n) r ^= x << k;
+              setX(r); break; }
             case 0x21: {                                      // insertps
               const cs = insn.rm.kind === 'xmm' ? (im >> 6) & 3 : 0, cd = (im >> 4) & 3;
               const v = insn.rm.kind === 'xmm' ? L(this.xmm[insn.rm.r], cs, 32) : this.mem.read(this.ea(insn.rm), 4n);
@@ -746,7 +766,7 @@ export class CPU {
         let a = 0n, b2 = 0n, c = 0n, d = 0n;
         if (leaf === 0) { a = 7n; b2 = 0x756e6547n; d = 0x49656e69n; c = 0x6c65746en; }   // "GenuineIntel"
         else if (leaf === 1) { a = 0x000306a0n; b2 = 0x00010800n; c = 0x80000001n /* hypervisor|sse3? no: bit0 sse3 OFF -> 0x80000000|1? */ , d = 0x178bfbffn;
-          c = this.mem.cpuV2 ? 0x80982201n : 0x80000000n; }   // ecx: hypervisor bit (plus, for cpuV2: sse3 ssse3 cx16 sse4.1 sse4.2 popcnt); edx: baseline incl. sse2
+          c = this.mem.cpuV2 ? 0x80982203n : 0x80000000n; }   // ecx: hypervisor bit (plus, for cpuV2: sse3 pclmulqdq ssse3 cx16 sse4.1 sse4.2 popcnt); edx: baseline incl. sse2
         else if (leaf === 7) { a = 0n; b2 = 0n; c = 0n; d = 0n; }
         else if (leaf === 0x80000000) { a = 0x80000008n; }
         else if (leaf === 0x80000001) { c = 1n; d = 0x28100800n; }   // lahf_lm; syscall+nx+rdtscp+lm
@@ -1095,6 +1115,15 @@ export class CPU {
         const r = (acc - dstv) & M; this.subFlags(acc, dstv, r, S);
         if (acc === dstv) this.set(insn.dst, this.get(insn.src) & M);
         else this.setReg({ kind: 'reg', r: 0, size: S }, dstv);
+        break; }
+      case 'cmpxchgdq': {                          // cmpxchg8b / cmpxchg16b: compare RDX:RAX (EDX:EAX) with the memory operand, ZF only
+        const at = this.ea(insn.rm), n = insn.wide ? 8n : 4n, bits = n * 8n, MK = (1n << bits) - 1n;
+        const lo = this.mem.read(at, n), hi = this.mem.read(at + n, n);
+        if (lo === (this.regs[0] & MK) && hi === (this.regs[2] & MK)) {
+          this.mem.write(at, n, this.regs[3] & MK); this.mem.write(at + n, n, this.regs[1] & MK); this.f.zf = 1;
+        } else {
+          this.regs[0] = lo; this.regs[2] = hi; this.f.zf = 0;
+        }
         break; }
       case 'xadd': { const a = this.get(insn.dst), b2 = this.get(insn.src), r = (a + b2) & M;
         this.addFlags(a, b2, r, S, a + b2 > M ? 1 : 0);

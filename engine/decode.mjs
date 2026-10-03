@@ -205,7 +205,7 @@ export function decode(fetch, rip) {
                       0xDF:1, 0xF5:1, 0xE7:1, 0xF0:1, 0xD0:1, 0x7C:1, 0x7D:1,                                  // pandn, pmaddwd, movntdq
                       0xD1:1, 0xD2:1, 0xD3:1, 0xE1:1, 0xE2:1, 0xF1:1, 0xF2:1, 0xF3:1,  // p{sll,srl,sra}{w,d,q} by-reg
                       0x54:1, 0x55:1, 0x56:1, 0x57:1, 0x2A:1, 0x2C:1, 0x2D:1, 0x2E:1, 0x2F:1,
-                      0x50:1, 0x51:1, 0x58:1, 0x59:1, 0x5A:1, 0x5B:1, 0x5C:1, 0x5D:1, 0x5E:1, 0x5F:1, 0x2B:1, 0xC6:1 };
+                      0x50:1, 0x51:1, 0x58:1, 0x59:1, 0x5A:1, 0x5B:1, 0x5C:1, 0x5D:1, 0x5E:1, 0x5F:1, 0x2B:1, 0xC6:1, 0xE6:1 };
     const SSE_IMM8 = { 0x70:1, 0xC5:1, 0xC4:1, 0xC6:1, 0xC2:1 };
     const SSE_GRP_SHIFT = { 0x71:1, 0x72:1, 0x73:1 };
     if (SSE_GRP_SHIFT[o2]) {
@@ -223,6 +223,12 @@ export function decode(fetch, rip) {
       }
       const extra = SSE_IMM8[o2] ? Number(immU(1)) : undefined;
       return fin({ mnem: 'sse', op: o2, p66: opsize === 2, pF3: !!rep, pF2: !!rep2, W, xr, rm, imm8: extra });
+    }
+    if (o2 === 0xC7) {                                    // group 9: cmpxchg8b (/1, REX.W: cmpxchg16b) on a memory operand
+      const m = b(), sub = (m >> 3) & 7;
+      if (sub !== 1 || (m >> 6) === 3) throw new Error(`unsupported 0f c7 /${sub} at ${rip.toString(16)}`);
+      i--; const [, mem] = modrm(8);
+      return fin({ mnem: 'cmpxchgdq', rm: mem, wide: W });
     }
     if (o2 === 0x1E) { b(); return fin({ mnem: 'nop' }); }   // endbr64 / nop variants
     if (o2 === 0xB0) { const [r, rm] = modrm(1);   return fin({ mnem: 'cmpxchg', dst: rm, src: r, size: 1 }); }

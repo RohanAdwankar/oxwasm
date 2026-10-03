@@ -1550,6 +1550,10 @@ export class LinuxEngine {
     }
     throw new PathErr(40);                       // ELOOP: forty hops and still a link
   }
+  // CPUs the guest sees (sched_getaffinity, /proc/cpuinfo, /proc/stat, /sys/devices/system/cpu/online).
+  // Runtimes size their thread pools from it. Execution is still one host thread.
+  get ncpu() { return this._ncpu ?? 1; }
+  set ncpu(n) { this._ncpu = n; }
   // d_type for a directory entry: a symlink says so, which is how ldconfig
   // (and find, ls, rsync) decide whether to stat or lstat it
   _dtype(dir, name, isdir) {
@@ -1653,12 +1657,15 @@ export class LinuxEngine {
         return enc('1 1 0:1 / / rw - rootfs rootfs rw\n2 1 0:2 / /proc rw - proc proc rw\n3 1 0:3 / /dev rw - devtmpfs devtmpfs rw\n');
       case '/proc/self/limits':
         return enc('Limit                     Soft Limit           Hard Limit           Units     \nMax stack size            8388608              unlimited            bytes     \nMax open files            4096                 1048576              files     \n');
-      case '/proc/cpuinfo':
-        return enc('processor\t: 0\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 85\nmodel name\t: oxwasm x86-64\nstepping\t: 4\n' +
-          'microcode\t: 0x1\ncpu MHz\t\t: 2000.000\ncache size\t: 8192 KB\nphysical id\t: 0\nsiblings\t: 1\ncore id\t\t: 0\ncpu cores\t: 1\napicid\t\t: 0\n' +
-          'fpu\t\t: yes\nfpu_exception\t: yes\ncpuid level\t: 13\nwp\t\t: yes\n' +
-          'flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx lm constant_tsc nopl pni ssse3 cx16 sse4_1 sse4_2 popcnt\n' +
-          'bogomips\t: 4000.00\nclflush size\t: 64\ncache_alignment\t: 64\naddress sizes\t: 46 bits physical, 48 bits virtual\n\n');
+      case '/proc/cpuinfo': {
+        let out = '';
+        for (let c = 0; c < this.ncpu; c++)
+          out += `processor\t: ${c}\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 85\nmodel name\t: oxwasm x86-64\nstepping\t: 4\n` +
+            `microcode\t: 0x1\ncpu MHz\t\t: 2000.000\ncache size\t: 8192 KB\nphysical id\t: 0\nsiblings\t: ${this.ncpu}\ncore id\t\t: ${c}\ncpu cores\t: ${this.ncpu}\napicid\t\t: ${c}\n` +
+            'fpu\t\t: yes\nfpu_exception\t: yes\ncpuid level\t: 13\nwp\t\t: yes\n' +
+            'flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx lm constant_tsc nopl pni ssse3 cx16 sse4_1 sse4_2 popcnt\n' +
+            'bogomips\t: 4000.00\nclflush size\t: 64\ncache_alignment\t: 64\naddress sizes\t: 46 bits physical, 48 bits virtual\n\n';
+        return enc(out); }
       case '/proc/meminfo':
         return enc(`MemTotal:       ${memKB} kB\nMemFree:        ${memKB >> 1} kB\nMemAvailable:   ${memKB >> 1} kB\nBuffers:               0 kB\nCached:                0 kB\n` +
           `SwapCached:            0 kB\nActive:                0 kB\nInactive:              0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nDirty:                 0 kB\n` +
@@ -1667,7 +1674,8 @@ export class LinuxEngine {
       case '/proc/version': return enc('Linux version 6.1.0 (oxwasm) (gcc) #1 oxwasm\n');
       case '/proc/uptime': return enc(`${(this.nowMs() / 1000).toFixed(2)} ${(this.nowMs() / 1000).toFixed(2)}\n`);
       case '/proc/loadavg': return enc('0.00 0.00 0.00 1/1 2\n');
-      case '/proc/stat': return enc('cpu  0 0 0 0 0 0 0 0 0 0\ncpu0 0 0 0 0 0 0 0 0 0 0\nintr 0\nctxt 0\nbtime 1700000000\nprocesses 1\nprocs_running 1\nprocs_blocked 0\n');
+      case '/proc/stat': return enc('cpu  0 0 0 0 0 0 0 0 0 0\n' + Array.from({ length: this.ncpu }, (_, c) => `cpu${c} 0 0 0 0 0 0 0 0 0 0\n`).join('') + 'intr 0\nctxt 0\nbtime 1700000000\nprocesses 1\nprocs_running 1\nprocs_blocked 0\n');
+      case '/sys/devices/system/cpu/online': case '/sys/devices/system/cpu/possible': case '/sys/devices/system/cpu/present': return enc(this.ncpu > 1 ? `0-${this.ncpu - 1}\n` : '0\n');
       case '/proc/sys/kernel/osrelease': return enc('6.1.0\n');
       case '/proc/sys/kernel/ostype': return enc('Linux\n');
       case '/proc/sys/kernel/version': return enc('#1 oxwasm\n');
@@ -2184,7 +2192,9 @@ export class LinuxEngine {
           const hi = a1 + len; this._fixedHi = this._fixedHi === undefined ? hi : (hi > this._fixedHi ? hi : this._fixedHi);
         }
         const off0 = Number(at - this.base);
-        if (off0 < 0 || off0 + Number(len) > this.ram.length) { ret(-12n); break; }   // ENOMEM
+        if (off0 < 0 || off0 + Number(len) > this.ram.length) {   // ENOMEM: give back what was taken, or the failed probe still moved the arena
+          if (fixedAt === null) this._mmapGive(at, len);
+          ret(-12n); break; }
         this.ram.fill(0, off0, off0 + Number(len));          // fresh mapping is zeroed
         if (!(flags & ANON) && this.fds.get(fdArg)?.gen === 'zero') { ret(at); break; }   // /dev/zero: anonymous
         if (!(flags & ANON)) {
@@ -2465,7 +2475,9 @@ export class LinuxEngine {
           aotCallThreshold: this.aotCallThreshold, aotLoopThreshold: this.aotLoopThreshold,
           xserver: this.xserver });
         if (this.strace) ceng.strace = [];                   // a traced parent traces its children
-        if (this.childMemMB !== undefined) ceng.childMemMB = this.childMemMB;   // grandchildren too (cargo -> rustc -> cc -> collect2 -> ld)
+        if (this.childMemMB !== undefined) ceng.childMemMB = this.childMemMB;
+        if (this._ncpu !== undefined) ceng._ncpu = this._ncpu;
+        if (this.mem.cpuV2) ceng.mem.cpuV2 = true;   // grandchildren too (cargo -> rustc -> cc -> collect2 -> ld)
         if (this.assembleWatDeferred) { ceng.assembleWatDeferred = this.assembleWatDeferred; ceng.pumpAsm = this.pumpAsm; }
         ceng.sigign = new Set(t.proc?.sigign ?? this.sigign ?? []);   // exec keeps ignored signals ignored (handlers reset to default)
         if (this.onChildEngine) { ceng.onChildEngine = this.onChildEngine; this.onChildEngine(ceng, argv); }   // tooling: see every execve'd image, grandchildren included, even ones reaped inside one run slice
@@ -2624,11 +2636,11 @@ export class LinuxEngine {
         }
         if (cur) h.pos = pos + done;
         ret(BigInt(done)); break; }
-      case 204: {                                            // sched_getaffinity: one CPU
+      case 204: {                                            // sched_getaffinity: ncpu CPUs
         const n = Math.min(Number(a2), 8);
         const o = this.RAMOFF + Number(a3 - this.base);
         new Uint8Array(this.wmem.buffer, o, n).fill(0);
-        new DataView(this.wmem.buffer).setUint8(o, 1);
+        new DataView(this.wmem.buffer).setUint8(o, (1 << Math.min(this.ncpu, 8)) - 1);
         ret(8n); break; }
       case 60: case 231: {                                   // exit / exit_group
         const t = this.threads[this.ti];
@@ -4788,6 +4800,8 @@ export class LinuxEngine {
       xserver: o.xserver, mtimes: o.mtimes, tty: o.tty, ttyRows: o.ttyRows, ttyCols: o.ttyCols, stdin: o.stdin });
     if (this.strace) ceng.strace = [];                       // a traced parent traces its children
     if (this.childMemMB !== undefined) ceng.childMemMB = this.childMemMB;
+        if (this._ncpu !== undefined) ceng._ncpu = this._ncpu;
+        if (this.mem.cpuV2) ceng.mem.cpuV2 = true;
     if (this.execAnon !== undefined) ceng.execAnon = this.execAnon;
     if (this.assembleWatDeferred) { ceng.assembleWatDeferred = this.assembleWatDeferred; ceng.pumpAsm = this.pumpAsm; }
     if (this.onChildEngine) { ceng.onChildEngine = this.onChildEngine; this.onChildEngine(ceng, o.argv); }

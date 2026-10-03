@@ -466,7 +466,7 @@ export function analyze(mem, entry, { maxInsns = 20000, noJtab = false, entries 
     // and that fnstcw being an escape made it an `entry undecodable`
     // refusal - mawk ran the whole function interpreted 1,996 times.
     if (insn.mnem === 'x87' && insn.op === 0xD9 && (insn.sub === 5 || insn.sub === 7) && insn.rm) insn.mnem = 'fcw';
-    if (['hlt','ud2','int3','int','cpuid','sse4','popcnt','loopx','fxsave','fxrstor','x87','rcl','rcr','emms','popf'].includes(insn.mnem)) {   // rcl/rcr: rare, interpreter-only
+    if (['hlt','ud2','int3','int','cpuid','sse4','popcnt','loopx','fxsave','fxrstor','x87','rcl','rcr','emms','popf','cmpxchgdq'].includes(insn.mnem)) {   // rcl/rcr: rare, interpreter-only
       insnAt.set(key, { mnem: 'udec', rip, next: rip + BigInt(insn.len), len: insn.len });
       continue;
     }
@@ -2072,6 +2072,21 @@ function emitUnitFunction(a0, fnAddr, ctx) {
         const NEG = '(v128.const f32x4 -2147483648 -2147483648 -2147483648 -2147483648)';
         const inRange = `(v128.and (f32x4.eq ${v} ${v}) (v128.and (f32x4.lt ${v} ${LIM}) (f32x4.ge ${v} ${NEG})))`;
         put(`(v128.bitselect (i32x4.trunc_sat_f32x4_s ${v}) (i32x4.splat (i32.const -2147483648)) ${inRange})`);
+        break; }
+      // 0F E6: cvtdq2pd (F3), cvttpd2dq (66), cvtpd2dq (F2). The first is one
+      // wasm instruction. The other two narrow two f64 to the LOW two i32
+      // lanes and zero the rest; like 0F 5B they answer 0x80000000 for a NaN
+      // or an out-of-range value where trunc_sat gives 0 or clamps, so the
+      // range test runs on the rounded value and picks the indefinite.
+      case 0xE6: {
+        if (insn.pF3) { put(`(f64x2.convert_low_i32x4_s ${xv(rm, next)})`); break; }
+        const t = VT();
+        L.push(`(local.set ${t} ${insn.p66 ? `(f64x2.trunc ${xv(rm, next)})` : `(f64x2.nearest ${xv(rm, next)})`})`);
+        const v = `(local.get ${t})`;
+        const LIM = '(v128.const f64x2 2147483648 2147483648)', NEG = '(v128.const f64x2 -2147483648 -2147483648)';
+        const m = `(v128.and (f64x2.eq ${v} ${v}) (v128.and (f64x2.lt ${v} ${LIM}) (f64x2.ge ${v} ${NEG})))`;
+        const mask = `(i8x16.shuffle 0 1 2 3 8 9 10 11 16 17 18 19 16 17 18 19 ${m} (v128.const i32x4 0 0 0 0))`;
+        put(`(v128.bitselect (i32x4.trunc_sat_f64x2_s_zero ${v}) (v128.const i32x4 -2147483648 -2147483648 0 0) ${mask})`);
         break; }
       case 0x5A: {                                            // cvtss2sd / cvtsd2ss / cvtps2pd / cvtpd2ps
         if (insn.pF3) put(`(f64x2.replace_lane 0 ${dst} (f64.promote_f32 (f32x4.extract_lane 0 ${xv(rm,next)})))`);
