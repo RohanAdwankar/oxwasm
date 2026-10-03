@@ -171,6 +171,7 @@ export class LinuxEngine {
     // the link_map chain - and _dl_fini walked an l_next of 0x31 at exit.
     this.mmapNext = align(this.brk + (total / 4n > (64n << 20n) ? total / 4n : (64n << 20n)), PAGE);
     this._mmapBase = this.mmapNext;
+    this._zeroAbove = this.mmapNext;
     this.stackTop = lo + total - 4096n;
 
     // one contiguous guest region backed by wasm memory -> interpreter and
@@ -234,6 +235,10 @@ export class LinuxEngine {
     this.cpu = new CPU(this.mem);
     this.cpu.fsBase = 0n;
     this.cpu.onSyscall = (cpu) => this.syscall(cpu);
+    if (ENV.OXWASM_STATS) {            // per-syscall wall time, printed with the exit stats
+      const orig = this.syscall.bind(this);
+      this.syscall = (cpu) => { const nr = Number(cpu.regs[0]), t0 = performance.now(); try { return orig(cpu); } finally { const m = (this.stats.sysMs ??= {}); m[nr] = (m[nr] || 0) + performance.now() - t0; } };
+    }
     // green threads: clone(CLONE_VM) adds a CPU context over the shared
     // memory; the scheduler switches at block points (every blocking syscall
     // already unwinds to run() and re-executes on resume, so a switch is
@@ -1550,6 +1555,12 @@ export class LinuxEngine {
     }
     throw new PathErr(40);                       // ELOOP: forty hops and still a link
   }
+  // The arena bump pointer. _zeroAbove is the highest it has ever been: the
+  // memory above is untouched wasm zero pages, so a new mapping there needs no
+  // zeroing. Undefined (a restored engine, whose RAM above may hold stale
+  // bytes) means always zero.
+  get mmapNext() { return this._mn; }
+  set mmapNext(v) { this._mn = v; if (this._zeroAbove !== undefined && v > this._zeroAbove) this._zeroAbove = v; }
   // CPUs the guest sees (sched_getaffinity, /proc/cpuinfo, /proc/stat, /sys/devices/system/cpu/online).
   // Runtimes size their thread pools from it. Execution is still one host thread.
   get ncpu() { return this._ncpu ?? 1; }
@@ -2180,6 +2191,7 @@ export class LinuxEngine {
         // munmap left, or at/above the bump pointer within RAM. HotSpot
         // reserves its heap and code cache this way (falling back to hints).
         const NOREPLACE = 0x100000n;
+        const zeroAboveBefore = this._zeroAbove;
         let fixedAt = (flags & FIXED) ? a1 : null;
         if (fixedAt === null && (flags & NOREPLACE)) {
           if (this._mmapFree(a1, len)) fixedAt = a1; else { ret(-17n); break; }
@@ -2193,9 +2205,19 @@ export class LinuxEngine {
         }
         const off0 = Number(at - this.base);
         if (off0 < 0 || off0 + Number(len) > this.ram.length) {   // ENOMEM: give back what was taken, or the failed probe still moved the arena
-          if (fixedAt === null) this._mmapGive(at, len);
+          if (fixedAt === null) { this._mmapGive(at, len); this._zeroAbove = zeroAboveBefore; }
           ret(-12n); break; }
-        this.ram.fill(0, off0, off0 + Number(len));          // fresh mapping is zeroed
+        // A mapping is zeroed, but address space nothing has ever been mapped
+        // at is still the zero page wasm gave us: only the part at or below the
+        // high-water mark (the largest the arena has been, see mmapNext) can
+        // hold stale bytes. Bun reserves gigabytes it never touches, and
+        // zeroing them was a fifth of its startup.
+        {
+          const end0 = off0 + Number(len);
+          const hw = zeroAboveBefore === undefined ? Infinity : Number(zeroAboveBefore - this.base);   // the mark before THIS mapping raised it
+          if (off0 < hw) this.ram.fill(0, off0, Math.min(end0, hw));
+          if (fixedAt !== null && this._zeroAbove !== undefined && at + len > this._zeroAbove) this._zeroAbove = at + len;
+        }
         if (!(flags & ANON) && this.fds.get(fdArg)?.gen === 'zero') { ret(at); break; }   // /dev/zero: anonymous
         if (!(flags & ANON)) {
           const h = this.fds.get(fdArg);
@@ -2643,6 +2665,7 @@ export class LinuxEngine {
         new DataView(this.wmem.buffer).setUint8(o, (1 << Math.min(this.ncpu, 8)) - 1);
         ret(8n); break; }
       case 60: case 231: {                                   // exit / exit_group
+        if (ENV.OXWASM_STATS && this._ctor?.argv?.[0]?.includes(ENV.OXWASM_STATS)) { const st = this.stats; console.error(`[stats] ${this._ctor.argv[0]} interp=${st.interpreted} aotRuns=${st.aotRuns} compiledRuns=${st.compiledRuns} units=${this.aotFns.size} syscalls=${Object.values(st.syscalls).reduce((x, y) => x + y, 0)} wallMs=${Math.round(this.nowMs())} sysMs=${JSON.stringify(Object.fromEntries(Object.entries(st.sysMs ?? {}).filter(([, v]) => v > 50).map(([k, v]) => [k, Math.round(v)])))} tiers=${JSON.stringify(st.tiers)} extra=${JSON.stringify(Object.fromEntries(Object.entries(st).filter(([k, v]) => typeof v === 'number' && !['interpreted', 'aotRuns', 'compiledRuns'].includes(k))))}`); }
         const t = this.threads[this.ti];
         if (this._shmAt?.length) this._shmExit(t);            // shared-memory attaches reach the segment before the image goes
         if (t.proc && nr === 60 && this.threads.some(x => x !== t && x.state !== 'dead' && x.proc === t.proc)) {

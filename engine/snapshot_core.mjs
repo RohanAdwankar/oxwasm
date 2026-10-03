@@ -96,7 +96,7 @@ export function restoreEngineCore(eng, xs, assets, CPUctor, inflate) {
   // mmapNext (GIMP's file mappings, plug-in scratch) as reusable arena and
   // handed live memory out twice - the shipped page lost its File menu on a
   // rebuilt engine. A restored engine's arena starts where its mmapNext is.
-  eng._mmapBase = state._mmapBase ?? state.mmapNext; eng._mmapHoles = [];
+  eng._mmapBase = state._mmapBase ?? state.mmapNext; eng._mmapHoles = []; eng._zeroAbove = undefined;
   eng.execRanges = state.execRanges.map(([a, b]) => [BigInt(a), BigInt(b)]);
   eng.execRangesStatic = (state.execRangesStatic ?? state.execRanges).map(([a, b]) => [BigInt(a), BigInt(b)]);  // loop tiers stay on the pre-widening ground
   eng.maps = state.maps;
