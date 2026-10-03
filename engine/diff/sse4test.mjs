@@ -98,8 +98,9 @@ int main(){ for(int i=0;i<${PAIRS.length};i++){ unsigned long long o[4]={0,0,0,0
   if (mism) { bad++; console.log(`  ${name}: ${mism}/${PAIRS.length} mismatches`); }
 
   // the compiled tier, for the forms it emits (flags are not captured here: no pushfq in a unit)
-  if (name !== 'ptest') {
-    writeFileSync('/tmp/s4a.asm', 'BITS 64\n' + pre + body + '\nmovdqu [0x420100], xmm0\nret');
+  {
+    const abody = name === 'ptest' ? body + '\nsetz al\nmovzx eax, al\nmovd xmm0, eax' : body;   // ptest: ZF read back with setz
+    writeFileSync('/tmp/s4a.asm', 'BITS 64\n' + pre + abody + '\nmovdqu [0x420100], xmm0\nret');
     execFileSync('nasm', ['-f', 'bin', '-o', '/tmp/s4a.bin', '/tmp/s4a.asm']);
     const acode = new Uint8Array(0x30000); acode.set(readFileSync('/tmp/s4a.bin'));
     let unit = null;
@@ -124,7 +125,8 @@ int main(){ for(int i=0;i<${PAIRS.length};i++){ unsigned long long o[4]={0,0,0,0
       rv[4] = BigInt.asIntN(64, CODE + 0x1000n); dv.setBigUint64(0x1000, SENT, true);
       try { inst.exports[unit.entryName](); } catch (e) { if (String(e.message).includes('escape')) { escaped = true; break; } throw e; }
       const got = hex((dv.getBigUint64(off + 0x108, true) << 64n) | dv.getBigUint64(off + 0x100, true));
-      const [hv] = hw[k].split(' ');
+      let [hv, hfl] = hw[k].split(' ');
+      if (name === 'ptest') hv = hex(BigInt((parseInt(hfl, 16) & 0x40) ? 1 : 0));
       aotN++;
       if (hv !== got) { amism++; if (amism <= 2) console.log(`  ${name} (compiled) a=${hex(a)} b=${hex(b)}\n      hw   ${hv}\n      aot  ${got}`); }
     }

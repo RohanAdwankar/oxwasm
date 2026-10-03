@@ -7,7 +7,7 @@
 import { CPU, Memory } from './interp.mjs';
 import { compileLoop } from './jit2.mjs';
 import { compileVectorLoop } from './jitsimd.mjs';
-import { compileUnitWat, pltStubWat, FTMAP, FTMAP_MAX, FTDLIMIT, FTFUEL, FTLOOP, FTNEST, LOOPYIELD_N,
+import { compileUnitWat, pltStubWat, FTMAP, FTMAP_MAX, FTENTRY, FTDLIMIT, FTFUEL, FTLOOP, FTNEST, LOOPYIELD_N,
          FTHASH, FTHBITS, FTHMASK, FTHBYTES, CWLO_SLOT, CWLEN_SLOT, CWMAP, CWMAP_PAGES } from './aot_wat.mjs';
 // OXWASM_DISPSTAT=1: count the rips that HAD a compiled unit and were not
 // dispatched anyway. Off by default - it costs a map lookup per instruction.
@@ -236,6 +236,7 @@ export class LinuxEngine {
     this.cpu = new CPU(this.mem);
     this.cpu.fsBase = 0n;
     this.cpu.onSyscall = (cpu) => this.syscall(cpu);
+    if (ENV.OXWASM_DEOPTLOG) this.deoptLog = new Map();   // rip -> count of deopts from compiled code, printed with the exit stats
     if (ENV.OXWASM_STATS) {            // per-syscall wall time, printed with the exit stats
       const orig = this.syscall.bind(this);
       this.syscall = (cpu) => { const nr = Number(cpu.regs[0]), t0 = performance.now(); try { return orig(cpu); } finally { const m = (this.stats.sysMs ??= {}); m[nr] = (m[nr] || 0) + performance.now() - t0; } };
@@ -267,7 +268,11 @@ export class LinuxEngine {
     this.aotCallThreshold = aotCallThreshold;
     this.aotLoopThreshold = aotLoopThreshold;
     if (assembleWat) {
-      this.cpu.onCall = (t) => this.profileTarget(t);
+      this.cpu.onCall = (t) => {
+        const ce = (this._callEntries ??= new Set());
+        if (!ce.has(t)) { ce.add(t); const ix = this._ftIdxOf?.get(t); if (ix !== undefined) new DataView(this.wmem.buffer).setUint8(FTENTRY + ix, 1); }   // called after it was mapped: flag it now
+        this.profileTarget(t);
+      };   // _callEntries: real function entries (a longjmp landing is never called)
       // a PLT stub reaches the real function via `jmp *GOT` — profile the
       // indirect-jump landing so tail-called library functions (memcpy,
       // strlen, ...) tier up like directly-called ones.
@@ -370,6 +375,17 @@ export class LinuxEngine {
     try { return a !== null ? this.mem.read(a, 8n) : null; } catch { return null; }
   }
 
+  // Does the code at `a` begin like a function: [endbr64] push %rbp; mov %rsp,%rbp. A function reached
+  // only by jmp (a sibling call) is never `call`ed, but a longjmp landing - the case that must not chain -
+  // sits mid-function and never starts with a frame-setup prologue.
+  _looksLikeFnEntry(a) {
+    try {
+      let at = a;
+      if (this.mem.read(at, 4n) === 0xfa1e0ff3n) at += 4n;   // endbr64
+      return (this.mem.read(at, 4n) === 0xe5894855n);        // 55 48 89 e5
+    } catch { return false; }
+  }
+
   // Compile the call-graph closure rooted at `entry` (a function entry or a
   // loop head — the translator only needs "runs forward to this frame's ret")
   // and register every function the unit produced for dispatch.
@@ -400,6 +416,8 @@ export class LinuxEngine {
     if (idx >= this.ftab.length) this.ftab.grow(Math.min(this.ftab.length, FTMAP_MAX - this.ftab.length));
     this.ftab.set(idx, f);
     const dv = new DataView(this.wmem.buffer);
+    dv.setUint8(FTENTRY + idx, (this._callEntries?.has(a) || this._looksLikeFnEntry(a)) ? 1 : 0);   // a real function entry: tail jumps may chain to it from a nested unit
+    (this._ftIdxOf ??= new Map()).set(a, idx);
     const au = BigInt.asUintN(64, a);
     // open addressing with linear probing, mirroring $ftr's own walk
     let p = FTHASH + (((Math.imul(Number(au & 0xFFFFFFFFn), 0x9E3779B1) >>> (32 - FTHBITS))) << 4);
@@ -1214,6 +1232,7 @@ export class LinuxEngine {
         const retAddr = this.mem.read(rsp0, 8n);
         const rspExit = BigInt.asUintN(64, rsp0 + 8n);
         let f = this.aotFns.get(target);
+        if (this.deoptLog) { const m = (this.calloutLog ??= new Map()); const kk = target.toString(16) + (f ? '' : ' (no unit)'); m.set(kk, (m.get(kk) || 0) + 1); }
         if (f && this.aotBudget !== undefined && --this.aotBudget < 0) f = null;
         if (this.chainSlow) f = null;                       // diagnostic: disable wasm-to-wasm fastpath
         // Shared wasm-frame budget (FTDEPTH, also bumped by in-wasm
@@ -1294,13 +1313,22 @@ export class LinuxEngine {
         // whose wasm frame is below us. Running the landing nested here
         // would keep a stale frame chain alive; unwind to the top loop
         // instead, which resumes at t from the published state.
-        if (_rsp0 !== undefined && BigInt.asUintN(64, this.regview[4]) > BigInt.asUintN(64, _rsp0)) {
+        // A jump to a REAL FUNCTION ENTRY (a target the guest has called) that already has a
+        // compiled unit is a tail call, even when the stack sits above this unit's entry rsp:
+        // a landing unit entered mid-function has its whole frame above rsp0, so every
+        // epilogue-and-jump looks like an abandoned frame. Running it nested costs nothing;
+        // unwinding by exception cost ~100 us each (JavaScriptCore: 200k per 20k allocations).
+        // A longjmp lands inside a function and is never a call target, so it still unwinds.
+        const tailToFn = f && this._callEntries?.has(t);
+        if (!tailToFn && _rsp0 !== undefined && BigInt.asUintN(64, this.regview[4]) > BigInt.asUintN(64, _rsp0)) {
           this.stats.frameGone = (this.stats.frameGone || 0) + 1;
+          if (ENV.OXWASM_FGTRACE && this._ctor?.argv?.[0]?.includes(ENV.OXWASM_FGTRACE) && ((this._fgN = (this._fgN | 0) + 1) <= 30)) console.error(`[fg] rip=${t.toString(16)} rsp=${BigInt.asUintN(64, this.regview[4]).toString(16)} rsp0=${BigInt.asUintN(64, _rsp0).toString(16)} diff=${BigInt.asUintN(64, this.regview[4]) - BigInt.asUintN(64, _rsp0)}`);
           if (globalThis.__frameTrace) console.error(`<framegone deopt rip=${t.toString(16)} rsp=${BigInt.asUintN(64, this.regview[4]).toString(16)} rsp0=${BigInt.asUintN(64, _rsp0).toString(16)} depth=${this._deoD | 0}>`);
           throw new DeoptUnwind(t);
         }
         const fdv = (this._ftdv ??= new DataView(this.wmem.buffer));
         const fd = fdv.getUint32(FTMAP + 8, true);
+        if (ENV.OXWASM_FDTRACE && this._ctor?.argv?.[0]?.includes(ENV.OXWASM_FDTRACE) && ((this._fdN = (this._fdN | 0) + 1) % 7919 === 0 || this._fdN < 12)) console.error(`[fd] t=${t.toString(16)} depth=${fd} limit=${FTDLIMIT} fuel=${fdv.getUint32(FTFUEL, true)} nest=${fdv.getUint32(FTNEST, true)} f=${!!f} chainSlow=${!!this.chainSlow} deoD=${this._deoD | 0} chainT=${this._deoChainT?.toString(16)} sliceDl=${this.sliceDeadline != null}`);
         if (f && !this.chainSlow && t !== this._deoChainT && (this._deoD | 0) < 200 &&
             fd < FTDLIMIT &&                                   // shared wasm-frame budget (see callout)
             (this.sliceDeadline == null || performance.now() <= this.sliceDeadline)) {
@@ -2667,6 +2695,8 @@ export class LinuxEngine {
         ret(8n); break; }
       case 60: case 231: {                                   // exit / exit_group
         if (ENV.OXWASM_IHIST && globalThis.__ihist && this._ctor?.argv?.[0]?.includes(ENV.OXWASM_IHIST)) { const b = new Map(); for (const [k, v] of globalThis.__ihist) { const kk = (BigInt(k) >> 6n << 6n).toString(16); b.set(kk, (b.get(kk) || 0) + v); } console.error('[ihist] ' + [...b].sort((x, y) => y[1] - x[1]).slice(0, 60).map(([k, v]) => k + '=' + v).join(' ')); }
+        if (this.calloutLog && ENV.OXWASM_STATS && this._ctor?.argv?.[0]?.includes(ENV.OXWASM_STATS)) console.error('[callouts] ' + [...this.calloutLog].sort((x, y) => y[1] - x[1]).slice(0, 30).map(([k, v]) => k + ' x' + v).join(' | '));
+        if (this.deoptLog && ENV.OXWASM_STATS && this._ctor?.argv?.[0]?.includes(ENV.OXWASM_STATS)) console.error('[deopts] ' + [...this.deoptLog].sort((x, y) => y[1] - x[1]).slice(0, 40).map(([k, v]) => k.toString(16) + ' x' + v).join(' '));
         if (ENV.OXWASM_STATS && this._ctor?.argv?.[0]?.includes(ENV.OXWASM_STATS)) console.error('[aotfail] ' + this.hotFailures(30).slice(0, 40).map((f) => f.addr.toString(16) + ' x' + f.calls + ' ' + f.why).join(' | '));
         if (ENV.OXWASM_STATS && this._ctor?.argv?.[0]?.includes(ENV.OXWASM_STATS)) { const st = this.stats; console.error(`[stats] ${this._ctor.argv[0]} interp=${st.interpreted} aotRuns=${st.aotRuns} compiledRuns=${st.compiledRuns} units=${this.aotFns.size} syscalls=${Object.values(st.syscalls).reduce((x, y) => x + y, 0)} wallMs=${Math.round(this.nowMs())} sysMs=${JSON.stringify(Object.fromEntries(Object.entries(st.sysMs ?? {}).filter(([, v]) => v > 50).map(([k, v]) => [k, Math.round(v)])))} tiers=${JSON.stringify(st.tiers)} extra=${JSON.stringify(Object.fromEntries(Object.entries(st).filter(([k, v]) => typeof v === 'number' && !['interpreted', 'aotRuns', 'compiledRuns'].includes(k))))}`); }
         const t = this.threads[this.ti];

@@ -39,6 +39,11 @@ export const FTHBYTES = FTSLOTS * 16;
 // registered entries, capped to keep the load factor (here 61%) low enough
 // that linear probing stays short
 export const FTMAP_MAX = 20000;
+// One byte per table slot (FTMAP_MAX of them): 1 when the slot's function is a real function ENTRY, i.e. an
+// address the guest has CALLED. A tail jump to one may chain from a nested unit whose stack is above its
+// entry rsp (a landing unit entered mid-function has its whole frame above rsp0, so every epilogue-and-jump
+// looks like an abandoned frame); a longjmp landing is never called, so it is never flagged.
+export const FTENTRY = 0x18000;
 export const MXCSR_SLOT = 144;   // regfile slot: the SSE control word, kept inert (see the stmxcsr/ldmxcsr emit)
 export const DF_SLOT = 152;      // regfile slot: the direction flag, so std/cld survive the unit boundary
 export const ESTICKY_SLOT = 160;  // regfile slot: the AC/ID bits popf stored, which pushf reads back
@@ -47,10 +52,11 @@ const SSE4_AOT = new Set([
   0x3800, 0x3829, 0x3837, 0x3838, 0x3839, 0x383a, 0x383b, 0x383c, 0x383d, 0x383e, 0x383f, 0x3840, 0x381c, 0x381d, 0x381e,
   0x3820, 0x3821, 0x3822, 0x3823, 0x3824, 0x3825, 0x3830, 0x3831, 0x3832, 0x3833, 0x3834, 0x3835,
   0x3810, 0x3814, 0x3815,
-  0x3a08, 0x3a09, 0x3a0a, 0x3a0b, 0x3a0c, 0x3a0d, 0x3a0e, 0x3a0f, 0x3a20, 0x3a22]);
+  0x3a08, 0x3a09, 0x3a0a, 0x3a0b, 0x3a0c, 0x3a0d, 0x3a0e, 0x3a0f, 0x3a14, 0x3a15, 0x3a16, 0x3a17, 0x3a20, 0x3a22,
+  0x3817]);
 export const sse4Compiled = (insn) => insn.mnem === 'sse4' && SSE4_AOT.has((insn.map === 0x38 ? 0x3800 : 0x3a00) | insn.op);
 // the regs these forms read as a GPR (rm field) rather than an xmm
-const sse4RmIsGpr = (insn) => insn.map === 0x3a && (insn.op === 0x20 || insn.op === 0x22);
+const sse4RmIsGpr = (insn) => insn.map === 0x3a && (insn.op === 0x20 || insn.op === 0x22 || (insn.op >= 0x14 && insn.op <= 0x17));
 export const FCW_SLOT = 164;      // regfile slot: the x87 control word, so fnstcw/fldcw need not escape
 // MEASUREMENT ONLY (OXWASM_STOREGUARD=1): what would it cost to make compiled
 // code's stores observable? Two of the three largest interpretation costs in
@@ -1934,6 +1940,15 @@ function emitUnitFunction(a0, fnAddr, ctx) {
         else if (im < 32) { for (let i = 0; i < 16; i++) idx.push(i + im - 16); put(`(i8x16.shuffle ${idx.join(' ')} ${dst} ${ZERO})`); }
         else put(ZERO);
         return; }
+      case 0x14: case 0x15: case 0x16: case 0x17: {     // pextrb / pextrw / pextrd|pextrq / extractps: lane -> GPR (zero-extended) or memory
+        const q = op === 0x16 && insn.W;
+        const bytes = op === 0x14 ? 1 : op === 0x15 ? 2 : q ? 8 : 4;
+        const e = op === 0x14 ? `(i64.extend_i32_u (i8x16.extract_lane_u ${im & 15} ${dst}))`
+                : op === 0x15 ? `(i64.extend_i32_u (i16x8.extract_lane_u ${im & 7} ${dst}))`
+                : q ? `(i64x2.extract_lane ${im & 1} ${dst})`
+                : `(i64.extend_i32_u (i32x4.extract_lane ${im & 3} ${dst}))`;
+        L.push(wr(rm.kind === 'xmm' ? { kind: 'reg', r: rm.r, size: bytes === 8 ? 8 : 4 } : rm, bytes === 8 ? 8 : bytes, e, next));
+        return; }
       case 0x20: { const g = rm.kind === 'xmm' ? rd({ kind: 'reg', r: rm.r, size: 4 }, 4, next) : `(i64.load8_u ${wasmAddr(rm, next)})`;
         put(`(i8x16.replace_lane ${im & 15} ${dst} (i32.wrap_i64 ${g}))`); return; }
       case 0x22: {
@@ -2259,7 +2274,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     if (insn.mnem === 'bt' || insn.mnem === 'bts' || insn.mnem === 'btr' || insn.mnem === 'btc') return true;
     if (insn.mnem === 'mul1' || insn.mnem === 'imul1') return true;   // CF=OF = widening overflow, in $fr
     if (insn.mnem === 'imul2' || insn.mnem === 'imul3') return true;   // same: CF=OF = the product did not fit
-    if (insn.mnem === 'bsf' || insn.mnem === 'bsr' || insn.mnem === 'popcnt' || insn.mnem === 'cmpxchgdq') return true;   // ZF <- (src==0), ZF <- equal
+    if (insn.mnem === 'bsf' || insn.mnem === 'bsr' || insn.mnem === 'popcnt' || insn.mnem === 'cmpxchgdq' || (insn.mnem === 'sse4' && insn.map === 0x38 && insn.op === 0x17)) return true;   // ZF <- (src==0), ZF <- equal
     return false;
   };
   // Instructions that write flags in a way we DON'T model: a nearest such
@@ -2297,6 +2312,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       // reading the operand, not a result.
       case 'bsf': case 'bsr': case 'popcnt': return { kind:'zf', size:S };
       case 'cmpxchgdq': return { kind:'zf', size:8 };
+      case 'sse4': return (insn.map === 0x38 && insn.op === 0x17) ? { kind:'zf', size:8 } : null;
       case 'inc': return { kind:'inc', size:S };
       case 'dec': return { kind:'dec', size:S };
       // 'cf' is CF alone (bt family leaves OF undefined); 'cfof' is the
@@ -2498,7 +2514,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   // template's entry rsp; guarding those cost javac 41M deopts in 400 s.
   const tailJmp = () => { usesFtr = true; return [
     icResolve('(local.get $rex)'),
-    `(if (i32.and ${ftHit} (i32.or (i64.le_u (local.get $r4) (local.get $rsp0)) (i32.eqz (i32.load (i32.const ${FTNEST})))))`,
+    `(if (i32.and ${ftHit} (i32.or (i64.le_u (local.get $r4) (local.get $rsp0)) (i32.or (i32.eqz (i32.load (i32.const ${FTNEST}))) (i32.load8_u (i32.add (i32.const ${FTENTRY}) (local.get $fti))))))`,
     `  (then ${ftBurn} ${ftDec} (return_call_indirect $ft (type $uft) (local.get $fti))))`,
   ]; };
 
@@ -3431,7 +3447,11 @@ function emitUnitFunction(a0, fnAddr, ctx) {
         case 'stmxcsr': L.push(wr(insn.dst, 4, `(i64.extend_i32_u (i32.load (i32.const ${MXCSR_SLOT})))`, next)); break;
         case 'ldmxcsr': L.push(`(i32.store (i32.const ${MXCSR_SLOT}) (i32.wrap_i64 ${rd(insn.dst, 4, next)}))`); break;
         case 'sse':          emitSSE(insn, next, L, setFlags); break;
-        case 'sse4':         emitSSE4(insn, next, L); break;
+        case 'sse4':
+          if (insn.map === 0x38 && insn.op === 0x17) {     // ptest: ZF <- (dst & src) == 0, held in $fr for the 'zf' flag kind
+            if (producers.has(ii)) { L.push(`(local.set $fr (i64.extend_i32_u (v128.any_true (v128.and (local.get ${xreg(insn.xr)}) ${xv(insn.rm, next)}))))`); flagState = { kind: 'zf', size: 8 }; }
+          } else emitSSE4(insn, next, L);
+          break;
         case 'ssegrpshift':  emitSSEShift(insn, L); break;
         case 'jmp': case 'jcc': case 'ret': case 'retn': case 'jmpind': case 'udec': break;  // terminator handled below
         default: throw new Error('AOT: unhandled '+insn.mnem+' @ '+insn.rip.toString(16));
