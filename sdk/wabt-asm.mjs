@@ -12,7 +12,7 @@
 // a dead assembler would have been all of them.
 const SEED_DEPTH = 149;      // what the wabt builds seen so far allow; confirmed on both sides below
 
-const watDepth = (s) => {
+export const watDepth = (s) => {
   let d = 0, m = 0, q = false;
   for (let i = 0; i < s.length; i++) {
     const c = s[i];
@@ -71,5 +71,28 @@ export async function makeInProcessAssembler() {
   asm.close = () => {};
   asm.inProcess = true;
   asm.maxDepth = maxDepth;
+  return asm;
+}
+
+/**
+ * Hand units too deeply nested for wabt to a native wat2wasm, when the process can start one.
+ * wabt parses on a fixed 64 kB stack, so the deepest functions (long br_table ladders) are the
+ * ones it refuses, and those are often the hottest dispatch loops. `makeFallback` is called at
+ * most once, on the first such unit; if it throws, those units stay refused as before.
+ */
+export function withNativeFallback(asm, makeFallback) {
+  let fb = null, tried = false;
+  const submit = asm.submit, pump = asm.pump, pending = asm.pendingCount;
+  asm.submit = (wat, cb) => {
+    if (watDepth(wat) > asm.maxDepth) {
+      if (!tried) { tried = true; try { fb = makeFallback(); } catch { fb = null; } }
+      if (fb) { fb.submit(wat, cb); return; }
+    }
+    submit(wat, cb);
+  };
+  asm.pump = () => pump() + (fb ? fb.pump() : 0);
+  asm.pendingCount = () => pending() + (fb ? fb.pendingCount() : 0);
+  const close = asm.close;
+  asm.close = () => { close(); try { fb?.close?.(); } catch {} };
   return asm;
 }

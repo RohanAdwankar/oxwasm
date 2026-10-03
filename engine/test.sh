@@ -66,6 +66,7 @@ node dotconvtest.mjs
 node cvtintest.mjs
 node pclmultest.mjs
 node cmpxchgdqtest.mjs
+node aotcxtest.mjs
 node cvtdqpdtest.mjs
 node flagjointest.mjs
 node fuzzaot.mjs 200 1

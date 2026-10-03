@@ -13,6 +13,7 @@ import { compileUnitWat, pltStubWat, FTMAP, FTMAP_MAX, FTDLIMIT, FTFUEL, FTLOOP,
 // dispatched anyway. Off by default - it costs a map lookup per instruction.
 // the environment, where there is one: the engine also runs in a browser tab, which has no `process`
 const ENV = typeof process !== 'undefined' && process.env ? process.env : {};
+if (ENV.OXWASM_IHIST) globalThis.__ihist = new Map();   // sampled histogram of interpreted rips (every 64th step), dumped at exit
 const DISPSTAT = typeof process !== 'undefined' && ENV.OXWASM_DISPSTAT === '1';
 // OXWASM_STOREGUARD=1 (measurement): compiled code checks every store against
 // a window of translated generated code and calls back on a hit. The engine
@@ -2665,6 +2666,8 @@ export class LinuxEngine {
         new DataView(this.wmem.buffer).setUint8(o, (1 << Math.min(this.ncpu, 8)) - 1);
         ret(8n); break; }
       case 60: case 231: {                                   // exit / exit_group
+        if (ENV.OXWASM_IHIST && globalThis.__ihist && this._ctor?.argv?.[0]?.includes(ENV.OXWASM_IHIST)) { const b = new Map(); for (const [k, v] of globalThis.__ihist) { const kk = (BigInt(k) >> 6n << 6n).toString(16); b.set(kk, (b.get(kk) || 0) + v); } console.error('[ihist] ' + [...b].sort((x, y) => y[1] - x[1]).slice(0, 60).map(([k, v]) => k + '=' + v).join(' ')); }
+        if (ENV.OXWASM_STATS && this._ctor?.argv?.[0]?.includes(ENV.OXWASM_STATS)) console.error('[aotfail] ' + this.hotFailures(30).slice(0, 40).map((f) => f.addr.toString(16) + ' x' + f.calls + ' ' + f.why).join(' | '));
         if (ENV.OXWASM_STATS && this._ctor?.argv?.[0]?.includes(ENV.OXWASM_STATS)) { const st = this.stats; console.error(`[stats] ${this._ctor.argv[0]} interp=${st.interpreted} aotRuns=${st.aotRuns} compiledRuns=${st.compiledRuns} units=${this.aotFns.size} syscalls=${Object.values(st.syscalls).reduce((x, y) => x + y, 0)} wallMs=${Math.round(this.nowMs())} sysMs=${JSON.stringify(Object.fromEntries(Object.entries(st.sysMs ?? {}).filter(([, v]) => v > 50).map(([k, v]) => [k, Math.round(v)])))} tiers=${JSON.stringify(st.tiers)} extra=${JSON.stringify(Object.fromEntries(Object.entries(st).filter(([k, v]) => typeof v === 'number' && !['interpreted', 'aotRuns', 'compiledRuns'].includes(k))))}`); }
         const t = this.threads[this.ti];
         if (this._shmAt?.length) this._shmExit(t);            // shared-memory attaches reach the segment before the image goes

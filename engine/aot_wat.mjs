@@ -42,6 +42,15 @@ export const FTMAP_MAX = 20000;
 export const MXCSR_SLOT = 144;   // regfile slot: the SSE control word, kept inert (see the stmxcsr/ldmxcsr emit)
 export const DF_SLOT = 152;      // regfile slot: the direction flag, so std/cld survive the unit boundary
 export const ESTICKY_SLOT = 160;  // regfile slot: the AC/ID bits popf stored, which pushf reads back
+// The SSSE3 / SSE4.1 forms (decoded as mnem 'sse4') the compiled tier emits; the rest stay escapes.
+const SSE4_AOT = new Set([
+  0x3800, 0x3829, 0x3837, 0x3838, 0x3839, 0x383a, 0x383b, 0x383c, 0x383d, 0x383e, 0x383f, 0x3840, 0x381c, 0x381d, 0x381e,
+  0x3820, 0x3821, 0x3822, 0x3823, 0x3824, 0x3825, 0x3830, 0x3831, 0x3832, 0x3833, 0x3834, 0x3835,
+  0x3810, 0x3814, 0x3815,
+  0x3a08, 0x3a09, 0x3a0a, 0x3a0b, 0x3a0c, 0x3a0d, 0x3a0e, 0x3a0f, 0x3a20, 0x3a22]);
+export const sse4Compiled = (insn) => insn.mnem === 'sse4' && SSE4_AOT.has((insn.map === 0x38 ? 0x3800 : 0x3a00) | insn.op);
+// the regs these forms read as a GPR (rm field) rather than an xmm
+const sse4RmIsGpr = (insn) => insn.map === 0x3a && (insn.op === 0x20 || insn.op === 0x22);
 export const FCW_SLOT = 164;      // regfile slot: the x87 control word, so fnstcw/fldcw need not escape
 // MEASUREMENT ONLY (OXWASM_STOREGUARD=1): what would it cost to make compiled
 // code's stores observable? Two of the three largest interpretation costs in
@@ -466,7 +475,11 @@ export function analyze(mem, entry, { maxInsns = 20000, noJtab = false, entries 
     // and that fnstcw being an escape made it an `entry undecodable`
     // refusal - mawk ran the whole function interpreted 1,996 times.
     if (insn.mnem === 'x87' && insn.op === 0xD9 && (insn.sub === 5 || insn.sub === 7) && insn.rm) insn.mnem = 'fcw';
-    if (['hlt','ud2','int3','int','cpuid','sse4','popcnt','loopx','fxsave','fxrstor','x87','rcl','rcr','emms','popf','cmpxchgdq'].includes(insn.mnem)) {   // rcl/rcr: rare, interpreter-only
+    if (['hlt','ud2','int3','int','cpuid','loopx','fxsave','fxrstor','x87','rcl','rcr','emms','popf'].includes(insn.mnem)) {   // rcl/rcr: rare, interpreter-only
+      insnAt.set(key, { mnem: 'udec', rip, next: rip + BigInt(insn.len), len: insn.len });
+      continue;
+    }
+    if (insn.mnem === 'sse4' && !sse4Compiled(insn)) {
       insnAt.set(key, { mnem: 'udec', rip, next: rip + BigInt(insn.len), len: insn.len });
       continue;
     }
@@ -1485,6 +1498,11 @@ function emitUnitFunction(a0, fnAddr, ctx) {
         if (insn.rm?.kind === 'mem') { if (insn.rm.base>=0) mark(insn.rm.base); if (insn.rm.index>=0) mark(insn.rm.index); }
         break; }
       case 'ssegrpshift': break;   // xmm only
+      case 'sse4': {
+        const mark = (r) => { seenR[r]=true; any64[r]=true; };
+        if (insn.rm?.kind === 'xmm' && sse4RmIsGpr(insn)) mark(insn.rm.r);
+        if (insn.rm?.kind === 'mem') { if (insn.rm.base>=0) mark(insn.rm.base); if (insn.rm.index>=0) mark(insn.rm.index); }
+        break; }
       default:
         noteRW(insn.dst, WRITES_DST.has(insn.mnem)); noteRW(insn.src, false); noteRW(insn.src2, false);
     }
@@ -1638,6 +1656,11 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       if (insn.rm?.kind === 'xmm' && !sseRmIsGpr(insn)) xUsed.add(insn.rm.r);
     }
     if (insn.mnem === 'ssegrpshift') xUsed.add(insn.xrm);
+    if (insn.mnem === 'sse4') {
+      xUsed.add(insn.xr);
+      if (insn.rm?.kind === 'xmm' && !sse4RmIsGpr(insn)) xUsed.add(insn.rm.r);
+      if (insn.map === 0x38 && (insn.op === 0x10 || insn.op === 0x14 || insn.op === 0x15)) xUsed.add(0);   // the blend mask is xmm0
+    }
   }
   const xreg = (r) => '$x' + r;
   const xSpill  = (r) => `(v128.store (i32.const ${XMMOFF + r*16}) (local.get ${xreg(r)}))`;
@@ -1860,6 +1883,69 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     0xEF:'v128.xor',0xDB:'v128.and',0xEB:'v128.or',
     0x57:'v128.xor',0x54:'v128.and',0x56:'v128.or',
   };
+  function emitSSE4(insn, next, L) {
+    const map = insn.map, op = insn.op, im = insn.imm8, xr = insn.xr, rm = insn.rm;
+    const dst = `(local.get ${xreg(xr)})`;
+    const put = (e) => L.push(setx(xr, e));
+    const key = (map === 0x38 ? 0x3800 : 0x3a00) | op;
+    // source xmm/m128, or the narrower memory forms of pmovsx/zx
+    const memLoad = { 0x3820: 'v128.load64_zero', 0x3821: 'v128.load32_zero', 0x3823: 'v128.load64_zero', 0x3824: 'v128.load32_zero', 0x3825: 'v128.load64_zero',
+                      0x3830: 'v128.load64_zero', 0x3831: 'v128.load32_zero', 0x3833: 'v128.load64_zero', 0x3834: 'v128.load32_zero', 0x3835: 'v128.load64_zero' }[key];
+    const src = () => rm.kind === 'xmm' ? `(local.get ${xreg(rm.r)})`
+      : key === 0x3822 || key === 0x3832 ? `(v128.load16_lane 0 ${wasmAddr(rm, next)} ${ZERO})`
+      : `(${memLoad ?? 'v128.load'} ${wasmAddr(rm, next)})`;
+    const MINMAX = { 0x38: 'i8x16.min_s', 0x39: 'i32x4.min_s', 0x3a: 'i16x8.min_u', 0x3b: 'i32x4.min_u', 0x3c: 'i8x16.max_s', 0x3d: 'i32x4.max_s', 0x3e: 'i16x8.max_u', 0x3f: 'i32x4.max_u' };
+    if (map === 0x38) {
+      if (MINMAX[op]) { put(`(${MINMAX[op]} ${dst} ${src()})`); return; }
+      if ((op >= 0x20 && op <= 0x25) || (op >= 0x30 && op <= 0x35)) {
+        const sx = op < 0x30 ? 's' : 'u', k = op & 7, v = src();
+        const w8 = (x) => `(i16x8.extend_low_i8x16_${sx} ${x})`, w16 = (x) => `(i32x4.extend_low_i16x8_${sx} ${x})`, w32 = (x) => `(i64x2.extend_low_i32x4_${sx} ${x})`;
+        put([w8(v), w16(w8(v)), w32(w16(w8(v))), w16(v), w32(w16(v)), w32(v)][k]); return; }
+      switch (op) {
+        case 0x00: put(`(i8x16.swizzle ${dst} (v128.and ${src()} (v128.const i8x16 ${Array(16).fill(0x8f).join(' ')})))`); return;
+        case 0x29: put(`(i64x2.eq ${dst} ${src()})`); return;
+        case 0x37: put(`(i64x2.gt_s ${dst} ${src()})`); return;
+        case 0x40: put(`(i32x4.mul ${dst} ${src()})`); return;
+        case 0x1c: put(`(i8x16.abs ${src()})`); return;
+        case 0x1d: put(`(i16x8.abs ${src()})`); return;
+        case 0x1e: put(`(i32x4.abs ${src()})`); return;
+        case 0x10: put(`(v128.bitselect ${src()} ${dst} (i8x16.shr_s (local.get ${xreg(0)}) (i32.const 7)))`); return;     // pblendvb
+        case 0x14: put(`(v128.bitselect ${src()} ${dst} (i32x4.shr_s (local.get ${xreg(0)}) (i32.const 31)))`); return;    // blendvps
+        case 0x15: put(`(v128.bitselect ${src()} ${dst} (i64x2.shr_s (local.get ${xreg(0)}) (i32.const 63)))`); return;    // blendvpd
+      }
+      throw new Error('AOT sse4 0f38 ' + op.toString(16));
+    }
+    switch (op) {
+      case 0x08: case 0x09: case 0x0a: case 0x0b: {      // roundps / roundpd / roundss / roundsd
+        const mode = (im & 4) ? 0 : (im & 3), nm = ['nearest', 'floor', 'ceil', 'trunc'][mode];
+        const v = src();
+        if (op === 0x08) put(`(f32x4.${nm} ${v})`);
+        else if (op === 0x09) put(`(f64x2.${nm} ${v})`);
+        else if (op === 0x0a) put(`(f32x4.replace_lane 0 ${dst} (f32.${nm} (f32x4.extract_lane 0 ${v})))`);
+        else put(`(f64x2.replace_lane 0 ${dst} (f64.${nm} (f64x2.extract_lane 0 ${v})))`);
+        return; }
+      case 0x0c: case 0x0d: case 0x0e: {                 // blendps / blendpd / pblendw: lane i from the source when imm bit i is set
+        const eb = op === 0x0c ? 4 : op === 0x0d ? 8 : 2, n = 16 / eb, idx = [];
+        for (let i = 0; i < n; i++) for (let b = 0; b < eb; b++) idx.push(((im >> i) & 1 ? 16 : 0) + i * eb + b);
+        put(`(i8x16.shuffle ${idx.join(' ')} ${dst} ${src()})`); return; }
+      case 0x0f: {                                       // palignr: (dst:src) >> (imm*8)
+        const idx = [];
+        if (im < 16) { for (let i = 0; i < 16; i++) idx.push(i + im); put(`(i8x16.shuffle ${idx.join(' ')} ${src()} ${dst})`); }
+        else if (im < 32) { for (let i = 0; i < 16; i++) idx.push(i + im - 16); put(`(i8x16.shuffle ${idx.join(' ')} ${dst} ${ZERO})`); }
+        else put(ZERO);
+        return; }
+      case 0x20: { const g = rm.kind === 'xmm' ? rd({ kind: 'reg', r: rm.r, size: 4 }, 4, next) : `(i64.load8_u ${wasmAddr(rm, next)})`;
+        put(`(i8x16.replace_lane ${im & 15} ${dst} (i32.wrap_i64 ${g}))`); return; }
+      case 0x22: {
+        if (insn.W) { const g = rm.kind === 'xmm' ? rd({ kind: 'reg', r: rm.r, size: 8 }, 8, next) : `(i64.load ${wasmAddr(rm, next)})`;
+          put(`(i64x2.replace_lane ${im & 1} ${dst} ${g})`); }
+        else { const g = rm.kind === 'xmm' ? rd({ kind: 'reg', r: rm.r, size: 4 }, 4, next) : `(i64.load32_u ${wasmAddr(rm, next)})`;
+          put(`(i32x4.replace_lane ${im & 3} ${dst} (i32.wrap_i64 ${g}))`); }
+        return; }
+    }
+    throw new Error('AOT sse4 0f3a ' + op.toString(16));
+  }
+
   function emitSSE(insn, next, L, setFlags) {
     const op = insn.op, xr = insn.xr, rm = insn.rm;
     const dst = `(local.get ${xreg(xr)})`;
@@ -2173,7 +2259,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     if (insn.mnem === 'bt' || insn.mnem === 'bts' || insn.mnem === 'btr' || insn.mnem === 'btc') return true;
     if (insn.mnem === 'mul1' || insn.mnem === 'imul1') return true;   // CF=OF = widening overflow, in $fr
     if (insn.mnem === 'imul2' || insn.mnem === 'imul3') return true;   // same: CF=OF = the product did not fit
-    if (insn.mnem === 'bsf' || insn.mnem === 'bsr') return true;   // ZF <- (src==0)
+    if (insn.mnem === 'bsf' || insn.mnem === 'bsr' || insn.mnem === 'popcnt' || insn.mnem === 'cmpxchgdq') return true;   // ZF <- (src==0), ZF <- equal
     return false;
   };
   // Instructions that write flags in a way we DON'T model: a nearest such
@@ -2209,7 +2295,8 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       // bsf/bsr define ZF and nothing else - SF, CF and OF are architecturally
       // undefined - and $fr holds the SOURCE, so reading a sign off it is
       // reading the operand, not a result.
-      case 'bsf': case 'bsr': return { kind:'zf', size:S };
+      case 'bsf': case 'bsr': case 'popcnt': return { kind:'zf', size:S };
+      case 'cmpxchgdq': return { kind:'zf', size:8 };
       case 'inc': return { kind:'inc', size:S };
       case 'dec': return { kind:'dec', size:S };
       // 'cf' is CF alone (bt family leaves OF undefined); 'cfof' is the
@@ -2842,6 +2929,31 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           if (producers.has(ii)) { L.push(`(local.set $fr (local.get ${t}))`); flagState = { kind: 'zf', size: S }; }
           L.push(`(if (i64.ne (local.get ${t}) (i64.const 0)) (then ${wr(insn.dst, S, e, next)}))`);
           break; }
+        case 'popcnt': {
+          // dst = number of set bits in src; ZF <- (src==0). CF/OF/SF/PF are
+          // cleared, which the 'zf' flag kind (as for bsf) never lets a consumer read.
+          const t = T();
+          L.push(`(local.set ${t} ${rd(insn.src, S, next)})`);
+          if (producers.has(ii)) { L.push(`(local.set $fr (local.get ${t}))`); flagState = { kind: 'zf', size: S }; }
+          L.push(wr(insn.dst, S, `(i64.popcnt (local.get ${t}))`, next));
+          break; }
+        case 'cmpxchgdq': {
+          // cmpxchg8b / cmpxchg16b: compare RDX:RAX with the memory pair; equal ->
+          // store RCX:RBX and ZF=1, else load the pair into RDX:RAX and ZF=0.
+          // Threads never preempt inside a unit, so LOCK is free. $fr holds
+          // (lo^rax)|(hi^rdx), zero exactly when equal: the 'zf' flag kind.
+          const n = insn.wide ? 8 : 4, ld = insn.wide ? 'i64.load' : 'i64.load32_u', st = insn.wide ? 'i64.store' : 'i64.store32';
+          const ta = T(), tl = T(), th = T(), tx = T();
+          L.push(`(local.set ${ta} (i64.extend_i32_u ${wasmAddr(insn.rm, next)}))`);
+          const A0 = `(i32.wrap_i64 (local.get ${ta}))`, A1 = `(i32.wrap_i64 (i64.add (local.get ${ta}) (i64.const ${n})))`;
+          L.push(`(local.set ${tl} (${ld} ${A0}))`, `(local.set ${th} (${ld} ${A1}))`);
+          const raxv = rd({ kind: 'reg', r: 0, size: 8 }, insn.wide ? 8 : 4, next), rdxv = rd({ kind: 'reg', r: 2, size: 8 }, insn.wide ? 8 : 4, next);
+          L.push(`(local.set ${tx} (i64.or (i64.xor (local.get ${tl}) ${raxv}) (i64.xor (local.get ${th}) ${rdxv})))`);
+          L.push(`(if (i64.eqz (local.get ${tx}))`,
+                 `(then (${st} ${A0} ${rd({ kind: 'reg', r: 3, size: 8 }, insn.wide ? 8 : 4, next)}) (${st} ${A1} ${rd({ kind: 'reg', r: 1, size: 8 }, insn.wide ? 8 : 4, next)}))`,
+                 `(else ${wr({ kind: 'reg', r: 0, size: 8 }, 8, `(local.get ${tl})`, next)} ${wr({ kind: 'reg', r: 2, size: 8 }, 8, `(local.get ${th})`, next)}))`);
+          if (producers.has(ii)) { L.push(`(local.set $fr (local.get ${tx}))`); flagState = { kind: 'zf', size: 8 }; }
+          break; }
         case 'bswap': {
           const bs32 = (e) => `(i32.or (i32.or (i32.shl ${e} (i32.const 24)) (i32.and (i32.shl ${e} (i32.const 8)) (i32.const 16711680))) (i32.or (i32.and (i32.shr_u ${e} (i32.const 8)) (i32.const 65280)) (i32.shr_u ${e} (i32.const 24))))`;
           if (S === 4) L.push(wr32reg(insn.dst.r, bs32(rd32(insn.dst,next))));
@@ -3319,6 +3431,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
         case 'stmxcsr': L.push(wr(insn.dst, 4, `(i64.extend_i32_u (i32.load (i32.const ${MXCSR_SLOT})))`, next)); break;
         case 'ldmxcsr': L.push(`(i32.store (i32.const ${MXCSR_SLOT}) (i32.wrap_i64 ${rd(insn.dst, 4, next)}))`); break;
         case 'sse':          emitSSE(insn, next, L, setFlags); break;
+        case 'sse4':         emitSSE4(insn, next, L); break;
         case 'ssegrpshift':  emitSSEShift(insn, L); break;
         case 'jmp': case 'jcc': case 'ret': case 'retn': case 'jmpind': case 'udec': break;  // terminator handled below
         default: throw new Error('AOT: unhandled '+insn.mnem+' @ '+insn.rip.toString(16));

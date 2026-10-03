@@ -15,7 +15,7 @@ import { LinuxEngine } from '../engine/linux.mjs';
 import { CPU } from '../engine/interp.mjs';
 import { snapshotEngine, restoreEngine } from '../engine/snapshot.mjs';
 import { makeAssembler } from '../tools/assemble.mjs';
-import { makeInProcessAssembler } from './wabt-asm.mjs';
+import { makeInProcessAssembler, withNativeFallback } from './wabt-asm.mjs';
 import { buildImage, findPythonTree, CACHE_DIR, DEFAULT_COMMANDS } from './image.mjs';
 
 const HERE = new URL('.', import.meta.url).pathname;
@@ -106,7 +106,7 @@ export class EngineHost {
     // child process. `assembler: 'wat2wasm'` keeps the native tool and its broker processes.
     let asm = null;
     if (o.assembler !== 'wat2wasm') {
-      try { asm = await makeInProcessAssembler(); }
+      try { asm = withNativeFallback(await makeInProcessAssembler(), () => makeAssembler({ tag: 'oxsb' })); }
       catch (e) { o.log?.(`in-process assembler unavailable (${e.message}); using wat2wasm`); }
     }
     if (!asm) {

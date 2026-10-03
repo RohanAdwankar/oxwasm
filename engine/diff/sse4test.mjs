@@ -7,6 +7,7 @@
 // bit with the CPU running the same instruction. ptest is compared through the
 // ZF and CF it sets.
 import { CPU, Memory } from '../interp.mjs';
+import { compileFunctionWat } from '../aot_wat.mjs';
 import { execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync } from 'node:fs';
 
@@ -54,7 +55,7 @@ FORMS.push(['popcnt32', 'popcnt eax, [rsp-64]\nmovd xmm0, eax', true], ['popcnt6
 
 const hex = (v) => v.toString(16).padStart(32, '0');
 const fmt = (v) => hex(v & ONES);
-let bad = 0, n = 0;
+let bad = 0, n = 0, aotForms = 0, aotSkipped = 0, aotN = 0;
 for (const [name, body, memForm] of FORMS) {
   // hardware: one program, all pairs
   const table = PAIRS.map(([a, b]) => `{0x${(a & (2n**64n-1n)).toString(16)}ULL,0x${(a >> 64n).toString(16)}ULL,0x${(b & (2n**64n-1n)).toString(16)}ULL,0x${(b >> 64n).toString(16)}ULL}`).join(',');
@@ -95,6 +96,41 @@ int main(){ for(int i=0;i<${PAIRS.length};i++){ unsigned long long o[4]={0,0,0,0
     if (hv !== got && !ptest || (ptest && hf !== gf)) { mism++; if (mism <= 2) console.log(`  ${name} a=${hex(a)} b=${hex(b)}\n      hw     ${hv} ${hf}\n      interp ${got} ${gf}`); }
   });
   if (mism) { bad++; console.log(`  ${name}: ${mism}/${PAIRS.length} mismatches`); }
+
+  // the compiled tier, for the forms it emits (flags are not captured here: no pushfq in a unit)
+  if (name !== 'ptest') {
+    writeFileSync('/tmp/s4a.asm', 'BITS 64\n' + pre + body + '\nmovdqu [0x420100], xmm0\nret');
+    execFileSync('nasm', ['-f', 'bin', '-o', '/tmp/s4a.bin', '/tmp/s4a.asm']);
+    const acode = new Uint8Array(0x30000); acode.set(readFileSync('/tmp/s4a.bin'));
+    let unit = null;
+    try { unit = compileFunctionWat(new Memory([{ base: CODE, bytes: acode }]), CODE, { guestBase: CODE, ramBase: 0 }); } catch (e) { unit = null; }
+    if (!unit) { aotSkipped++; continue; }
+    writeFileSync('/tmp/s4a.wat', unit.wat);
+    execFileSync('wat2wasm', ['--enable-tail-call', '/tmp/s4a.wat', '-o', '/tmp/s4a.wasm']);
+    const mod = new WebAssembly.Module(readFileSync('/tmp/s4a.wasm'));
+    let amism = 0, escaped = false;
+    for (let k = 0; k < PAIRS.length && !escaped; k++) {
+      const [a, b] = PAIRS[k];
+      const mem = new WebAssembly.Memory({ initial: 4096 });
+      const stub = () => { throw new Error('escape'); };
+      const inst = new WebAssembly.Instance(mod, { js: { mem, ftab: new WebAssembly.Table({ initial: 0, element: 'anyfunc' }) },
+                                                   env: { syscall: stub, callout: stub, deopt: stub, loophot: stub, codewrite: stub } });
+      const rv = new BigInt64Array(mem.buffer, 0, 16), dv = new DataView(mem.buffer);
+      new Uint8Array(mem.buffer).set(acode, 0);
+      const off = Number(BUF - CODE);
+      dv.setBigUint64(off, a & (2n**64n-1n), true); dv.setBigUint64(off + 8, a >> 64n, true);
+      dv.setBigUint64(off + 16, b & (2n**64n-1n), true); dv.setBigUint64(off + 24, b >> 64n, true);
+      for (let q = 0; q < 16; q++) rv[q] = 0n;
+      rv[4] = BigInt.asIntN(64, CODE + 0x1000n); dv.setBigUint64(0x1000, SENT, true);
+      try { inst.exports[unit.entryName](); } catch (e) { if (String(e.message).includes('escape')) { escaped = true; break; } throw e; }
+      const got = hex((dv.getBigUint64(off + 0x108, true) << 64n) | dv.getBigUint64(off + 0x100, true));
+      const [hv] = hw[k].split(' ');
+      aotN++;
+      if (hv !== got) { amism++; if (amism <= 2) console.log(`  ${name} (compiled) a=${hex(a)} b=${hex(b)}\n      hw   ${hv}\n      aot  ${got}`); }
+    }
+    if (escaped) aotSkipped++; else { aotForms++; if (amism) { bad++; console.log(`  ${name} (compiled): ${amism}/${PAIRS.length} mismatches`); } }
+  }
 }
 console.log(`\n${FORMS.length - bad}/${FORMS.length} SSSE3/SSE4.1 forms bit-exact against hardware (${n} vector cases)`);
+console.log(`${aotForms} forms also checked in the compiled tier (${aotN} vector cases); ${aotSkipped} stay interpreter-only`);
 if (bad) process.exit(1);
