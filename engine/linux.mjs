@@ -445,6 +445,7 @@ export class LinuxEngine {
   // compiled code make indirect calls / cross-unit calls / indirect tail
   // jumps without a JS boundary or regfile sync.
   registerAotFn(a, f) {
+    if (ENV.OXWASM_DISPLOG && this._ctor?.argv?.[0]?.includes('opencode')) { const [lo, hi] = ENV.OXWASM_DISPLOG.split('-').map(Number); if ((this.stats.disp || 0) >= lo && (this.stats.disp || 0) <= hi) console.error(`[reg disp=${this.stats.disp}] ${a.toString(16)}`); }
     this.aotFns.set(a, f); this._entryAdd(a);
     // __noFtab bisect lever: an empty map makes every $ftr miss, so all
     // sites take their pre-existing x_callout / x_deopt fallbacks
@@ -459,14 +460,14 @@ export class LinuxEngine {
     // 26,000 mapped functions the probe chains degrade and at 32,768 an
     // unmapped lookup would never find an empty slot to stop on. The hash has
     // to grow with the ceiling - it is 40% loaded today.
-    if (!f || globalThis.__noFtab || this._ftSeen.has(a)) return;
+    if (!f || globalThis.__noFtab || this._aotOff || this._ftSeen.has(a)) return;
     if (this._ftCount >= FTMAP_MAX) { this._ftFull = (this._ftFull || 0) + 1; return; }
     this._ftSeen.add(a); this._entryAdd(a);
     const idx = this._ftCount++;
     if (idx >= this.ftab.length) this.ftab.grow(Math.min(this.ftab.length, FTMAP_MAX - this.ftab.length));
     this.ftab.set(idx, f);
     const dv = new DataView(this.wmem.buffer);
-    dv.setUint8(FTENTRY + idx, (this._callEntries?.has(a) || this._looksLikeFnEntry(a)) ? 1 : 0);   // a real function entry: tail jumps may chain to it from a nested unit
+    dv.setUint8(FTENTRY + idx, (ENV.OXWASM_FTENTRY && (this._callEntries?.has(a) || this._looksLikeFnEntry(a))) ? 1 : 0);   // a real function entry: tail jumps may chain to it from a nested unit
     (this._ftIdxOf ??= new Map()).set(a, idx);
     const au = BigInt.asUintN(64, a);
     // open addressing with linear probing, mirroring $ftr's own walk
@@ -778,7 +779,7 @@ export class LinuxEngine {
         skip: (c) => ((this._ftSeen.has(BigInt(c)) || (this._pendingFns !== undefined && this._pendingFns.has(c))) && !UNPRUNE.has(c))
                   || (!CLOSURE_ALL && (this.aotCalls.get(BigInt(c)) || 0) < CLOSURE_MIN),
         // bisect aids: fnVeto never compiles these; fnAllow compiles only these (roots and closure members)
-        veto: (c) => this._isVforkStub(BigInt(c)) || (this.fnVeto?.has(c) ?? false) || (this.fnAllow ? !this.fnAllow.has(c) : false),   // a vfork stub is never compiled, as a root or inside a closure
+        veto: (c) => this._isVforkStub(BigInt(c)) || (this.fnVeto?.has(c) ?? false) || (this.fnAllow ? !this.fnAllow.has(c) : false) || this._envVeto(c),   // a vfork stub is never compiled, as a root or inside a closure
         tinyMemo: (this._tinyMemo ??= new Map()),
         failMemo: (this._failMemo ??= new Map()),
         sizeMemo: (this._sizeMemo ??= new Map()),          // sizes of callees the size gate refused (cleared per range by _invalidateCode)
@@ -917,6 +918,8 @@ export class LinuxEngine {
   // Returns the rip to continue at.
   dispatchAot(f) {
     this.stats.disp = (this.stats.disp || 0) + 1;
+    if (ENV.OXWASM_DISPLOG && this._ctor?.argv?.[0]?.includes('opencode')) { const [lo, hi] = ENV.OXWASM_DISPLOG.split('-').map(Number); if (this.stats.disp >= lo && this.stats.disp <= hi) console.error(`[disp ${this.stats.disp}] rip=${this.cpu.rip.toString(16)} rsp=${this.cpu.regs[4].toString(16)}`); }
+    if (ENV.OXWASM_AOTSTOP && this.stats.disp === +ENV.OXWASM_AOTSTOP && this._ctor?.argv?.[0]?.includes('opencode')) { this._aotOff = true; if (ENV.OXWASM_AOTSTOP_HARD) { new DataView(this.wmem.buffer).setUint32(FTMAP, 0, true); new Uint8Array(this.wmem.buffer, FTHASH, FTHBYTES).fill(0); this._ftCount = 0; this._ftSeen = new Set(); this._entries = null; } console.error('[aotstop] at disp', this.stats.disp); }
     if (this._cleanSync) this.stats.dispClean = (this.stats.dispClean || 0) + 1;
     // Save/restore the wasm-frame budget word (FTMAP+8) around the dispatch:
     // interpUntil dispatches units NESTED under live wasm frames (a callout's
@@ -1084,7 +1087,7 @@ export class LinuxEngine {
     let guard = 0;
     let branched = true;      // compiled entries are branch targets: only look up after a branch
     while (!done()) {
-      let f = branched ? this.aotFns.get(this.cpu.rip) : undefined;
+      let f = branched && !this._aotOff ? this.aotFns.get(this.cpu.rip) : undefined;
       if (f && this.aotBudget !== undefined && --this.aotBudget < 0) f = null;
       // stack budget: this interpreter can be nested deep under live wasm
       // frames (contained deopt/callout) — don't dispatch further fat wasm
@@ -1287,7 +1290,7 @@ export class LinuxEngine {
         if (rsp0 < 0x10000n && this.onBadRsp) this.onBadRsp(target, rsp0);
         const retAddr = this.mem.read(rsp0, 8n);
         const rspExit = BigInt.asUintN(64, rsp0 + 8n);
-        let f = this.aotFns.get(target);
+        let f = this._aotOff ? undefined : this.aotFns.get(target);
         if (this.deoptLog) { const m = (this.calloutLog ??= new Map()); const kk = target.toString(16) + (f ? '' : ' (no unit)'); m.set(kk, (m.get(kk) || 0) + 1); }
         if (f && this.aotBudget !== undefined && --this.aotBudget < 0) f = null;
         if (this.chainSlow) f = null;                       // diagnostic: disable wasm-to-wasm fastpath
@@ -1358,7 +1361,7 @@ export class LinuxEngine {
         this.stats.deopts = (this.stats.deopts || 0) + 1;
         if (this.deoptLog) this.deoptLog.set(t, (this.deoptLog.get(t) || 0) + 1);
         if (this.inExec(t)) this.profileTarget(t);
-        const f = this.aotFns.get(t);
+        const f = this._aotOff ? undefined : this.aotFns.get(t);
         // t !== _deoChainT: an instruction-escape deopt (rdtsc/cpuid/div
         // guard) passes its own rip — a landing-unit rooted exactly there
         // would re-deopt at the same t forever; only the interpreter can
@@ -1375,7 +1378,8 @@ export class LinuxEngine {
         // epilogue-and-jump looks like an abandoned frame. Running it nested costs nothing;
         // unwinding by exception cost ~100 us each (JavaScriptCore: 200k per 20k allocations).
         // A longjmp lands inside a function and is never a call target, so it still unwinds.
-        const tailToFn = f && this._callEntries?.has(t);
+        const tailToFn = ENV.OXWASM_FTENTRY && f && this._callEntries?.has(t);
+        if (tailToFn && globalThis.__frameTrace && _rsp0 !== undefined && BigInt.asUintN(64, this.regview[4]) > BigInt.asUintN(64, _rsp0)) console.error(`<tailfn t=${t.toString(16)} rsp=${BigInt.asUintN(64, this.regview[4]).toString(16)} rsp0=${BigInt.asUintN(64, _rsp0).toString(16)}>`);
         if (!tailToFn && _rsp0 !== undefined && BigInt.asUintN(64, this.regview[4]) > BigInt.asUintN(64, _rsp0)) {
           this.stats.frameGone = (this.stats.frameGone || 0) + 1;
           if (ENV.OXWASM_FGTRACE && this._ctor?.argv?.[0]?.includes(ENV.OXWASM_FGTRACE) && ((this._fgN = (this._fgN | 0) + 1) <= 30)) console.error(`[fg] rip=${t.toString(16)} rsp=${BigInt.asUintN(64, this.regview[4]).toString(16)} rsp0=${BigInt.asUintN(64, _rsp0).toString(16)} diff=${BigInt.asUintN(64, this.regview[4]) - BigInt.asUintN(64, _rsp0)}`);
@@ -2060,6 +2064,12 @@ export class LinuxEngine {
     const nr = Number(cpu.regs[0]);
     const [a1, a2, a3] = [cpu.regs[7], cpu.regs[6], cpu.regs[2]];   // rdi rsi rdx
     this.stats.syscalls[nr] = (this.stats.syscalls[nr] || 0) + 1;
+    if (ENV.OXWASM_SCTRACE && this._ctor?.argv?.[0]?.includes('opencode')) {
+      const t = this.threads[this.ti], r = cpu.regs;
+      const line = `${t?.id} ${nr} ${a1.toString(16)} ${a2.toString(16)} ${a3.toString(16)} sp=${r[4].toString(16)} bp=${r[5].toString(16)} bx=${r[3].toString(16)} r12=${r[12].toString(16)} r13=${r[13].toString(16)} r14=${r[14].toString(16)} r15=${r[15].toString(16)}`;
+      const buf = (this._sct ??= []); buf.push(line);
+      if (buf.length >= 500) { process.getBuiltinModule('node:fs').appendFileSync(ENV.OXWASM_SCTRACE, buf.join('\n') + '\n'); buf.length = 0; }
+    }
     if (ENV.OXWASM_MMAPTRACE && nr === 9 && a2 >= BigInt('0x' + ENV.OXWASM_MMAPTRACE) && a2 < BigInt('0x' + (ENV.OXWASM_MMAPTRACE_MAX || 'ffffffffffffff')) && this._ctor?.argv?.[0]?.includes('opencode') && (this._mtN = (this._mtN | 0) + 1) <= 3) {   // who asks for a huge mapping: the guest's rbp chain
       const out = []; try { let bp = cpu.regs[5]; for (let i = 0; i < 24 && bp; i++) { out.push('0x' + this.mem.read(bp + 8n, 8n).toString(16)); bp = this.mem.read(bp, 8n); } } catch {}
       console.error(`[mmaptrace] len=${a2.toString(16)} prot=${cpu.regs[2].toString(16)} flags=${cpu.regs[10].toString(16)} rbp-chain: ${out.join(' ')}`); }
@@ -2068,7 +2078,7 @@ export class LinuxEngine {
     // its syscall history, not a fault address
     const ret = this.strace
       ? (v) => { cpu.regs[0] = BigInt.asUintN(64, v);
-                 if (ENV.OXWASM_STRACE_SIGNAL && (nr === 234 || nr === 200 || nr === 62)) console.error(`[signal syscall nr=${nr} args=${a1.toString(16)},${a2.toString(16)}] argv0=${this._ctor?.argv?.[0]} last:\n  ` + this.strace.slice(-3).join('\n  ') + '\n  rbpchain:' + (() => { const out = []; try { let bp = cpu.regs[5]; for (let i = 0; i < 16 && bp; i++) { out.push('0x' + this.mem.read(bp + 8n, 8n).toString(16)); bp = this.mem.read(bp, 8n); } } catch {} return out.join(' '); })() + '\n  stack:' + (() => { const out = []; try { const sp = cpu.regs[4]; for (let i = 0n; i < 200n; i++) { const w = this.mem.read(sp + i * 8n, 8n); const m = (this.maps ?? []).find((x) => w >= x.at && w < x.at + BigInt(x.len)); if (m) out.push(`${m.path}+0x${(w - m.at + BigInt(m.fileOff ?? 0)).toString(16)}`); else if (w >= 0x400000n && w < 0x520000n) out.push('exe 0x' + w.toString(16)); } } catch {} return '\n    ' + out.slice(0, 24).join('\n    '); })());
+                 if (ENV.OXWASM_STRACE_SIGNAL && (nr === 234 || nr === 200 || nr === 62)) console.error(`[signal syscall nr=${nr} args=${a1.toString(16)},${a2.toString(16)}] argv0=${this._ctor?.argv?.[0]} last:\n  ` + this.strace.slice(-3).join('\n  ') + '\n  regs:' + [...cpu.regs].map((r, i) => i + '=' + r.toString(16)).join(' ') + '\n  ipbytes:' + (() => { try { let bp = cpu.regs[5]; for (let i = 0; i < 4; i++) bp = this.mem.read(bp, 8n); const off = this.mem.read(bp + 0x24n, 4n); const out = ['cfr=' + bp.toString(16), 'off=' + off.toString(16), 'callee=' + this.mem.read(bp + 0x10n, 8n).toString(16)]; const base = cpu.regs[13] + off; const b = []; for (let i = -24n; i < 16n; i++) b.push(Number(this.mem.read(base + i, 1n)).toString(16).padStart(2, '0')); return out.join(' ') + ' bytes:' + b.join(' '); } catch (e) { return String(e); } })() + '\n  rbpchain:' + (() => { const out = []; try { let bp = cpu.regs[5]; for (let i = 0; i < 16 && bp; i++) { out.push('0x' + this.mem.read(bp + 8n, 8n).toString(16)); bp = this.mem.read(bp, 8n); } } catch {} return out.join(' '); })() + '\n  stack:' + (() => { const out = []; try { const sp = cpu.regs[4]; for (let i = 0n; i < 200n; i++) { const w = this.mem.read(sp + i * 8n, 8n); const m = (this.maps ?? []).find((x) => w >= x.at && w < x.at + BigInt(x.len)); if (m) out.push(`${m.path}+0x${(w - m.at + BigInt(m.fileOff ?? 0)).toString(16)}`); else if (w >= 0x400000n && w < 0x520000n) out.push('exe 0x' + w.toString(16)); } } catch {} return '\n    ' + out.slice(0, 24).join('\n    '); })());
                  if (ENV.OXWASM_DBG_ERR && BigInt.asIntN(64, v) === BigInt(-ENV.OXWASM_DBG_ERR)) console.error(`[errno ${ENV.OXWASM_DBG_ERR}] tid=${this.threads[this.ti]?.id} nr=${nr} args=${a1.toString(16)},${a2.toString(16)},${a3.toString(16)} argv0=${this._ctor?.argv?.[0]}`);
                  let ps = '';   // decode the path argument of the fs family
                  try { if (nr === 257 || nr === 262) ps = ' "' + this.readPath(a2) + '"';
@@ -2482,6 +2492,7 @@ export class LinuxEngine {
         break;
       case 218: { const t = this.threads[this.ti]; t.ctid = a1; ret(BigInt(t.id)); break; }  // set_tid_address
       case 56: case 57: case 58: {                           // clone / fork / vfork
+        if (ENV.OXWASM_CLONETRACE && this._ctor?.argv?.[0]?.includes('opencode')) console.error(`[clone] nr=${nr} flags=${a1.toString(16)} stack=${a2.toString(16)} disp=${this.stats.disp} rip=${this.cpu.rip.toString(16)}`);
         const flags = nr === 56 ? Number(a1 & 0xffffffffn) : 0;
         // posix_spawn is clone(CLONE_VM|CLONE_VFORK|SIGCHLD): a vfork child
         // on its own small stack, not a thread — CLONE_VFORK decides
@@ -2677,6 +2688,7 @@ export class LinuxEngine {
       case 273: ret(0n); break;                              // set_robust_list
       case 157: {                                            // prctl(option, ...)
         const op = Number(a1), t = this.threads[this.ti];
+        if (op === 15 && ENV.OXWASM_CLONETRACE) { let n2 = ''; for (let i = 0; i < 15; i++) { const c = Number(this.mem.read(a2 + BigInt(i), 1n)); if (!c) break; n2 += String.fromCharCode(c); } console.error(`[prctl-name] ${n2} disp=${this.stats.disp} ti=${this.ti}`); }
         if (op === 15) { let nm = ''; for (let i = 0; i < 15; i++) { const c = Number(this.mem.read(a2 + BigInt(i), 1n)); if (!c) break; nm += String.fromCharCode(c); } t.comm = nm; }   // PR_SET_NAME
         else if (op === 16) { const nm = t.comm ?? this.argv?.[0]?.split('/').pop()?.slice(0, 15) ?? ''; this.jsnap(a2, 16); for (let i = 0; i < 16; i++) this.mem.write(a2 + BigInt(i), 1n, BigInt(i < nm.length ? nm.charCodeAt(i) : 0)); }   // PR_GET_NAME
         else if (op === 3) { ret(1n); break; }                // PR_GET_DUMPABLE
@@ -2755,6 +2767,8 @@ export class LinuxEngine {
         new DataView(this.wmem.buffer).setUint8(o, (1 << Math.min(this.ncpu, 8)) - 1);
         ret(8n); break; }
       case 60: case 231: {                                   // exit / exit_group
+        if (ENV.OXWASM_AOTSTOP && this._ctor?.argv?.[0]?.includes('opencode')) console.error('[aotstop] exit total disp', this.stats.disp);
+        if (ENV.OXWASM_SCTRACE && this._sct?.length) { process.getBuiltinModule('node:fs').appendFileSync(ENV.OXWASM_SCTRACE, this._sct.join('\n') + '\n'); this._sct.length = 0; }
         if (ENV.OXWASM_IHIST && globalThis.__ihist && this._ctor?.argv?.[0]?.includes(ENV.OXWASM_IHIST)) { const b = new Map(); for (const [k, v] of globalThis.__ihist) { const kk = (BigInt(k) >> 6n << 6n).toString(16); b.set(kk, (b.get(kk) || 0) + v); } console.error('[ihist] ' + [...b].sort((x, y) => y[1] - x[1]).slice(0, 60).map(([k, v]) => k + '=' + v).join(' ')); }
         if (this.calloutLog && ENV.OXWASM_STATS && this._ctor?.argv?.[0]?.includes(ENV.OXWASM_STATS)) console.error('[callouts] ' + [...this.calloutLog].sort((x, y) => y[1] - x[1]).slice(0, 30).map(([k, v]) => k + ' x' + v).join(' | '));
         if (this.deoptLog && ENV.OXWASM_STATS && this._ctor?.argv?.[0]?.includes(ENV.OXWASM_STATS)) console.error('[deopts] ' + [...this.deoptLog].sort((x, y) => y[1] - x[1]).slice(0, 40).map(([k, v]) => k.toString(16) + ' x' + v).join(' '));
@@ -5490,7 +5504,7 @@ export class LinuxEngine {
         }
         if (this._sigAny && this._sigPoll()) branched = true;     // asynchronous delivery at an insn boundary
         const key = this.cpu.rip;
-        let f = branched ? this.aotFns.get(key) : undefined;
+        let f = branched && !this._aotOff ? this.aotFns.get(key) : undefined;
         if (globalThis.__dbgRip !== undefined && key === globalThis.__dbgRip && ((this._dbgN = (this._dbgN | 0) + 1) & 0xFFFFF) === 1) console.error(`<dbgrip ${key.toString(16)} branched=${branched} f=${typeof f} has=${this.aotFns.has(key)} budget=${this.aotBudget} n=${this._dbgN}>`);
         // OXWASM_DISPSTAT: why an rip with a compiled unit was NOT dispatched.
         // A hot loop head can hold a real export and still run interpreted,
@@ -5558,6 +5572,22 @@ export class LinuxEngine {
     } catch (e) { if (e !== EXIT) throw e; }
     return { exitCode: this.exitCode, stdout: this.stdout.join(''),
              stderr: (this.stderr || []).join(''), stats: this.stats };
+  }
+
+  // bisect aids (env): OXWASM_FNVETO_FILE = file of hex entries never compiled; OXWASM_FNDUMP = file the considered entries are written to at exit
+  _envVeto(c) {
+    if (typeof process === 'undefined') return false;
+    if (this._ev === undefined) {
+      const f = ENV.OXWASM_FNVETO_FILE;
+      this._ev = f ? new Set(process.getBuiltinModule('node:fs').readFileSync(f, 'utf8').split(/\s+/).filter(Boolean)) : null;
+      const fa = ENV.OXWASM_FNALLOW_FILE;
+      this._ea = fa ? new Set(process.getBuiltinModule('node:fs').readFileSync(fa, 'utf8').split(/\s+/).filter(Boolean)) : null;
+      if (ENV.OXWASM_FNDUMP && !globalThis.__fnDump) globalThis.__fnDump = new Set();
+    }
+    if (globalThis.__fnDump) { const h = BigInt(c).toString(16); if (!globalThis.__fnDump.has(h)) { globalThis.__fnDump.add(h); process.getBuiltinModule('node:fs').appendFileSync(ENV.OXWASM_FNDUMP, h + '\n'); } }
+    const hx = BigInt(c).toString(16);
+    if (ENV.OXWASM_DUMPFN && ENV.OXWASM_DUMPFN.split(',').includes(hx)) { const b = new Uint8Array(0x600); for (let i = 0; i < b.length; i++) { try { b[i] = Number(this.mem.read(BigInt(c) + BigInt(i), 1n)); } catch { break; } } process.getBuiltinModule('node:fs').writeFileSync(ENV.OXWASM_DUMPDIR + '/fn_' + hx + '.bin', b); }
+    return (this._ev ? this._ev.has(hx) : false) || (this._ea ? !this._ea.has(hx) : false);
   }
 
   tryCompile(hk, head) {

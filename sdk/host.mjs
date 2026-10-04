@@ -43,7 +43,7 @@ function cacheKey({ python, packages, commands, memMB, network, rootfs, cpuV2, c
 // <cache>/units/<engine hash>/<program id>/<entry hex>.wasm. The engine decides what is safe to put in it (units
 // confined to the program's static image) and keys it by a hash of that image; here it is only files.
 let _engineHash = null;
-const engineHash = () => _engineHash ??= sha(...['linux.mjs', 'aot_wat.mjs', 'interp.mjs', 'decode.mjs'].map((f) => readFileSync(join(HERE, '..', 'engine', f))), process.version);
+const engineHash = () => _engineHash ??= sha(...['linux.mjs', 'aot_wat.mjs', 'interp.mjs', 'decode.mjs'].map((f) => readFileSync(join(HERE, '..', 'engine', f))), process.version, process.env.OXWASM_FNVETO_FILE ? readFileSync(process.env.OXWASM_FNVETO_FILE) : '', process.env.OXWASM_FNALLOW_FILE ? readFileSync(process.env.OXWASM_FNALLOW_FILE) : '');
 function makeUnitStore(cacheDir) {
   const root = join(cacheDir, 'units', engineHash());
   return {
@@ -186,6 +186,8 @@ export class EngineHost {
       // clock when its fuel runs out; bottomless fuel means one run() can hold
       // the thread indefinitely. The packed browser page sets the same pair.
       if (process.env.OXWASM_NOAOT) { eng.aotCallThreshold = 1e15; eng.aotLoopThreshold = 1e15; }
+      if (process.env.OXWASM_AOTCALL) { eng.aotCallThreshold = +process.env.OXWASM_AOTCALL; eng.aotLoopThreshold = +process.env.OXWASM_AOTLOOP; }
+      if (process.env.OXWASM_FRAMETRACE) globalThis.__frameTrace = true;
       eng.chainFuel = 2048; eng.loopYield = 20000;
       return eng;
     };

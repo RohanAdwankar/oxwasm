@@ -616,7 +616,7 @@ export function analyze(mem, entry, { maxInsns = 20000, noJtab = false, entries 
     return null;
   };
   let dbudget = 4096;             // total discovered targets across the function
-  while (jmpinds.length && dbudget > 0) {
+  while (jmpinds.length && dbudget > 0 && !(typeof process !== 'undefined' && process.env.OXWASM_NOJTAB)) {
     const j = jmpinds.shift();
     const td = tableOf(j);
     if (td == null) continue;
