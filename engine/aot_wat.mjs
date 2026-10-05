@@ -1992,9 +1992,19 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       // register operand = MOVHLPS (dst low <- src HIGH), memory = movlps
       // (dst low <- [mem]). Taking the low half in both cases is a silent
       // wrong-pointer bug wherever gcc unpacks an xmm-returned pair.
-      case 0x12: put(`(i64x2.replace_lane 0 ${dst} ${rm.kind==='xmm'?xhi(rm,next):`(i64.load ${wasmAddr(rm,next)})`})`); break;  // movhlps / movlps
+      // F2/F3 prefixes make 0F 12 / 0F 16 the SSE3 duplicates (movddup, movsldup,
+      // movshdup), whole-register writes with nothing kept from dst. Decoded as
+      // movhlps, movsldup zeroed the low lane: ICU's uhash computed its resize
+      // high-water mark through one (length*ratio, vectorised by gcc), got 0,
+      // rehashed on every insert and grew the table until Bun died of ENOMEM.
+      case 0x12:
+        if (insn.pF3) { const v = xv(rm, next); put(`(i8x16.shuffle 0 1 2 3 0 1 2 3 8 9 10 11 8 9 10 11 ${v} ${v})`); break; }   // movsldup: lanes [0,0,2,2]
+        if (insn.pF2) { put(rm.kind === 'xmm' ? `(i64x2.splat ${xlo(rm, next)})` : `(i64x2.splat (i64.load ${wasmAddr(rm, next)}))`); break; }   // movddup
+        put(`(i64x2.replace_lane 0 ${dst} ${rm.kind==='xmm'?xhi(rm,next):`(i64.load ${wasmAddr(rm,next)})`})`); break;  // movhlps / movlps
       case 0x13: storeRm(8, dst); break;                                      // movlps store low
-      case 0x16: put(`(i64x2.replace_lane 1 ${dst} ${rm.kind==='xmm'?xlo(rm,next):`(i64.load ${wasmAddr(rm,next)})`})`); break;  // movhps load high
+      case 0x16:
+        if (insn.pF3) { const v = xv(rm, next); put(`(i8x16.shuffle 4 5 6 7 4 5 6 7 12 13 14 15 12 13 14 15 ${v} ${v})`); break; }   // movshdup: lanes [1,1,3,3]
+        put(`(i64x2.replace_lane 1 ${dst} ${rm.kind==='xmm'?xlo(rm,next):`(i64.load ${wasmAddr(rm,next)})`})`); break;  // movhps load high
       case 0x17: L.push(`(v128.store64_lane 1 ${wasmAddr(rm, next)} ${dst})`); break;   // movhps store high (lane, addr, value)
       case 0x6E:                                                              // movd/movq gpr/mem -> xmm (zero upper)
         if (insn.W) put(`(i64x2.replace_lane 0 ${ZERO} ${rm.kind==='xmm'?rd({kind:'reg',r:rm.r,size:8},8,next):`(i64.load ${wasmAddr(rm,next)})`})`);

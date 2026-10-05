@@ -22,6 +22,7 @@ const DISPSTAT = typeof process !== 'undefined' && ENV.OXWASM_DISPSTAT === '1';
 const STOREGUARD = typeof process !== 'undefined' && ENV.OXWASM_STOREGUARD === '1';
 // Rewrites of one page before it is declared volatile and left interpreted.
 const CW_VOLATILE = Number(ENV.OXWASM_CW_VOLATILE || 8);
+const SYSCALL_PREEMPT = Number(ENV.OXWASM_SYSCALL_PREEMPT || 512);   // compiled-code syscalls between forced thread rotations (see aotEnv.syscall)
 // OXWASM_ANON_HEAT: calls required before GENERATED code is translated, as
 // against a program's own text. A JIT's output has a different life
 // expectancy from a binary's .text - it may be replaced before it is worth
@@ -747,6 +748,7 @@ export class LinuxEngine {
     // pump and deferred entries re-trigger on their next call
     const t0c = (this.tierMsMax !== undefined) ? performance.now() : 0;
     const un = (this._unitN = (this._unitN || 0) + 1);   // bisect aid: veto unit N -> stays interpreted
+    if (typeof process !== 'undefined' && (ENV.OXWASM_FNVETO_FILE || ENV.OXWASM_FNALLOW_FILE || ENV.OXWASM_FNDUMP) && this._envVeto(entry)) { this.aotFailed.add(k); this.noteAotFail(entry, 'vetoed by env (bisect)'); return; }
     if (this.unitFilter && !this.unitFilter(un, entry)) { this.aotFailed.add(k); this.noteAotFail(entry, 'vetoed by unitFilter (bisect)'); return; }
     // vfork stays interpreted. Its child runs on the parent's stack and returns
     // through the parent's frame, which only works when the interpreter owns
@@ -1266,6 +1268,20 @@ export class LinuxEngine {
         if (this._sigRedirected) { this._sigRedirected = false; throw new DeoptUnwind(this.cpu.rip); }
         // rip is already the post-syscall address: the unwind resumes there
         if (this._kidsDue()) { this.blocked = { deadline: this.nowMs() }; throw new BlockUnwind(this.cpu.rip); }
+        // Preemption at a syscall boundary. The run loop rotates threads every
+        // 0x3FFFF interpreter steps, but a thread spinning in COMPILED code
+        // (clock_gettime in a deadline loop: WTF's ParkingLot, JSC's mutator
+        // waiting for its collector) never returns to the run loop, so a
+        // sibling it is waiting on starves until its own timed wait expires
+        // and asserts (Bun with the JIT on: SIGABRT from the GC thread). The
+        // syscall has completed and rip is past it, so the unwind resumes
+        // after it; the thread is parked with an immediate deadline and runs
+        // again after the siblings' quanta.
+        if (this.threads.length > 1 && (this._scPre = (this._scPre | 0) + 1) >= SYSCALL_PREEMPT &&
+            this.threads.some((t, i) => i !== this.ti && t.state === 'run')) {
+          this._scPre = 0; this.stats.syscallPreempt = (this.stats.syscallPreempt || 0) + 1;
+          this.blocked = { deadline: this.nowMs() }; throw new BlockUnwind(this.cpu.rip);
+        }
       },
       callout: (target) => {
         target = BigInt.asUintN(64, target);
@@ -2064,6 +2080,13 @@ export class LinuxEngine {
     const nr = Number(cpu.regs[0]);
     const [a1, a2, a3] = [cpu.regs[7], cpu.regs[6], cpu.regs[2]];   // rdi rsi rdx
     this.stats.syscalls[nr] = (this.stats.syscalls[nr] || 0) + 1;
+    if (ENV.OXWASM_MMAPSTAT && (nr === 9 || nr === 11 || nr === 25) && this._ctor?.argv?.[0]?.includes('opencode')) {
+      const ms = (this._mmapStat ??= { mmapN: 0, mmapB: 0n, munmapN: 0, munmapB: 0n, mremapN: 0, bySize: new Map() });
+      if (nr === 9) { ms.mmapN++; ms.mmapB += a2; const k = (a2 >> 20n).toString() + 'MB/' + cpu.regs[10].toString(16); ms.bySize.set(k, (ms.bySize.get(k) || 0) + 1); }
+      else if (nr === 11) { ms.munmapN++; ms.munmapB += a2; } else ms.mremapN++;
+    }
+    if (ENV.OXWASM_CLOCKCHAIN && nr === 228 && this._ctor?.argv?.[0]?.includes('opencode') && ((this._ccN = (this._ccN | 0) + 1) % (+ENV.OXWASM_CLOCKCHAIN) === 0)) { const out = []; try { let bp = cpu.regs[5]; for (let i = 0; i < 24 && bp; i++) { out.push(this.mem.read(bp + 8n, 8n).toString(16)); bp = this.mem.read(bp, 8n); } } catch {} console.error(`[clock#${this._ccN}] rip=${cpu.rip.toString(16)} chain=${out.join(',')}`); }
+    if (this._mmapStat && nr === 234) { const ms = this._mmapStat; console.error(`[mmapstat@tgkill] mmap n=${ms.mmapN} ${ms.mmapB >> 20n}MB munmap n=${ms.munmapN} ${ms.munmapB >> 20n}MB mmapNext=${this.mmapNext?.toString(16)} base=${this._mmapBase?.toString(16)} holes=${(this._mmapHoles ?? []).map(([l, h]) => l.toString(16) + '+' + ((h - l) >> 20n) + 'MB').join(',')} bySize=${[...ms.bySize].sort((x, y) => y[1] - x[1]).slice(0, 16).map(([k, v]) => k + 'x' + v).join(' ')}`); }
     if (ENV.OXWASM_SCTRACE && this._ctor?.argv?.[0]?.includes('opencode')) {
       const t = this.threads[this.ti], r = cpu.regs;
       const line = `${t?.id} ${nr} ${a1.toString(16)} ${a2.toString(16)} ${a3.toString(16)} sp=${r[4].toString(16)} bp=${r[5].toString(16)} bx=${r[3].toString(16)} r12=${r[12].toString(16)} r13=${r[13].toString(16)} r14=${r[14].toString(16)} r15=${r[15].toString(16)}`;
@@ -2078,14 +2101,16 @@ export class LinuxEngine {
     // its syscall history, not a fault address
     const ret = this.strace
       ? (v) => { cpu.regs[0] = BigInt.asUintN(64, v);
-                 if (ENV.OXWASM_STRACE_SIGNAL && (nr === 234 || nr === 200 || nr === 62)) console.error(`[signal syscall nr=${nr} args=${a1.toString(16)},${a2.toString(16)}] argv0=${this._ctor?.argv?.[0]} last:\n  ` + this.strace.slice(-3).join('\n  ') + '\n  regs:' + [...cpu.regs].map((r, i) => i + '=' + r.toString(16)).join(' ') + '\n  ipbytes:' + (() => { try { let bp = cpu.regs[5]; for (let i = 0; i < 4; i++) bp = this.mem.read(bp, 8n); const off = this.mem.read(bp + 0x24n, 4n); const out = ['cfr=' + bp.toString(16), 'off=' + off.toString(16), 'callee=' + this.mem.read(bp + 0x10n, 8n).toString(16)]; const base = cpu.regs[13] + off; const b = []; for (let i = -24n; i < 16n; i++) b.push(Number(this.mem.read(base + i, 1n)).toString(16).padStart(2, '0')); return out.join(' ') + ' bytes:' + b.join(' '); } catch (e) { return String(e); } })() + '\n  rbpchain:' + (() => { const out = []; try { let bp = cpu.regs[5]; for (let i = 0; i < 16 && bp; i++) { out.push('0x' + this.mem.read(bp + 8n, 8n).toString(16)); bp = this.mem.read(bp, 8n); } } catch {} return out.join(' '); })() + '\n  stack:' + (() => { const out = []; try { const sp = cpu.regs[4]; for (let i = 0n; i < 200n; i++) { const w = this.mem.read(sp + i * 8n, 8n); const m = (this.maps ?? []).find((x) => w >= x.at && w < x.at + BigInt(x.len)); if (m) out.push(`${m.path}+0x${(w - m.at + BigInt(m.fileOff ?? 0)).toString(16)}`); else if (w >= 0x400000n && w < 0x520000n) out.push('exe 0x' + w.toString(16)); } } catch {} return '\n    ' + out.slice(0, 24).join('\n    '); })());
+                 if (ENV.OXWASM_MMAPLOG && (nr === 9 || nr === 11 || nr === 25 || nr === 28 || nr === 12) && this._ctor?.argv?.[0]?.includes('opencode')) process.getBuiltinModule('node:fs').appendFileSync(ENV.OXWASM_MMAPLOG, `${nr} hint=${a1.toString(16)} len=${a2.toString(16)} prot=${a3.toString(16)} flags=${cpu.regs[10].toString(16)} -> ${BigInt.asUintN(64, v).toString(16)} next=${this.mmapNext?.toString(16)}` + (nr === 9 && a2 >= 0x4000000n ? ' chain=' + (() => { const out = []; try { let bp = cpu.regs[5]; for (let i = 0; i < 20 && bp; i++) { out.push(this.mem.read(bp + 8n, 8n).toString(16)); bp = this.mem.read(bp, 8n); } } catch {} return out.join(','); })() : '') + '\n');
+                 if (ENV.OXWASM_MMAPTRACE && nr === 9 && v === -12n) { const out = []; try { let bp = cpu.regs[5]; for (let i = 0; i < 24 && bp; i++) { out.push('0x' + this.mem.read(bp + 8n, 8n).toString(16)); bp = this.mem.read(bp, 8n); } } catch {} console.error(`[mmap ENOMEM] len=${a2.toString(16)} prot=${a3.toString(16)} flags=${cpu.regs[10].toString(16)} mmapNext=${this.mmapNext?.toString(16)} memEnd=${(this.base + BigInt(this.mem?.size ?? 0)).toString(16)} rbp-chain: ${out.join(' ')}`); }
+                 if (ENV.OXWASM_STRACE_SIGNAL && (nr === 234 || nr === 200 || nr === 62)) console.error(`[signal syscall nr=${nr} args=${a1.toString(16)},${a2.toString(16)}] argv0=${this._ctor?.argv?.[0]} last:\n  ` + this.strace.slice(-(+ENV.OXWASM_STRACE_N || 3)).join('\n  ') + '\n  threads:' + this.threads.map((t, i) => { let self = '?', tid = '?'; try { self = this.mem.read(t.cpu.fsBase + 0x10n, 8n).toString(16); tid = this.mem.read(t.cpu.fsBase + 0x2d0n, 4n).toString(); } catch {} return `[${i}] id=${t.id} st=${t.state} fs=${t.cpu.fsBase?.toString(16)} self=${self} tcbtid=${tid}`; }).join(' ') + '\n  regs:' + [...cpu.regs].map((r, i) => i + '=' + r.toString(16)).join(' ') + '\n  ipbytes:' + (() => { try { let bp = cpu.regs[5]; for (let i = 0; i < 4; i++) bp = this.mem.read(bp, 8n); const off = this.mem.read(bp + 0x24n, 4n); const out = ['cfr=' + bp.toString(16), 'off=' + off.toString(16), 'callee=' + this.mem.read(bp + 0x10n, 8n).toString(16)]; const base = cpu.regs[13] + off; const b = []; for (let i = -24n; i < 16n; i++) b.push(Number(this.mem.read(base + i, 1n)).toString(16).padStart(2, '0')); return out.join(' ') + ' bytes:' + b.join(' '); } catch (e) { return String(e); } })() + '\n  rbpchain:' + (() => { const out = []; try { let bp = cpu.regs[5]; for (let i = 0; i < 16 && bp; i++) { out.push('0x' + this.mem.read(bp + 8n, 8n).toString(16)); bp = this.mem.read(bp, 8n); } } catch {} return out.join(' '); })() + '\n  stack:' + (() => { const out = []; try { const sp = cpu.regs[4]; for (let i = 0n; i < 200n; i++) { const w = this.mem.read(sp + i * 8n, 8n); const m = (this.maps ?? []).find((x) => w >= x.at && w < x.at + BigInt(x.len)); if (m) out.push(`${m.path}+0x${(w - m.at + BigInt(m.fileOff ?? 0)).toString(16)}`); else if (w >= 0x400000n && w < 0x520000n) out.push('exe 0x' + w.toString(16)); } } catch {} return '\n    ' + out.slice(0, 24).join('\n    '); })());
                  if (ENV.OXWASM_DBG_ERR && BigInt.asIntN(64, v) === BigInt(-ENV.OXWASM_DBG_ERR)) console.error(`[errno ${ENV.OXWASM_DBG_ERR}] tid=${this.threads[this.ti]?.id} nr=${nr} args=${a1.toString(16)},${a2.toString(16)},${a3.toString(16)} argv0=${this._ctor?.argv?.[0]}`);
                  let ps = '';   // decode the path argument of the fs family
                  try { if (nr === 257 || nr === 262) ps = ' "' + this.readPath(a2) + '"';
                        else if (nr === 2 || nr === 21 || nr === 89 || nr === 4 || nr === 6 || nr === 87 || nr === 82 || nr === 83 || nr === 59) ps = ' "' + this.readPath(a1) + '"';
                        else if (nr === 263 || nr === 264) ps = ' "' + this.readPath(a2) + '"'; } catch {}
                  this.strace.push(`[${this.threads[this.ti]?.id ?? 1}]${nr}(${a1.toString(16)},${a2.toString(16)},${a3.toString(16)})=${BigInt.asIntN(64, v)}${ps}`);
-                 if (this.strace.length > 400) this.strace.shift(); }
+                 if (this.strace.length > (+ENV.OXWASM_STRACE_CAP || 400)) this.strace.shift(); }
       : (v) => { cpu.regs[0] = BigInt.asUintN(64, v); };
     // resolve a write target: stdout / stderr sink, or a pipe buffer
     const defSink = (fd) => this.fds.get(fd) ?? (fd === 1 ? { sink: 'out' } : fd === 2 ? { sink: 'err' } : undefined);
@@ -2768,6 +2793,7 @@ export class LinuxEngine {
         ret(8n); break; }
       case 60: case 231: {                                   // exit / exit_group
         if (ENV.OXWASM_AOTSTOP && this._ctor?.argv?.[0]?.includes('opencode')) console.error('[aotstop] exit total disp', this.stats.disp);
+        if (this._mmapStat) { const ms = this._mmapStat; console.error(`[mmapstat] mmap n=${ms.mmapN} ${ms.mmapB >> 20n}MB munmap n=${ms.munmapN} ${ms.munmapB >> 20n}MB mremap=${ms.mremapN} mmapNext=${this.mmapNext?.toString(16)} base=${this._mmapBase?.toString(16)} holes=${this._mmapHoles?.length} holeMB=${(this._mmapHoles ?? []).reduce((t, [l, h]) => t + (h - l), 0n) >> 20n} bySize=${[...ms.bySize].sort((x, y) => y[1] - x[1]).slice(0, 14).map(([k, v]) => k + 'x' + v).join(' ')}`); }
         if (ENV.OXWASM_SCTRACE && this._sct?.length) { process.getBuiltinModule('node:fs').appendFileSync(ENV.OXWASM_SCTRACE, this._sct.join('\n') + '\n'); this._sct.length = 0; }
         if (ENV.OXWASM_IHIST && globalThis.__ihist && this._ctor?.argv?.[0]?.includes(ENV.OXWASM_IHIST)) { const b = new Map(); for (const [k, v] of globalThis.__ihist) { const kk = (BigInt(k) >> 6n << 6n).toString(16); b.set(kk, (b.get(kk) || 0) + v); } console.error('[ihist] ' + [...b].sort((x, y) => y[1] - x[1]).slice(0, 60).map(([k, v]) => k + '=' + v).join(' ')); }
         if (this.calloutLog && ENV.OXWASM_STATS && this._ctor?.argv?.[0]?.includes(ENV.OXWASM_STATS)) console.error('[callouts] ' + [...this.calloutLog].sort((x, y) => y[1] - x[1]).slice(0, 30).map(([k, v]) => k + ' x' + v).join(' | '));
@@ -3360,13 +3386,14 @@ export class LinuxEngine {
             // per thread, as nanosleep and poll do) and checked on re-entry.
             if (this._deadline == null) {
               const o = this.RAMOFF + Number(tp - this.base);
+              if (ENV.OXWASM_FUTEXTRACE) { const v = new DataView(this.wmem.buffer); console.error(`[futex wait] tid=${this.threads[this.ti]?.id} addr=${a1.toString(16)} op=${a2.toString(16)} ts=${v.getBigUint64(o, true)}.${v.getBigUint64(o + 8, true)} now=${Date.now()} engine=${this.nowMs().toFixed(1)}`); }
               const v = new DataView(this.wmem.buffer);
               let ms = Number(v.getBigUint64(o, true)) * 1000 + Number(v.getBigUint64(o + 8, true)) / 1e6;
               if (op === 9) {                                 // WAIT_BITSET: absolute time
                 if (ms > 1e11) ms = ms - Date.now() + this.nowMs();   // realtime epoch -> engine clock
               } else ms = this.nowMs() + ms;                  // WAIT: relative
               this._deadline = ms;
-            } else if (this.nowMs() >= this._deadline) { this._deadline = null; ret(-110n); break; }   // ETIMEDOUT
+            } else if (this.nowMs() >= this._deadline) { if (ENV.OXWASM_FUTEXTRACE) { const o = this.RAMOFF + Number(tp - this.base), v = new DataView(this.wmem.buffer); console.error(`[futex ETIMEDOUT] tid=${this.threads[this.ti]?.id} addr=${a1.toString(16)} op=${a2.toString(16)} ts=${v.getBigUint64(o, true)}.${v.getBigUint64(o + 8, true)} now=${Date.now()} engine=${this.nowMs().toFixed(1)} deadline=${this._deadline.toFixed(1)} rip=${cpu.rip.toString(16)}`); } this._deadline = null; ret(-110n); break; }   // ETIMEDOUT
             dl = this._deadline;
           }
           this._futexAddr = a1;                               // park() records it on the thread
@@ -5586,7 +5613,7 @@ export class LinuxEngine {
     }
     if (globalThis.__fnDump) { const h = BigInt(c).toString(16); if (!globalThis.__fnDump.has(h)) { globalThis.__fnDump.add(h); process.getBuiltinModule('node:fs').appendFileSync(ENV.OXWASM_FNDUMP, h + '\n'); } }
     const hx = BigInt(c).toString(16);
-    if (ENV.OXWASM_DUMPFN && ENV.OXWASM_DUMPFN.split(',').includes(hx)) { const b = new Uint8Array(0x600); for (let i = 0; i < b.length; i++) { try { b[i] = Number(this.mem.read(BigInt(c) + BigInt(i), 1n)); } catch { break; } } process.getBuiltinModule('node:fs').writeFileSync(ENV.OXWASM_DUMPDIR + '/fn_' + hx + '.bin', b); }
+    if (ENV.OXWASM_DUMPFN && ENV.OXWASM_DUMPFN.split(',').includes(hx)) { const b = new Uint8Array(0x600); for (let i = 0; i < b.length; i++) { try { b[i] = Number(this.mem.read(BigInt(c) + BigInt(i), 1n)); } catch { break; } } process.getBuiltinModule('node:fs').writeFileSync(ENV.OXWASM_DUMPDIR + '/fn_' + hx + '.bin', b); const m = (this.maps ?? []).find((x) => BigInt(c) >= x.at && BigInt(c) < x.at + BigInt(x.len)); console.error(`[dumpfn] ${hx} map=${m ? m.path + '+0x' + (BigInt(c) - m.at + BigInt(m.fileOff ?? 0)).toString(16) : 'anon'} execRanges=${(this.execRanges ?? []).filter(([x, y]) => BigInt(c) >= x && BigInt(c) < y).map(([x, y]) => x.toString(16) + '-' + y.toString(16)).join(',')}`); }
     return (this._ev ? this._ev.has(hx) : false) || (this._ea ? !this._ea.has(hx) : false);
   }
 
