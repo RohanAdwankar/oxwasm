@@ -3980,7 +3980,7 @@ const BLOCKLOOPS = typeof process !== 'undefined' && process.env?.OXWASM_BLOCKLO
 // OXWASM_TAILCUT=0 follows tail jumps into other functions again (A/B)
 const TAILCUT = !(typeof process !== 'undefined' && process.env?.OXWASM_TAILCUT === '0');
 const LOOPYIELD = !((typeof process !== 'undefined' && process.env?.OXWASM_LOOPYIELD === '0') || globalThis.__loopYield === false);
-export const LOOPYIELD_N = (typeof process !== 'undefined' && +process.env?.OXWASM_LOOPYIELD_N) || 4000000;   // backward edges per yield; dispatchAot's fill and the in-wasm refill agree
+export const LOOPYIELD_N = (typeof process !== 'undefined' && +process.env?.OXWASM_LOOPYIELD_N) || 1000000;   // backward edges per yield (dispatchAot's fill and the in-wasm refill agree); 4M let a spin-wait hold the engine for seconds between thread rotations
 // Opt out with OXWASM_INLINE=0 or globalThis.__inline = false.
 // OXWASM_INLINE_BUDGET caps the callee size in instructions - the default is
 // in the low hundreds because gzip's three hot callees are 66, 88 and 114,

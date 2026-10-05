@@ -165,12 +165,13 @@ export class EngineHost {
         files: image.files, mtimes: image.mtimes, memMB, assembleWat, net: netp, diskMB: o.diskMB ?? 1024,
       });
       eng.assembleWatDeferred = assembleWatDeferred;
-      if (o.unitCache !== false) { try { eng.unitStore = unitStore ??= makeUnitStore(CACHE_DIR); } catch {} }   // compiled units persist across runs and programs
+      if (o.unitCache !== false && process.env.OXWASM_UNITCACHE !== '0') { try { eng.unitStore = unitStore ??= makeUnitStore(CACHE_DIR); } catch {} }   // compiled units persist across runs and programs
       // exec'd programs: the child engines default to browser-sized units (24 functions, 4,000 instructions, for wabt.js);
       // a Node host assembles in-process or with wat2wasm and can take real hot functions
       eng.childUnitMaxFuncs = o.unitMaxFuncs ?? 96; eng.childUnitMaxInsns = o.unitMaxInsns ?? 30000;
       if (o.cpus) eng.ncpu = o.cpus;                     // CPUs the guest sees (default 1): runtimes size their thread pools from it
       if (o.childMemMB) eng.childMemMB = o.childMemMB;   // RAM for each exec'd program (default 256 MB): large binaries need more
+      if (o.maxProcs) eng.maxProcs = o.maxProcs;         // live processes the sandbox may have (default 64): fork fails with EAGAIN past it
       if (process.env.OXWASM_STRACE) eng.strace = [];     // debugging: keep a ring of syscalls, shown when the guest exits unexpectedly
       if (process.env.OXWASM_STRACE) eng.strace = [];     // debugging: syscall ring, printed on tgkill/kill when OXWASM_STRACE_SIGNAL is set
       if (image.meta) {                             // a rootfs carries symlinks, empty directories and file modes
@@ -188,6 +189,8 @@ export class EngineHost {
       if (process.env.OXWASM_NOAOT) { eng.aotCallThreshold = 1e15; eng.aotLoopThreshold = 1e15; }
       if (process.env.OXWASM_AOTCALL) { eng.aotCallThreshold = +process.env.OXWASM_AOTCALL; eng.aotLoopThreshold = +process.env.OXWASM_AOTLOOP; }
       if (process.env.OXWASM_FRAMETRACE) globalThis.__frameTrace = true;
+      if (process.env.OXWASM_CHAINSLOW) eng.chainSlow = true;   // A/B: no wasm-to-wasm chaining at callouts/deopts (every hop interprets or unwinds)
+      if (process.env.OXWASM_SHADOW) { eng.shadowChildLib = process.env.OXWASM_SHADOW; eng.shadowMax = +(process.env.OXWASM_SHADOW_MAX || 50); if (process.env.OXWASM_SHADOW_BOOT) eng.shadowLib = eng.shadowChildLib; }   // differential shadow of compiled dispatches (exec'd programs; OXWASM_SHADOW_BOOT=1 for the boot shell too), see shadowDispatch
       eng.chainFuel = 2048; eng.loopYield = 20000;
       return eng;
     };

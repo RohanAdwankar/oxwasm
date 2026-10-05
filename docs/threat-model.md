@@ -32,7 +32,7 @@ So the claims below are claims about those handlers, not about a kernel.
 | A guest cannot spend unbounded host memory | RAM is capped by `memMB`; file writes by any process in the guest, and unnamed files (memfd, O_TMPFILE), are charged against `diskMB` (default 1024) and refused with ENOSPC | allocation past `memMB`, a 6 GB write, the same write from a spawned process, a memfd |
 | A guest that never yields cannot hang the host | The sandbox runs in a worker thread that the parent terminates on timeout | busy-loop containment in `sandboxtest.mjs` |
 | Hostile system calls do not affect the host | Handlers take guest pointers through bounds-checked guest-memory accessors | 19 syscalls with wild pointers and dangerous numbers |
-| A fork bomb is contained | It ends in an error or a timeout; the host is unaffected | fork-bomb check |
+| A fork bomb is contained | A sandbox may have `maxProcs` live processes (default 64); fork/clone fail with EAGAIN past that. Each forked child that outlives its exec window is a full engine (its own memory plus a copy of the parent's live pages, tens of MB for a python process), so the cap is what bounds the host memory a fork bomb can take | fork-bomb check |
 | With `isolation: 'process'`, an engine bug that gives a guest JavaScript execution still cannot read host files outside a short allow-list, write outside the cache and directories you name, or start a process | The sandbox runs in a child process under Node's `--permission` model, with no child-process permission | a self-test run inside that process: reads of `/etc/passwd`, `/proc/self/environ` and `$HOME`, a write to `/tmp`, and a spawn are all denied (needs `OXWASM_TEST_ROOTFS`) |
 
 ## What is not claimed
