@@ -68,6 +68,7 @@ node pclmultest.mjs
 node cmpxchgdqtest.mjs
 node dupstest.mjs
 node atomic8test.mjs
+node patchtest.mjs
 node aotcxtest.mjs
 node cvtdqpdtest.mjs
 node flagjointest.mjs

@@ -1836,7 +1836,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
            `(local.set $gp (i32.sub (local.get $ga) (i32.load (i32.const ${CWLO_SLOT})))) ` +
            `(if (i32.lt_u (local.get $gp) (i32.load (i32.const ${CWLEN_SLOT}))) ` +
            `(then (if (i32.load8_u (i32.add (i32.const ${CWMAP}) (i32.shr_u (local.get $gp) (i32.const 12)))) ` +
-           `(then (call $x_cw (local.get $ga)))))) ` +
+           `(then (call $x_cw (local.get $ga) (i64.const ${next === undefined ? 0 : next})))))) ` +
            `(${ST[size]} (local.get $ga) ${expr})`;
   };
   const ALU = { add:'i64.add', sub:'i64.sub', and:'i64.and', or:'i64.or', xor:'i64.xor' };
@@ -4225,7 +4225,7 @@ export function compileUnitWat(mem, entry, opts = {}) {
   wat += '  (import "env" "loophot" (func $x_loophot (param i64)))\n';   // a loop head that ran long without a unit of its own (see FTLOOP)
   // Only when the guard is on, so a module built without it keeps exactly the
   // imports every existing consumer supplies.
-  if (STOREGUARD) wat += '  (import "env" "codewrite" (func $x_cw (param i32)))\n';
+  if (STOREGUARD) wat += '  (import "env" "codewrite" (func $x_cw (param i32 i64)))\n';   // (address, guest rip after the storing instruction)
   // the global dispatch table + its in-wasm resolver, iff some site chains
   // through it (indirect call, out-of-unit static call, indirect tail jump)
   const tf0 = PHASE ? performance.now() : 0;

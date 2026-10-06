@@ -5,6 +5,7 @@
 import { decode } from './decode.mjs';
 
 const MASK = { 1: 0xFFn, 2: 0xFFFFn, 4: 0xFFFFFFFFn, 8: 0xFFFFFFFFFFFFFFFFn };
+const ICACHE_MAX = 1 << 18;     // decoded instructions kept per CPU (see step)
 // bit-accurate float <-> raw-bits conversion for the SSE lanes
 const FPB = new DataView(new ArrayBuffer(8));
 const FP = {
@@ -24,7 +25,14 @@ export class Memory {
   // watch: optional write-watchpoint (addr, n, v) => void, called before any
   // write overlapping [watchLo, watchHi). Debug aid; null = no cost beyond
   // the null check.
-  constructor(regions) { this.regions = regions; this.pend = null; this.watch = null; }   // [{base, bytes}]
+  constructor(regions) { this.regions = regions; this.pend = null; this.watch = null; this.jit = null; this.jitBase = 0n; }   // [{base, bytes}]
+  // jit: optional page map (1 = a page the guest mapped or mprotected
+  // executable at runtime: a JIT's code cache). Instructions decoded from
+  // such a page keep their bytes and are checked against memory on every
+  // step, because the guest patches that code in place (JSC repatches call
+  // targets, inline caches and lazy slow paths; an address-keyed decode
+  // cache served the old instruction). Static text pays only a null check.
+  jitPage(addr) { return this.jit !== null && this.jit[Number((addr - this.jitBase) >> 12n)] === 1; }
   find(addr) {
     const l = this._last;
     if (l !== undefined && addr >= l.base && addr < l.end) return l;
@@ -163,8 +171,16 @@ export class CPU {
   step() {
     const rip = this.rip;
     let insn = (this.icache ??= new Map()).get(rip);
+    if (insn !== undefined && insn.sig0 !== undefined &&
+        (this.mem.read(rip, 8n) !== insn.sig0 || (insn.sig1 !== undefined && this.mem.read(rip + 8n, 8n) !== insn.sig1))) insn = undefined;   // patched since it was decoded
     if (insn === undefined) {
       insn = decode((i) => Number(this.mem.read(rip + BigInt(i), 1n)), rip);
+      if (this.mem.jitPage(rip)) { insn.sig0 = this.mem.read(rip, 8n); if (insn.len > 8) insn.sig1 = this.mem.read(rip + 8n, 8n); }
+      // Bounded: a long interpreted stretch of a big program (a JS engine's whole
+      // interpreter loop) decoded millions of distinct instructions and the map
+      // alone reached several GB. Past the cap the map restarts; the working set
+      // re-decodes once, which is noise against the interpretation itself.
+      if (this.icache.size >= ICACHE_MAX) this.icache.clear();
       this.icache.set(rip, insn);
     }
     const next = rip + BigInt(insn.len);

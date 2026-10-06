@@ -37,6 +37,18 @@ const PAGE = 4096n;
 const align = (v, a) => (v + a - 1n) & ~(a - 1n);
 const EXIT = Symbol('guest-exit');           // unwinds live wasm frames on exit()
 const SHADOW_ABORT = { shadowAbort: true };
+const SHADOW_DISP = ENV.OXWASM_SHADOW_DISP ? ENV.OXWASM_SHADOW_DISP.split('-').map(Number) : null;
+const AOTSKIP = ENV.OXWASM_AOTSKIP ? ENV.OXWASM_AOTSKIP.split('-').map(Number) : null;
+const DISPRING = !!ENV.OXWASM_DISPRING;
+// OXWASM_DETRANDOM=<seed>: every byte of randomness the guest sees (AT_RANDOM, getrandom, /dev/urandom)
+// comes from a seeded generator, so a run can be replayed exactly (diagnosis; never for real use).
+let _detRnd = ENV.OXWASM_DETRANDOM ? (BigInt(ENV.OXWASM_DETRANDOM) | 0x9E3779B97F4A7C15n) & 0xFFFFFFFFFFFFFFFFn : null;
+function fillRandom(u8) {
+  if (_detRnd === null) return crypto.getRandomValues(u8);
+  let x = _detRnd;
+  for (let i = 0; i < u8.length; i++) { x ^= (x << 13n) & 0xFFFFFFFFFFFFFFFFn; x ^= x >> 7n; x ^= (x << 17n) & 0xFFFFFFFFFFFFFFFFn; u8[i] = Number(x & 0xFFn); }
+  _detRnd = x; return u8;
+}
 const BRANCHY = new Set(['jmp','jcc','call','ret','retn','jmpind','callind','syscall','leave','hlt','int3']);
 // A deopt DESTROYS the live wasm frames instead of interpreting under them:
 // at the escape point every register was spilled to the regfile and all
@@ -89,6 +101,8 @@ export class LinuxEngine {
                           xserver = null, mtimes = {}, tty = false, ttyRows = 24, ttyCols = 80,
                           stdin = null, net = null, diskMB = 0, maxProcs = 64 } = {}) {
     this._diskQuota = diskMB * 1048576;       // 0 = unlimited
+    if (ENV.OXWASM_RIPLOG) { this._ripLog = new Set(ENV.OXWASM_RIPLOG.split(',').map((h) => BigInt('0x' + h))); this._ripLogRing = []; if (ENV.OXWASM_AOTSKIP_AT) { const [a, b] = ENV.OXWASM_AOTSKIP_AT.split(':'); this._skipAt = [BigInt('0x' + a), b]; } }   // regs at these rips (interpreted), last 48, dumped by _onBreak
+    if (ENV.OXWASM_RIPTRACE) { this.ripTrace = new Array(65536).fill(0n); this.ripTraceI = 0; const [lo, hi] = (ENV.OXWASM_RIPTRACE_RANGE || '0-ffffffffffff').split('-'); this._rtLo = BigInt('0x' + lo); this._rtHi = BigInt('0x' + hi); }   // recent rips: AOT entry/exit (negative) and interpreted steps; dumped by _onBreak
     this.maxProcs = maxProcs;                 // live processes per sandbox (root engine's value counts; see _liveProcs)
     this._netProvider = net;                  // host-side network bridge (see sdk/net.mjs); null = no network
     this.files = files;                       // path -> Uint8Array (read-only)
@@ -563,6 +577,7 @@ export class LinuxEngine {
   // Unwind the wasm frames to the top loop, which resumes at the landing.
   _finishFrame(retAddr, rspExit) {
     this.interpUntil(() => (this.cpu.rip === retAddr && this.cpu.regs[4] === rspExit) || this.cpu.regs[4] > rspExit);
+    if (DISPRING) this._dr('finished', retAddr, this.cpu.rip, this.cpu.regs[4]);
     this.syncOut();
     if (globalThis.__frameTrace && this.cpu.regs[4] <= rspExit) console.error(`<finish retAddr=${retAddr.toString(16)} rsp=${this.cpu.regs[4].toString(16)} rspExit=${rspExit.toString(16)}>`);
     if (this.cpu.regs[4] > rspExit) { this.stats.frameGone = (this.stats.frameGone || 0) + 1; if (globalThis.__frameTrace) console.error(`<framegone callout rip=${this.cpu.rip.toString(16)} rsp=${this.cpu.regs[4].toString(16)} rspExit=${rspExit.toString(16)}>`); throw new DeoptUnwind(this.cpu.rip); }
@@ -572,6 +587,12 @@ export class LinuxEngine {
   // closure-pruning and known-entry sets (a fresh mapping here must be able
   // to join closures again) - cancel in-flight units that hold any of it, and
   // rebuild the dispatch hash if anything compiled was dropped.
+  // Pages the guest made executable at runtime (see Memory.jitPage).
+  _jitMark(lo, hi, on) {
+    const m = this.mem.jit ??= (this.mem.jitBase = this.base, new Uint8Array(Math.ceil(this.ram.length / 4096)));
+    let a = Number((lo - this.base) >> 12n); const b = Number((hi - this.base + 4095n) >> 12n);
+    for (a = Math.max(a, 0); a < b && a < m.length; a++) m[a] = on;
+  }
   _invalidateCode(lo, hi) {
     const inR = (k) => k >= lo && k < hi;
     let hit = false;
@@ -954,7 +975,9 @@ export class LinuxEngine {
     const fn0 = fdv.getUint32(FTNEST, true); fdv.setUint32(FTNEST, 0, true);   // this dispatch's frame is top-level: its exit rip is honoured
     this.syncOut();
     const entry = this.cpu.rip; this._lastEntry = entry;
+    if (DISPRING) this._dr('disp', entry, this.cpu.regs[4]);
     try { let exit = f();
+      if (DISPRING) this._dr('exit', entry, BigInt.asUintN(64, exit), this.aotDrive ? 1 : 0);
       if (fdv.getUint32(FTLOOP, true) === 0) this.stats.loopYieldTop = (this.stats.loopYieldTop || 0) + 1;   // the frame returned on a spent loop budget: a top-level yield
       // In-wasm driver: a top frame's guest ret exits its wasm function, but
       // the next rip is usually another compiled function — chain to it in
@@ -962,10 +985,11 @@ export class LinuxEngine {
       // the same fuel/depth budgets) instead of paying a JS round-trip with a
       // full regfile syncOut/syncIn per top-frame ret.
       if (this.aotDrive) exit = this.aotDrive(exit);
+      if (DISPRING) this._dr('driven', entry, BigInt.asUintN(64, exit));
       this.syncIn(); this.stats.aotRuns++;
       if (this.onProgress && this.stats.aotRuns % 4e6 === 0) this.onProgress('aot');
       return BigInt.asUintN(64, exit); }
-    catch (e) { if (e instanceof DeoptUnwind) { this.syncIn(); if (globalThis.__frameTrace) console.error(`<dispatch-catch entry=${entry.toString(16)} erip=${e.rip.toString(16)} rsp=${this.cpu.regs[4].toString(16)} iu=${this._iuDepth | 0}>`);
+    catch (e) { if (DISPRING) this._dr(e instanceof DeoptUnwind ? 'unwind' : e instanceof BlockUnwind ? 'block' : 'throw', entry, e.rip ?? 0n); if (e instanceof DeoptUnwind) { this.syncIn(); if (globalThis.__frameTrace) console.error(`<dispatch-catch entry=${entry.toString(16)} erip=${e.rip.toString(16)} rsp=${this.cpu.regs[4].toString(16)} iu=${this._iuDepth | 0}>`);
         // A deopt back to the exact rip we dispatched made zero progress, and
         // the caller's loop will re-dispatch the same function — with a deopt
         // GUARD at the entry insn (e.g. a 128-bit `div` whose back-edge
@@ -1009,13 +1033,36 @@ export class LinuxEngine {
     const savedBudget = this.aotBudget; this.aotBudget = 0;
     this.mem.jrnl = [];
     let ok = true, steps = 0;
+    // OXWASM_SHADOW_EXIT: a unit need not come back to its return address - a
+    // tail jump out (LLInt's native-call trampoline jumps into the throw path
+    // when the native set an exception) exits it elsewhere, and the plain
+    // shadow could only bail there, silently. Exit-matched mode records the
+    // interpreter's state before every step (registers, flags, and the values
+    // its writes stored), runs the compiled side, and compares at the first
+    // recorded state whose rip and rsp are where the compiled frame actually
+    // left. Costly (a snapshot per step); for hunting, not for sweeps.
+    const exitMatch = !!ENV.OXWASM_SHADOW_EXIT, trace = exitMatch ? [] : null, CAP = exitMatch ? 200000 : 5e6;
+    // Registers and xmm per step go into one preallocated buffer (48 words a step): the
+    // per-step slices were most of the cost of a shadowed dispatch.
+    const TB = exitMatch ? (this._shadowTB ??= new BigInt64Array((CAP + 2) * 48)) : null;
+    const rec = () => {
+      const jr = this.mem.jrnl, from = trace.length ? trace[trace.length - 1].jn : 0, wr = [];
+      for (let i = from; i < jr.length; i++) { const [a, n, _o, snap] = jr[i]; wr.push(snap ? [a, BigInt(snap.length), this.mem.view(a, BigInt(snap.length)).slice()] : [a, n, this.mem.read(a, n)]); }
+      const o = trace.length * 48;
+      for (let r = 0; r < 16; r++) TB[o + r] = BigInt.asIntN(64, cpu.regs[r]);
+      for (let r = 0; r < 16; r++) { const x = cpu.xmm[r] ?? 0n; TB[o + 16 + 2 * r] = BigInt.asIntN(64, x & 0xFFFFFFFFFFFFFFFFn); TB[o + 17 + 2 * r] = BigInt.asIntN(64, x >> 64n); }
+      trace.push({ rip: cpu.rip, rsp: cpu.regs[4], f: { ...cpu.f }, jn: jr.length, wr });
+    };
     try {
       while (!(cpu.rip === retAddr && cpu.regs[4] === rspExit)) {
+        if (trace) rec();
         cpu.step();
         if (this.exitCode !== null || this.blocked) { ok = false; break; }
-        if (++steps > 5e6) { ok = false; break; }
+        if (++steps > CAP) { ok = exitMatch; break; }   // exit-matched: the trace so far may still hold the exit
       }
-    } catch (e) { ok = false; if (!(e === SHADOW_ABORT || e instanceof Error)) throw e; }
+      if (trace && ok) rec();
+    } catch (e) { ok = false; if (!(e === SHADOW_ABORT || e instanceof Error)) throw e; if (trace) (st.abortedAt ??= new Map()).set(`${entryRip.toString(16)}@${cpu.rip.toString(16)}${e === SHADOW_ABORT ? 'sys' : 'err'}`, (st.abortedAt?.get(`${entryRip.toString(16)}@${cpu.rip.toString(16)}${e === SHADOW_ABORT ? 'sys' : 'err'}`) ?? 0) + 1); }
+    if (trace && !ok && !this.blocked && this.exitCode === null && steps <= CAP) { /* recorded above */ } else if (trace && !ok) (st.abortedAt ??= new Map()).set(`${entryRip.toString(16)}@${cpu.rip.toString(16)}${this.blocked ? 'blk' : 'cap'}`, (st.abortedAt?.get(`${entryRip.toString(16)}@${cpu.rip.toString(16)}${this.blocked ? 'blk' : 'cap'}`) ?? 0) + 1);
     this._shadowInterp = false;
     const jr = this.mem.jrnl; this.mem.jrnl = null;
     this.aotBudget = savedBudget;
@@ -1033,7 +1080,53 @@ export class LinuxEngine {
     // restore entry state and run the compiled side for real
     cpu.regs = regs0.slice(); cpu.xmm = xmm0.slice(); cpu.fsBase = fs0; cpu.f = { ...fl0 };
     cpu.rip = entryRip;
+    // Exit-matched mode also watches for STRAY stores: bytes near the stack the compiled side
+    // changed that the interpreter never wrote by the matched step. The journal only knows the
+    // interpreter's stores, so a unit writing where it should not was invisible to the comparison.
+    let snapLo = 0n, snap = null;
+    if (trace !== null && ok) { try { snapLo = rsp0 - 16384n; snap = this.mem.view(snapLo, 16384n + 131072n).slice(); } catch { snap = null; } }
     const exitRip = this.dispatchAot(f);
+    if (trace !== null) {
+      if (!ok || (this._shadowDiverged ?? 0) >= 100) { st.aborted++; this._shadowBusy = false; return exitRip; }
+      const ks = []; for (let i = 0; i < trace.length; i++) if (trace[i].rip === exitRip && trace[i].rsp === cpu.regs[4]) ks.push(i);
+      if (!ks.length) { st.aborted++; (st.noexit ??= new Map()).set(entryRip, (st.noexit.get(entryRip) ?? 0) + 1); this._shadowBusy = false; return exitRip; }
+      st.compared++;
+      let best = null;
+      for (const k of ks) {                                 // a loop revisits (rip, rsp): report only if no visit matches
+        const T = trace[k], diffs = [], o = k * 48;
+        for (let r = 0; r < 16; r++) { const v = BigInt.asUintN(64, TB[o + r]); if (cpu.regs[r] !== v) diffs.push(`r${r} aot=${cpu.regs[r].toString(16)} interp=${v.toString(16)}`); }
+        for (let r = 0; r < 16; r++) { const v = BigInt.asUintN(64, TB[o + 16 + 2 * r]) | (BigInt.asUintN(64, TB[o + 17 + 2 * r]) << 64n); const a = cpu.xmm[r] ?? 0n; if (a !== v) diffs.push(`xmm${r} aot=${a.toString(16)} interp=${v.toString(16)}`); }
+        // Flags are usually dead where a unit leaves (a call, a return, a jump the condition of
+        // which was consumed): exit-matched mode ignores them unless OXWASM_SHADOW_FLAGS=1, so a
+        // dozen dead-flag reports do not use up the divergence cap before a real one.
+        if (ENV.OXWASM_SHADOW_FLAGS) for (const key of Object.keys(T.f)) if (cpu.f[key] !== T.f[key]) diffs.push(`flag ${key} aot=${cpu.f[key]} interp=${T.f[key]}`);
+        else for (const key of Object.keys(T.f)) if (cpu.f[key] !== T.f[key]) (st.flagOnly ??= new Map()).set(`${entryRip.toString(16)}>${exitRip.toString(16)}`, (st.flagOnly?.get(`${entryRip.toString(16)}>${exitRip.toString(16)}`) ?? 0) + 1);
+        // The interpreter's memory at step k, byte by byte: its writes replayed in order (a wide
+        // store followed by narrower ones to the same bytes must compare as the narrower ones left it)
+        const img = new Map();
+        for (let i = 0; i <= k; i++) for (const [a, n, v] of trace[i].wr) {
+          if (typeof v === 'bigint') { for (let b = 0n; b < n; b++) img.set(a + b, Number((v >> (8n * b)) & 0xFFn)); }
+          else for (let b = 0; b < v.length; b++) img.set(a + BigInt(b), v[b]);
+        }
+        let shown = 0;
+        for (const [a, v] of img) { const cur = Number(this.mem.read(a, 1n)); if (cur !== v) { if (shown++ < 12) diffs.push(`mem 0x${a.toString(16)} aot=${cur.toString(16)} interp=${v.toString(16)}`); } }
+        if (shown > 12) diffs.push(`... ${shown} bytes differ`);
+        if (snap !== null) {
+          const cur = this.mem.view(snapLo, BigInt(snap.length)); let stray = 0;
+          for (let i = 0; i < snap.length; i++) if (cur[i] !== snap[i] && !img.has(snapLo + BigInt(i))) { if (stray++ < 12) diffs.push(`stray 0x${(snapLo + BigInt(i)).toString(16)} was=${snap[i].toString(16)} aot=${cur[i].toString(16)} (rsp0-${(rsp0 - snapLo - BigInt(i)).toString(16)})`); }
+          if (stray > 12) diffs.push(`... ${stray} stray bytes`);
+        }
+        if (best === null || diffs.length < best.diffs.length) best = { k, diffs };
+        if (!diffs.length) break;
+      }
+      if (best.diffs.length) {
+        st.diverged++; this._shadowDiverged = (this._shadowDiverged ?? 0) + 1;
+        console.error(`<SHADOW-DIVERGE fn=0x${entryRip.toString(16)} exit=0x${exitRip.toString(16)} step=${best.k}/${trace.length} entry=[${regs0.map(v=>v.toString(16)).join(',')}]>`);
+        for (const d of best.diffs.slice(0, 20)) console.error('  ' + d);
+      }
+      this._shadowBusy = false;
+      return exitRip;
+    }
     if (!(ok && exitRip === retAddr && cpu.regs[4] === rspExit)) st.aborted++;
     if (ok && exitRip === retAddr && cpu.regs[4] === rspExit && (this._shadowDiverged ?? 0) < 12) {
       st.compared++;
@@ -1069,7 +1162,49 @@ export class LinuxEngine {
     return exitRip;
   }
 
+  // OXWASM_AOTSKIP=lo-hi: the dispatches numbered lo..hi-1 run INTERPRETED to the function's
+  // exit instead of entering the unit (the compiled code stays registered for every other
+  // dispatch). Bisecting the range that makes a failing run pass costs only the interpretation
+  // of that range, where OXWASM_AOTSTOP paid for the whole interpreted tail of the run.
+  // OXWASM_DISPRING=1: a ring of the last 512 unit dispatches / callouts / deopts / frame finishes
+  // (kind, addresses, rsp, dispatch number), dumped by _onBreak: the compiled-code history the
+  // interpreted rip trace cannot see.
+  _dr(kind, a, b, c) { const r = (this._dring ??= new Array(512)); r[this._dringI = ((this._dringI | 0) + 1) % 512] = `${kind} ${a.toString(16)} ${b === undefined ? '' : b.toString(16)} ${c === undefined ? '' : c.toString(16)} d=${this.stats.disp} rsp=${BigInt.asUintN(64, this.regview[4]).toString(16)}`; }
+  _ripHit(before) {
+    const r = this.cpu.regs, rd = (a, n) => { try { return this.mem.read(a, n).toString(16); } catch { return '?'; } };
+    // OXWASM_AOTSKIP_AT=rip:site  the first interpreted hit of rip with [rbp+0x24]==site arms an
+    // interpreted window of OXWASM_AOTSKIP_N dispatches (dispatch numbers drift between runs)
+    // OXWASM_AOTSKIP_REL=lo-hi narrows the window to dispatches lo..hi-1 counted from the arming point.
+    if (this._skipAt !== undefined && this._skipUntil === undefined && before === this._skipAt[0] && rd(r[5] + 0x24n, 4n) === this._skipAt[1]) { const rel = (ENV.OXWASM_AOTSKIP_REL || ('0-' + (ENV.OXWASM_AOTSKIP_N || 400))).split('-').map(Number); this._skipFrom = (this.stats.disp | 0) + rel[0]; this._skipUntil = (this.stats.disp | 0) + rel[1]; console.error(`[aotskip] armed at disp ${this.stats.disp}: skipping ${this._skipFrom}..${this._skipUntil}`); }
+    this._ripLogRing.push(`${before.toString(16)} disp=${this.stats.disp} r13=${r[13].toString(16)} r8=${r[8].toString(16)} r12=${r[12].toString(16)} rbp=${r[5].toString(16)} rsp=${r[4].toString(16)} rax=${r[0].toString(16)} r10=${r[10].toString(16)} site=${rd(r[5] + 0x24n, 4n)} cb=${rd(r[5] + 0x10n, 8n)} [rsp]=${rd(r[4], 8n)}`);
+    if (this._ripLogRing.length > +(ENV.OXWASM_RIPLOG_N || 48)) this._ripLogRing.shift();
+    // file log once the window is armed; before that one hit in 1024, to see where a run that never arms is
+    if (ENV.OXWASM_RIPLOG_FILE && (this._skipAt === undefined || this._skipUntil !== undefined || ((this._ripN = (this._ripN | 0) + 1) & 1023) === 0)) { (this._ripLogBuf ??= []).push(this._ripLogRing[this._ripLogRing.length - 1]); if (this._ripLogBuf.length >= 64) this._ripLogFlush(); }
+  }
+  _ripLogFlush() { if (this._ripLogBuf?.length) { process.getBuiltinModule('node:fs').appendFileSync(ENV.OXWASM_RIPLOG_FILE, this._ripLogBuf.join('\n') + '\n'); this._ripLogBuf.length = 0; } }
+  _interpOne() {
+    const cpu = this.cpu, rsp0 = cpu.regs[4];
+    let retAddr = null; try { retAddr = this.mem.read(rsp0, 8n); } catch {}
+    const rspExit = rsp0 + 8n;
+    let steps = 0;
+    while (!(cpu.rip === retAddr && cpu.regs[4] === rspExit) && !(cpu.regs[4] > rspExit)) {
+      const before = cpu.rip;
+      if (this._ripLog !== undefined && this._ripLog.has(before)) this._ripHit(before);
+      const insn = cpu.step(); this.stats.interpreted++;
+      if (this.exitCode !== null) throw EXIT;
+      if (this.blocked) { cpu.rip = before; break; }           // the run loop parks; the syscall re-executes
+      if (++steps > 2e6) break;
+    }
+    return cpu.rip;
+  }
   dispatchMaybeShadow(f) {
+    if (AOTSKIP !== null && this._ctor?.argv?.[0]?.includes('opencode')) {
+      const d = this.stats.disp | 0;
+      if (d >= AOTSKIP[0] && d < AOTSKIP[1]) { this.stats.disp = d + 1; this.stats.skipped = (this.stats.skipped || 0) + 1; return this._interpOne(); }
+    }
+    if (this._skipUntil !== undefined && (this.stats.disp | 0) < this._skipUntil && (this.stats.disp | 0) >= this._skipFrom) {
+      if (ENV.OXWASM_AOTSKIP_LOG) console.error(`[aotskip] disp ${this.stats.disp} rip=${this.cpu.rip.toString(16)} rsp=${this.cpu.regs[4].toString(16)} rbp=${this.cpu.regs[5].toString(16)} r8=${this.cpu.regs[8].toString(16)}`);
+      this.stats.disp = (this.stats.disp | 0) + 1; this.stats.skipped = (this.stats.skipped || 0) + 1; return this._interpOne(); }
     if (this.shadowLib && !this.shadowRange) {
       if (this.shadowLib === 'all') { this.shadowRange = [0n, 1n << 63n]; console.error('<shadow armed: every mapping>'); }
       for (const m of this.maps ?? []) if (m.path.includes(this.shadowLib)) {
@@ -1081,6 +1216,10 @@ export class LinuxEngine {
     if (!this.shadowRange || this._shadowBusy ||
         this.cpu.rip < this.shadowRange[0] || this.cpu.rip >= this.shadowRange[1])
       return this.dispatchAot(f);
+    // OXWASM_SHADOW_DISP=lo-hi: shadow only the dispatches numbered lo..hi (stats.disp), so a
+    // failure the AOTSTOP bisect placed at dispatch N can be examined without shadowing the
+    // hundreds of thousands before it (a full shadow of opencode never reaches N in time).
+    if (SHADOW_DISP !== null && ((this.stats.disp | 0) < SHADOW_DISP[0] || (this.stats.disp | 0) > SHADOW_DISP[1])) return this.dispatchAot(f);
     const k = this.cpu.rip;
     const n = (this._shadowClean ??= new Map()).get(k) ?? 0;
     // Exonerate after this many clean passes, so shadowing a hot function does
@@ -1114,10 +1253,14 @@ export class LinuxEngine {
       // frames (contained deopt/callout) — don't dispatch further fat wasm
       // frames when the shared budget word says the stack is near its edge
       if (f && (this._ftdv ??= new DataView(this.wmem.buffer)).getUint32(FTMAP + 8, true) >= FTDLIMIT) { f = null; this.stats.dispDeep = (this.stats.dispDeep || 0) + 1; }
-      if (f) { this.cpu.rip = this.dispatchMaybeShadow(f);
+      if (f) { if (this.ripTrace !== undefined) this.ripTrace[this.ripTraceI++ & 65535] = -this.cpu.rip;
+               this.cpu.rip = this.dispatchMaybeShadow(f);
+               if (this.ripTrace !== undefined) this.ripTrace[this.ripTraceI++ & 65535] = -this.cpu.rip;
                if (this.blocked) throw new BlockUnwind(this.cpu.rip);
                continue; }
       const before = this.cpu.rip;
+      if (this.ripTrace !== undefined && before >= this._rtLo && before < this._rtHi) this.ripTrace[this.ripTraceI++ & 65535] = before;
+            if (this._ripLog !== undefined && this._ripLog.has(before)) this._ripHit(before);
       this._cleanSync = false;
       if (BREAKS !== null && BREAKS.has(this.cpu.rip)) this._onBreak();
       const insn = this.cpu.step(); this.stats.interpreted++;
@@ -1182,9 +1325,9 @@ export class LinuxEngine {
   // covering that page - the guest is patching its own code, which is the
   // thing the engine could not see and the reason anonymous executable memory
   // is not translatable by default.
-  _codeWrite(waddr) {
+  _codeWrite(waddr, next) {
     const g = this.base + BigInt((waddr >>> 0) - this.RAMOFF);
-    if (this._watchArmed) { this._watchLog(g, 0, 0n, 'compiled'); return; }
+    if (this._watchArmed) { this._watchLog(g, 0, 0n, 'compiled next=' + (next === undefined ? '?' : BigInt.asUintN(64, next).toString(16))); return; }
     const lo = g & ~4095n;
     this.stats.codeWrites = (this.stats.codeWrites || 0) + 1;
     this._invalidateCode(lo, lo + 4096n);
@@ -1258,7 +1401,7 @@ export class LinuxEngine {
 
   aotEnv() {
     return {
-      codewrite: (a) => this._codeWrite(a),
+      codewrite: (a, next) => this._codeWrite(a, next),
       loophot: (a) => this._loopHot(BigInt.asUintN(64, a)),
       // rip = guest address of the syscall instruction (an emit-time constant)
       // so a blocking syscall can suspend: state is spilled, frames unwind,
@@ -1363,6 +1506,7 @@ export class LinuxEngine {
         if (rsp0 < 0x10000n && this.onBadRsp) this.onBadRsp(target, rsp0);
         const retAddr = this.mem.read(rsp0, 8n);
         const rspExit = BigInt.asUintN(64, rsp0 + 8n);
+        if (DISPRING) this._dr('callout', target, retAddr, rspExit);
         let f = this._aotOff ? undefined : this.aotFns.get(target);
         if (this.deoptLog) { const m = (this.calloutLog ??= new Map()); const kk = target.toString(16) + (f ? '' : ' (no unit)'); m.set(kk, (m.get(kk) || 0) + 1); }
         if (f && this.aotBudget !== undefined && --this.aotBudget < 0) f = null;
@@ -1383,6 +1527,7 @@ export class LinuxEngine {
             ftdv.setUint32(FTMAP + 8, ftd + 1, true);
             const exit = BigInt.asUintN(64, f());
             ftdv.setUint32(FTMAP + 8, ftd, true);
+            if (DISPRING) this._dr('callout-exit', target, exit, retAddr);
             if (this.onCalloutExit) this.onCalloutExit(target, exit, retAddr);
             // The caller DROPS this return and resumes after its call, so we
             // may only come back once the call really returned. A compiled
@@ -1401,6 +1546,7 @@ export class LinuxEngine {
             // regfile; finish the frame by interpreting, contained here so the
             // caller's wasm frame survives.
             this.syncIn(); this.cpu.rip = e.rip;
+            if (DISPRING) this._dr('callout-catch', target, e.rip, retAddr);
             if (globalThis.__frameTrace) console.error(`<callout-catch target=${target.toString(16)} erip=${e.rip.toString(16)} retAddr=${retAddr.toString(16)} rspExit=${rspExit.toString(16)} rsp=${this.cpu.regs[4].toString(16)}>`);
             this._finishFrame(retAddr, rspExit);
             if (globalThis.__frameTrace) console.error(`<callout-ret(catch) target=${target.toString(16)} retAddr=${retAddr.toString(16)}>`);
@@ -1415,6 +1561,7 @@ export class LinuxEngine {
         // interpreted forever at ~5M steps per cycle.
         if (this.assembleWat) this.profileTarget(target);
         this.syncIn(); this.cpu.rip = target;
+        if (DISPRING) this._dr('callout-interp', target, retAddr, rspExit);
         this._finishFrame(retAddr, rspExit);
         if (globalThis.__frameTrace) console.error(`<callout-ret(interp) target=${target.toString(16)} retAddr=${retAddr.toString(16)} rsp=${this.cpu.regs[4].toString(16)}>`);
         return BigInt.asIntN(64, retAddr);
@@ -1429,6 +1576,7 @@ export class LinuxEngine {
       // Profile the landing so an indirect jump that only runs inside AOT code
       // (a compiled trampoline, a jump table) still tiers up its target.
       deopt: (rip, _rsp0) => {
+        if (DISPRING) this._dr('deopt', BigInt.asUintN(64, rip), _rsp0 === undefined ? 0n : BigInt.asUintN(64, _rsp0));
         if (this._loopHotSeen?.has(BigInt.asUintN(64, rip))) this.stats.loopYieldNested = (this.stats.loopYieldNested || 0) + 1;   // a nested frame's yield arrives as a deopt to a loop head
         const t = BigInt.asUintN(64, rip);
         this.stats.deopts = (this.stats.deopts || 0) + 1;
@@ -1484,7 +1632,7 @@ export class LinuxEngine {
     const strPtrs = argv.map(s => put(new TextEncoder().encode(s + '\0')));
     const envPtrs = this.env.map(s => put(new TextEncoder().encode(s + '\0')));
     const platPtr = put(new TextEncoder().encode('x86_64\0'));
-    const randPtr = put(crypto.getRandomValues(new Uint8Array(16)));
+    const randPtr = put(fillRandom(new Uint8Array(16)));
     sp &= ~15n;
     const auxv = [
       [3n, this.aux.phdr], [4n, BigInt(this.aux.phent)], [5n, BigInt(this.aux.phnum)],  // AT_PHDR/PHENT/PHNUM
@@ -1858,7 +2006,7 @@ export class LinuxEngine {
       case '/proc/sys/kernel/ngroups_max': return enc('65536\n');
       case '/proc/sys/kernel/cap_last_cap': return enc('40\n');
       case '/proc/sys/kernel/random/boot_id': return enc('9d5a2e42-0f1c-4a7e-b0f6-6d5c1e0a1b2c\n');
-      case '/proc/sys/kernel/random/uuid': { const h = [...crypto.getRandomValues(new Uint8Array(16))].map(b => b.toString(16).padStart(2, '0')).join('');
+      case '/proc/sys/kernel/random/uuid': { const h = [...fillRandom(new Uint8Array(16))].map(b => b.toString(16).padStart(2, '0')).join('');
         return enc(`${h.slice(0,8)}-${h.slice(8,12)}-${h.slice(12,16)}-${h.slice(16,20)}-${h.slice(20)}\n`); }
       case '/proc/sys/vm/overcommit_memory': return enc('0\n');
       case '/proc/sys/vm/max_map_count': return enc('65530\n');
@@ -2417,6 +2565,7 @@ export class LinuxEngine {
           if (off0 < hw) this.ram.fill(0, off0, Math.min(end0, hw));
           if (fixedAt !== null && this._zeroAbove !== undefined && at + len > this._zeroAbove) this._zeroAbove = at + len;
         }
+        if ((flags & ANON) && (a3 & 4n)) this._jitMark(at, at + len, 1);   // a JIT's code cache: its instructions are re-checked when cached
         if (!(flags & ANON) && this.fds.get(fdArg)?.gen === 'zero') { ret(at); break; }   // /dev/zero: anonymous
         if (!(flags & ANON)) {
           const h = this.fds.get(fdArg);
@@ -2451,6 +2600,7 @@ export class LinuxEngine {
         this._unmapRange(lo, hi);                            // shared-mapping write-back
         this._mmapGive(lo, align(a2, PAGE));                 // the arena reuses it
         this._invalidateCode(lo, hi);
+        if (this.mem.jit !== null) this._jitMark(lo, hi, 0);
         ret(0n); break; }
       case 10: {                                             // mprotect(addr, len, prot): no page protection here, but
         // in exec-anon mode it is the JIT's W^X signal: a range made
@@ -2459,6 +2609,7 @@ export class LinuxEngine {
         // a range made writable-without-exec is about to be rewritten, so
         // its translations go. That makes W^X JITs sound under execAnon;
         // RWX code caches that rewrite in place stay the reason it is opt-in.
+        if (a3 & 4n) this._jitMark(a1, a1 + align(a2, PAGE), 1);   // W^X JITs flip pages executable after writing them
         if (this.execAnon ?? EXEC_ANON) {
           const lo = a1, hi = a1 + align(a2, PAGE);
           if (a3 & 4n) { if (!this.execRanges.some(([a, b]) => a <= lo && hi <= b)) { this.execRanges.push([lo, hi]); this._ieCache = undefined; this._genCache = undefined; this._updateCodeWindow(); } }
@@ -2503,7 +2654,7 @@ export class LinuxEngine {
           if (!this._efaultNoted) { this._efaultNoted = true; console.error(`<getrandom EFAULT buf=${buf.toString(16)} len=${len} base=${this.base.toString(16)} ram=${this.ram.length.toString(16)} rip=${cpu.rip.toString(16)} tid=${this.threads[this.ti]?.id}>`); }
           ret(-14n); break; }
         const bytes = new Uint8Array(len);
-        crypto.getRandomValues(bytes.subarray(0, Math.min(len, 65536)));
+        fillRandom(bytes.subarray(0, Math.min(len, 65536)));
         this.ram.set(bytes, off);
         ret(BigInt(len)); break; }
       case 16: {                                             // ioctl
@@ -2872,7 +3023,10 @@ export class LinuxEngine {
         new DataView(this.wmem.buffer).setUint8(o, (1 << Math.min(this.ncpu, 8)) - 1);
         ret(8n); break; }
       case 60: case 231: {                                   // exit / exit_group
-        if (ENV.OXWASM_AOTSTOP && this._ctor?.argv?.[0]?.includes('opencode')) console.error('[aotstop] exit total disp', this.stats.disp);
+        // OXWASM_STRACE_EXIT=1 (with OXWASM_STRACE=1): a guest that exits non-zero without a word shows its last syscalls
+        if (ENV.OXWASM_STRACE_EXIT && this.strace && (a1 & 0xffn) !== 0n && this._ctor?.argv?.[0]?.includes('opencode')) console.error(`[exit ${nr} code=${a1 & 0xffn} tid=${this.threads[this.ti]?.id} rip=${cpu.rip.toString(16)}] last:\n  ` + this.strace.slice(-(+ENV.OXWASM_STRACE_N || 40)).join('\n  '));
+        if ((ENV.OXWASM_AOTSTOP || AOTSKIP) && this._ctor?.argv?.[0]?.includes('opencode')) console.error('[aotstop] exit total disp', this.stats.disp, 'skipped', this.stats.skipped || 0);
+        if (this._shadowStats && this._ctor?.argv?.[0]?.includes('opencode')) { const st = this._shadowStats; console.error(`[shadow] tried=${st.tried} compared=${st.compared} aborted=${st.aborted} diverged=${st.diverged} noexit=${[...(st.noexit ?? [])].map(([k, v]) => k.toString(16) + ':' + v).join(',')} flagOnly=${[...(st.flagOnly ?? [])].map(([k, v]) => k + ':' + v).join(',')} abortedAt=${[...(st.abortedAt ?? [])].map(([k, v]) => k + ':' + v).join(',')}`); }
         if (ENV.OXWASM_DUMPMEM && this._ctor?.argv?.[0]?.includes('opencode')) { try { const [ah, lh, file] = ENV.OXWASM_DUMPMEM.split(':'); const at = BigInt('0x' + ah), len = parseInt(lh, 16); const out = new Uint8Array(len); for (let i = 0; i < len; i++) out[i] = Number(this.mem.read(at + BigInt(i), 1n)); process.getBuiltinModule('node:fs').writeFileSync(file, out); } catch (e) { console.error('[dumpmem]', e.message); } }
         if (this._mmapStat) { const ms = this._mmapStat; console.error(`[mmapstat] mmap n=${ms.mmapN} ${ms.mmapB >> 20n}MB munmap n=${ms.munmapN} ${ms.munmapB >> 20n}MB mremap=${ms.mremapN} mmapNext=${this.mmapNext?.toString(16)} base=${this._mmapBase?.toString(16)} holes=${this._mmapHoles?.length} holeMB=${(this._mmapHoles ?? []).reduce((t, [l, h]) => t + (h - l), 0n) >> 20n} bySize=${[...ms.bySize].sort((x, y) => y[1] - x[1]).slice(0, 14).map(([k, v]) => k + 'x' + v).join(' ')}`); }
         if (ENV.OXWASM_SCTRACE && this._sct?.length) { process.getBuiltinModule('node:fs').appendFileSync(ENV.OXWASM_SCTRACE, this._sct.join('\n') + '\n'); this._sct.length = 0; }
@@ -3227,7 +3381,7 @@ export class LinuxEngine {
         if (h.gen) {                                          // /dev/zero, /dev/urandom
           const n = Number(a3); this.jsnap(a2, n);
           const dst = this.ram.subarray(Number(a2 - this.base), Number(a2 - this.base) + n);
-          if (h.gen === 'zero') dst.fill(0); else for (let i = 0; i < n; i += 65536) crypto.getRandomValues(dst.subarray(i, Math.min(n, i + 65536)));
+          if (h.gen === 'zero') dst.fill(0); else for (let i = 0; i < n; i += 65536) fillRandom(dst.subarray(i, Math.min(n, i + 65536)));
           h.pos += n; ret(BigInt(n)); break;
         }
         if (h.isdir) { ret(-21n); break; }                    // EISDIR: a directory reads through getdents64 only
@@ -5066,6 +5220,7 @@ export class LinuxEngine {
     for (const L of this._fsMeta().rlocks?.values() ?? []) for (const x of L) if (x.owner === t.proc) x.owner = ceng;
     const _r1 = ENV.OXWASM_PROCTRACE ? process.memoryUsage().rss : 0;
     this._copyLiveRam(ceng);                                 // the child's view, before rollback (live ranges only)
+    if (this.mem.jit !== null) { ceng.mem.jit = this.mem.jit.slice(); ceng.mem.jitBase = this.mem.jitBase; }   // its JIT pages too
     if (ENV.OXWASM_PROCTRACE) { const r2 = process.memoryUsage().rss; console.error(`[mat] engine=${(_r1 - _r0) >> 20}MB copy=${(r2 - _r1) >> 20}MB units=${this.unitStore ? 'y' : 'n'}`); }
     ceng.brk = this.brk; ceng.mmapNext = this.mmapNext; ceng._mmapBase = this._mmapBase; ceng._mmapHoles = (this._mmapHoles || []).map(h => [h[0], h[1]]);
     ceng.execRanges = this.execRanges.slice();
@@ -5668,9 +5823,9 @@ export class LinuxEngine {
         // lookup was skipped" or "unit, but the budget refused it".
         if (DISPSTAT) { if (!branched && this.aotFns.get(key)) this.stats.noLook = (this.stats.noLook || 0) + 1; }
         if (f && this.aotBudget !== undefined && --this.aotBudget < 0) { f = null; this.stats.dispBudget = (this.stats.dispBudget || 0) + 1; }
-        if (f) { if (this.ripTrace !== undefined) { this.ripTrace[this.ripTraceI++ & 1023] = -key; }   // negative = AOT entry
+        if (f) { if (this.ripTrace !== undefined) { this.ripTrace[this.ripTraceI++ & 65535] = -key; }   // negative = AOT entry
                  this.cpu.rip = this.dispatchMaybeShadow(f);
-                 if (this.ripTrace !== undefined) { this.ripTrace[this.ripTraceI++ & 1023] = -this.cpu.rip; }  // AOT exit
+                 if (this.ripTrace !== undefined) { this.ripTrace[this.ripTraceI++ & 65535] = -this.cpu.rip; }  // AOT exit
                  branched = true;
                  if (this.blocked) { if (this.park()) continue; break; }
                  if (this.itimer?.at != null) this._checkAlarm();
@@ -5686,7 +5841,9 @@ export class LinuxEngine {
           this.cpu.rip = c.exit; this.stats.compiledRuns++; branched = true; continue;
         }
         const before = this.cpu.rip;
-        if (this.ripTrace !== undefined) this.ripTrace[this.ripTraceI++ & 1023] = before;
+        if (this.ripTrace !== undefined && before >= this._rtLo && before < this._rtHi) this.ripTrace[this.ripTraceI++ & 65535] = before;
+      if (this._ripLog !== undefined && this._ripLog.has(before)) this._ripHit(before);
+
         let insn;
         this._cleanSync = false;
         if (BREAKS !== null && BREAKS.has(this.cpu.rip)) this._onBreak();
@@ -5749,9 +5906,44 @@ export class LinuxEngine {
   }
 
   _onBreak() {
-    const c = this.cpu, r = c.regs, q = (a) => { try { return this.mem.read(a, 8n).toString(16); } catch { return '?'; } };
-    console.error(`[break ${c.rip.toString(16)}] tid=${this.threads[this.ti]?.id} rdi=${r[7].toString(16)} rsi=${r[6].toString(16)} rdx=${r[2].toString(16)} rax=${r[0].toString(16)} rsp=${r[4].toString(16)} [rdi+340..]=${[0x340n, 0x348n, 0x350n, 0x358n].map((o) => q(r[7] + o)).join(',')} ret=${q(r[4])}`);
+    const c = this.cpu, r = c.regs, q = (a, n = 8n) => { try { return this.mem.read(a, n).toString(16); } catch { return '?'; } };
+    // OXWASM_BREAK_RANGEADDR=hex: report only when [vm.lastStackTop, rsp) (JSC sanitizeStackForVM's zeroing range,
+    // rdi = VM) covers that address - the one call that wipes a live frame among tens of thousands
+    if (ENV.OXWASM_BREAK_RANGEADDR) { const X = BigInt('0x' + ENV.OXWASM_BREAK_RANGEADDR); let lst; try { lst = this.mem.read(r[7] + 0x1f830n, 8n); } catch { return; } if (!(lst <= X && X < r[4])) return; }
+    // OXWASM_BREAK_VMTOP=1: report only when vm.topCallFrame (VM+0x20, rdi = VM) lies BELOW rsp - a live JS
+    // frame under the stack pointer, which sanitizeStackForVM then zeroes. Legit calls have it above.
+    if (ENV.OXWASM_BREAK_VMTOP) { let top; try { top = this.mem.read(r[7] + 0x20n, 8n); } catch { return; } if (!(top !== 0n && top < r[4])) return; }
+    const names = ['rax','rcx','rdx','rbx','rsp','rbp','rsi','rdi','r8','r9','r10','r11','r12','r13','r14','r15'];
+    let out = `[break ${c.rip.toString(16)}] tid=${this.threads[this.ti]?.id} disp=${this.stats.disp} ` + names.map((n, i) => `${n}=${r[i].toString(16)}`).join(' ') + ` [rdi+1f830]=${q(r[7] + 0x1f830n)} vmtop=${q(r[7] + 0x20n)} [rsp]=${q(r[4])} [rsp+8]=${q(r[4] + 8n)} fs=${c.fsBase?.toString(16)}\n`;
+    // JSC call frames up the rbp chain: return pc, CodeBlock slot (+0x10), callee (+0x18), argc/callSiteIndex (+0x20/+0x24)
+    let f = r[5];
+    for (let k = 0; k < 14 && f > 0x1000n; k++) {
+      out += `  frame rbp=${f.toString(16)} ret=${q(f + 8n)} cb=${q(f + 0x10n)} callee=${q(f + 0x18n)} argc=${q(f + 0x20n, 4n)} site=${q(f + 0x24n, 4n)}\n`;
+      let nf; try { nf = this.mem.read(f, 8n); } catch { break; } if (nf <= f) break; f = nf;
+    }
+    // OXWASM_BREAK_CB=hexsite: dump the CodeBlock of every JS frame (heap pointer in +0x10) and, for each
+    // heap-pointer field in it, the bytecode bytes at pointer+site - the base among them is the instruction stream
+    // OXWASM_BREAK_TABLES=1: JSC LLInt opcode maps (narrow / wide16 / wide32 at 0x5bdc000 + k*0x800): entries 0, 1, 0x52
+    if (ENV.OXWASM_BREAK_TABLES) { for (let t = 0; t < 3; t++) { const base = 0x5bdc000n + BigInt(t) * 0x800n; out += `  optable${t}: [0]=${q(base)} [1]=${q(base + 8n)} [0x52]=${q(base + 0x52n * 8n)} [0x53]=${q(base + 0x53n * 8n)} [0x51]=${q(base + 0x51n * 8n)}\n`; } }
+    if (ENV.OXWASM_BREAK_CB) {
+      const site = BigInt('0x' + ENV.OXWASM_BREAK_CB); let f2 = r[5];
+      for (let k = 0; k < 14 && f2 > 0x1000n; k++) {
+        let cb; try { cb = this.mem.read(f2 + 0x10n, 8n); } catch { break; }
+        if (cb >= 0x59000000n && cb < 0x6c000000n) {
+          out += `  codeblock frame=${f2.toString(16)} cb=${cb.toString(16)}:`;
+          for (let w = 0; w < 32; w++) { const v = this.mem.read(cb + BigInt(w * 8), 8n); out += ` [${(w * 8).toString(16)}]=${v.toString(16)}`;
+            if (v >= 0x59000000n && v < 0x6c000000n && w > 0) { let bs = ''; for (let b = -8n; b < 12n; b++) bs += q(v + site + b, 1n).padStart(2, '0') + (b === -1n ? '|' : ' '); out += `{@+site: ${bs}}`; } }
+          out += '\n';
+        }
+        let nf; try { nf = this.mem.read(f2, 8n); } catch { break; } if (nf <= f2) break; f2 = nf;
+      }
+    }
+    if (this._ripLogRing !== undefined) { this._ripLogFlush(); out += '  riplog:\n    ' + this._ripLogRing.join('\n    ') + '\n'; }
+    if (this._dring !== undefined) { const r = this._dring, n = r.length, i0 = this._dringI | 0; const lines = []; for (let i = 0; i < n; i++) { const e = r[(i0 + i) % n]; if (e) lines.push(e); } out += '  dispring:\n    ' + lines.join('\n    ') + '\n'; }
+    if (this.ripTrace !== undefined) { const n = +(ENV.OXWASM_RIPTRACE_N || 160), seq = []; for (let i = n; i >= 1; i--) { const v = this.ripTrace[(this.ripTraceI - i) & 65535]; seq.push(v < 0n ? 'A' + (-v).toString(16) : v.toString(16)); } out += '  riptrace (A=aot entry/exit): ' + seq.join(' ') + '\n'; }
+    console.error(out);
   }
+
 
   // Diagnosis: OXWASM_WATCHPAGE=hex (with OXWASM_STOREGUARD=1 for compiled stores) logs every store into that
   // 4K page: interpreter stores through Memory.watch, compiled stores through the store guard window.
@@ -5767,6 +5959,9 @@ export class LinuxEngine {
     console.error(`[watch armed] page=${this._watchPage.toString(16)} storeguard=${STOREGUARD}`);
   }
   _watchLog(addr, n, v, how) {
+    // OXWASM_WATCHADDR=hex[:len]: within the watched page, log only stores overlapping this range
+    // (a compiled store reports its address only; it is taken as 8 bytes)
+    if (ENV.OXWASM_WATCHADDR) { const [ah, lh] = ENV.OXWASM_WATCHADDR.split(':'); const wa = BigInt('0x' + ah), wl = BigInt(lh || '8'); const nn = BigInt(n || 8); if (!(addr < wa + wl && addr + nn > wa)) return; }
     const line = `[watch] tid=${this.threads[this.ti]?.id} ${how} addr=${addr.toString(16)} n=${n} v=${(typeof v === 'bigint' ? v : BigInt(v || 0)).toString(16)} lastEntry=${this._lastEntry?.toString(16)} disp=${this.stats.disp}`;
     if (ENV.OXWASM_WATCHLOG) process.getBuiltinModule('node:fs').appendFileSync(ENV.OXWASM_WATCHLOG, line + '\n'); else console.error(line);
   }
