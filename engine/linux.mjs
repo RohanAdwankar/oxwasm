@@ -40,6 +40,7 @@ const SHADOW_ABORT = { shadowAbort: true };
 const SHADOW_DISP = ENV.OXWASM_SHADOW_DISP ? ENV.OXWASM_SHADOW_DISP.split('-').map(Number) : null;
 const AOTSKIP = ENV.OXWASM_AOTSKIP ? ENV.OXWASM_AOTSKIP.split('-').map(Number) : null;
 const DISPRING = !!ENV.OXWASM_DISPRING;
+const AT_SHADOW = !!ENV.OXWASM_AT_SHADOW;
 // OXWASM_DETRANDOM=<seed>: every byte of randomness the guest sees (AT_RANDOM, getrandom, /dev/urandom)
 // comes from a seeded generator, so a run can be replayed exactly (diagnosis; never for real use).
 let _detRnd = ENV.OXWASM_DETRANDOM ? (BigInt(ENV.OXWASM_DETRANDOM) | 0x9E3779B97F4A7C15n) & 0xFFFFFFFFFFFFFFFFn : null;
@@ -1175,7 +1176,12 @@ export class LinuxEngine {
     // OXWASM_AOTSKIP_AT=rip:site  the first interpreted hit of rip with [rbp+0x24]==site arms an
     // interpreted window of OXWASM_AOTSKIP_N dispatches (dispatch numbers drift between runs)
     // OXWASM_AOTSKIP_REL=lo-hi narrows the window to dispatches lo..hi-1 counted from the arming point.
-    if (this._skipAt !== undefined && this._skipUntil === undefined && before === this._skipAt[0] && rd(r[5] + 0x24n, 4n) === this._skipAt[1]) { const rel = (ENV.OXWASM_AOTSKIP_REL || ('0-' + (ENV.OXWASM_AOTSKIP_N || 400))).split('-').map(Number); this._skipFrom = (this.stats.disp | 0) + rel[0]; this._skipUntil = (this.stats.disp | 0) + rel[1]; console.error(`[aotskip] armed at disp ${this.stats.disp}: skipping ${this._skipFrom}..${this._skipUntil}`); }
+    // OXWASM_AOTSKIP_AT_N=n arms at the n-th matching hit; OXWASM_AT_BREAK=1 also runs _onBreak there.
+    // OXWASM_AOTSKIP_AT_TIGHT=k: only when the last 2000 hits spanned fewer than 2000*k dispatches (a spin, not a loop doing work)
+    if (this._skipAt !== undefined && this._skipUntil === undefined && before === this._skipAt[0] && rd(r[5] + 0x24n, 4n) === this._skipAt[1] && ((this._skipAtN = (this._skipAtN | 0) + 1) >= +(ENV.OXWASM_AOTSKIP_AT_N || 1)) &&
+        (!ENV.OXWASM_AOTSKIP_AT_TIGHT || (() => { const h = (this._atHist ??= new Int32Array(2000)), n = this._skipAtN, d = this.stats.disp | 0; const old = h[n % 2000]; h[n % 2000] = d; return n > 2000 && d - old < 2000 * +ENV.OXWASM_AOTSKIP_AT_TIGHT; })())) {
+      if (ENV.OXWASM_AT_BREAK) { console.error(`[at-break] hit ${this._skipAtN} of ${before.toString(16)} disp=${this.stats.disp}`); this._onBreak(); }
+      if (ENV.OXWASM_AT_AOTOFF) { this._aotOff = true; console.error(`[at-aotoff] compiled code off from disp ${this.stats.disp}`); } const rel = (ENV.OXWASM_AOTSKIP_REL || ('0-' + (ENV.OXWASM_AOTSKIP_N || 400))).split('-').map(Number); this._skipFrom = (this.stats.disp | 0) + rel[0]; this._skipUntil = (this.stats.disp | 0) + rel[1]; if (ENV.OXWASM_AOTSKIP_STEPS) this._skipSteps = +ENV.OXWASM_AOTSKIP_STEPS; console.error(`[aotskip] armed at disp ${this.stats.disp}: skipping ${this._skipFrom}..${this._skipUntil}`); }
     this._ripLogRing.push(`${before.toString(16)} disp=${this.stats.disp} r13=${r[13].toString(16)} r8=${r[8].toString(16)} r12=${r[12].toString(16)} rbp=${r[5].toString(16)} rsp=${r[4].toString(16)} rax=${r[0].toString(16)} r10=${r[10].toString(16)} site=${rd(r[5] + 0x24n, 4n)} cb=${rd(r[5] + 0x10n, 8n)} [rsp]=${rd(r[4], 8n)}`);
     if (this._ripLogRing.length > +(ENV.OXWASM_RIPLOG_N || 48)) this._ripLogRing.shift();
     // file log once the window is armed; before that one hit in 1024, to see where a run that never arms is
@@ -1194,6 +1200,7 @@ export class LinuxEngine {
       if (this.exitCode !== null) throw EXIT;
       if (this.blocked) { cpu.rip = before; break; }           // the run loop parks; the syscall re-executes
       if (++steps > 2e6) break;
+      if (this._skipSteps !== undefined && --this._skipSteps <= 0) { console.error(`[aotskip] step budget spent at disp ${this.stats.disp} rip=${cpu.rip.toString(16)}`); break; }
     }
     return cpu.rip;
   }
@@ -1202,7 +1209,13 @@ export class LinuxEngine {
       const d = this.stats.disp | 0;
       if (d >= AOTSKIP[0] && d < AOTSKIP[1]) { this.stats.disp = d + 1; this.stats.skipped = (this.stats.skipped || 0) + 1; return this._interpOne(); }
     }
-    if (this._skipUntil !== undefined && (this.stats.disp | 0) < this._skipUntil && (this.stats.disp | 0) >= this._skipFrom) {
+    // OXWASM_AOTSKIP_STEPS=k: the window is also bounded to k interpreted steps in total (a dispatch of a
+    // long-running frame otherwise interprets it to its exit, which for a module's top-level frame is the
+    // rest of the program)
+    // OXWASM_AT_SHADOW=1: the armed window is SHADOWED (compiled vs interpreted, see shadowDispatch)
+    // instead of interpreted; dispatches outside it run compiled as usual
+    if (AT_SHADOW) { if (this._skipUntil !== undefined && (this.stats.disp | 0) < this._skipUntil && (this.stats.disp | 0) >= this._skipFrom) { this.shadowRange ??= [0n, 1n << 63n]; return this.shadowDispatch(f); } return this.dispatchAot(f); }
+    if (this._skipUntil !== undefined && (this.stats.disp | 0) < this._skipUntil && (this.stats.disp | 0) >= this._skipFrom && (this._skipSteps === undefined || this._skipSteps > 0)) {
       if (ENV.OXWASM_AOTSKIP_LOG) console.error(`[aotskip] disp ${this.stats.disp} rip=${this.cpu.rip.toString(16)} rsp=${this.cpu.regs[4].toString(16)} rbp=${this.cpu.regs[5].toString(16)} r8=${this.cpu.regs[8].toString(16)}`);
       this.stats.disp = (this.stats.disp | 0) + 1; this.stats.skipped = (this.stats.skipped || 0) + 1; return this._interpOne(); }
     if (this.shadowLib && !this.shadowRange) {
@@ -2312,7 +2325,7 @@ export class LinuxEngine {
     if (this._mmapStat && nr === 234) { const ms = this._mmapStat; console.error(`[mmapstat@tgkill] mmap n=${ms.mmapN} ${ms.mmapB >> 20n}MB munmap n=${ms.munmapN} ${ms.munmapB >> 20n}MB mmapNext=${this.mmapNext?.toString(16)} base=${this._mmapBase?.toString(16)} holes=${(this._mmapHoles ?? []).map(([l, h]) => l.toString(16) + '+' + ((h - l) >> 20n) + 'MB').join(',')} bySize=${[...ms.bySize].sort((x, y) => y[1] - x[1]).slice(0, 16).map(([k, v]) => k + 'x' + v).join(' ')}`); }
     if (ENV.OXWASM_SCTRACE && this._ctor?.argv?.[0]?.includes('opencode')) {
       const t = this.threads[this.ti], r = cpu.regs;
-      const line = `${t?.id} ${nr} ${a1.toString(16)} ${a2.toString(16)} ${a3.toString(16)} sp=${r[4].toString(16)} bp=${r[5].toString(16)} bx=${r[3].toString(16)} r12=${r[12].toString(16)} r13=${r[13].toString(16)} r14=${r[14].toString(16)} r15=${r[15].toString(16)}`;
+      const line = `${t?.id} ${nr} ${a1.toString(16)} ${a2.toString(16)} ${a3.toString(16)} d=${this.stats.disp} sp=${r[4].toString(16)} bp=${r[5].toString(16)} bx=${r[3].toString(16)} r12=${r[12].toString(16)} r13=${r[13].toString(16)} r14=${r[14].toString(16)} r15=${r[15].toString(16)}`;
       const buf = (this._sct ??= []); buf.push(line);
       if (buf.length >= 500) { process.getBuiltinModule('node:fs').appendFileSync(ENV.OXWASM_SCTRACE, buf.join('\n') + '\n'); buf.length = 0; }
     }
@@ -3702,10 +3715,14 @@ export class LinuxEngine {
         }
         const now = this.nowMs();
         if (n > 0 || timeoutMs === 0 || (this._deadline != null && now >= this._deadline)) {
+          // OXWASM_EPOLLSPIN=1: a wait that keeps returning without ever blocking is reported once with
+          // what it reports and why (an fd that stays ready, a zero timeout, a deadline already past)
+          if (ENV.OXWASM_EPOLLSPIN) { h.ep.spin = (h.ep.spin | 0) + 1; if (h.ep.spin === 20000) { const why = []; for (const [tfd, it] of h.ep.interest) { const t = this.fds.get(tfd); why.push(`fd${tfd}:${t ? Object.keys(t).filter((k) => ['pts','lsock','dsock','pidfd','sock','ino','pipe','ev','tfd','sfd','bytes'].includes(k) && t[k]).join('/') : 'closed'} ev=${it.events.toString(16)} ready=${t ? readyR(t) : '-'}${t?.pipe ? ` pipe(chunks=${t.pipe.chunks.length} weof=${!!t.pipe.weof})` : ''}${t?.ev ? ` evcount=${t.ev.count}` : ''}${t?.tfd ? ' timerfd' : ''}`); } console.error(`[epollspin] tid=${this.threads[this.ti]?.id} epfd=${a1} n=${n} timeout=${timeoutMs} deadline=${this._deadline} now=${now} ${why.join(' | ')}`); } }
           this._deadline = null; ret(BigInt(n)); break;
         }
+        if (ENV.OXWASM_EPOLLSPIN) h.ep.spin = 0;
         this._deadline ??= (timeoutMs < 0 ? Infinity : now + timeoutMs);
-        this.block(this._capByTimerfd(this._deadline)); break; }
+        this.block(this._capByTimerfd(this._deadline, h.ep.interest.keys())); break; }
       case 13: {                                              // rt_sigaction(sig, act*, oldact*, sz)
         const sig = Number(a1);
         if (sig < 1 || sig > 64 || sig === 9 || sig === 19) { ret(-22n); break; }   // EINVAL
@@ -4586,12 +4603,12 @@ export class LinuxEngine {
           : !!h.bytes;                                        // regular file: always ready (EOF too)
         const base = this.RAMOFF + Number(a1 - this.base);
         this.jsnap(a1, nfds * 8);                             // revents go back into the caller's array
-        let ready = 0;
+        let ready = 0; const polled = [];
         for (let i = 0; i < nfds; i++) {
           const o = base + i * 8;
           const fd = v.getInt32(o, true), ev = v.getUint16(o + 4, true);
           let re = 0;
-          if (fd >= 0) {
+          if (fd >= 0) { polled.push(fd);
             const h = this.fds.get(fd);
             if (!h && fd > 2) re = 0x20;                      // POLLNVAL
             else { if ((ev & 1) && readyR(h)) re |= 1;        // POLLIN
@@ -4619,7 +4636,7 @@ export class LinuxEngine {
           this._deadline = null; unmask(); ret(BigInt(ready)); break;
         }
         this._deadline ??= (timeoutMs < 0 ? Infinity : now + timeoutMs);
-        this.block(this._capByTimerfd(this._deadline)); break; }
+        this.block(this._capByTimerfd(this._deadline, polled)); break; }
       case 23: case 270: {                                    // select / pselect6
         const nfds = Number(a1), v = new DataView(this.wmem.buffer);
         const rp = a2, wp = a3, ep = cpu.regs[10], tp = cpu.regs[8];
@@ -4663,7 +4680,7 @@ export class LinuxEngine {
           unmask(); ret(BigInt(rd.length + wr.length)); break;
         }
         this._deadline ??= (timeoutMs < 0 ? Infinity : now + timeoutMs);
-        this.block(this._capByTimerfd(this._deadline)); break; }
+        this.block(this._capByTimerfd(this._deadline, (rp ? scan(rp) : []).concat(wp ? scan(wp) : []))); break; }
       default:
         ret(-38n);                                           // ENOSYS
         (this.unknown ||= new Set()).add(nr);
@@ -4965,9 +4982,21 @@ export class LinuxEngine {
   }
   _tfdReady(t) { this._tfdTick(t); return t.fired > 0; }
   _sfdReady(sfd) { return this.threads.some(x => x.state !== 'dead' && ((x.pending ?? 0n) & sfd.mask) !== 0n); }
-  _capByTimerfd(dl) {
+  // The deadline a wait sleeps to, capped by the next expiry of the timerfds it WATCHES (`fds`): a
+  // wait must wake when one of its own timerfds expires, nothing else. It used to be capped by every
+  // timerfd in the process: a one-shot timerfd that had expired, owned and polled by another thread
+  // (Bun's event loop timer, with that thread blocked in a futex), kept its past expiry, and an
+  // epoll_pwait on a different epoll fd blocked to that past time, woke at once with nothing ready,
+  // blocked again - a livelock at full speed that starved every other thread (opencode, in roughly
+  // one run in three). Expired timers are ticked first so an unread one-shot never yields a past
+  // deadline; one that has fired is ready and was reported by the readiness scan.
+  _capByTimerfd(dl, fds) {
     let e = dl === Infinity ? null : dl;
-    for (const [, h] of this.fds) if (h?.tfd?.at != null) e = e == null ? h.tfd.at : Math.min(e, h.tfd.at);
+    for (const fd of fds) {
+      const t = this.fds.get(fd)?.tfd; if (!t || t.at == null) continue;
+      this._tfdTick(t);
+      if (t.at != null) e = e == null ? t.at : Math.min(e, t.at);
+    }
     return e;
   }
   // dequeue the lowest pending signal in `set` from thread t (or any thread
@@ -5913,6 +5942,10 @@ export class LinuxEngine {
     // OXWASM_BREAK_VMTOP=1: report only when vm.topCallFrame (VM+0x20, rdi = VM) lies BELOW rsp - a live JS
     // frame under the stack pointer, which sanitizeStackForVM then zeroes. Legit calls have it above.
     if (ENV.OXWASM_BREAK_VMTOP) { let top; try { top = this.mem.read(r[7] + 0x20n, 8n); } catch { return; } if (!(top !== 0n && top < r[4])) return; }
+    // OXWASM_BREAK_GREP=text: print every place the text occurs in guest memory, with context (an error
+    // message the guest built, a string an unhandled rejection carries)
+    if (ENV.OXWASM_BREAK_GREP) try { const pat = new TextEncoder().encode(ENV.OXWASM_BREAK_GREP), ram = new Uint8Array(this.wmem.buffer, this.RAMOFF, this.ram.length); let n = 0, i = 0; const out = []; while (n < 40 && (i = ram.indexOf(pat[0], i)) >= 0) { let ok = true; for (let j = 1; j < pat.length; j++) if (ram[i + j] !== pat[j]) { ok = false; break; } if (ok && i < +(ENV.OXWASM_BREAK_GREP_MIN || 0x8000000)) { i += pat.length; continue; }   // skip the static image: error-message templates
+        if (ok) { n++; const lo = Math.max(0, i - 80), hi = Math.min(ram.length, i + 160); let txt = ''; for (let k = lo; k < hi; k++) { const b = ram[k]; txt += (b >= 32 && b < 127) ? String.fromCharCode(b) : (b === 0 ? '' : '.'); } out.push(`${(this.base + BigInt(i)).toString(16)}: ${txt}`); i += pat.length; } else i++; } console.error(`[grep "${ENV.OXWASM_BREAK_GREP}"] ${n} hits\n  ` + out.join('\n  ')); } catch (e) { console.error('[grep] failed: ' + e.message); }
     const names = ['rax','rcx','rdx','rbx','rsp','rbp','rsi','rdi','r8','r9','r10','r11','r12','r13','r14','r15'];
     let out = `[break ${c.rip.toString(16)}] tid=${this.threads[this.ti]?.id} disp=${this.stats.disp} ` + names.map((n, i) => `${n}=${r[i].toString(16)}`).join(' ') + ` [rdi+1f830]=${q(r[7] + 0x1f830n)} vmtop=${q(r[7] + 0x20n)} [rsp]=${q(r[4])} [rsp+8]=${q(r[4] + 8n)} fs=${c.fsBase?.toString(16)}\n`;
     // JSC call frames up the rbp chain: return pc, CodeBlock slot (+0x10), callee (+0x18), argc/callSiteIndex (+0x20/+0x24)
