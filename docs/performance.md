@@ -749,3 +749,23 @@ exactly the case `xpack` already covers, and is not this packer's.
 
 Reverted. What is kept from the attempt is the snapshot bug it exposed (the
 382 MB of JSON) and `diff/snaptest.mjs`.
+
+## opencode (Bun/JavaScriptCore) steady-state JavaScript vs the same binary natively
+
+`bench/jssteady.js`: recursion, typed-array math, object/property access, string
+building, sort, Map/Set and JSON round trips, one round about 0.6 s natively. Round
+time after warm-up (best of the later rounds), the same `opencode` binary run as bun
+(`BUN_BE_BUN=1`) on a Firecracker VM, 4 vCPU:
+
+| configuration | ms per round | vs native with JIT |
+|---|---|---|
+| native, JSC JIT on | 629 | 1.0x |
+| native, JSC JIT off (LLInt only) | 2925 | 4.6x |
+| oxwasm, JIT off (LLInt compiled to wasm) | 25387 | 40x |
+| oxwasm, JIT on, generated code translated (EXEC_ANON + STOREGUARD) | first small round 448 s | not usable |
+
+Against the same interpreter natively the emulation costs 7x to 12x per phase (fib 7.1x,
+strings 7.5x, maps 7.8x, objects 8.6x, math 9.6x, json 10.2x, sorting 11.8x). The JIT on
+adds the other 4.6x natively, and the translated-JIT route currently spends its time
+re-translating code JSC patches in place. Within 20% of native needs both the 7x to 12x and
+the JIT gap closed; neither is closed yet.
