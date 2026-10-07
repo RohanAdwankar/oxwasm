@@ -41,6 +41,9 @@ const SHADOW_OK_SYS = new Set([228, 96, 201, 39, 186, 24, 102, 104, 107, 108, 11
 const SHADOW_DISP = ENV.OXWASM_SHADOW_DISP ? ENV.OXWASM_SHADOW_DISP.split('-').map(Number) : null;
 const AOTSKIP = ENV.OXWASM_AOTSKIP ? ENV.OXWASM_AOTSKIP.split('-').map(Number) : null;
 const DISPRING = !!ENV.OXWASM_DISPRING;
+if (ENV.OXWASM_SIGTRACE) globalThis.__sigtrace = true;   // raise / deliver lines on stderr
+const TRACE_ARGV = ENV.OXWASM_TRACE_ARGV ?? 'opencode';   // which program (argv0 substring; '' = every process) the heartbeat and syscall trace follow
+const HEARTBEAT = ENV.OXWASM_HEARTBEAT ? (+ENV.OXWASM_HEARTBEAT | 0) : 0;   // OXWASM_HEARTBEAT=2^k-1: a line every 2^k dispatches (does the engine still dispatch?)
 const DUMP_AT_MS = ENV.OXWASM_DUMP_AT_MS ? +ENV.OXWASM_DUMP_AT_MS : null;   // wall-clock ms (engine clock) after which up to three thread states are dumped from the clock fast path (a hang's whereabouts)
 const DISPRING_N = Math.max(512, +ENV.OXWASM_DISPRING || 0);
 const DISPRING_WATCH = ENV.OXWASM_DISPRING_WATCH ? ENV.OXWASM_DISPRING_WATCH.split(',').map((h) => BigInt('0x' + h)) : null;   // guest addresses whose u64 each ring entry records   // OXWASM_DISPRING=<n>: ring size (1 = the default 512)
@@ -977,6 +980,7 @@ export class LinuxEngine {
   // Returns the rip to continue at.
   dispatchAot(f) {
     this.stats.disp = (this.stats.disp || 0) + 1;
+    if (HEARTBEAT && (this.stats.disp & HEARTBEAT) === 0 && this._ctor?.argv?.[0]?.includes(TRACE_ARGV)) console.error(`[hb] disp=${this.stats.disp} rip=${this.cpu.rip.toString(16)} tid=${this.threads[this.ti]?.id} rsp=${this.cpu.regs[4].toString(16)} t=${Math.round(this.nowMs())} interp=${this.stats.interpreted} aot=${this.stats.aotRuns}`);
     if (ENV.OXWASM_DISPLOG && this._ctor?.argv?.[0]?.includes('opencode')) { const [lo, hi] = ENV.OXWASM_DISPLOG.split('-').map(Number); if (this.stats.disp >= lo && this.stats.disp <= hi) console.error(`[disp ${this.stats.disp}] rip=${this.cpu.rip.toString(16)} rsp=${this.cpu.regs[4].toString(16)}`); }
     if (ENV.OXWASM_AOTSTOP && this.stats.disp === +ENV.OXWASM_AOTSTOP && this._ctor?.argv?.[0]?.includes('opencode')) { this._aotOff = true; if (ENV.OXWASM_AOTSTOP_HARD) { new DataView(this.wmem.buffer).setUint32(FTMAP, 0, true); new Uint8Array(this.wmem.buffer, FTHASH, FTHBYTES).fill(0); this._ftCount = 0; this._ftSeen = new Set(); this._entries = null; } console.error('[aotstop] at disp', this.stats.disp); }
     if (this._cleanSync) this.stats.dispClean = (this.stats.dispClean || 0) + 1;
@@ -2376,7 +2380,7 @@ export class LinuxEngine {
     }
     if (ENV.OXWASM_CLOCKCHAIN && nr === 228 && this._ctor?.argv?.[0]?.includes('opencode') && ((this._ccN = (this._ccN | 0) + 1) % (+ENV.OXWASM_CLOCKCHAIN) === 0)) { const out = []; try { let bp = cpu.regs[5]; for (let i = 0; i < 24 && bp; i++) { out.push(this.mem.read(bp + 8n, 8n).toString(16)); bp = this.mem.read(bp, 8n); } } catch {} console.error(`[clock#${this._ccN}] rip=${cpu.rip.toString(16)} chain=${out.join(',')}`); }
     if (this._mmapStat && nr === 234) { const ms = this._mmapStat; console.error(`[mmapstat@tgkill] mmap n=${ms.mmapN} ${ms.mmapB >> 20n}MB munmap n=${ms.munmapN} ${ms.munmapB >> 20n}MB mmapNext=${this.mmapNext?.toString(16)} base=${this._mmapBase?.toString(16)} holes=${(this._mmapHoles ?? []).map(([l, h]) => l.toString(16) + '+' + ((h - l) >> 20n) + 'MB').join(',')} bySize=${[...ms.bySize].sort((x, y) => y[1] - x[1]).slice(0, 16).map(([k, v]) => k + 'x' + v).join(' ')}`); }
-    if (ENV.OXWASM_SCTRACE && this._ctor?.argv?.[0]?.includes('opencode')) {
+    if (ENV.OXWASM_SCTRACE && this._ctor?.argv?.[0]?.includes(TRACE_ARGV)) {
       const t = this.threads[this.ti], r = cpu.regs;
       const line = `${t?.id} ${nr} ${a1.toString(16)} ${a2.toString(16)} ${a3.toString(16)} d=${this.stats.disp} sp=${r[4].toString(16)} bp=${r[5].toString(16)} bx=${r[3].toString(16)} r12=${r[12].toString(16)} r13=${r[13].toString(16)} r14=${r[14].toString(16)} r15=${r[15].toString(16)}`;
       const buf = (this._sct ??= []); buf.push(line);
@@ -3917,9 +3921,12 @@ export class LinuxEngine {
         this.jsnap(a1, 8); this.mem.write(a1, 8n, t.pending); ret(0n); break; }
       case 130: {                                             // rt_sigsuspend(mask*, sz)
         const t = this._ts(this.threads[this.ti]);
-        t.suspendOld = t.sigmask;
+        // a woken, re-executed sigsuspend must keep the mask saved by its FIRST execution: overwriting it
+        // with the temporary mask lost the caller's mask for good once the handler had run
+        t.suspendOld ??= t.sigmask;
         t.sigmask = this.mem.read(a1, 8n) & ~((1n << 8n) | (1n << 18n));
         const sig = this._sigDeliverable(t);
+        if (ENV.OXWASM_SIGDIAG && (this._ssN = (this._ssN | 0) + 1) % 20000 === 1) console.error(`[sigsuspend] n=${this._ssN} tid=${t.id} proc=${t.proc?.pid} mask=${t.sigmask.toString(16)} pending=${t.pending.toString(16)} deliverable=${sig} handler=${sig ? this.sigact?.get(sig)?.handler?.toString(16) : '-'} procSigact=${t.proc?.sigact ? [...t.proc.sigact.keys()].join(',') : '-'} engSigact=${[...(this.sigact ?? new Map()).keys()].join(',')} children=${(this.children ?? []).map((c) => c.pid + ':' + c.exited + ':pp=' + (c.pp?.pid ?? 'main')).join(' ')}`);
         if (sig) { ret(-4n); this._sigDeliver(cpu, t, sig, cpu.rip); break; }   // EINTR after the handler
         this.block(null); break; }
       case 131: {                                             // sigaltstack(new*, old*)
@@ -5156,6 +5163,7 @@ export class LinuxEngine {
     if (!sig) return;
     const act = this.sigact.get(sig);
     if (!act) { this._sigDefault(t, sig); return; }
+    if (t.suspendOld != null) { cpu.regs[0] = BigInt.asUintN(64, -4n); this._sigDeliver(cpu, t, sig, cpu.rip + 2n); return; }   // see _sigPoll
     this._sigDeliver(cpu, t, sig, cpu.rip);
   }
   _sigPoll() {                                                                  // run-loop quantum
@@ -5165,6 +5173,11 @@ export class LinuxEngine {
     if (!sig) return false;
     const act = this.sigact.get(sig);
     if (!act) { this._sigDefault(t, sig); return false; }
+    // A thread parked in sigsuspend / a masked wait has its syscall REWOUND (rip at the syscall insn, to
+    // be re-executed on wake): a handler delivered here returned to that insn and went back to sleep
+    // (the wait is never restarted; it must fail with EINTR once the handler has run). ash's `wait`
+    // slept forever on a SIGCHLD it had already handled - the finished child was never reaped.
+    if (t.suspendOld != null) { this.cpu.regs[0] = BigInt.asUintN(64, -4n); this._sigDeliver(this.cpu, t, sig, this.cpu.rip + 2n); return true; }
     this._sigDeliver(this.cpu, t, sig, this.cpu.rip);
     return true;
   }
