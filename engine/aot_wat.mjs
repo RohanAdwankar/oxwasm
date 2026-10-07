@@ -2522,6 +2522,18 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   // simply where the guest goes next. HotSpot's template interpreter uses rsp
   // as the Java operand stack and dispatches every bytecode with rsp above the
   // template's entry rsp; guarding those cost javac 41M deopts in 400 s.
+  // After an in-unit call returns, the guest must be back at this site's pre-push rsp: the callee
+  // popped the return address this site pushed. A callee that left at some OTHER stack level has
+  // returned PAST this frame - an exception thrown in a nested callee, caught by a handler in the
+  // caller (JSC's op_catch resets rsp to the catching frame only after the jump the chain guard
+  // checked), the caller then returning normally through the structural callee's `ret`; or any
+  // longjmp-like unwind that ends in a `ret`. Continuing here would run this frame's continuation
+  // with the state of a frame above it (JSC's LLInt then read the grandparent's call-site index
+  // and resumed 7 bytes into a 14-byte instruction; opencode's --version threw a TypeError from
+  // a turndown feature test). Hand the callee's exit up instead: every stale frame above does the
+  // same, and the top-level dispatch honours the rip where the guest actually is. The locals were
+  // just reloaded from the regfile, so no spill is needed before leaving.
+  const retCheck = (rb) => `(if (i64.ne (local.get $r4) (local.get ${rb})) (then (return (local.get $rex))))`;
   const tailJmp = () => { usesFtr = true; return [
     icResolve('(local.get $rex)'),
     `(if (i32.and ${ftHit} (i32.or (i64.le_u (local.get $r4) (local.get $rsp0)) (i32.or (i32.eqz (i32.load (i32.const ${FTNEST}))) (i32.load8_u (i32.add (i32.const ${FTENTRY}) (local.get $fti))))))`,
@@ -3255,13 +3267,16 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           // three things around it were each measured to cost nothing.
           if (insn.inlineTo !== undefined) break;
           L.push(SA_MARK);
+          // The callee's exit rip is kept (not dropped) and the guest rsp is checked against its
+          // pre-push value once the regfile is reloaded: see retCheck below.
+          const rb = T(); L.push(`(local.set ${rb} (i64.add (local.get $r4) (i64.const 8)))`);
           if (canDirect(target.toString()))
             // stack-budget check even on direct calls: past it, x_callout
             // interprets the callee instead of nesting another wasm frame
             L.push(ftSave(),
                    `(if ${ftOk}`,
-                   `  (then ${ftBurn} ${nestUp}(drop (call $f_${target.toString(16)}))${nestDn} ${ftRestore})`,
-                   `  (else (drop (call $x_callout (i64.const ${hexs(target)})))))`);
+                   `  (then ${ftBurn} ${nestUp}(local.set $rex (call $f_${target.toString(16)}))${nestDn} ${ftRestore})`,
+                   `  (else (local.set $rex (call $x_callout (i64.const ${hexs(target)})))))`);
           else {
             // out-of-unit target: it may be compiled in ANOTHER unit — chain
             // through the global dispatch table without a JS round-trip
@@ -3269,10 +3284,10 @@ function emitUnitFunction(a0, fnAddr, ctx) {
             L.push(icResolve(`(i64.const ${hexs(target)})`),
                    ftSave(),
                    `(if ${ftHit}`,
-                   `  (then ${ftBurn} ${nestUp}(drop (call_indirect $ft (type $uft) (local.get $fti)))${nestDn} ${ftRestore})`,
-                   `  (else (drop (call $x_callout (i64.const ${hexs(target)})))))`);
+                   `  (then ${ftBurn} ${nestUp}(local.set $rex (call_indirect $ft (type $uft) (local.get $fti)))${nestDn} ${ftRestore})`,
+                   `  (else (local.set $rex (call $x_callout (i64.const ${hexs(target)})))))`);
           }
-          L.push(RC_MARK);
+          L.push(RC_MARK, retCheck(rb));
           break; }
         case 'callind': {   // compute target BEFORE the push moves rsp
           const t = T(); L.push(`(local.set ${t} ${rd(insn.src,8,next)})`);
@@ -3280,12 +3295,13 @@ function emitUnitFunction(a0, fnAddr, ctx) {
                  `(i64.store ${wasmAddr({base:4,index:-1,disp:0n},next)} (i64.const ${hexs(next)}))`);
           L.push(SA_MARK);
           usesFtr = true;
+          const rb = T(); L.push(`(local.set ${rb} (i64.add (local.get $r4) (i64.const 8)))`);
           L.push(icResolve(`(local.get ${t})`),
                  ftSave(),
                  `(if ${ftHit}`,
-                 `  (then ${ftBurn} ${nestUp}(drop (call_indirect $ft (type $uft) (local.get $fti)))${nestDn} ${ftRestore})`,
-                 `  (else (drop (call $x_callout (local.get ${t})))))`);
-          L.push(RC_MARK);
+                 `  (then ${ftBurn} ${nestUp}(local.set $rex (call_indirect $ft (type $uft) (local.get $fti)))${nestDn} ${ftRestore})`,
+                 `  (else (local.set $rex (call $x_callout (local.get ${t})))))`);
+          L.push(RC_MARK, retCheck(rb));
           break; }
         case 'syscall':
           // pass this syscall's guest rip: a BLOCKING syscall (poll/select/

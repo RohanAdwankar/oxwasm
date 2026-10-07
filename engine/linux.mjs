@@ -37,10 +37,23 @@ const PAGE = 4096n;
 const align = (v, a) => (v + a - 1n) & ~(a - 1n);
 const EXIT = Symbol('guest-exit');           // unwinds live wasm frames on exit()
 const SHADOW_ABORT = { shadowAbort: true };
+const SHADOW_OK_SYS = new Set([228, 96, 201, 39, 186, 24, 102, 104, 107, 108, 110, 28, 17, 202]);   // 28 madvise: advice only; 17 pread64: a read; 202 futex: a wake is harmless, a wait blocks and aborts   // idempotent, read-only: allowed inside a shadow interpretation
 const SHADOW_DISP = ENV.OXWASM_SHADOW_DISP ? ENV.OXWASM_SHADOW_DISP.split('-').map(Number) : null;
 const AOTSKIP = ENV.OXWASM_AOTSKIP ? ENV.OXWASM_AOTSKIP.split('-').map(Number) : null;
 const DISPRING = !!ENV.OXWASM_DISPRING;
+const DUMP_AT_MS = ENV.OXWASM_DUMP_AT_MS ? +ENV.OXWASM_DUMP_AT_MS : null;   // wall-clock ms (engine clock) after which up to three thread states are dumped from the clock fast path (a hang's whereabouts)
+const DISPRING_N = Math.max(512, +ENV.OXWASM_DISPRING || 0);
+const DISPRING_WATCH = ENV.OXWASM_DISPRING_WATCH ? ENV.OXWASM_DISPRING_WATCH.split(',').map((h) => BigInt('0x' + h)) : null;   // guest addresses whose u64 each ring entry records   // OXWASM_DISPRING=<n>: ring size (1 = the default 512)
 const AT_SHADOW = !!ENV.OXWASM_AT_SHADOW;
+const AT_SHADOW_RSP = ENV.OXWASM_AT_SHADOW_RSP ? ENV.OXWASM_AT_SHADOW_RSP.split('-').map((h) => BigInt('0x' + h)) : null;   // OXWASM_AT_SHADOW_RSP=lo-hi: shadow only dispatches entered with rsp in [lo, hi)
+const AT_SHADOW_FN = ENV.OXWASM_AT_SHADOW_FN ? new Set(ENV.OXWASM_AT_SHADOW_FN.split(',').map((h) => BigInt('0x' + h))) : null;
+const ROOTVETO = ENV.OXWASM_ROOTVETO ? ENV.OXWASM_ROOTVETO.split(',').map((r) => { const [lo, hi] = r.split('-'); return [BigInt('0x' + lo), hi ? BigInt('0x' + hi) : BigInt('0x' + lo) + 1n]; }) : null;
+// OXWASM_ARM_FP=<offset hex>:<bytes hex>:<maxsite hex>:<riplo hex>-<riphi hex>: arm the diagnostic window at the
+// first interpreted step with rip in [riplo, riphi) (an interpreter's handler range) where the bytes at
+// r13+offset equal <bytes> (the frame runs the bytecode that carries that instruction) and the frame's call
+// site index ([rbp+0x24]) is below maxsite (the frame has not reached it yet). Finds a frame by its code,
+// not by a heap address or a dispatch count, so it survives runs that lay memory out differently.
+const ARM_FP = ENV.OXWASM_ARM_FP ? (() => { const [o, b, m, r, mn] = ENV.OXWASM_ARM_FP.split(':'); const [lo, hi] = r.split('-'); return { off: BigInt('0x' + o), bytes: Uint8Array.from(b.match(/../g).map((x) => parseInt(x, 16))), maxSite: Number('0x' + m), minSite: mn ? Number('0x' + mn) : 0, lo: BigInt('0x' + lo), hi: BigInt('0x' + hi) }; })() : null;   // optional 5th field: minimum call site index
 // OXWASM_DETRANDOM=<seed>: every byte of randomness the guest sees (AT_RANDOM, getrandom, /dev/urandom)
 // comes from a seeded generator, so a run can be replayed exactly (diagnosis; never for real use).
 let _detRnd = ENV.OXWASM_DETRANDOM ? (BigInt(ENV.OXWASM_DETRANDOM) | 0x9E3779B97F4A7C15n) & 0xFFFFFFFFFFFFFFFFn : null;
@@ -463,6 +476,10 @@ export class LinuxEngine {
   // compiled code make indirect calls / cross-unit calls / indirect tail
   // jumps without a JS boundary or regfile sync.
   registerAotFn(a, f) {
+    // OXWASM_ROOTVETO=lo-hi[,lo-hi|addr...] (hex): compiled functions with an entry in a listed range are
+    // never registered, so they run interpreted and chains into them deopt; a bisect over guest code
+    // that leaves the unit cache key alone (the veto file is part of it, and a cold compile is slow)
+    if (ROOTVETO !== null) { const aa = BigInt(a); for (const [lo, hi] of ROOTVETO) if (aa >= lo && aa < hi) { (this._rootVetoed ??= new Set()).add(aa); this.aotFailed.add(aa); return; } }
     if (ENV.OXWASM_DISPLOG && this._ctor?.argv?.[0]?.includes('opencode')) { const [lo, hi] = ENV.OXWASM_DISPLOG.split('-').map(Number); if ((this.stats.disp || 0) >= lo && (this.stats.disp || 0) <= hi) console.error(`[reg disp=${this.stats.disp}] ${a.toString(16)}`); }
     this.aotFns.set(a, f); this._entryAdd(a);
     // __noFtab bisect lever: an empty map makes every $ftr miss, so all
@@ -1046,6 +1063,14 @@ export class LinuxEngine {
     // Registers and xmm per step go into one preallocated buffer (48 words a step): the
     // per-step slices were most of the cost of a shadowed dispatch.
     const TB = exitMatch ? (this._shadowTB ??= new BigInt64Array((CAP + 2) * 48)) : null;
+    // Past CAP, exit-matched mode keeps a cheap (rip, rsp) tail for CAP2 more steps: a compiled dispatch
+    // that chains through an interpreter's handlers runs millions of guest instructions before its frame
+    // exits, and the full per-step snapshot cannot stretch that far. A tail match proves the compiled
+    // exit lies on the interpreter's path (control flow agrees, state not compared); no match at all
+    // within CAP + CAP2 steps is the control-flow divergence signal.
+    const CAP2 = exitMatch ? +(ENV.OXWASM_SHADOW_CAP2 || 4e6) : 0;
+    const cfRip = CAP2 ? (this._shadowCfRip ??= new BigUint64Array(CAP2)) : null, cfRsp = CAP2 ? (this._shadowCfRsp ??= new BigUint64Array(CAP2)) : null;
+    let cfN = 0;
     const rec = () => {
       const jr = this.mem.jrnl, from = trace.length ? trace[trace.length - 1].jn : 0, wr = [];
       for (let i = from; i < jr.length; i++) { const [a, n, _o, snap] = jr[i]; wr.push(snap ? [a, BigInt(snap.length), this.mem.view(a, BigInt(snap.length)).slice()] : [a, n, this.mem.read(a, n)]); }
@@ -1056,13 +1081,14 @@ export class LinuxEngine {
     };
     try {
       while (!(cpu.rip === retAddr && cpu.regs[4] === rspExit)) {
-        if (trace) rec();
+        if (trace && steps <= CAP) rec();
+        else if (cfRip !== null) { if (cfN >= CAP2) { ok = exitMatch; break; } cfRip[cfN] = cpu.rip; cfRsp[cfN] = cpu.regs[4]; cfN++; }
         cpu.step();
         if (this.exitCode !== null || this.blocked) { ok = false; break; }
-        if (++steps > CAP) { ok = exitMatch; break; }   // exit-matched: the trace so far may still hold the exit
+        if (++steps > CAP && cfRip === null) { ok = exitMatch; break; }   // exit-matched: the trace so far may still hold the exit
       }
       if (trace && ok) rec();
-    } catch (e) { ok = false; if (!(e === SHADOW_ABORT || e instanceof Error)) throw e; if (trace) (st.abortedAt ??= new Map()).set(`${entryRip.toString(16)}@${cpu.rip.toString(16)}${e === SHADOW_ABORT ? 'sys' : 'err'}`, (st.abortedAt?.get(`${entryRip.toString(16)}@${cpu.rip.toString(16)}${e === SHADOW_ABORT ? 'sys' : 'err'}`) ?? 0) + 1); }
+    } catch (e) { ok = false; if (!(e === SHADOW_ABORT || e instanceof Error)) throw e; if (trace) (st.abortedAt ??= new Map()).set(`${entryRip.toString(16)}@${cpu.rip.toString(16)}${e === SHADOW_ABORT ? 'sys' + this._shadowAbortNr : 'err'}`, (st.abortedAt?.get(`${entryRip.toString(16)}@${cpu.rip.toString(16)}${e === SHADOW_ABORT ? 'sys' : 'err'}`) ?? 0) + 1); }
     if (trace && !ok && !this.blocked && this.exitCode === null && steps <= CAP) { /* recorded above */ } else if (trace && !ok) (st.abortedAt ??= new Map()).set(`${entryRip.toString(16)}@${cpu.rip.toString(16)}${this.blocked ? 'blk' : 'cap'}`, (st.abortedAt?.get(`${entryRip.toString(16)}@${cpu.rip.toString(16)}${this.blocked ? 'blk' : 'cap'}`) ?? 0) + 1);
     this._shadowInterp = false;
     const jr = this.mem.jrnl; this.mem.jrnl = null;
@@ -1090,7 +1116,14 @@ export class LinuxEngine {
     if (trace !== null) {
       if (!ok || (this._shadowDiverged ?? 0) >= 100) { st.aborted++; this._shadowBusy = false; return exitRip; }
       const ks = []; for (let i = 0; i < trace.length; i++) if (trace[i].rip === exitRip && trace[i].rsp === cpu.regs[4]) ks.push(i);
-      if (!ks.length) { st.aborted++; (st.noexit ??= new Map()).set(entryRip, (st.noexit.get(entryRip) ?? 0) + 1); this._shadowBusy = false; return exitRip; }
+      if (!ks.length && cfN > 0) { let j = -1; for (let i = 0; i < cfN; i++) if (cfRip[i] === exitRip && cfRsp[i] === cpu.regs[4]) { j = i; break; }
+        if (j >= 0) { st.cfmatch = (st.cfmatch || 0) + 1; console.error(`<SHADOW-CFMATCH fn=0x${entryRip.toString(16)} disp=${this.stats.disp} exit=0x${exitRip.toString(16)} at-step=${CAP + j + 1}>`); this._shadowBusy = false; return exitRip; } }
+      if (!ks.length) { st.aborted++; (st.noexit ??= new Map()).set(entryRip, (st.noexit.get(entryRip) ?? 0) + 1);
+        // The compiled frame left at a (rip, rsp) the interpreter never reached: either it ran past the
+        // interpreter's step caps, or the two took different paths. Report where each side was.
+        const same = []; for (let i = 0; i < trace.length; i++) if (trace[i].rip === exitRip) same.push(`${i}@rsp=${trace[i].rsp.toString(16)}`);
+        console.error(`<SHADOW-NOEXIT fn=0x${entryRip.toString(16)} disp=${this.stats.disp} exit=0x${exitRip.toString(16)} rsp=${cpu.regs[4].toString(16)} entry-rsp=${rsp0.toString(16)} interp-steps=${trace.length}+${cfN}${steps > CAP + CAP2 ? ' (capped)' : ''} interp-last=0x${trace[trace.length - 1].rip.toString(16)}/${trace[trace.length - 1].rsp.toString(16)} exit-rip-seen-at=[${same.slice(0, 6).join(',')}] last-rips=[${trace.slice(-24).map((t) => t.rip.toString(16)).join(' ')}]>`);
+        this._shadowBusy = false; return exitRip; }
       st.compared++;
       let best = null;
       for (const k of ks) {                                 // a loop revisits (rip, rsp): report only if no visit matches
@@ -1170,7 +1203,18 @@ export class LinuxEngine {
   // OXWASM_DISPRING=1: a ring of the last 512 unit dispatches / callouts / deopts / frame finishes
   // (kind, addresses, rsp, dispatch number), dumped by _onBreak: the compiled-code history the
   // interpreted rip trace cannot see.
-  _dr(kind, a, b, c) { const r = (this._dring ??= new Array(512)); r[this._dringI = ((this._dringI | 0) + 1) % 512] = `${kind} ${a.toString(16)} ${b === undefined ? '' : b.toString(16)} ${c === undefined ? '' : c.toString(16)} d=${this.stats.disp} rsp=${BigInt.asUintN(64, this.regview[4]).toString(16)}`; }
+  _dr(kind, a, b, c) { const N = DISPRING_N, r = (this._dring ??= new Array(N)); r[this._dringI = ((this._dringI | 0) + 1) % N] = `${kind} ${a.toString(16)} ${b === undefined ? '' : b.toString(16)} ${c === undefined ? '' : c.toString(16)} d=${this.stats.disp} rsp=${BigInt.asUintN(64, this.regview[4]).toString(16)} rbp=${BigInt.asUintN(64, this.regview[5]).toString(16)}${DISPRING_WATCH === null ? '' : ' w=' + DISPRING_WATCH.map((a) => { try { return this.mem.read(a, 8n).toString(16); } catch { return '?'; } }).join('/')}`; }
+  _armFp(rip) {
+    if (this._skipUntil !== undefined || rip < ARM_FP.lo || rip >= ARM_FP.hi) return;
+    const r = this.cpu.regs; let site;
+    try { site = Number(this.mem.read(r[5] + 0x24n, 4n)); const a = r[13] + ARM_FP.off; for (let i = 0; i < ARM_FP.bytes.length; i++) if (Number(this.mem.read(a + BigInt(i), 1n)) !== ARM_FP.bytes[i]) return; } catch { return; }
+    if (site >= ARM_FP.maxSite || site < ARM_FP.minSite) return;
+    const rel = (ENV.OXWASM_AOTSKIP_REL || ('0-' + (ENV.OXWASM_AOTSKIP_N || 400))).split('-').map(Number);
+    this._skipFrom = (this.stats.disp | 0) + rel[0]; this._skipUntil = (this.stats.disp | 0) + rel[1]; if (ENV.OXWASM_AOTSKIP_STEPS) this._skipSteps = +ENV.OXWASM_AOTSKIP_STEPS;
+    console.error(`[aotskip] armed by fingerprint at disp ${this.stats.disp} rip=${rip.toString(16)} site=${site.toString(16)} r13=${r[13].toString(16)}: window ${this._skipFrom}..${this._skipUntil}`);
+    if (ENV.OXWASM_AT_BREAK) this._onBreak();
+    if (ENV.OXWASM_AT_AOTOFF) { this._aotOff = true; console.error(`[at-aotoff] compiled code off from disp ${this.stats.disp}`); }
+  }
   _ripHit(before) {
     const r = this.cpu.regs, rd = (a, n) => { try { return this.mem.read(a, n).toString(16); } catch { return '?'; } };
     // OXWASM_AOTSKIP_AT=rip:site  the first interpreted hit of rip with [rbp+0x24]==site arms an
@@ -1196,6 +1240,7 @@ export class LinuxEngine {
     while (!(cpu.rip === retAddr && cpu.regs[4] === rspExit) && !(cpu.regs[4] > rspExit)) {
       const before = cpu.rip;
       if (this._ripLog !== undefined && this._ripLog.has(before)) this._ripHit(before);
+      if (ARM_FP !== null) this._armFp(before);
       const insn = cpu.step(); this.stats.interpreted++;
       if (this.exitCode !== null) throw EXIT;
       if (this.blocked) { cpu.rip = before; break; }           // the run loop parks; the syscall re-executes
@@ -1214,7 +1259,8 @@ export class LinuxEngine {
     // rest of the program)
     // OXWASM_AT_SHADOW=1: the armed window is SHADOWED (compiled vs interpreted, see shadowDispatch)
     // instead of interpreted; dispatches outside it run compiled as usual
-    if (AT_SHADOW) { if (this._skipUntil !== undefined && (this.stats.disp | 0) < this._skipUntil && (this.stats.disp | 0) >= this._skipFrom) { this.shadowRange ??= [0n, 1n << 63n]; return this.shadowDispatch(f); } return this.dispatchAot(f); }
+    // OXWASM_AT_SHADOW_FN=hex[,hex]: within the window, shadow only dispatches of these roots
+    if (AT_SHADOW) { if (this._skipUntil !== undefined && (this.stats.disp | 0) < this._skipUntil && (this.stats.disp | 0) >= this._skipFrom && (AT_SHADOW_FN === null || AT_SHADOW_FN.has(this.cpu.rip)) && (AT_SHADOW_RSP === null || (this.cpu.regs[4] >= AT_SHADOW_RSP[0] && this.cpu.regs[4] < AT_SHADOW_RSP[1]))) { this.shadowRange ??= [0n, 1n << 63n]; return this.shadowDispatch(f); } return this.dispatchAot(f); }
     if (this._skipUntil !== undefined && (this.stats.disp | 0) < this._skipUntil && (this.stats.disp | 0) >= this._skipFrom && (this._skipSteps === undefined || this._skipSteps > 0)) {
       if (ENV.OXWASM_AOTSKIP_LOG) console.error(`[aotskip] disp ${this.stats.disp} rip=${this.cpu.rip.toString(16)} rsp=${this.cpu.regs[4].toString(16)} rbp=${this.cpu.regs[5].toString(16)} r8=${this.cpu.regs[8].toString(16)}`);
       this.stats.disp = (this.stats.disp | 0) + 1; this.stats.skipped = (this.stats.skipped || 0) + 1; return this._interpOne(); }
@@ -1274,6 +1320,8 @@ export class LinuxEngine {
       const before = this.cpu.rip;
       if (this.ripTrace !== undefined && before >= this._rtLo && before < this._rtHi) this.ripTrace[this.ripTraceI++ & 65535] = before;
             if (this._ripLog !== undefined && this._ripLog.has(before)) this._ripHit(before);
+      if (ARM_FP !== null) this._armFp(before);
+      if (ARM_FP !== null) this._armFp(before);
       this._cleanSync = false;
       if (BREAKS !== null && BREAKS.has(this.cpu.rip)) this._onBreak();
       const insn = this.cpu.step(); this.stats.interpreted++;
@@ -1428,6 +1476,7 @@ export class LinuxEngine {
           const nr = Number(this.regview[0]);
           if ((nr === 228 || nr === 39 || nr === 186 || nr === 24) && !this._sigAny && !this.strace && !this.dbgClockWatch && !(this.children !== undefined && this.children.length !== 0) && !ENV.OXWASM_SCTRACE && !ENV.OXWASM_MMAPSTAT && !ENV.OXWASM_WATCHPAGE && !ENV.OXWASM_CLOCKCHAIN) {
             this.stats.syscalls[nr] = (this.stats.syscalls[nr] || 0) + 1;
+            if (DUMP_AT_MS !== null && this._ctor?.argv?.[0]?.includes('opencode') && this.nowMs() > DUMP_AT_MS && (this._dumpedN = (this._dumpedN | 0)) < 3 && (this.stats.syscalls[nr] & 0xFFFF) === 0) { this._dumpedN++; console.error(`[dump-at] thread ${this.threads[this.ti]?.id} nr=${nr} t=${Math.round(this.nowMs())}`); this._onBreak(); }
             let r = 0n;
             if (nr === 228) {
               const clk = Number(this.regview[7]), ts = BigInt.asUintN(64, this.regview[6]);
@@ -2311,7 +2360,11 @@ export class LinuxEngine {
   }
 
   syscall(cpu) {
-    if (this._shadowInterp) throw SHADOW_ABORT;   // shadow interp must stay side-effect free
+    // shadow interp must stay side-effect free: only the idempotent, read-only syscalls run in it
+    // (clock_gettime, gettimeofday, time, getpid, gettid, the uid/gid family, sched_yield) - a
+    // dispatch that reads the clock was otherwise never compared, and a JS engine's handler loop
+    // reads it constantly
+    if (this._shadowInterp && !SHADOW_OK_SYS.has(Number(cpu.regs[0]))) { this._shadowAbortNr = Number(cpu.regs[0]); throw SHADOW_ABORT; }
     const nr = Number(cpu.regs[0]);
     const [a1, a2, a3] = [cpu.regs[7], cpu.regs[6], cpu.regs[2]];   // rdi rsi rdx
     this.stats.syscalls[nr] = (this.stats.syscalls[nr] || 0) + 1;
@@ -3072,7 +3125,9 @@ export class LinuxEngine {
         if (nr === 231 || this.threads.filter(x => x.state !== 'dead').length <= 1) {
           this._flushSharedMaps();                            // dirty shared pages reach the file
           this._rlockExit(this);                              // POSIX record locks die with the process
-          this.exitCode = Number(a1 & 0xffn); cpu.halted = true; ret(0n); break;
+          this.exitCode = Number(a1 & 0xffn); cpu.halted = true; ret(0n);
+          if (ENV.OXWASM_EXITDIAG) console.error(`[exitdiag] ${this._ctor?.argv?.[0]} nr=${nr} code=${this.exitCode} tid=${t.id} threads=${this.threads.map((x) => x.id + ':' + x.state).join(',')} t=${Math.round(this.nowMs())}`);
+          break;
         }
         t.state = 'dead';
         if (t.ctid) { this.mem.write(t.ctid, 4n, 0n); this.futexWake(t.ctid, 1 << 30); }
@@ -5760,6 +5815,7 @@ export class LinuxEngine {
         } }   // errorStack: where in the engine a child died (tooling)
       }
       if (c.exited === null && e.exitCode !== null) {
+        if (ENV.OXWASM_EXITDIAG) console.error(`[exitdiag] parent sees child pid=${c.pid} exit=${e.exitCode} t=${Math.round(this.nowMs())}`);
         c.exited = e.exitCode;
         this._ptyHangup(e);
         this._pipeEofSweep([...e.fds.values()]);
@@ -5872,6 +5928,7 @@ export class LinuxEngine {
         const before = this.cpu.rip;
         if (this.ripTrace !== undefined && before >= this._rtLo && before < this._rtHi) this.ripTrace[this.ripTraceI++ & 65535] = before;
       if (this._ripLog !== undefined && this._ripLog.has(before)) this._ripHit(before);
+      if (ARM_FP !== null) this._armFp(before);
 
         let insn;
         this._cleanSync = false;
