@@ -769,3 +769,25 @@ strings 7.5x, maps 7.8x, objects 8.6x, math 9.6x, json 10.2x, sorting 11.8x). Th
 adds the other 4.6x natively, and the translated-JIT route currently spends its time
 re-translating code JSC patches in place. Within 20% of native needs both the 7x to 12x and
 the JIT gap closed; neither is closed yet.
+
+### After compiling LLInt as one multi-entry function
+
+`bench/jssteady.js` is too slow to iterate on, so these use a smaller mix (same phases,
+fib(24), 300k math iterations, ...). Native on the same box: 156 ms per round with the JIT
+off, 45 ms with it on. oxwasm, JIT off, the dispatch loop compiled as a single wasm function
+with an entry at every block start: 1161 ms best round (about 1.5 s typical), 7.4x the native
+interpreter and 26x native with the JIT. Per phase against native JIT-off: fib 41 vs 6, math
+128 vs 15, objects 148 vs 23, sorting 181 vs 16, maps 203 vs 41, json 125 vs 14. The fib phase
+fell from about 3000 ms; the rest is the same 7x to 11x.
+
+What it took, and what each piece cost when it was missing: the wasm-frame budget (1200) made
+every callout past depth ~12 interpret its callee (22k callouts in six rounds), so the budget
+and the worker stack are now settable (`OXWASM_FTDLIMIT`, `OXWASM_STACKMB`); absolute jump
+tables without a byte-index bound were read as 1024 targets and pulled unrelated functions
+into one 14k-block unit; V8's baseline compiler spends about 2 KB per byte of wasm, so every
+multi-MB unit is a multi-GB compile on a 16 GB host.
+
+JIT on does not complete on this host: translating JSC's generated code produces about 1100
+new units in the first minutes and the process is killed at 13 GB. Even with that solved,
+translated x86 runs at best a small multiple of native, so within 20% of native-with-JIT is
+not reachable by this route on this evidence.
