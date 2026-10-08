@@ -75,7 +75,24 @@ const STOREGUARD = typeof process !== 'undefined' && process.env?.OXWASM_STOREGU
 // Largest wat text this emitter will hand the runtime for ONE function; see
 // the refusal at the end of the function emitter for the two measurements
 // that bracket it.
-const MAXWAT = 5_000_000;
+const MAXWAT = Number(process.env.OXWASM_MAXWAT || 5_000_000);
+// A computed goto with a table this wide is an interpreter's dispatch: the one kind of
+// function worth compiling whole, however large (JavaScriptCore's LLInt has 272 per site).
+const MEGA_SITE = Number((typeof process !== 'undefined' && process.env?.OXWASM_MEGA_SITE) || 256);
+// ... and the root has to be one of its handlers: a small function whose tail jump
+// happens to reach some unrelated big switch is not an interpreter.
+function isDispatchRoot(an, entry) {
+  // an interpreter repeats its dispatch at the end of every handler: many sites
+  // sharing wide tables. A lexer's byte switch is one site.
+  let sites = 0, lo = null, hi = null;
+  for (const ts of an.jtabs?.values?.() ?? []) {
+    if (ts.length < MEGA_SITE) continue;
+    sites++;
+    for (const t of ts) { if (lo === null || t < lo) lo = t; if (hi === null || t > hi) hi = t; }
+  }
+  return sites >= Number((typeof process !== "undefined" && process.env?.OXWASM_MEGA_SITES) || 400) && entry >= lo - 0x10000n && entry <= hi + 0x10000n;
+}
+const MAXWAT_MEGA = Number(process.env.OXWASM_MAXWAT_MEGA || 60_000_000);
 export const EFLAGS_SLOT = 136;   // regfile slot: EFLAGS handed to the interpreter at an escape (bit 63 = valid; syncIn applies and clears it)
 export const FNPROF_BASE = 0x20000, FNPROF_SLOTS = 1 << 14;   // OXWASM_FNPROF counters: 16384 x i64, in the dead space below FTHASH
 export const fnprofSlot = (a) => FNPROF_BASE + ((Number((BigInt(a) >> 4n) & 0x3fffn)) * 8);
@@ -97,7 +114,7 @@ export const BLKPROF = new Set(((typeof process !== 'undefined' && process.env?.
 // checks the budget first and takes its JS fallback past it; the engine's
 // callout then INTERPRETS the callee (thin JS frames, any depth), so the
 // worst case is the pre-chaining regime, bounded. Exported for linux.mjs.
-export const FTDEPTH = FTMAP + 8, FTDLIMIT = 1200;
+export const FTDEPTH = FTMAP + 8, FTDLIMIT = Number((typeof process !== 'undefined' && process.env?.OXWASM_FTDLIMIT) || 1200);
 // Chain fuel (u32 at FTMAP+12): in-wasm chains bypass the JS callout's
 // slice-deadline check, so a browser pump's 12ms slice could disappear into
 // one unpreemptible multi-second wasm block. Every in-wasm chain site burns
@@ -497,8 +514,8 @@ export function analyze(mem, entry, { maxInsns = 20000, noJtab = false, entries 
       // discoverable forms: `jmp *R` (table load traced upward) and
       // `jmp *table(,%idx,8)` (table named right in the operand)
       if (!noJtab && (insn.src?.kind === 'reg'
-          || (insn.src?.kind === 'mem' && insn.src.base < 0 && insn.src.index >= 0
-              && insn.src.scale === 8 && !insn.src.ripRel && !insn.src.fs))) jmpinds.push(insn);
+          || (insn.src?.kind === 'mem' && insn.src.index >= 0 && insn.src.scale === 8 && !insn.src.fs
+              && ((insn.src.base < 0 && !insn.src.ripRel) || (insn.src.base >= 0 && !insn.src.ripRel))))) jmpinds.push(insn);
       continue;
     }
     if (insn.mnem === 'jmp') {
@@ -561,7 +578,46 @@ export function analyze(mem, entry, { maxInsns = 20000, noJtab = false, entries 
   //   add    %rdx, %rax
   //   jmp    *%rax
   // Unrecognised, that switch fell to the chain/deopt form at every case.
-  const tableOf = (j) => { const t = tableOfAbs(j); return t == null ? tableOfPic(j) : { tbl: t, width: 8, rel: false }; };
+  // An index register loaded by a byte-sized zero-extending load (an opcode / byte-code dispatch) bounds the table at
+  // 256 entries: reading on until an entry falls outside the plausibility window ran into the NEXT table and the data
+  // after it, and decoded pointers into the middle of instructions.
+  const byteIdxCount = (j) => {
+    if (j.src.kind !== 'mem' || j.src.index < 0) return undefined;
+    const d = defAbove(j, j.src.index);
+    return d && d.mnem === 'movzx' && d.srcSize === 1 ? 256 : undefined;
+  };
+  const tableOf = (j) => {
+    const t = tableOfAbs(j);
+    if (t == null) return tableOfPic(j);
+    let count = byteIdxCount(j);
+    if (count === undefined) {
+      // the switch's own bounds check (`cmp $K,%idx; ja default`) bounds an
+      // absolute table the way it bounds a PIC one: without it a 4-way switch
+      // was read as 1024 targets and its junk tail pulled in whole functions
+      const ld = j.src.kind === 'mem' ? null : defAbove(j, j.src.r);
+      const idx = j.src.kind === 'mem' ? j.src.index : (ld && ld.mnem === 'mov' && ld.src.kind === 'mem' ? ld.src.index : -1);
+      if (idx >= 0) {
+        let cur = ld ?? j, n = -1;
+        for (let st = 0; st < 12 && n < 0; st++) {
+          const q = byNext.get(cur.rip.toString()); if (!q || q.mnem === 'udec') break;
+          if (q.mnem === 'cmp' && q.dst?.kind === 'reg' && q.dst.r === idx && q.src?.kind === 'imm') {
+            const br = insnAt.get(q.next.toString());
+            if (br?.mnem === 'jcc' && (br.cond === 'a' || br.cond === 'ae' || br.cond === 'b' || br.cond === 'be'))
+              n = Number(q.src.v) + (br.cond === 'a' || br.cond === 'be' ? 1 : 0);
+            else break;
+          }
+          else if (wrReg(q, idx) && q.mnem !== 'movzx' && q.mnem !== 'mov' && q.mnem !== 'sub' && q.mnem !== 'add' && q.mnem !== 'lea') break;
+          cur = q;
+        }
+        if (n >= 2 && n <= 1024) count = n;
+      }
+    }
+    // the base-register form has no other bound: read on past a table's end
+    // and the junk after it became 1024-way "switches" (and, through them,
+    // 14,000-block functions out of a string comparison)
+    if (j.src.kind === 'mem' && j.src.base >= 0 && count === undefined) return null;
+    return { tbl: t, width: 8, rel: false, count };
+  };
   const tableOfPic = (j) => {
     if (j.src.kind !== 'reg') return null;
     const add = defAbove(j, j.src.r);
@@ -603,6 +659,16 @@ export function analyze(mem, entry, { maxInsns = 20000, noJtab = false, entries 
     return { tbl: BigInt.asUintN(64, lb.src.disp + (lb.src.ripRel ? lb.next : 0n)), width: 4, rel: true, count: n };
   };
   const tableOfAbs = (j) => {
+    // jmp *disp(%base,%idx,8) with the base register loaded by a lea / mov imm just above: an
+    // interpreter's dispatch (JavaScriptCore's LLInt ends every bytecode handler with
+    // `lea table(%rip),%rsi; jmp *(%rsi,%rax,8)`). The table is base + disp.
+    if (j.src.kind === 'mem' && j.src.base >= 0 && j.src.index >= 0 && j.src.scale === 8 && !j.src.fs) {
+      const lb = defAbove(j, j.src.base);
+      if (lb && lb.mnem === 'lea' && lb.src.kind === 'mem' && lb.src.index < 0 && (lb.src.ripRel || lb.src.base < 0))
+        return BigInt.asUintN(64, lb.src.disp + (lb.src.ripRel ? lb.next : 0n) + j.src.disp);
+      if (lb && lb.mnem === 'mov' && lb.src.kind === 'imm') return BigInt.asUintN(64, lb.src.v + j.src.disp);
+      return null;
+    }
     if (j.src.kind === 'mem') return BigInt.asUintN(64, j.src.disp);
     const ld = defAbove(j, j.src.r);
     if (!ld || ld.mnem !== 'mov' || (ld.size||8) !== 8 || ld.src.kind !== 'mem'
@@ -633,6 +699,33 @@ export function analyze(mem, entry, { maxInsns = 20000, noJtab = false, entries 
     jtabs.set(j.rip.toString(), targets);
     for (const t of targets) if (!seen.has(Number(t)) && dbudget > 0) { dbudget--; work.push(t); }
     drain();                      // newly decoded handlers may end in more jmpinds
+  }
+  // Jump-table targets that are tiny stubs - `call <crash>` followed by a data word, an interpreter's
+  // invalid-opcode landing pads (JavaScriptCore's LLInt has dozens, nine bytes apart) - leave junk behind:
+  // the fall-through after the call decodes the data word as code, overlapping the NEXT stub. Where an
+  // overlap involves an instruction that was only reached as the fall-through of a call (or of
+  // such junk), that instruction is dropped and the call ends its block like a noreturn call (its
+  // continuation is a deopt to the real address, so a wrong guess costs a frame's interpretation).
+  // Only functions with a discovered jump table take this path; any other overlap still refuses the function.
+  if (jtabs.size) {
+    const junk = new Set();
+    const junkTail = (x) => { const pr = byNext.get(x.rip.toString()); return pr && (pr.mnem === 'call' || junk.has(pr.rip.toString())) ? pr : null; };
+    for (let round = 0; round < 64; round++) {
+      const as = [...insnAt.keys()].map(BigInt).sort((a, b) => a < b ? -1 : 1);
+      const victims = [];
+      for (let i = 1; i < as.length; i++) {
+        const p = insnAt.get(as[i - 1].toString()), q = insnAt.get(as[i].toString());
+        if (!p || !q || as[i] >= as[i - 1] + BigInt(p.len) || q.next === p.next) continue;
+        const v = junkTail(p) ? p : junkTail(q) ? q : null;
+        if (v) victims.push(v);
+      }
+      if (!victims.length) break;
+      for (const v of victims) {
+        const pr = junkTail(v); if (!pr) continue;
+        if (pr.mnem === 'call') pr.noretCut = true;
+        junk.add(v.rip.toString()); insnAt.delete(v.rip.toString());
+      }
+    }
   }
   const addrs = [...insnAt.keys()].map(BigInt).sort((a,b)=>a<b?-1:1);
   const leaders = new Set([entry.toString()]);
@@ -3888,14 +3981,23 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   // dispatch one returns early, and a cap on the other alone caught nothing,
   // because a function big enough to worry about is exactly the kind that
   // gets the dispatch layout.
+  const MEGA_BIG = DISP && hasJtab && isDispatchRoot(a0, fnAddr);
   const finish = (w) => {
-    if (w.length > MAXWAT) throw new Error('emitted function exceeds the runtime limit: ' + w.length + ' bytes of wat');
+    if (w.length > (MEGA_BIG ? MAXWAT_MEGA : MAXWAT)) throw new Error('emitted function exceeds the runtime limit: ' + w.length + ' bytes of wat');
     return w;
   };
-  let wat = `  (func $${name} (export "${name}") (result i64)\n`;
+  // Multi-entry dispatch function: a function whose jump table has many
+  // targets (an interpreter's handler table) is entered at any of them.
+  // $pc becomes a parameter, the entry exports are thin wrappers that pick
+  // the block, and the prologue reloads every register (a target other than
+  // block 0 may read any of them). One copy then serves every root that
+  // reaches the table, instead of one full copy per root.
+  const MEGA = DISP && hasJtab && isDispatchRoot(a0, fnAddr);
+  if (MEGA) entryKeep = null;
+  let wat = MEGA ? `  (func $${name}_m (param $pc i32) (result i64)\n` : `  (func $${name} (export "${name}") (result i64)\n`;
   for (let r=0;r<16;r++) wat += `    (local $r${r} ${isI32(r)?'i32':'i64'})\n`;
   wat += '    (local $fa i64) (local $fb i64) (local $fr i64) (local $cf i64) (local $fbits i64) (local $rsp0 i64) (local $rex i64)\n';
-  if (DISP || hasJtab) wat += '    (local $pc i32)\n';
+  if ((DISP || hasJtab) && !MEGA) wat += '    (local $pc i32)\n';
   if (usesFtr) wat += '    (local $fti i32)\n';
   if (usesFts) wat += '    (local $fts i32)\n';
   if (usesGa) wat += '    (local $ga i32) (local $gp i32)\n';
@@ -3964,6 +4066,18 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     wat += '    ))\n';                                                 // close loop + exit block
     if (usesYield) wat += '    (unreachable))\n' + yieldTail();          // close $yield; its tail follows
     wat += '    (unreachable)\n  )\n';
+    if (MEGA) {
+      wat += `  (func $${name} (export "${name}") (result i64) (return_call $${name}_m (i32.const 0)))\n`;
+      const seen = new Set([name]);
+      // every block start, not only table targets: the engine enters a unit at
+      // wherever a return, a yield or a deopt landed, and each of those used to
+      // compile its own full copy
+      for (let j = 0; j < N; j++) {
+        const en = 'f_' + blocks[j].start.toString(16);
+        if (seen.has(en)) continue; seen.add(en);
+        wat += `  (func (export "${en}") (result i64) (return_call $${name}_m (i32.const ${j})))\n`;
+      }
+    }
     return finish(wat + jtrFunc());
   }
   for (let i=0;i<N;i++) {
@@ -4065,6 +4179,8 @@ export function compileUnitWat(mem, entry, opts = {}) {
     for (const bi of cyc) for (const insn of an.blocks[bi].insns)
       if (insn.mnem === 'call') hotSites.add(((insn.next + insn.rel) & an.M).toString());
   };
+  const UNIT_TOTAL = Number((typeof process !== 'undefined' && process.env?.OXWASM_UNIT_TOTAL) || 60000);
+  let unitInsns = 0;
   const funcs = new Map();                       // addrStr -> analysis
   const poisoned = new Set();                    // addrStr -> engine-only (callout)
   const pending = [entry];
@@ -4105,7 +4221,7 @@ export function compileUnitWat(mem, entry, opts = {}) {
     try {
       let an;
       try { const tA = PHASE ? performance.now() : 0;
-            an = analyze(mem, a, { maxInsns, noJtab: !!globalThis.__noJtab, entries: opts.entries ?? null, callTargets: opts.callTargets ?? null });
+            an = analyze(mem, a, { maxInsns: Math.min(maxInsns, opts.calleeMaxInsns ?? 30000), noJtab: !!globalThis.__noJtab, entries: opts.entries ?? null, callTargets: opts.callTargets ?? null });
             if (PHASE) { PH.analyzed++; let n = 0; for (const b of an.blocks) n += b.insns.length; PH.analyzedInsns += n;
               if (PH.seen.has(k)) { PH.dup = (PH.dup ?? 0) + 1; PH.dupInsns = (PH.dupInsns ?? 0) + n; PH.dupMs = (PH.dupMs ?? 0) + performance.now() - tA; } else PH.seen.add(k);
               const bk = n < 100 ? '<100' : n < 500 ? '<500' : n < 2000 ? '<2000' : n < 8000 ? '<8000' : '>=8000';   // per-size buckets: [analyses, ms, insns]
@@ -4115,7 +4231,16 @@ export function compileUnitWat(mem, entry, opts = {}) {
         // jump-table discovery can push a function over the size budget;
         // it compiled before the feature, so retry without it
         if (!/function too large/.test(e.message) || globalThis.__noJtab) throw e;
-        an = analyze(mem, a, { maxInsns, noJtab: true, entries: opts.entries ?? null, callTargets: opts.callTargets ?? null });
+        // an interpreter loop (a function whose computed goto has a real table)
+        // is the one root allowed past the budget: the whole handler set is
+        // one function. Only the entry, and only when it has a table; anything
+        // else that big stays refused (a 3 MB unit costs gigabytes in V8's
+        // baseline compiler alone).
+        an = null;
+        if (k === entry.toString() && maxInsns > (opts.calleeMaxInsns ?? 30000)) {
+          try { an = analyze(mem, a, { maxInsns, noJtab: false, entries: opts.entries ?? null, callTargets: opts.callTargets ?? null }); if (!an.jtabs?.size || !isDispatchRoot(an, a)) an = null; } catch { an = null; }
+        }
+        if (!an) an = analyze(mem, a, { maxInsns: Math.min(maxInsns, opts.calleeMaxInsns ?? 30000), noJtab: true, entries: opts.entries ?? null, callTargets: opts.callTargets ?? null });
       }
       // a body that starts undecodable compiles to a pure deopt — worse than
       // useless: dispatching it can ping-pong with the engine. Poison instead
@@ -4158,6 +4283,12 @@ export function compileUnitWat(mem, entry, opts = {}) {
         const st = (globalThis.__hotUnpruneStats ??= { kept: 0, insns: 0, refused: 0 });
         if (n > HOTSIZE || hotSpent + n > HOTUN) { st.refused++; continue; }   // stays pruned: its sites chain through $ftr
         hotSpent += n; st.kept++; st.insns += n; }
+      { let n = 0; for (const b of an.blocks) n += b.insns.length;
+        // closure budget: a callee that would grow the unit past it stays out and
+        // chains through $ftr. Resolving more jump tables made some closures
+        // 3 MB of wasm, which V8's baseline compiler alone spends gigabytes on.
+        if (k !== entry.toString() && unitInsns + n > UNIT_TOTAL) continue;
+        unitInsns += n; }
       funcs.set(k, an);
       // the ROOT's cycles only: noting every member's cycles cascaded (m4:
       // 862 callees, 116k instructions kept over one run, +2 s of startup)
@@ -4271,7 +4402,14 @@ export function compileUnitWat(mem, entry, opts = {}) {
     (local.get $rip))\n`;
   }
   let blocks = 0;
-  for (const [k, t] of texts) { wat += t; blocks += funcs.get(k).blocks.length; }
+  // multi-entry wrappers must not duplicate another function's export
+  const ownNames = new Set(); for (const [k] of texts) ownNames.add('f_' + BigInt(k).toString(16));
+  const wrapSeen = new Set();
+  for (const [k, t] of texts) {
+    wat += t.includes('(return_call $f_') ? t.replace(/^  \(func \(export "(f_[0-9a-f]+)"\) \(result i64\) \(return_call \$f_[0-9a-f]+_m [^\n]*\n/gm,
+      (m, n) => (ownNames.has(n) || wrapSeen.has(n)) ? '' : (wrapSeen.add(n), m)) : t;
+    blocks += funcs.get(k).blocks.length;
+  }
   wat += ')\n';
   return { wat,
            entryName: 'f_' + entry.toString(16),

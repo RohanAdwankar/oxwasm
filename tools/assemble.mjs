@@ -47,7 +47,7 @@ export function makeAssembler({ debugNames = false, tag = 'oxasm', workers = +(p
   const extra = [];
   const direct = (wat) => {                        // fallback: spawn from here
     const w = `/tmp/${tag}_${uid}_${n++}`; writeFileSync(w + '.wat', wat);
-    try { execFileSync('wat2wasm', [...flags, w + '.wat', '-o', w + '.wasm']); return new Uint8Array(readFileSync(w + '.wasm')); }
+    try { execFileSync('sh', ['-c', 'ulimit -s unlimited 2>/dev/null; exec wat2wasm "$@"', 'sh', ...flags, w + '.wat', '-o', w + '.wasm']); return new Uint8Array(readFileSync(w + '.wasm')); }
     finally { for (const s of ['.wat', '.wasm']) { try { unlinkSync(w + s); } catch {} } }
   };
   let broker = null, syncB = null;
@@ -60,7 +60,7 @@ export function makeAssembler({ debugNames = false, tag = 'oxasm', workers = +(p
     const dir = mkdtempSync(`/tmp/${tag}${suffix}_`), inF = dir + '/in', outF = dir + '/out';
     execSync(`mkfifo "${inF}" "${outF}"`);
     const sh = spawn('sh', ['-c',
-      `while IFS= read -r p; do wat2wasm ${flags.join(' ')} "$p.wat" -o "$p.wasm" 2>"$p.err"; echo $?; done <"${inF}" >"${outF}"`],
+      `ulimit -s unlimited 2>/dev/null; while IFS= read -r p; do wat2wasm ${flags.join(' ')} "$p.wat" -o "$p.wasm" 2>"$p.err"; echo $?; done <"${inF}" >"${outF}"`],
       { stdio: ['ignore', 'ignore', 'inherit'] });
     sh.unref();
     const b = { sh, inFd: openSync(inF, 'w'), outFd: openSync(outF, FSC.O_RDONLY | FSC.O_NONBLOCK), dir, line: Buffer.alloc(4096), buf: '', pending: [] };

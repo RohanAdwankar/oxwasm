@@ -50,7 +50,7 @@ let _engineHash = null;
 // Env knobs that change what the emitter produces are part of the key too: a unit built with
 // OXWASM_STOREGUARD=1 or another loop-yield budget is not interchangeable with the default build.
 const CODEGEN_KNOBS = ['OXWASM_STOREGUARD', 'OXWASM_LOOPYIELD', 'OXWASM_LOOPYIELD_N', 'OXWASM_INLINE', 'OXWASM_INLINE_BUDGET', 'OXWASM_NARROW', 'OXWASM_TAILCUT', 'OXWASM_BLOCKLOOPS', 'OXWASM_FTENTRY'];
-const engineHash = () => _engineHash ??= sha(CODEGEN_KNOBS.map((k) => k + '=' + (process.env[k] ?? '')).join(' '), ...(process.env.OXWASM_UNITCACHE_FULLKEY ? ['linux.mjs', 'aot_wat.mjs', 'interp.mjs', 'decode.mjs'] : ['aot_wat.mjs', 'decode.mjs']).map((f) => readFileSync(join(HERE, '..', 'engine', f))), process.version, process.env.OXWASM_FNVETO_FILE ? readFileSync(process.env.OXWASM_FNVETO_FILE) : '', process.env.OXWASM_FNALLOW_FILE ? readFileSync(process.env.OXWASM_FNALLOW_FILE) : '');
+const engineHash = () => _engineHash ??= process.env.OXWASM_UNITCACHE_KEY || sha(CODEGEN_KNOBS.map((k) => k + '=' + (process.env[k] ?? '')).join(' '), ...(process.env.OXWASM_UNITCACHE_FULLKEY ? ['linux.mjs', 'aot_wat.mjs', 'interp.mjs', 'decode.mjs'] : ['aot_wat.mjs', 'decode.mjs']).map((f) => readFileSync(join(HERE, '..', 'engine', f))), process.version, process.env.OXWASM_FNVETO_FILE ? readFileSync(process.env.OXWASM_FNVETO_FILE) : '', process.env.OXWASM_FNALLOW_FILE ? readFileSync(process.env.OXWASM_FNALLOW_FILE) : '');
 function makeUnitStore(cacheDir) {
   const root = join(cacheDir, 'units', engineHash());
   return {
@@ -175,7 +175,7 @@ export class EngineHost {
       if (o.unitCache !== false && process.env.OXWASM_UNITCACHE !== '0') { try { eng.unitStore = unitStore ??= makeUnitStore(CACHE_DIR); } catch {} }   // compiled units persist across runs and programs
       // exec'd programs: the child engines default to browser-sized units (24 functions, 4,000 instructions, for wabt.js);
       // a Node host assembles in-process or with wat2wasm and can take real hot functions
-      eng.childUnitMaxFuncs = o.unitMaxFuncs ?? 96; eng.childUnitMaxInsns = o.unitMaxInsns ?? 30000;
+      eng.childUnitMaxFuncs = o.unitMaxFuncs ?? 96; eng.childUnitMaxInsns = o.unitMaxInsns ?? Number(process.env.OXWASM_UNIT_MAXINSNS || 30000);
       if (o.cpus) eng.ncpu = o.cpus;                     // CPUs the guest sees (default 1): runtimes size their thread pools from it
       if (o.childMemMB) eng.childMemMB = o.childMemMB;   // RAM for each exec'd program (default 256 MB): large binaries need more
       if (o.maxProcs) eng.maxProcs = o.maxProcs;         // live processes the sandbox may have (default 64): fork fails with EAGAIN past it

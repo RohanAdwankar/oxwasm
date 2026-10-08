@@ -644,6 +644,12 @@ export class LinuxEngine {
     if (unit.cancelled) return;
     for (const a of unit.funcs)
       if (!this.aotFns.get(a)) this.registerAotFn(a, instance.exports['f_' + a.toString(16)]);
+    // a multi-entry function exports a wrapper per entry it can be started at
+    for (const name of Object.keys(instance.exports))
+      if (name.startsWith('f_')) {
+        const a = BigInt('0x' + name.slice(2));
+        if (!this.aotFns.get(a) && !this.aotFailed.has(a)) this.registerAotFn(a, instance.exports[name]);
+      }
     if (instance.exports.drive) this.aotDrive = instance.exports.drive;
     this.stats.tiers.aot = (this.stats.tiers.aot || 0) + 1;
   }
@@ -923,6 +929,11 @@ export class LinuxEngine {
         const ak = a;
         if (!this.aotFns.has(ak)) this.registerAotFn(ak, inst.exports['f_' + a.toString(16)]);
       }
+      for (const name of Object.keys(inst.exports))
+        if (name.startsWith('f_')) {
+          const a = BigInt('0x' + name.slice(2));
+          if (!this.aotFns.get(a) && !this.aotFailed.has(a)) this.registerAotFn(a, inst.exports[name]);
+        }
       if (inst.exports.drive) this.aotDrive = inst.exports.drive;
       if (!this.aotFns.has(k)) throw new Error('entry missing from unit');
       this.stats.tiers.aot = (this.stats.tiers.aot || 0) + 1;
@@ -990,6 +1001,7 @@ export class LinuxEngine {
     // us and unbound the stack. run() resets the word at true top level.
     const fdv = (this._ftdv ??= new DataView(this.wmem.buffer));
     const fd0 = fdv.getUint32(FTMAP + 8, true);
+    if (ENV.OXWASM_DEPTHLOG && fd0 > 200 && ((this.stats.dd = (this.stats.dd | 0) + 1) % 3000) === 1) console.error(`[ddisp] rip=${this.cpu.rip.toString(16)} fd0=${fd0} rsp=${this.cpu.regs[4].toString(16)}`);
     // fill the chain-fuel tank for this dispatch (see FTFUEL in aot_wat.mjs);
     // hosts that set no sliceDeadline get an effectively bottomless tank
     fdv.setUint32(FTFUEL, this.chainFuel ?? 0x0FFFFFFF, true);
@@ -1584,7 +1596,8 @@ export class LinuxEngine {
         // callee interprets: thin JS frames only, any depth.
         const ftdv = (this._ftdv ??= new DataView(this.wmem.buffer));
         const ftd = ftdv.getUint32(FTMAP + 8, true);
-        if (f && ftd >= FTDLIMIT) f = null;
+        if (f && ftd >= FTDLIMIT) { f = null; this.stats.coDepth = (this.stats.coDepth | 0) + 1; if (ENV.OXWASM_DEPTHLOG && (this.stats.coDepth % 2000) === 1) console.error(`[depth] target=${target.toString(16)} ftd=${ftd} ret=${retAddr.toString(16)} iu=${this._iuDepth | 0} rsp=${rsp0.toString(16)}`); }
+        if (!f) this.stats.coNoF = (this.stats.coNoF | 0) + 1;
         if (f) {
           // Target is compiled: run it wasm-to-wasm over the shared register
           // file — NO BigInt cpu<->memory sync (the expensive part). It reads
@@ -1601,6 +1614,7 @@ export class LinuxEngine {
             // with the frame still open — finish the chain first.
             if (exit === retAddr && BigInt.asUintN(64, this.regview[4]) === rspExit)
               return BigInt.asIntN(64, exit);
+            this.stats.coExitMismatch = (this.stats.coExitMismatch | 0) + 1;
             this.syncIn(); this.cpu.rip = exit;
             this._finishFrame(retAddr, rspExit);
             return BigInt.asIntN(64, retAddr);
@@ -1611,6 +1625,7 @@ export class LinuxEngine {
             // Deopt inside the compiled callee: its state is spilled to the
             // regfile; finish the frame by interpreting, contained here so the
             // caller's wasm frame survives.
+            this.stats.coCatch = (this.stats.coCatch | 0) + 1;
             this.syncIn(); this.cpu.rip = e.rip;
             if (DISPRING) this._dr('callout-catch', target, e.rip, retAddr);
             if (globalThis.__frameTrace) console.error(`<callout-catch target=${target.toString(16)} erip=${e.rip.toString(16)} retAddr=${retAddr.toString(16)} rspExit=${rspExit.toString(16)} rsp=${this.cpu.regs[4].toString(16)}>`);
@@ -3097,13 +3112,14 @@ export class LinuxEngine {
         if (ENV.OXWASM_STRACE_EXIT && this.strace && (a1 & 0xffn) !== 0n && this._ctor?.argv?.[0]?.includes('opencode')) console.error(`[exit ${nr} code=${a1 & 0xffn} tid=${this.threads[this.ti]?.id} rip=${cpu.rip.toString(16)}] last:\n  ` + this.strace.slice(-(+ENV.OXWASM_STRACE_N || 40)).join('\n  '));
         if ((ENV.OXWASM_AOTSTOP || AOTSKIP) && this._ctor?.argv?.[0]?.includes('opencode')) console.error('[aotstop] exit total disp', this.stats.disp, 'skipped', this.stats.skipped || 0);
         if (this._shadowStats && this._ctor?.argv?.[0]?.includes('opencode')) { const st = this._shadowStats; console.error(`[shadow] tried=${st.tried} compared=${st.compared} aborted=${st.aborted} diverged=${st.diverged} noexit=${[...(st.noexit ?? [])].map(([k, v]) => k.toString(16) + ':' + v).join(',')} flagOnly=${[...(st.flagOnly ?? [])].map(([k, v]) => k + ':' + v).join(',')} abortedAt=${[...(st.abortedAt ?? [])].map(([k, v]) => k + ':' + v).join(',')}`); }
-        if (ENV.OXWASM_DUMPMEM && this._ctor?.argv?.[0]?.includes('opencode')) { try { const [ah, lh, file] = ENV.OXWASM_DUMPMEM.split(':'); const at = BigInt('0x' + ah), len = parseInt(lh, 16); const out = new Uint8Array(len); for (let i = 0; i < len; i++) out[i] = Number(this.mem.read(at + BigInt(i), 1n)); process.getBuiltinModule('node:fs').writeFileSync(file, out); } catch (e) { console.error('[dumpmem]', e.message); } }
+        if (ENV.OXWASM_DUMPMEM && this._ctor?.argv?.[0]?.includes('opencode')) { try { for (const spec of ENV.OXWASM_DUMPMEM.split(';')) { const [ah, lh, file] = spec.split(':'); const at = BigInt('0x' + ah), len = parseInt(lh, 16); const out = new Uint8Array(len); for (let i = 0; i < len; i++) out[i] = Number(this.mem.read(at + BigInt(i), 1n)); process.getBuiltinModule('node:fs').writeFileSync(file, out); } } catch (e) { console.error('[dumpmem]', e.message); } }   // ';' separates several address:length:file ranges
         if (this._mmapStat) { const ms = this._mmapStat; console.error(`[mmapstat] mmap n=${ms.mmapN} ${ms.mmapB >> 20n}MB munmap n=${ms.munmapN} ${ms.munmapB >> 20n}MB mremap=${ms.mremapN} mmapNext=${this.mmapNext?.toString(16)} base=${this._mmapBase?.toString(16)} holes=${this._mmapHoles?.length} holeMB=${(this._mmapHoles ?? []).reduce((t, [l, h]) => t + (h - l), 0n) >> 20n} bySize=${[...ms.bySize].sort((x, y) => y[1] - x[1]).slice(0, 14).map(([k, v]) => k + 'x' + v).join(' ')}`); }
         if (ENV.OXWASM_SCTRACE && this._sct?.length) { process.getBuiltinModule('node:fs').appendFileSync(ENV.OXWASM_SCTRACE, this._sct.join('\n') + '\n'); this._sct.length = 0; }
         if (ENV.OXWASM_IHIST && globalThis.__ihist && this._ctor?.argv?.[0]?.includes(ENV.OXWASM_IHIST)) { const b = new Map(); for (const [k, v] of globalThis.__ihist) { const kk = (BigInt(k) >> 6n << 6n).toString(16); b.set(kk, (b.get(kk) || 0) + v); } console.error('[ihist] ' + [...b].sort((x, y) => y[1] - x[1]).slice(0, 60).map(([k, v]) => k + '=' + v).join(' ')); }
         if (this.calloutLog && ENV.OXWASM_STATS && this._ctor?.argv?.[0]?.includes(ENV.OXWASM_STATS)) console.error('[callouts] ' + [...this.calloutLog].sort((x, y) => y[1] - x[1]).slice(0, 30).map(([k, v]) => k + ' x' + v).join(' | '));
         if (this.deoptLog && ENV.OXWASM_STATS && this._ctor?.argv?.[0]?.includes(ENV.OXWASM_STATS)) console.error('[deopts] ' + [...this.deoptLog].sort((x, y) => y[1] - x[1]).slice(0, 40).map(([k, v]) => k.toString(16) + ' x' + v).join(' '));
         if (ENV.OXWASM_STATS && this._ctor?.argv?.[0]?.includes(ENV.OXWASM_STATS)) console.error('[aotfail] ' + this.hotFailures(30).slice(0, 40).map((f) => f.addr.toString(16) + ' x' + f.calls + ' ' + f.why).join(' | '));
+        if (ENV.OXWASM_HASFN && ENV.OXWASM_STATS && this._ctor?.argv?.[0]?.includes(ENV.OXWASM_STATS)) console.error('[hasfn] ftdepth=' + new DataView(this.wmem.buffer).getUint32(FTMAP + 8, true) + ' limit=' + FTDLIMIT + ' ftCount=' + this._ftCount + ' ftFull=' + (this._ftFull | 0) + ' ' + ENV.OXWASM_HASFN.split(',').map((h) => h + '=' + (typeof this.aotFns.get(BigInt('0x' + h)))).join(' '));
         if (ENV.OXWASM_STATS && this._ctor?.argv?.[0]?.includes(ENV.OXWASM_STATS)) { const st = this.stats; console.error(`[stats] ${this._ctor.argv[0]} interp=${st.interpreted} aotRuns=${st.aotRuns} compiledRuns=${st.compiledRuns} units=${this.aotFns.size} syscalls=${Object.values(st.syscalls).reduce((x, y) => x + y, 0)} wallMs=${Math.round(this.nowMs())} sysMs=${JSON.stringify(Object.fromEntries(Object.entries(st.sysMs ?? {}).filter(([, v]) => v > 50).map(([k, v]) => [k, Math.round(v)])))} tiers=${JSON.stringify(st.tiers)} extra=${JSON.stringify(Object.fromEntries(Object.entries(st).filter(([k, v]) => typeof v === 'number' && !['interpreted', 'aotRuns', 'compiledRuns'].includes(k))))}`); }
         const t = this.threads[this.ti];
         if (this._shmAt?.length) this._shmExit(t);            // shared-memory attaches reach the segment before the image goes

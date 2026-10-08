@@ -80,11 +80,15 @@ export async function makeInProcessAssembler() {
  * ones it refuses, and those are often the hottest dispatch loops. `makeFallback` is called at
  * most once, on the first such unit; if it throws, those units stay refused as before.
  */
+// Past this size the in-process assembler's wasm heap alone costs gigabytes (a 9 MB
+// interpreter unit took a 16 GB host to its OOM kill); the native tool streams it.
+const BIGWAT = Number(process.env.OXWASM_BIGWAT || 3_000_000);
 export function withNativeFallback(asm, makeFallback) {
   let fb = null, tried = false;
+  const base = (w) => asm(w);
   const submit = asm.submit, pump = asm.pump, pending = asm.pendingCount;
   asm.submit = (wat, cb) => {
-    if (watDepth(wat) > asm.maxDepth) {
+    if (wat.length > BIGWAT || watDepth(wat) > asm.maxDepth) {
       if (!tried) { tried = true; try { fb = makeFallback(); } catch { fb = null; } }
       if (fb) { fb.submit(wat, cb); return; }
     }
@@ -94,5 +98,13 @@ export function withNativeFallback(asm, makeFallback) {
   asm.pendingCount = () => pending() + (fb ? fb.pendingCount() : 0);
   const close = asm.close;
   asm.close = () => { close(); try { fb?.close?.(); } catch {} };
-  return asm;
+  // the synchronous path hits the same two limits
+  const sync = (wat) => {
+    if (wat.length > BIGWAT || watDepth(wat) > asm.maxDepth) {
+      if (!tried) { tried = true; try { fb = makeFallback(); } catch { fb = null; } }
+      if (fb) return fb(wat);
+    }
+    return base(wat);
+  };
+  return Object.assign(sync, asm);
 }
