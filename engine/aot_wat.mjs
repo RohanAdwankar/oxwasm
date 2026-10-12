@@ -1527,6 +1527,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     mode = 'dispatch';
   }
   const DISP = mode === 'dispatch';
+  const MEGA = DISP && hasJtab && isDispatchRoot(a0, fnAddr);
   if (globalThis.__layoutOf) globalThis.__layoutOf.set(fnAddr.toString(16), mode + (hasJtab ? '+jtab' : '') + ' N=' + N + (globalThis.__lastStructErr ? ' (' + globalThis.__lastStructErr + ')' : ''));
   globalThis.__lastStructErr = null;
   { const st = globalThis.__inlStats = globalThis.__inlStats || { fns: 0, callees: 0 };
@@ -2633,6 +2634,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     `  (then ${ftBurn} ${ftDec} (return_call_indirect $ft (type $uft) (local.get $fti))))`,
   ]; };
 
+  const pcmaps = new Map();
   function emitBlock(i) {
     const blk = blocks[i]; const L = [];
     if (BLKPROF.size && BLKPROF.has(fnAddr.toString())) { const sl = blkprofSlot(blk.start); L.push(`(i64.store (i32.const ${sl}) (i64.add (i64.load (i32.const ${sl})) (i64.const 1)))`); }
@@ -3711,9 +3713,22 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       // loop — one in-wasm branch per computed goto instead of a JS deopt
       // round-trip. An unknown address (tail call, an undecoded table row)
       // still deopts, so resolution is exact by construction.
+      const jmap = (r) => t.remap?.get(r) ?? r;          // node splitting: this site's copy of a case block
+      // An interpreter's dispatch (`jmp *(%base,%idx,8)` over a wide table whose
+      // targets were all read at analysis time) needs no load and no search:
+      // the index selects the block directly. A miss falls through to the
+      // generic path, which stays exact.
+      const lastI = blk.insns[blk.insns.length - 1];
+      const tsFast = DISP && MEGA ? a0.jtabs?.get(lastI.rip.toString()) : null;
+      if (tsFast && tsFast.length >= 128 && t.src.kind === 'mem' && t.src.index >= 0 && t.src.scale === 8 && !t.src.fs) {
+        const key = tsFast.map(String).join(',');
+        let pm = pcmaps.get(key); if (!pm) { pm = { id: pcmaps.size, ts: tsFast }; pcmaps.set(key, pm); }
+        L.push(`(local.set $pc (call $pcm_${fnAddr.toString(16)}_${pm.id} ${rd({ kind: 'reg', r: t.src.index }, 8, lnext)}))`);
+        if (t.remap) for (const [r, v] of t.remap) L.push(`(if (i32.eq (local.get $pc) (i32.const ${r})) (then (local.set $pc (i32.const ${v}))))`);
+        L.push(`(br_if $L_disp (i32.ge_s (local.get $pc) (i32.const 0)))`);
+      }
       L.push(`(local.set $rex ${rd(t.src,8,lnext)})`);
       L.push(`(local.set $pc (call $jtr_${fnAddr.toString(16)} (local.get $rex)))`);
-      const jmap = (r) => t.remap?.get(r) ?? r;          // node splitting: this site's copy of a case block
       if (DISP) {
         if (t.remap) for (const [r, v] of t.remap) L.push(`(if (i32.eq (local.get $pc) (i32.const ${r})) (then (local.set $pc (i32.const ${v}))))`);
         L.push(`(br_if $L_disp (i32.ge_s (local.get $pc) (i32.const 0)))`);
@@ -3992,7 +4007,6 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   // the block, and the prologue reloads every register (a target other than
   // block 0 may read any of them). One copy then serves every root that
   // reaches the table, instead of one full copy per root.
-  const MEGA = DISP && hasJtab && isDispatchRoot(a0, fnAddr);
   if (MEGA) entryKeep = null;
   let wat = MEGA ? `  (func $${name}_m (param $pc i32) (result i64)\n` : `  (func $${name} (export "${name}") (result i64)\n`;
   for (let r=0;r<16;r++) wat += `    (local $r${r} ${isI32(r)?'i32':'i64'})\n`;
@@ -4042,7 +4056,21 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       const mid = (lo + hi) >> 1;
       return `(if (result i32) (i64.lt_u (local.get $a) (i64.const ${hexs(pairs[mid][0])}))\n      (then ${bs(lo, mid)})\n      (else ${bs(mid, hi)}))`;
     };
-    return `  (func $jtr_${fnAddr.toString(16)} (param $a i64) (result i32)\n    ${bs(0, pairs.length)}\n  )\n`;
+    let pcm = '';
+    const startToIdx = new Map(pairs.map(([a, j]) => [a, j]));
+    for (const [, pm] of pcmaps) {
+      const n = pm.ts.length;
+      pcm += `  (func $pcm_${fnAddr.toString(16)}_${pm.id} (param $i i64) (result i32)\n    (block $e (result i32)\n`;
+      pcm += `      (if (i64.ge_u (local.get $i) (i64.const ${n})) (then (br $e (i32.const -1))))\n`;
+      for (let k = n - 1; k >= 0; k--) pcm += '      (block $c' + k + '\n';
+      pcm += `      (br_table ${Array.from({ length: n }, (_, k) => '$c' + k).join(' ')} $c0 (i32.wrap_i64 (local.get $i))))\n`;
+      for (let k = 0; k < n; k++) {
+        const j = startToIdx.get(pm.ts[k]);
+        pcm += `      (br $e (i32.const ${j === undefined ? -1 : j}))${k < n - 1 ? ')' : ''}\n`;
+      }
+      pcm += '    )\n  )\n';
+    }
+    return pcm + `  (func $jtr_${fnAddr.toString(16)} (param $a i64) (result i32)\n    ${bs(0, pairs.length)}\n  )\n`;
   };
   if (DISP) {
     // flat br_table dispatch: $pc holds the current block's RPO index. Block
