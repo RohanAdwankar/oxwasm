@@ -2450,7 +2450,12 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     if (cur === 'kill') killsFlags[b] = true;
   }
   const preds = Array.from({length:N}, ()=>[]);
-  for (let b = 0; b < N; b++) for (const s of succs[b]) if (s >= 0) preds[s].push(b);
+  // An interpreter's computed-goto dispatch is a flags barrier: its handlers never
+  // read flags set by the previous one. Without this every flag producer in the
+  // function reached every flag consumer through the 769-way dispatch edges, and
+  // each handler computed the full EFLAGS word it then threw away.
+  const flagBarrier = (b) => DISP && MEGA && term[b].kind === 'jtab';
+  for (let b = 0; b < N; b++) { if (flagBarrier(b)) continue; for (const s of succs[b]) if (s >= 0) preds[s].push(b); }
   const inDefs = Array.from({length:N}, ()=>new Set());
   const outDefs = Array.from({length:N}, ()=>new Set());
   { let changed = true, guard = 0;
@@ -2635,6 +2640,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   ]; };
 
   const pcmaps = new Map();
+  const jtabStarts = new Set([...jtabUnion].map(j => blocks[j].start));
   function emitBlock(i) {
     const blk = blocks[i]; const L = [];
     if (BLKPROF.size && BLKPROF.has(fnAddr.toString())) { const sl = blkprofSlot(blk.start); L.push(`(i64.store (i32.const ${sl}) (i64.add (i64.load (i32.const ${sl})) (i64.const 1)))`); }
@@ -3720,11 +3726,13 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       // generic path, which stays exact.
       const lastI = blk.insns[blk.insns.length - 1];
       const tsFast = DISP && MEGA ? a0.jtabs?.get(lastI.rip.toString()) : null;
-      if (tsFast && tsFast.length >= 128 && t.src.kind === 'mem' && t.src.index >= 0 && t.src.scale === 8 && !t.src.fs) {
+      if (tsFast && tsFast.length >= 128 && !t.remap && tsFast.every(a => jtabStarts.has(a)) && t.src.kind === 'mem' && t.src.index >= 0 && t.src.scale === 8 && !t.src.fs) {
         const key = tsFast.map(String).join(',');
         let pm = pcmaps.get(key); if (!pm) { pm = { id: pcmaps.size, ts: tsFast }; pcmaps.set(key, pm); }
-        L.push(`(local.set $pc (call $pcm_${fnAddr.toString(16)}_${pm.id} ${rd({ kind: 'reg', r: t.src.index }, 8, lnext)}))`);
-        if (t.remap) for (const [r, v] of t.remap) L.push(`(if (i32.eq (local.get $pc) (i32.const ${r})) (then (local.set $pc (i32.const ${v}))))`);
+        // synthetic pc: the dispatch br_table has one extra entry per table row
+        // (N + offset + index) that branches straight to that row's block
+        const ix = rd({ kind: 'reg', r: t.src.index }, 8, lnext);
+        L.push(`(local.set $pc (select (i32.add (i32.wrap_i64 ${ix}) (i32.const @@PCM${pm.id}@@)) (i32.const -1) (i64.lt_u ${ix} (i64.const ${tsFast.length}))))`);
         L.push(`(br_if $L_disp (i32.ge_s (local.get $pc) (i32.const 0)))`);
       }
       L.push(`(local.set $rex ${rd(t.src,8,lnext)})`);
@@ -4056,29 +4064,24 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       const mid = (lo + hi) >> 1;
       return `(if (result i32) (i64.lt_u (local.get $a) (i64.const ${hexs(pairs[mid][0])}))\n      (then ${bs(lo, mid)})\n      (else ${bs(mid, hi)}))`;
     };
-    let pcm = '';
-    const startToIdx = new Map(pairs.map(([a, j]) => [a, j]));
-    for (const [, pm] of pcmaps) {
-      const n = pm.ts.length;
-      pcm += `  (func $pcm_${fnAddr.toString(16)}_${pm.id} (param $i i64) (result i32)\n    (block $e (result i32)\n`;
-      pcm += `      (if (i64.ge_u (local.get $i) (i64.const ${n})) (then (br $e (i32.const -1))))\n`;
-      for (let k = n - 1; k >= 0; k--) pcm += '      (block $c' + k + '\n';
-      pcm += `      (br_table ${Array.from({ length: n }, (_, k) => '$c' + k).join(' ')} $c0 (i32.wrap_i64 (local.get $i))))\n`;
-      for (let k = 0; k < n; k++) {
-        const j = startToIdx.get(pm.ts[k]);
-        pcm += `      (br $e (i32.const ${j === undefined ? -1 : j}))${k < n - 1 ? ')' : ''}\n`;
-      }
-      pcm += '    )\n  )\n';
-    }
-    return pcm + `  (func $jtr_${fnAddr.toString(16)} (param $a i64) (result i32)\n    ${bs(0, pairs.length)}\n  )\n`;
+    return `  (func $jtr_${fnAddr.toString(16)} (param $a i64) (result i32)\n    ${bs(0, pairs.length)}\n  )\n`;
   };
   if (DISP) {
     // flat br_table dispatch: $pc holds the current block's RPO index. Block
     // bodies run in order; a non-fallthrough edge sets $pc and br's $L_disp.
     wat += '    (block $exit_disp\n    (loop $L_disp\n';
     for (let k = N-1; k >= 0; k--) wat += `      (block $b${k}\n`;
-    const tab = Array.from({length:N}, (_,k)=>'$b'+k).join(' ');
-    wat += `      (br_table ${tab} $exit_disp (local.get $pc)))\n`;   // closes $b0
+    const tabA = Array.from({length:N}, (_,k)=>'$b'+k);
+    const startToIdx = new Map([...jtabUnion].map(j => [blocks[j].start, j]));
+    let pcOff = N;
+    const pcOffs = [];
+    for (const [, pm] of pcmaps) {
+      pcOffs[pm.id] = pcOff;
+      for (const t of pm.ts) { const j = startToIdx.get(t); tabA.push(j === undefined ? '$exit_disp' : '$b' + j); }
+      pcOff += pm.ts.length;
+    }
+    for (let k = 0; k < N; k++) if (bodies[k].includes('@@PCM')) bodies[k] = bodies[k].replace(/@@PCM(\d+)@@/g, (_, d) => pcOffs[+d]);
+    wat += `      (br_table ${tabA.join(' ')} $exit_disp (local.get $pc)))\n`;   // closes $b0
     for (let i=0;i<N;i++) {
       // a block with a SELF-EDGE (tight single-block loop - the hottest
       // backward-edge kind) gets a loop label so it branches directly instead
