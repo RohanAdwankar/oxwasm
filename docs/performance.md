@@ -822,3 +822,10 @@ Where the remaining JIT-off time goes: pure-call code. A guest call is ~60 wasm 
 why C++-runtime-heavy operations (`push` 20x, comparator sort 15x) are worse than bytecode
 dispatch (4-6x). Narrowing the protocol was measured earlier (bench/kernels/idealcall.mjs) and
 did not pay.
+
+JIT on, full small mix, measured (EXEC_ANON + STOREGUARD + TurboFan-only, cold-ish cache):
+- DFG and FTL on: round 0 took 553 s and round 1 never finished in the remaining 54 minutes.
+- baseline JIT only (DFG/FTL off): rounds of 124 s, 446 s, 471 s, 511 s, 569 s, 589 s - growing,
+  not converging.
+The single-phase results above (fib, math) converge; the mix does not, so the JIT-off compiled
+interpreter (about 800 ms per round) remains the best configuration measured.
