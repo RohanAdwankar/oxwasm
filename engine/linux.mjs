@@ -14,6 +14,7 @@ import { compileUnitWat, pltStubWat, FTMAP, FTMAP_MAX, FTENTRY, FTDLIMIT, FTFUEL
 // the environment, where there is one: the engine also runs in a browser tab, which has no `process`
 const ENV = typeof process !== 'undefined' && process.env ? process.env : {};
 if (ENV.OXWASM_IHIST) globalThis.__ihist = new Map();   // sampled histogram of interpreted rips (every 64th step), dumped at exit
+const RIPSAMPLE = typeof process !== 'undefined' && ENV.OXWASM_RIPSAMPLE ? Number(ENV.OXWASM_RIPSAMPLE) : 0;   // power of two minus one: sample the interpreter's rip every N steps
 const DISPSTAT = typeof process !== 'undefined' && ENV.OXWASM_DISPSTAT === '1';
 // OXWASM_STOREGUARD=1 (measurement): compiled code checks every store against
 // a window of translated generated code and calls back on a hit. The engine
@@ -5985,6 +5986,7 @@ export class LinuxEngine {
         // unit sitting in the broker's fifo (38 s against 11 s synchronous;
         // the unit came back at t=9 s and registered at t=38 s, the end).
         // Pump every 2^18 steps while anything is in flight.
+        if (RIPSAMPLE && (steps & RIPSAMPLE) === 0) console.error(`[rip] ${this.cpu.rip.toString(16)} tid=${this.threads?.[this.ti]?.id} interp=${this.stats.interpreted}`);
         if ((steps & 0x3FFFF) === 0 && this.pumpAsm && this._inflight && this._inflight.size) this.pumpAsm();
         if ((insn.mnem === 'jcc' || insn.mnem === 'jmp') && this.cpu.rip < before && this.inExec(this.cpu.rip)) {   // jmp: rotated-loop back-edge
           const hk = this.cpu.rip;
