@@ -14,6 +14,14 @@ import { compileUnitWat, pltStubWat, FTMAP, FTMAP_MAX, FTENTRY, FTDLIMIT, FTFUEL
 // the environment, where there is one: the engine also runs in a browser tab, which has no `process`
 const ENV = typeof process !== 'undefined' && process.env ? process.env : {};
 if (ENV.OXWASM_IHIST) globalThis.__ihist = new Map();   // sampled histogram of interpreted rips (every 64th step), dumped at exit
+
+// Keys of everything the engine caches about guest code (translations, failures, loop tiers, memos),
+// with the page each lives on. A store into generated code asks "does any of it live on this page?"
+// before scanning the tables: JSC emitting a function is thousands of stores, and the scan was
+// half of a JIT-on run (591 s of 1212 s in one profile).
+const pageOf = (k) => (typeof k === 'bigint' ? k : BigInt(k)) >> 12n;
+class PagedMap extends Map { constructor(pages) { super(); this.pages = pages; } set(k, v) { this.pages.add(pageOf(k)); return super.set(k, v); } }
+class PagedSet extends Set { constructor(pages) { super(); this.pages = pages; } add(k) { this.pages.add(pageOf(k)); return super.add(k); } }
 const RIPSAMPLE = typeof process !== 'undefined' && ENV.OXWASM_RIPSAMPLE ? Number(ENV.OXWASM_RIPSAMPLE) : 0;   // power of two minus one: sample the interpreter's rip every N steps
 const DISPSTAT = typeof process !== 'undefined' && ENV.OXWASM_DISPSTAT === '1';
 // OXWASM_STOREGUARD=1 (measurement): compiled code checks every store against
@@ -23,6 +31,10 @@ const DISPSTAT = typeof process !== 'undefined' && ENV.OXWASM_DISPSTAT === '1';
 const STOREGUARD = typeof process !== 'undefined' && ENV.OXWASM_STOREGUARD === '1';
 // Rewrites of one page before it is declared volatile and left interpreted.
 const CW_VOLATILE = Number(ENV.OXWASM_CW_VOLATILE || 8);
+// A volatile page that has gone this many interpreted steps without a write is trusted again: JSC patches an inline
+// cache once and the code then runs for good, and a page that stays interpreted for the life of the process is
+// a 100x tax on exactly the loops that matter.
+const CW_QUIET = Number(ENV.OXWASM_CW_QUIET || 2_000_000);
 const BREAKS = typeof process !== 'undefined' && ENV.OXWASM_BREAK ? new Set(ENV.OXWASM_BREAK.split(',').map((h) => BigInt('0x' + h))) : null;   // interpreter breakpoints: print the thread, registers and [rdi+0x340..] (diagnosis)
 const ROTATE_MS = Number(ENV.OXWASM_ROTATE_MS || 10);   // wall-clock quantum: a thread that has run this long yields to a runnable sibling (see _rotateDue)
 // OXWASM_ANON_HEAT: calls required before GENERATED code is translated, as
@@ -228,7 +240,7 @@ export class LinuxEngine {
     // 200 functions or 19,000 (see diff/instbench.mjs).
     this.ftab = new WebAssembly.Table({ element: 'anyfunc',
                                         initial: Math.min(FTAB_INIT, FTMAP_MAX), maximum: FTMAP_MAX });
-    this._ftCount = 0; this._ftSeen = new Set(); this._entries = null;
+    this._ftCount = 0; this._ftSeen = new PagedSet(this.codePages ??= new Set()); this._entries = null;
     this.regview = new BigInt64Array(this.wmem.buffer, 0, 16);
     this.fsview = new BigInt64Array(this.wmem.buffer, 128, 1);   // fs base for AOT TLS accesses
     this.mxview = new Uint32Array(this.wmem.buffer, 144, 1);     // MXCSR, so units can run stmxcsr/ldmxcsr instead of escaping
@@ -284,7 +296,7 @@ export class LinuxEngine {
     this.ti = 0; this.nextTid = 2; this._futexAddr = null;
     this.argv0 = argv[0]; this.setupStack(argv);
     this.cpu.rip = this.entry;
-    this.profile = new Map(); this.compiled = new Map();
+    this.profile = new Map(); this.compiled = new PagedMap(this.codePages ??= new Set());
     this.threshold = threshold;
     this.stats = { interpreted: 0, compiledRuns: 0, aotRuns: 0, tiers: {}, syscalls: {} };
     this._ftFull = 0;                         // functions refused by the FTMAP_MAX ceiling
@@ -295,8 +307,8 @@ export class LinuxEngine {
     // assembleWat: (watText) -> Uint8Array of wasm; injected because the text
     // assembler differs by host (wat2wasm CLI under node, wabt.js in a page).
     this.assembleWat = assembleWat;
-    this.aotFns = new Map();                  // ripStr -> wasm export
-    this.aotFailed = new Set();
+    this.aotFns = new PagedMap(this.codePages ??= new Set());                  // ripStr -> wasm export
+    this.aotFailed = new PagedSet(this.codePages ??= new Set());
     this.tierMs = 0;                          // sync translation time this slice (host zeroes; see tierMsMax)
     this.aotCalls = new Map();                // call-target profile
     this._unprune = UNPRUNE;
@@ -581,7 +593,7 @@ export class LinuxEngine {
     // open addressing has no in-place delete: clearing and reinserting is
     // the only way to drop an entry (a blacklisted unit, a restored image)
     new Uint8Array(this.wmem.buffer, FTHASH, FTHBYTES).fill(0);
-    this._ftCount = 0; this._ftSeen = new Set(); this._entries = null;
+    this._ftCount = 0; this._ftSeen = new PagedSet(this.codePages ??= new Set()); this._entries = null;
     for (const [a, f] of this.aotFns)
       if (f && !f.jsStub) this.registerAotFn(a, f);
   }
@@ -618,6 +630,18 @@ export class LinuxEngine {
   _invalidateCode(lo, hi) {
     const inR = (k) => k >= lo && k < hi;
     let hit = false;
+    // nothing cached lives on these pages: only the structures that are not keyed by page need a look
+    const p0 = lo >> 12n, p1 = (hi - 1n) >> 12n;
+    let touched = true;
+    if (p1 - p0 < 64n && this.codePages) { touched = false; for (let q = p0; q <= p1; q++) if (this.codePages.has(q)) { touched = true; break; } }
+    if (!touched) {
+      if (this.execAnon ?? EXEC_ANON) { const n = this.execRanges.length; this.execRanges = this.execRanges.filter(([a, b]) => !(a >= lo && b <= hi)); if (this.execRanges.length !== n) { this._ieCache = undefined; this._genCache = undefined; this._updateCodeWindow(); } }
+      if (this._inflight) for (const u of this._inflight) if (u.funcs.some(inR)) {
+        u.cancelled = true;
+        if (this._pendingFns) for (const a of u.funcs) this._pendingFns.delete(a.toString());
+      }
+      return;
+    }
     for (const k of this.aotFns.keys()) if (inR(k)) { this.aotFns.delete(k); hit = true; }
     for (const k of this.aotFailed) if (inR(k)) this.aotFailed.delete(k);
     if (this.compiled) for (const k of this.compiled.keys()) if (inR(k)) this.compiled.delete(k);
@@ -633,6 +657,7 @@ export class LinuxEngine {
       u.cancelled = true;
       if (this._pendingFns) for (const a of u.funcs) this._pendingFns.delete(a.toString());
     }
+    if (this.codePages) for (let q = p0; q <= p1 && p1 - p0 < 4096n; q++) this.codePages.delete(q);
     if (hit) this.rebuildFtmap();
   }
   finishAotUnit(unit, instance) {
@@ -811,7 +836,7 @@ export class LinuxEngine {
     // Generated code the guest keeps rewriting is left to the interpreter (see
     // _codeWrite). This also marks the region's pages as watched, so a write
     // to one is seen before the translation it invalidates is ever used.
-    if (this._cwCover(entry)) { this.aotFailed.add(k); this.noteAotFail(entry, 'volatile code page'); return; }
+    if (this._cwCover(entry)) { this.stats.volatileSkips = (this.stats.volatileSkips | 0) + 1; return; }   // not a failure: the page is trusted again once it has been quiet (CW_QUIET)
     const _tc0 = performance.now();
     const _unitEx = this.unitStore ? this._unitExeId() : null, _unitRs = this._exeRanges;   // the key at REQUEST time: the lookup used it, so the store must
     try {
@@ -833,8 +858,8 @@ export class LinuxEngine {
                   || (!CLOSURE_ALL && (this.aotCalls.get(BigInt(c)) || 0) < CLOSURE_MIN),
         // bisect aids: fnVeto never compiles these; fnAllow compiles only these (roots and closure members)
         veto: (c) => this._isVforkStub(BigInt(c)) || (this.fnVeto?.has(c) ?? false) || (this.fnAllow ? !this.fnAllow.has(c) : false) || this._envVeto(c),   // a vfork stub is never compiled, as a root or inside a closure
-        tinyMemo: (this._tinyMemo ??= new Map()),
-        failMemo: (this._failMemo ??= new Map()),
+        tinyMemo: (this._tinyMemo ??= new PagedMap(this.codePages ??= new Set())),
+        failMemo: (this._failMemo ??= new PagedMap(this.codePages ??= new Set())),
         sizeMemo: (this._sizeMemo ??= new Map()),          // sizes of callees the size gate refused (cleared per range by _invalidateCode)
         // size gate (see SIZEGATE): giant callees need the calls whatever rooted
         // the unit; a giant ROOT is gated only when the call profile asked for it
@@ -994,7 +1019,7 @@ export class LinuxEngine {
     this.stats.disp = (this.stats.disp || 0) + 1;
     if (HEARTBEAT && (this.stats.disp & HEARTBEAT) === 0 && this._ctor?.argv?.[0]?.includes(TRACE_ARGV)) console.error(`[hb] disp=${this.stats.disp} rip=${this.cpu.rip.toString(16)} tid=${this.threads[this.ti]?.id} rsp=${this.cpu.regs[4].toString(16)} t=${Math.round(this.nowMs())} interp=${this.stats.interpreted} aot=${this.stats.aotRuns}`);
     if (ENV.OXWASM_DISPLOG && this._ctor?.argv?.[0]?.includes('opencode')) { const [lo, hi] = ENV.OXWASM_DISPLOG.split('-').map(Number); if (this.stats.disp >= lo && this.stats.disp <= hi) console.error(`[disp ${this.stats.disp}] rip=${this.cpu.rip.toString(16)} rsp=${this.cpu.regs[4].toString(16)}`); }
-    if (ENV.OXWASM_AOTSTOP && this.stats.disp === +ENV.OXWASM_AOTSTOP && this._ctor?.argv?.[0]?.includes('opencode')) { this._aotOff = true; if (ENV.OXWASM_AOTSTOP_HARD) { new DataView(this.wmem.buffer).setUint32(FTMAP, 0, true); new Uint8Array(this.wmem.buffer, FTHASH, FTHBYTES).fill(0); this._ftCount = 0; this._ftSeen = new Set(); this._entries = null; } console.error('[aotstop] at disp', this.stats.disp); }
+    if (ENV.OXWASM_AOTSTOP && this.stats.disp === +ENV.OXWASM_AOTSTOP && this._ctor?.argv?.[0]?.includes('opencode')) { this._aotOff = true; if (ENV.OXWASM_AOTSTOP_HARD) { new DataView(this.wmem.buffer).setUint32(FTMAP, 0, true); new Uint8Array(this.wmem.buffer, FTHASH, FTHBYTES).fill(0); this._ftCount = 0; this._ftSeen = new PagedSet(this.codePages ??= new Set()); this._entries = null; } console.error('[aotstop] at disp', this.stats.disp); }
     if (this._cleanSync) this.stats.dispClean = (this.stats.dispClean || 0) + 1;
     // Save/restore the wasm-frame budget word (FTMAP+8) around the dispatch:
     // interpUntil dispatches units NESTED under live wasm frames (a callout's
@@ -1417,6 +1442,7 @@ export class LinuxEngine {
     // stops being translated, and the rest of the region carries on.
     const n = (this._cwCount ??= new Map()).get(lo) ?? 0;
     this._cwCount.set(lo, n + 1);
+    (this._cwLast ??= new Map()).set(lo, this.stats.interpreted);
     if (n + 1 >= CW_VOLATILE) {
       (this._volatilePages ??= new Set()).add(lo);
       this._cwMark(lo, 0);
@@ -1444,7 +1470,12 @@ export class LinuxEngine {
     for (const [x, y] of this.execRanges) {
       if (!(a >= x && a < y)) continue;
       if (stat.some(([p, q]) => p === x && q === y)) return false;      // a file image, not generated code
-      if (this._volatilePages?.has(a & ~4095n)) return true;            // caller must not translate it
+      if (this._volatilePages?.has(a & ~4095n)) {
+        const pg = a & ~4095n;
+        if (this.stats.interpreted - (this._cwLast?.get(pg) ?? 0) <= CW_QUIET) return true;   // caller must not translate it
+        this._volatilePages.delete(pg); this._cwCount.set(pg, 0);                       // quiet for long enough: translate again
+        this.stats.volatilePages = this._volatilePages.size; this.stats.cwQuieted = (this.stats.cwQuieted | 0) + 1;
+      }
       for (let p = x & ~4095n; p < y; p += 4096n)
         if (!this._volatilePages?.has(p)) this._cwMark(p, 1);
       return false;
