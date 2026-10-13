@@ -829,3 +829,22 @@ JIT on, full small mix, measured (EXEC_ANON + STOREGUARD + TurboFan-only, cold-i
   not converging.
 The single-phase results above (fib, math) converge; the mix does not, so the JIT-off compiled
 interpreter (about 800 ms per round) remains the best configuration measured.
+
+### JIT on, after trusting quiet code pages again (f11ad8b)
+
+The JIT-on slowdown had two causes in the engine, not in the guest. Every store into generated
+code scanned every translation table (591 s of a 1212 s run), and a code page that took eight
+patches was marked volatile and never translated again, so JSC's hot baseline-JIT loops stayed
+interpreted for the life of the process. A quiet page is now trusted again and the scan is
+skipped for pages with nothing cached.
+
+Small mix, baseline JIT only (`BUN_JSC_useDFGJIT=0 BUN_JSC_useFTLJIT=0`), EXEC_ANON +
+STOREGUARD + TurboFan-only, 30 rounds: round 0 96 s, then 23, 10, 2.5, 6.2, 1.6, then 0.75 to
+1.6 s per round from round 6 on, best 746 ms, typical 1.0-1.4 s, with occasional 7-20 s rounds
+when a page goes volatile again. Per phase minimum over the run: fib 5 ms (native 6 with the
+JIT off, 0.x with it on), math 34, objects 169 (not converged), strings 60, sorting 129,
+maps 89, json 72. That is the same neighbourhood as the JIT-off compiled interpreter
+(about 800 ms), not better.
+
+Full JIT (DFG and FTL on): rounds of 186, 160, 67, 158, 35, 75, 44 s and then an abort (rc 134)
+in the eighth - not usable.
