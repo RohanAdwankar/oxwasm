@@ -866,3 +866,6 @@ objects 22, strings 15, sorting 117, maps 77, json 34 (native with the JIT off: 
 callbacks) and maps are the remaining multiples. `useConcurrentGC=0` was worse (twice as slow).
 The same growth factors with the JIT off gave a best of 710 ms (objects 109), so the JIT-on
 objects/strings result needs both.
+
+DFG on (FTL off) with the same settings did not complete 100 rounds in 30 minutes; the
+baseline JIT alone is the usable JIT configuration.
