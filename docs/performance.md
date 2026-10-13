@@ -848,3 +848,21 @@ maps 89, json 72. That is the same neighbourhood as the JIT-off compiled interpr
 
 Full JIT (DFG and FTL on): rounds of 186, 160, 67, 158, 35, 75, 44 s and then an abort (rc 134)
 in the eighth - not usable.
+
+### GC pacing is most of the allocation-phase gap
+
+Per-phase times in the JIT-on runs varied 5x between rounds, concentrated in the allocating
+phases (objects, strings): that is JavaScriptCore's collector, which is call-dense C++ and
+pays the 15-20x call tax. Raising the heap growth factors makes collections rarer:
+
+    BUN_JSC_useDFGJIT=0 BUN_JSC_useFTLJIT=0 BUN_JSC_smallHeapGrowthFactor=8
+    BUN_JSC_mediumHeapGrowthFactor=8 BUN_JSC_largeHeapGrowthFactor=8
+
+with `OXWASM_EXEC_ANON=1 OXWASM_STOREGUARD=1 OXWASM_NOLIFTOFF=1 OXWASM_CW_VOLATILE=4
+OXWASM_STACKMB=256 OXWASM_FTDLIMIT=30000`, small mix, 150 rounds (410 s): round time min 329,
+p25 450, median 672, p75 939 ms (one 100 s outlier). Per phase minimum: fib 5, math 30,
+objects 22, strings 15, sorting 117, maps 77, json 34 (native with the JIT off: 6, 15, 23, 20,
+16, 41, 14). Objects and strings are at native interpreter speed; sorting (comparator
+callbacks) and maps are the remaining multiples. `useConcurrentGC=0` was worse (twice as slow).
+The same growth factors with the JIT off gave a best of 710 ms (objects 109), so the JIT-on
+objects/strings result needs both.

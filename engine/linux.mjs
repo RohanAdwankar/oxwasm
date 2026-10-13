@@ -23,6 +23,7 @@ const pageOf = (k) => (typeof k === 'bigint' ? k : BigInt(k)) >> 12n;
 class PagedMap extends Map { constructor(pages) { super(); this.pages = pages; } set(k, v) { this.pages.add(pageOf(k)); return super.set(k, v); } }
 class PagedSet extends Set { constructor(pages) { super(); this.pages = pages; } add(k) { this.pages.add(pageOf(k)); return super.add(k); } }
 const RIPSAMPLE = typeof process !== 'undefined' && ENV.OXWASM_RIPSAMPLE ? Number(ENV.OXWASM_RIPSAMPLE) : 0;   // power of two minus one: sample the interpreter's rip every N steps
+const CHURN = typeof process !== 'undefined' && ENV.OXWASM_CHURN === '1';
 const DISPSTAT = typeof process !== 'undefined' && ENV.OXWASM_DISPSTAT === '1';
 // OXWASM_STOREGUARD=1 (measurement): compiled code checks every store against
 // a window of translated generated code and calls back on a hit. The engine
@@ -642,6 +643,7 @@ export class LinuxEngine {
       }
       return;
     }
+    this.stats.invalSlow = (this.stats.invalSlow | 0) + 1;
     for (const k of this.aotFns.keys()) if (inR(k)) { this.aotFns.delete(k); hit = true; }
     for (const k of this.aotFailed) if (inR(k)) this.aotFailed.delete(k);
     if (this.compiled) for (const k of this.compiled.keys()) if (inR(k)) this.compiled.delete(k);
@@ -3258,6 +3260,11 @@ export class LinuxEngine {
         // where native dies 134. sig 0 stays a liveness probe.
         const sig = Number(nr === 62 ? a2 : a3);
         if (sig === 0) { ret(0n); break; }
+        if (ENV.OXWASM_ABORTDIAG && sig === 6) {          // who aborted: the guest return addresses on the stack at the call
+          const rsp = this.cpu.regs[4], words = [];
+          for (let i = 0n; i < 400n && words.length < 40; i++) { let w; try { w = this.mem.read(rsp + 8n * i, 8n); } catch { break; } if (w > 0x200000n && w < 0x6000000n) words.push(w.toString(16)); }
+          console.error(`[abort] tid=${this.threads[this.ti]?.id} rip=${this.cpu.rip.toString(16)} stack-code=${words.join(' ')}`);
+        }
         if (sig < 1 || sig > 64) { ret(-22n); break; }
         if (nr === 62) {
           // kill(pid): a process anywhere in the tree by pid; 0 the caller's
@@ -6017,6 +6024,7 @@ export class LinuxEngine {
         // unit sitting in the broker's fifo (38 s against 11 s synchronous;
         // the unit came back at t=9 s and registered at t=38 s, the end).
         // Pump every 2^18 steps while anything is in flight.
+        if (CHURN && (steps & 0xFFFF) === 0) { const nw = performance.now(); if (nw - (this._churnT ?? 0) > 1000) { const st = this.stats, pv = this._churnP ?? {}; const d = (k) => (st[k] | 0) - (pv[k] | 0); console.error(`[churn] t=${(nw / 1000) | 0} interp=${d('interpreted')} disp=${d('disp')} compiles=${d('compiles')} cw=${d('codeWrites')} inval=${d('invalSlow')} volSkip=${d('volatileSkips')} quiet=${d('cwQuieted')}`); this._churnP = { ...st }; this._churnT = nw; } }
         if (RIPSAMPLE && (steps & RIPSAMPLE) === 0) console.error(`[rip] ${this.cpu.rip.toString(16)} tid=${this.threads?.[this.ti]?.id} interp=${this.stats.interpreted}`);
         if ((steps & 0x3FFFF) === 0 && this.pumpAsm && this._inflight && this._inflight.size) this.pumpAsm();
         if ((insn.mnem === 'jcc' || insn.mnem === 'jmp') && this.cpu.rip < before && this.inExec(this.cpu.rip)) {   // jmp: rotated-loop back-edge
