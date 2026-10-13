@@ -12,7 +12,8 @@ import { compileUnitWat, pltStubWat, FTMAP, FTMAP_MAX, FTENTRY, FTDLIMIT, FTFUEL
 // OXWASM_DISPSTAT=1: count the rips that HAD a compiled unit and were not
 // dispatched anyway. Off by default - it costs a map lookup per instruction.
 // the environment, where there is one: the engine also runs in a browser tab, which has no `process`
-const ENV = typeof process !== 'undefined' && process.env ? process.env : {};
+// A plain copy: process.env is a C++ interceptor, and ENV.X is read on per-dispatch paths. Refreshed when an engine is built.
+const ENV = typeof process !== 'undefined' && process.env ? { ...process.env } : {};
 if (ENV.OXWASM_IHIST) globalThis.__ihist = new Map();   // sampled histogram of interpreted rips (every 64th step), dumped at exit
 
 // Keys of everything the engine caches about guest code (translations, failures, loop tiers, memos),
@@ -131,6 +132,7 @@ export class LinuxEngine {
                           assembleWat = null, aotCallThreshold = 4, aotLoopThreshold = 12,
                           xserver = null, mtimes = {}, tty = false, ttyRows = 24, ttyCols = 80,
                           stdin = null, net = null, diskMB = 0, maxProcs = 64 } = {}) {
+    if (typeof process !== 'undefined' && process.env) Object.assign(ENV, process.env);   // tests set knobs between engines
     this._diskQuota = diskMB * 1048576;       // 0 = unlimited
     if (ENV.OXWASM_RIPLOG) { this._ripLog = new Set(ENV.OXWASM_RIPLOG.split(',').map((h) => BigInt('0x' + h))); this._ripLogRing = []; if (ENV.OXWASM_AOTSKIP_AT) { const [a, b] = ENV.OXWASM_AOTSKIP_AT.split(':'); this._skipAt = [BigInt('0x' + a), b]; } }   // regs at these rips (interpreted), last 48, dumped by _onBreak
     if (ENV.OXWASM_RIPTRACE) { this.ripTrace = new Array(65536).fill(0n); this.ripTraceI = 0; const [lo, hi] = (ENV.OXWASM_RIPTRACE_RANGE || '0-ffffffffffff').split('-'); this._rtLo = BigInt('0x' + lo); this._rtHi = BigInt('0x' + hi); }   // recent rips: AOT entry/exit (negative) and interpreted steps; dumped by _onBreak
@@ -527,6 +529,7 @@ export class LinuxEngine {
     for (;;) {
       const k = dv.getBigUint64(p, true);
       if (k === 0n || k === au) break;
+      if (k === 1n) { this._ftTomb--; break; }                        // reuse a tombstone: the key is known absent
       p = FTHASH + (((p - FTHASH) + 16) & FTHMASK);
     }
     dv.setBigUint64(p, au, true);
@@ -589,7 +592,30 @@ export class LinuxEngine {
   // and each tail jump/call paid a JS hop (measured: ~500k callouts and
   // ~50k deopts per warm GIMP menu cycle, all to compiled-but-unmapped
   // functions).
+  // Take dropped entries out of the dispatch hash in place. The hash is open addressing, so an entry
+  // becomes a tombstone (key 1: never a code address, never the empty key 0, so $ftr's probe walks on
+  // past it) instead of the table being rebuilt: rebuilding re-registered every translated function
+  // per invalidation, and under a JIT that was most of the run. The funcref slot is leaked until the
+  // next full rebuild, which compaction triggers when the leak or the tombstones pile up.
+  _ftDrop(keys) {
+    this._ftTomb ??= 0;
+    const dv = new DataView(this.wmem.buffer);
+    for (const a of keys) {
+      if (!this._ftSeen.has(a)) continue;
+      const au = BigInt.asUintN(64, a);
+      let p = FTHASH + (((Math.imul(Number(au & 0xFFFFFFFFn), 0x9E3779B1) >>> (32 - FTHBITS))) << 4);
+      for (let n = 0; n < (FTHMASK >> 4) + 1; n++) {
+        const k = dv.getBigUint64(p, true);
+        if (k === 0n) break;
+        if (k === au) { dv.setBigUint64(p, 1n, true); this._ftTomb++; break; }
+        p = FTHASH + (((p - FTHASH) + 16) & FTHMASK);
+      }
+      this._ftSeen.delete(a); this._ftIdxOf?.delete(a);
+    }
+    if (this._ftTomb > ((FTHMASK >> 4) + 1) / 4 || this._ftCount > FTMAP_MAX - 256) { this._ftTomb = 0; this.rebuildFtmap(); }
+  }
   rebuildFtmap() {
+    this._ftTomb = 0; this.stats.ftRebuild = (this.stats.ftRebuild | 0) + 1;
     new DataView(this.wmem.buffer).setUint32(FTMAP, 0, true);
     // open addressing has no in-place delete: clearing and reinserting is
     // the only way to drop an entry (a blacklisted unit, a restored image)
@@ -644,7 +670,8 @@ export class LinuxEngine {
       return;
     }
     this.stats.invalSlow = (this.stats.invalSlow | 0) + 1;
-    for (const k of this.aotFns.keys()) if (inR(k)) { this.aotFns.delete(k); hit = true; }
+    const dropped = [];
+    for (const k of this.aotFns.keys()) if (inR(k)) { this.aotFns.delete(k); hit = true; dropped.push(k); }
     for (const k of this.aotFailed) if (inR(k)) this.aotFailed.delete(k);
     if (this.compiled) for (const k of this.compiled.keys()) if (inR(k)) this.compiled.delete(k);
     if (this.profile) for (const k of this.profile.keys()) if (inR(k)) this.profile.delete(k);
@@ -660,7 +687,7 @@ export class LinuxEngine {
       if (this._pendingFns) for (const a of u.funcs) this._pendingFns.delete(a.toString());
     }
     if (this.codePages) for (let q = p0; q <= p1 && p1 - p0 < 4096n; q++) this.codePages.delete(q);
-    if (hit) this.rebuildFtmap();
+    if (hit) this._ftDrop(dropped);
   }
   finishAotUnit(unit, instance) {
     this._inflight?.delete(unit);

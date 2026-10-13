@@ -869,3 +869,24 @@ objects/strings result needs both.
 
 DFG on (FTL off) with the same settings did not complete 100 rounds in 30 minutes; the
 baseline JIT alone is the usable JIT configuration.
+
+### Dispatch-table maintenance under a JIT, and the abort at large heap growth
+
+A stack sample of a DFG-on run put 5 of 6 samples in `rebuildFtmap`: every invalidation that
+dropped a translated unit rebuilt the whole dispatch hash (re-registering ~10k functions).
+Dropped entries are now tombstoned in place (key 1, which `$ftr`'s probe walks past), with a full
+rebuild only when tombstones or leaked funcref slots pile up. `process.env` reads on per-dispatch
+paths (an interceptor into C++) now go through a copy refreshed at engine construction.
+
+Heap growth factor 8 made the guest abort (rc 134) in the allocator after about 200 s, from
+exhausting the 3.9 GB child memory; factor 3 gives the same speed without it. Recommended
+opencode configuration, small mix, 200 rounds in 354 s, rc 0:
+
+    OXWASM_EXEC_ANON=1 OXWASM_STOREGUARD=1 OXWASM_NOLIFTOFF=1 OXWASM_CW_VOLATILE=4
+    OXWASM_STACKMB=256 OXWASM_FTDLIMIT=30000 OXWASM_MAXWAT=8000000
+    BUN_JSC_useDFGJIT=0 BUN_JSC_useFTLJIT=0
+    BUN_JSC_smallHeapGrowthFactor=3 BUN_JSC_mediumHeapGrowthFactor=3 BUN_JSC_largeHeapGrowthFactor=3
+
+round time min 351, p25 477, median 685, p75 870 ms, plus rare multi-second to 80 s outliers.
+Per phase minimum: fib 5, math 28, objects 23, strings 15, sorting 117, maps 76, json 33.
+Against native 45 ms (JIT) and 156 ms (JIT off): the median is 15x and 4.4x.
