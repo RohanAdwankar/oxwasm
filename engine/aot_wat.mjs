@@ -75,6 +75,7 @@ const STOREGUARD = typeof process !== 'undefined' && process.env?.OXWASM_STOREGU
 // Largest wat text this emitter will hand the runtime for ONE function; see
 // the refusal at the end of the function emitter for the two measurements
 // that bracket it.
+const WATCOMMENTS = typeof process !== 'undefined' && process.env?.OXWASM_WATCOMMENTS === '1';
 const MAXWAT = Number(process.env.OXWASM_MAXWAT || 5_000_000);
 // A computed goto with a table this wide is an interpreter's dispatch: the one kind of
 // function worth compiling whole, however large (JavaScriptCore's LLInt has 272 per site).
@@ -3772,7 +3773,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     return L.join('\n');
   }
 
-  const bodies = []; for (let i=0;i<N;i++) bodies.push(emitBlock(i));
+  const bodies = []; for (let i=0;i<N;i++) bodies.push((WATCOMMENTS ? ';; blk ' + i + ' @' + blocks[i].start.toString(16) + '\n' : '') + emitBlock(i));
 
   // ---- spill/reload narrowing ------------------------------------------------
   // Two dataflow passes over the emitted text shrink the register protocol.

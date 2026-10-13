@@ -8,6 +8,11 @@
 // process, not on someone else's machine. Where a feature is not built, the
 // call throws `NotSupportedError` saying so; nothing is a silent no-op.
 import { Worker } from 'node:worker_threads';
+import v8 from 'node:v8';
+// OXWASM_NOLIFTOFF=1: compile every wasm function with TurboFan only. V8's baseline compiler
+// spends about 2 GB on one multi-MB interpreter unit where TurboFan spends 0.4 GB, and that
+// transient is what takes a 16 GB host over the edge while a large guest warms up.
+if (process.env.OXWASM_NOLIFTOFF === '1') v8.setFlagsFromString('--no-liftoff');
 import { ProcessWorker } from './isolated.mjs';
 import { CACHE_DIR } from './image.mjs';
 import { randomBytes } from 'node:crypto';
