@@ -791,3 +791,34 @@ JIT on does not complete on this host: translating JSC's generated code produces
 new units in the first minutes and the process is killed at 13 GB. Even with that solved,
 translated x86 runs at best a small multiple of native, so within 20% of native-with-JIT is
 not reachable by this route on this evidence.
+
+### Second pass: flags barrier, direct dispatch, TurboFan-only, JIT-on configuration
+
+Small mix, JIT off, same box as above (native 156 ms per round): 1161 ms -> about 800 ms
+steady (rounds 7-11: 819-905 ms; best single round 799). Per phase: fib 30, math 60,
+objects 112, strings 93, sorting 165, maps 165, json 83 (native: 6, 15, 23, 20, 16, 41, 14).
+What moved it:
+
+- An interpreter's computed-goto dispatch is now a flags barrier in the cross-block flag
+  analysis. Every flag producer used to reach every soft consumer through the 769-way dispatch
+  edges, so each handler computed the full EFLAGS word and dropped it (the emitted unit shrank
+  from 9.7 MB to 8.5 MB of text).
+- The dispatch branches through the `br_table` by the bytecode value itself (extra table
+  entries per jump-table row) instead of loading the pointer and searching for it.
+- `OXWASM_NOLIFTOFF=1` (TurboFan only): V8's baseline compiler took 2.3 GB on the 1.3 MB
+  interpreter unit, TurboFan 0.4 GB. Peak RSS of the same run went from 12+ GB to 5.9 GB and the
+  speed did not change. This is what makes anything larger than the JIT-off benchmark fit in
+  16 GB.
+
+JIT on: every earlier JIT-on number in this file ran with generated code INTERPRETED, because
+`OXWASM_EXEC_ANON=1` (and `OXWASM_STOREGUARD=1` for in-place patching) were not set. With them
+set and DFG/FTL off, fib completes (rounds 4-5: 8-10 ms; native with the JIT 0.7 ms) and the
+math phase converges to 100-260 ms per round but is unstable (rounds of 3-15 s appear after
+code is patched and re-translated), which is still slower than the JIT-off compiled
+interpreter's 60 ms. The full small mix with the JIT on has not been completed.
+
+Where the remaining JIT-off time goes: pure-call code. A guest call is ~60 wasm operations
+(spill, hash lookup, budget accounting, reload) against 2 to 5 instructions natively, which is
+why C++-runtime-heavy operations (`push` 20x, comparator sort 15x) are worse than bytecode
+dispatch (4-6x). Narrowing the protocol was measured earlier (bench/kernels/idealcall.mjs) and
+did not pay.
