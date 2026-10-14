@@ -953,3 +953,7 @@ Loading 5,000 units as separate modules took 29.2 s in a standalone test and und
 excluded; a link is done once, offline). `opencode --version` with the warm per-handler cache: 77 s separate,
 34 s bundled, output `1.18.35`; table `set` + `grow` 9.6 s -> 0.05 s. Native is 0.8 s, so startup is now about
 40x instead of about 100x.
+
+Two further runs after re-bundling: 30 s each (guest wall time), stable. The remaining profile of that run
+(62 s including sandbox boot): interpreter 6 s, translation attempts that do not end in a unit (size-gate
+deferrals of giant functions are re-analysed) about 9 s, collector 3 s, wasm execution about 5 s.
