@@ -929,3 +929,13 @@ and it is the largest single item left for short-running workloads.
 The newer mega-unit configurations did not complete `--version` in 24+ minutes: cold, every
 startup path compiles its own units (about 100 per second are loaded, few are built), and the
 warm-up runs added only ~20 units per 27 minutes, so I could not get a warm number for them.
+
+Measured directly (`opencode --version`, warm per-handler cache, 5,149 units registered, 77 s run): table
+`set` 6.0 s and `grow` 3.6 s (three grows of about 1.2 s each), 9.6 s together; instantiation, module
+compilation and file reads are the other ~35 s of unit loading. Growing the table earlier does not
+help: an instance's dispatch table is a copy of the whole table, so 8,192 entries across 5,000
+instances is about a gigabyte. WebAssembly GC arrays of function references (an `array.set` is O(1) and
+fans out to nothing) would remove the table cost, but neither wabt 1.0.34 nor the 1.0.39 JS build parses
+GC text (`ref null`, `array.new_default`), so the assembler cannot produce those modules. Bundling many
+units into one module (merging their WAT, one instance) avoids both the instance count and the fan-out
+and is the way to go.

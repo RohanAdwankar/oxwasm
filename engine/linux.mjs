@@ -520,8 +520,8 @@ export class LinuxEngine {
     if (this._ftCount >= FTMAP_MAX) { this._ftFull = (this._ftFull || 0) + 1; return; }
     this._ftSeen.add(a); this._entryAdd(a);
     const idx = this._ftCount++;
-    if (idx >= this.ftab.length) this.ftab.grow(Math.min(this.ftab.length, FTMAP_MAX - this.ftab.length));
-    this.ftab.set(idx, f);
+    if (idx >= this.ftab.length) { const t0 = performance.now(); this.ftab.grow(Math.min(this.ftab.length, FTMAP_MAX - this.ftab.length)); this.stats.tabGrowMs = (this.stats.tabGrowMs || 0) + (performance.now() - t0); this.stats.tabGrows = (this.stats.tabGrows | 0) + 1; }
+    { const t0 = performance.now(); this.ftab.set(idx, f); this.stats.tabSetMs = (this.stats.tabSetMs || 0) + (performance.now() - t0); }
     const dv = new DataView(this.wmem.buffer);
     dv.setUint8(FTENTRY + idx, (ENV.OXWASM_FTENTRY && (this._callEntries?.has(a) || this._looksLikeFnEntry(a))) ? 1 : 0);   // a real function entry: tail jumps may chain to it from a nested unit
     (this._ftIdxOf ??= new Map()).set(a, idx);
