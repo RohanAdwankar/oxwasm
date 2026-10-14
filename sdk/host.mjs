@@ -8,7 +8,7 @@
 // be abandoned when that happens.
 import { makeNet } from './net.mjs';
 import { loadRootfs, resolveIn } from './rootfs.mjs';
-import { readFileSync, statSync, existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { readFileSync, statSync, existsSync, mkdirSync, renameSync, rmSync, writeFileSync, readdirSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { LinuxEngine } from '../engine/linux.mjs';
@@ -57,6 +57,12 @@ function makeUnitStore(cacheDir) {
     digest(chunks) { const h = createHash('sha1'); for (const c of chunks) h.update(c); return h.digest('hex').slice(0, 16); },
     exeId(chunks, extra) { const h = createHash('sha1'); for (const c of chunks) h.update(c); h.update(String(extra)); return h.digest('hex').slice(0, 20); },
     get(ex, k) { try { const b = readFileSync(join(root, ex, k + '.wasm')); if (process.env.OXWASM_UNITLOG) console.error('[unitstore hit]', ex, k); return new Uint8Array(b.buffer, b.byteOffset, b.length); } catch { if (process.env.OXWASM_UNITLOG) console.error('[unitstore miss]', ex, k); return undefined; } },
+    // bundle_N.wasm files of one program id: many units linked into a few modules (tools/bundle-units.mjs)
+    bundles(ex) {
+      const d = join(root, ex); let names;
+      try { names = readdirSync(d).filter((f) => f.startsWith('bundle_') && f.endsWith('.wasm')).sort(); } catch { return []; }
+      return names.map((f) => { const b = readFileSync(join(d, f)); return new Uint8Array(b.buffer, b.byteOffset, b.length); });
+    },
     put(ex, k, bytes) {
       const d = join(root, ex); mkdirSync(d, { recursive: true });
       const f = join(d, k + '.wasm'), t = f + '.' + process.pid + '.tmp';

@@ -431,7 +431,25 @@ export class LinuxEngine {
   _diskUnit(kk) {
     if (!this.unitStore) return undefined;
     const ex = this._unitExeId();
+    if (ex && this.unitStore.bundles && !(this._bundled ??= new Set()).has(ex)) { this._bundled.add(ex); this._loadBundles(ex); }
+    if (ex && this.aotFns.get(BigInt(kk))) return undefined;      // a bundle just registered it
     return ex ? this.unitStore.get(ex, kk.toString(16)) : undefined;
+  }
+  // Pre-linked bundles of this program's cached units (tools/bundle-units.mjs): a handful of instances instead
+  // of thousands. Every instance that imports the shared funcref table makes each table set cost O(instances).
+  _loadBundles(ex) {
+    let n = 0;
+    for (const bytes of this.unitStore.bundles(ex)) {
+      try {
+        const inst = new WebAssembly.Instance(new WebAssembly.Module(bytes), this.aotImports());
+        for (const name of Object.keys(inst.exports)) if (name.startsWith('f_')) {
+          const a = BigInt('0x' + name.slice(2));
+          if (!this.aotFns.get(a) && !this.aotFailed.has(a)) { this.registerAotFn(a, inst.exports[name]); n++; }
+        }
+        if (inst.exports.drive) this.aotDrive = inst.exports.drive;
+      } catch (e) { this.noteAotFail?.(0n, 'bundle: ' + e.message); }
+    }
+    this.stats.bundleFns = (this.stats.bundleFns | 0) + n;
   }
   // A finished unit: hand it to the manifest hook and, when a disk store is attached, persist it - but only
   // if every function in it lies in code the store key covers: the program's static image (executable and
@@ -775,6 +793,7 @@ export class LinuxEngine {
     if (this.unitStore && !this.unitBytes) this.unitBytes = (kk) => this._diskUnit(kk);
     if (this.unitBytes) {
       const bytes = this.unitBytes(k);
+      if (this.aotFns.get(k)) return;                      // registered by a bundle while looking
       if (bytes) {
         this.stats.unitHits = (this.stats.unitHits || 0) + 1;
         // A synchronous host (node: breadth, runbin, the benches) never

@@ -939,3 +939,17 @@ fans out to nothing) would remove the table cost, but neither wabt 1.0.34 nor th
 GC text (`ref null`, `array.new_default`), so the assembler cannot produce those modules. Bundling many
 units into one module (merging their WAT, one instance) avoids both the instance count and the fan-out
 and is the way to go.
+
+### Bundled units: startup 77 s -> 34 s
+
+`tools/wasmlink.mjs` links many unit modules into one (unify types and imports, renumber functions,
+rewrite the indices inside code bodies, keep the first export of each name). Its instruction walker
+reproduces the function bodies of 3,000 cached units byte for byte, and a 1,000-unit link validates.
+`tools/bundle-units.mjs <cache>/units/<engine hash>` writes `bundle_N.wasm` (about 16 MB each) next to the
+unit files of every program id with 50+ units; the engine loads a program id's bundles the first time it
+looks that id up, and registers every export, so the units it would have loaded one by one are already there.
+
+Loading 5,000 units as separate modules took 29.2 s in a standalone test and under 1 s bundled (link time
+excluded; a link is done once, offline). `opencode --version` with the warm per-handler cache: 77 s separate,
+34 s bundled, output `1.18.35`; table `set` + `grow` 9.6 s -> 0.05 s. Native is 0.8 s, so startup is now about
+40x instead of about 100x.
