@@ -7,6 +7,7 @@
 import { CPU, Memory } from './interp.mjs';
 import { compileLoop } from './jit2.mjs';
 import { compileVectorLoop } from './jitsimd.mjs';
+import { fnprofSlot } from './aot_wat.mjs';
 import { compileUnitWat, pltStubWat, FTMAP, FTMAP_MAX, FTENTRY, FTDLIMIT, FTFUEL, FTLOOP, FTNEST, LOOPYIELD_N,
          FTHASH, FTHBITS, FTHMASK, FTHBYTES, CWLO_SLOT, CWLEN_SLOT, CWMAP, CWMAP_PAGES } from './aot_wat.mjs';
 // OXWASM_DISPSTAT=1: count the rips that HAD a compiled unit and were not
@@ -501,6 +502,7 @@ export class LinuxEngine {
     if (ROOTVETO !== null) { const aa = BigInt(a); for (const [lo, hi] of ROOTVETO) if (aa >= lo && aa < hi) { (this._rootVetoed ??= new Set()).add(aa); this.aotFailed.add(aa); return; } }
     if (ENV.OXWASM_DISPLOG && this._ctor?.argv?.[0]?.includes('opencode')) { const [lo, hi] = ENV.OXWASM_DISPLOG.split('-').map(Number); if ((this.stats.disp || 0) >= lo && (this.stats.disp || 0) <= hi) console.error(`[reg disp=${this.stats.disp}] ${a.toString(16)}`); }
     this.aotFns.set(a, f); this._entryAdd(a);
+    if (f && !(this._extents?.has(a))) { let st = (this._noExtPg ??= new Map()).get(a >> 12n); if (!st) this._noExtPg.set(a >> 12n, st = new Set()); st.add(a); }
     // __noFtab bisect lever: an empty map makes every $ftr miss, so all
     // sites take their pre-existing x_callout / x_deopt fallbacks
     // Past FTMAP_MAX the function is never mapped, so every cross-unit call to
@@ -654,9 +656,22 @@ export class LinuxEngine {
     let a = Number((lo - this.base) >> 12n); const b = Number((hi - this.base + 4095n) >> 12n);
     for (a = Math.max(a, 0); a < b && a < m.length; a++) m[a] = on;
   }
-  _invalidateCode(lo, hi) {
+  // translated functions whose source bytes overlap [wlo, whi)
+  _extOverlap(wlo, whi) {
+    let out = null;
+    if (!this._extPages) return out;
+    for (let q = wlo >> 12n; q <= (whi - 1n) >> 12n; q++) {
+      const st = this._extPages.get(q); if (!st) continue;
+      for (const k of st) { const e = this._extents.get(k); if (e && e[0] < whi && e[1] > wlo) (out ??= []).push(k); }
+    }
+    return out;
+  }
+  // `exact` = [lo, hi) of the bytes actually written: translations are dropped only if THEIR bytes overlap it
+  // (a page of JIT memory holds several functions, and one being written must not stale its neighbours);
+  // everything keyed by address in the page is still cleaned as before. Returns whether translated code changed.
+  _invalidateCode(lo, hi, exact) {
     const inR = (k) => k >= lo && k < hi;
-    let hit = false;
+    let hit = false, changed = false;
     // nothing cached lives on these pages: only the structures that are not keyed by page need a look
     const p0 = lo >> 12n, p1 = (hi - 1n) >> 12n;
     let touched = true;
@@ -671,23 +686,39 @@ export class LinuxEngine {
     }
     this.stats.invalSlow = (this.stats.invalSlow | 0) + 1;
     const dropped = [];
-    for (const k of this.aotFns.keys()) if (inR(k)) { this.aotFns.delete(k); hit = true; dropped.push(k); }
-    for (const k of this.aotFailed) if (inR(k)) this.aotFailed.delete(k);
+    // a translated function is stale if ANY byte it was built from changed, not only its first
+    { const hitK = this._extOverlap(exact ? exact[0] : lo, exact ? exact[1] : hi);
+      if (hitK) for (const k of hitK) { if (this.aotFns.has(k)) { this.aotFns.delete(k); hit = true; dropped.push(k); } this._extents.delete(k); changed = true; } }
+    if (exact) {
+      // a store into a page of JIT memory: only translations built from the overwritten bytes go (above), plus
+      // any whose extent is unknown (they were loaded from the unit cache) by the old entry-in-page rule
+      if (this._noExtPg) for (let q = p0; q <= p1; q++) { const st = this._noExtPg.get(q); if (!st) continue;
+        for (const k of st) { if (this.aotFns.has(k) && inR(k)) { this.aotFns.delete(k); hit = true; dropped.push(k); changed = true; } st.delete(k); } }
+    } else {
+      for (const k of this.aotFns.keys()) if (inR(k)) { this.aotFns.delete(k); hit = true; dropped.push(k); changed = true; }
+    }
+    // a byte store beside translated code (the common case: the JIT emitting its next function) leaves every table alone
+    for (const k of this.aotFailed) if (inR(k)) this.aotFailed.delete(k);          // a few hundred at most
+    if (!exact || changed) {
     if (this.compiled) for (const k of this.compiled.keys()) if (inR(k)) this.compiled.delete(k);
     if (this.profile) for (const k of this.profile.keys()) if (inR(k)) this.profile.delete(k);
     for (const k of this.aotCalls.keys()) if (inR(k)) { this.aotCalls.delete(k); this._callTargets?.delete(k.toString()); }
-    for (const k of this._ftSeen) if (inR(k)) { this._ftSeen.delete(k); this._entries?.delete(k.toString()); }
+    // dispatch-hash entries of everything that is gone from aotFns; _ftDrop takes them out of the hash (and out of
+    // _ftSeen) - deleting them from _ftSeen here first would leave stale entries in the hash that still run the old code
+    for (const k of this._ftSeen) if (inR(k) && !this.aotFns.has(k)) { dropped.push(k); this._entries?.delete(k.toString()); }
     if (this._failMemo) for (const k of this._failMemo.keys()) if (inR(BigInt(k))) this._failMemo.delete(k);
     if (this._sizeDefer) for (const k of this._sizeDefer.keys()) if (inR(k)) this._sizeDefer.delete(k);
     if (this._sizeMemo) for (const k of this._sizeMemo.keys()) if (inR(BigInt(k))) this._sizeMemo.delete(k);
-    if (this.execAnon ?? EXEC_ANON) { const n = this.execRanges.length; this.execRanges = this.execRanges.filter(([a, b]) => !(a >= lo && b <= hi)); if (this.execRanges.length !== n) { this._ieCache = undefined; this._genCache = undefined; this._updateCodeWindow(); } }
+    if (!exact && (this.execAnon ?? EXEC_ANON)) { const n = this.execRanges.length; this.execRanges = this.execRanges.filter(([a, b]) => !(a >= lo && b <= hi)); if (this.execRanges.length !== n) { this._ieCache = undefined; this._genCache = undefined; this._updateCodeWindow(); } }
     if (this._tinyMemo) for (const k of this._tinyMemo.keys()) if (inR(BigInt(k))) this._tinyMemo.delete(k);
+    }
     if (this._inflight) for (const u of this._inflight) if (u.funcs.some(inR)) {
       u.cancelled = true;
       if (this._pendingFns) for (const a of u.funcs) this._pendingFns.delete(a.toString());
     }
-    if (this.codePages) for (let q = p0; q <= p1 && p1 - p0 < 4096n; q++) this.codePages.delete(q);
-    if (hit) this._ftDrop(dropped);
+    if (this.codePages && !exact) for (let q = p0; q <= p1 && p1 - p0 < 4096n; q++) this.codePages.delete(q);
+    if (hit || dropped.length) this._ftDrop(dropped);
+    return changed;
   }
   finishAotUnit(unit, instance) {
     this._inflight?.delete(unit);
@@ -913,6 +944,9 @@ export class LinuxEngine {
         // closure texts — child engines cap the unit size and chain instead
         ...(this.unitMaxFuncs ? { maxFuncs: this.unitMaxFuncs } : {}),
         ...(this.unitMaxInsns ? { maxInsns: this.unitMaxInsns } : {}) });
+      if (unit.ext) { const ex = this._extents ??= new Map(); for (const [k, a, b] of unit.ext) if (a !== null) {
+        ex.set(k, [a, b]); const ep = this._extPages ??= new Map();
+        for (let q = a >> 12n; q <= (b - 1n) >> 12n; q++) { this.codePages.add(q); let st = ep.get(q); if (!st) ep.set(q, st = new Set()); st.add(k); } } }
       if (this.onUnitWat) this.onUnitWat(un, entry, unit);
       // assembleWatAsync (browser): the assembler is 65% of the on-thread
       // tier-up cost and is a pure text -> bytes transform with no engine
@@ -1226,6 +1260,7 @@ export class LinuxEngine {
       }
       if (best.diffs.length) {
         st.diverged++; this._shadowDiverged = (this._shadowDiverged ?? 0) + 1;
+        if (ENV.OXWASM_DUMPDIR) { const b = new Uint8Array(0x800); for (let i = 0; i < b.length; i++) { try { b[i] = Number(this.mem.read(entryRip + BigInt(i), 1n)); } catch { break; } } try { process.getBuiltinModule('node:fs').writeFileSync(ENV.OXWASM_DUMPDIR + '/div_' + entryRip.toString(16) + '.bin', b); } catch {} }
         console.error(`<SHADOW-DIVERGE fn=0x${entryRip.toString(16)} exit=0x${exitRip.toString(16)} step=${best.k}/${trace.length} entry=[${regs0.map(v=>v.toString(16)).join(',')}]>`);
         for (const d of best.diffs.slice(0, 20)) console.error('  ' + d);
       }
@@ -1335,6 +1370,7 @@ export class LinuxEngine {
     if (this._skipUntil !== undefined && (this.stats.disp | 0) < this._skipUntil && (this.stats.disp | 0) >= this._skipFrom && (this._skipSteps === undefined || this._skipSteps > 0)) {
       if (ENV.OXWASM_AOTSKIP_LOG) console.error(`[aotskip] disp ${this.stats.disp} rip=${this.cpu.rip.toString(16)} rsp=${this.cpu.regs[4].toString(16)} rbp=${this.cpu.regs[5].toString(16)} r8=${this.cpu.regs[8].toString(16)}`);
       this.stats.disp = (this.stats.disp | 0) + 1; this.stats.skipped = (this.stats.skipped || 0) + 1; return this._interpOne(); }
+    if (ENV.OXWASM_SHADOW_RANGE && !this.shadowRange) { const [a, b] = ENV.OXWASM_SHADOW_RANGE.split('-').map((h) => BigInt('0x' + h)); this.shadowRange = [a, b]; console.error(`<shadow armed range ${ENV.OXWASM_SHADOW_RANGE}>`); }
     if (this.shadowLib && !this.shadowRange) {
       if (this.shadowLib === 'all') { this.shadowRange = [0n, 1n << 63n]; console.error('<shadow armed: every mapping>'); }
       for (const m of this.maps ?? []) if (m.path.includes(this.shadowLib)) {
@@ -3180,6 +3216,12 @@ export class LinuxEngine {
         if (this.calloutLog && ENV.OXWASM_STATS && this._ctor?.argv?.[0]?.includes(ENV.OXWASM_STATS)) console.error('[callouts] ' + [...this.calloutLog].sort((x, y) => y[1] - x[1]).slice(0, 30).map(([k, v]) => k + ' x' + v).join(' | '));
         if (this.deoptLog && ENV.OXWASM_STATS && this._ctor?.argv?.[0]?.includes(ENV.OXWASM_STATS)) console.error('[deopts] ' + [...this.deoptLog].sort((x, y) => y[1] - x[1]).slice(0, 40).map(([k, v]) => k.toString(16) + ' x' + v).join(' '));
         if (ENV.OXWASM_STATS && this._ctor?.argv?.[0]?.includes(ENV.OXWASM_STATS)) console.error('[aotfail] ' + this.hotFailures(30).slice(0, 40).map((f) => f.addr.toString(16) + ' x' + f.calls + ' ' + f.why).join(' | '));
+        if (ENV.OXWASM_FNPROF === '1' && ENV.OXWASM_STATS && this._ctor?.argv?.[0]?.includes(ENV.OXWASM_STATS)) {
+          const dv = new DataView(this.wmem.buffer), rows = [];
+          for (const a of this.aotFns.keys()) { const c = Number(dv.getBigUint64(fnprofSlot(a), true)); if (c) rows.push([c, a]); }
+          rows.sort((x, y) => y[0] - x[0]);
+          console.error('[fnprof] ' + rows.slice(0, 60).map(([c, a]) => a.toString(16) + 'x' + c).join(' '));
+        }
         if (ENV.OXWASM_HASFN && ENV.OXWASM_STATS && this._ctor?.argv?.[0]?.includes(ENV.OXWASM_STATS)) console.error('[hasfn] ftdepth=' + new DataView(this.wmem.buffer).getUint32(FTMAP + 8, true) + ' limit=' + FTDLIMIT + ' ftCount=' + this._ftCount + ' ftFull=' + (this._ftFull | 0) + ' ' + ENV.OXWASM_HASFN.split(',').map((h) => h + '=' + (typeof this.aotFns.get(BigInt('0x' + h)))).join(' '));
         if (ENV.OXWASM_STATS && this._ctor?.argv?.[0]?.includes(ENV.OXWASM_STATS)) { const st = this.stats; console.error(`[stats] ${this._ctor.argv[0]} interp=${st.interpreted} aotRuns=${st.aotRuns} compiledRuns=${st.compiledRuns} units=${this.aotFns.size} syscalls=${Object.values(st.syscalls).reduce((x, y) => x + y, 0)} wallMs=${Math.round(this.nowMs())} sysMs=${JSON.stringify(Object.fromEntries(Object.entries(st.sysMs ?? {}).filter(([, v]) => v > 50).map(([k, v]) => [k, Math.round(v)])))} tiers=${JSON.stringify(st.tiers)} extra=${JSON.stringify(Object.fromEntries(Object.entries(st).filter(([k, v]) => typeof v === 'number' && !['interpreted', 'aotRuns', 'compiledRuns'].includes(k))))}`); }
         const t = this.threads[this.ti];
@@ -6052,7 +6094,8 @@ export class LinuxEngine {
         // the unit came back at t=9 s and registered at t=38 s, the end).
         // Pump every 2^18 steps while anything is in flight.
         if (CHURN && (steps & 0xFFFF) === 0) { const nw = performance.now(); if (nw - (this._churnT ?? 0) > 1000) { const st = this.stats, pv = this._churnP ?? {}; const d = (k) => (st[k] | 0) - (pv[k] | 0); console.error(`[churn] t=${(nw / 1000) | 0} interp=${d('interpreted')} disp=${d('disp')} compiles=${d('compiles')} cw=${d('codeWrites')} inval=${d('invalSlow')} volSkip=${d('volatileSkips')} quiet=${d('cwQuieted')}`); this._churnP = { ...st }; this._churnT = nw; } }
-        if (RIPSAMPLE && (steps & RIPSAMPLE) === 0) console.error(`[rip] ${this.cpu.rip.toString(16)} tid=${this.threads?.[this.ti]?.id} interp=${this.stats.interpreted}`);
+        if (RIPSAMPLE && ENV.OXWASM_DUMPDIR && (this.stats.interpreted & RIPSAMPLE) === 0 && this.cpu.rip >= 0x5a000000n && this.cpu.rip < 0x5b000000n && !(this._dumpedPg ??= new Set()).has(this.cpu.rip >> 12n)) { this._dumpedPg.add(this.cpu.rip >> 12n); const pg = this.cpu.rip & ~4095n, b = new Uint8Array(4096); for (let i = 0; i < 4096; i++) { try { b[i] = Number(this.mem.read(pg + BigInt(i), 1n)); } catch { break; } } try { process.getBuiltinModule('node:fs').writeFileSync(ENV.OXWASM_DUMPDIR + '/pg_' + pg.toString(16) + '.bin', b); } catch {} }
+        if (RIPSAMPLE && (this.stats.interpreted & RIPSAMPLE) === 0) console.error(`[rip] ${this.cpu.rip.toString(16)} tid=${this.threads?.[this.ti]?.id} interp=${this.stats.interpreted}`);
         if ((steps & 0x3FFFF) === 0 && this.pumpAsm && this._inflight && this._inflight.size) this.pumpAsm();
         if ((insn.mnem === 'jcc' || insn.mnem === 'jmp') && this.cpu.rip < before && this.inExec(this.cpu.rip)) {   // jmp: rotated-loop back-edge
           const hk = this.cpu.rip;

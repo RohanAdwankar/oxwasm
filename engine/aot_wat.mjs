@@ -4446,6 +4446,11 @@ export function compileUnitWat(mem, entry, opts = {}) {
   return { wat,
            entryName: 'f_' + entry.toString(16),
            funcs: [...texts.keys()].map(k => BigInt(k)),
+           // the guest bytes each function was translated from: a patch anywhere in them stales the translation
+           ext: [...texts.keys()].map(k => { let lo = null, hi = null;
+             for (const b of funcs.get(k).blocks) { const e = b.insns.length ? b.insns[b.insns.length - 1].next : b.start;
+               if (lo === null || b.start < lo) lo = b.start; if (hi === null || e > hi) hi = e; }
+             return [BigInt(k), lo, hi]; }),
            poisoned: [...poisoned].map(k => BigInt(k)),
            blocks };
 }

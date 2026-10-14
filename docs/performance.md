@@ -890,3 +890,19 @@ opencode configuration, small mix, 200 rounds in 354 s, rc 0:
 round time min 351, p25 477, median 685, p75 870 ms, plus rare multi-second to 80 s outliers.
 Per phase minimum: fib 5, math 28, objects 23, strings 15, sorting 117, maps 76, json 33.
 Against native 45 ms (JIT) and 156 ms (JIT off): the median is 15x and 4.4x.
+
+### Reference with the baseline JIT only, and what DFG does
+
+Native, small mix, 40 rounds: baseline JIT only 43 ms, baseline+DFG 33 ms, all tiers 30 ms. The
+optimizing tiers are worth 1.3x natively on this mix, so the reference that matters for the
+oxwasm configuration above is 43 ms; its median of 682 ms (min 331) is 16x and 7.7x.
+
+DFG under oxwasm still fails: after a few rounds `new Map()` throws "Map is not a function"
+(reproduces in about five minutes with concurrent JIT off). The shadow comparison
+(`OXWASM_SHADOW_RANGE=5a000000-5b000000 OXWASM_SHADOW_EXIT=1`, `OXWASM_DUMPDIR` for the bytes of
+the diverging function) reported only differences in dead scratch registers and stack garbage
+below rsp, so the cause was not found. Cross-page extents for translated JIT functions
+(a patch anywhere in a function now invalidates it, not just a patch on its first page) did not
+cure it. Invalidating by the exact bytes stored, rather than by page, made the baseline JIT
+fail the same way within 20 rounds (bulk copies report one address), so invalidation stays
+page-granular.
