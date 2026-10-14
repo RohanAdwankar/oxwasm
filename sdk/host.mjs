@@ -63,6 +63,9 @@ function makeUnitStore(cacheDir) {
       try { names = readdirSync(d).filter((f) => f.startsWith('bundle_') && f.endsWith('.wasm')).sort(); } catch { return []; }
       return names.map((f) => { const b = readFileSync(join(d, f)); return new Uint8Array(b.buffer, b.byteOffset, b.length); });
     },
+    // the instruction count of a function the size gate deferred: kept so a later run need not analyse it again
+    getSize(ex, k) { try { return Number(readFileSync(join(root, ex, k + '.size'), 'utf8')); } catch { return undefined; } },
+    putSize(ex, k, n) { try { const d = join(root, ex); mkdirSync(d, { recursive: true }); writeFileSync(join(d, k + '.size'), String(n)); } catch {} },
     put(ex, k, bytes) {
       const d = join(root, ex); mkdirSync(d, { recursive: true });
       const f = join(d, k + '.wasm'), t = f + '.' + process.pid + '.tmp';

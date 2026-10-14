@@ -957,3 +957,8 @@ excluded; a link is done once, offline). `opencode --version` with the warm per-
 Two further runs after re-bundling: 30 s each (guest wall time), stable. The remaining profile of that run
 (62 s including sandbox boot): interpreter 6 s, translation attempts that do not end in a unit (size-gate
 deferrals of giant functions are re-analysed) about 9 s, collector 3 s, wasm execution about 5 s.
+
+The 82 size-gate deferrals in a startup run cost 3.7 s (45 ms each, re-analysing giant functions to learn they
+are not hot enough yet). The instruction count of each deferred root is now kept beside the cached units
+(`<entry>.size`), so a later run answers the gate without analysing: 81 of 81 deferrals answered from the
+store, `opencode --version` 30 s -> 28 s.

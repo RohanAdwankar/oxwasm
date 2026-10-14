@@ -917,7 +917,16 @@ export class LinuxEngine {
     // to one is seen before the translation it invalidates is ever used.
     if (this._cwCover(entry)) { this.stats.volatileSkips = (this.stats.volatileSkips | 0) + 1; return; }   // not a failure: the page is trusted again once it has been quiet (CW_QUIET)
     const _tc0 = performance.now();
-    const _unitEx = this.unitStore ? this._unitExeId() : null, _unitRs = this._exeRanges;   // the key at REQUEST time: the lookup used it, so the store must
+    const _unitEx = this.unitStore ? this._unitExeId() : null, _unitRs = this._exeRanges;
+    // a giant root deferred by the size gate in an earlier run: its size was kept beside the cached units, so the
+    // gate can answer without analysing the whole function again
+    if (SIZEGATE && this._gateCalls && _unitEx && this.unitStore.getSize) {
+      const n = this.unitStore.getSize(_unitEx, k.toString(16));
+      if (n !== undefined) {
+        const need = Math.min(256, Math.max(this.aotCallThreshold, n >> SIZEGATE_SHIFT));
+        if (need > this.aotCallThreshold && (this.aotCalls.get(k) || 0) < need) { (this._sizeDefer ??= new Map()).set(k, need); this.stats.sizeDeferKnown = (this.stats.sizeDeferKnown | 0) + 1; return; }
+      }
+    }   // the key at REQUEST time: the lookup used it, so the store must
     try {
       const unit = compileUnitWat(this.mem, entry, { guestBase: this.base, ramBase: this.RAMOFF,
         // prune the closure at functions already in the dispatch map: calls
@@ -948,7 +957,7 @@ export class LinuxEngine {
           if (need <= this.aotCallThreshold) return 0;
           const have = this.aotCalls.get(BigInt(c)) || 0;
           if (have >= need) return 0;
-          if (isRoot) (this._sizeDefer ??= new Map()).set(BigInt(c), need);
+          if (isRoot) { (this._sizeDefer ??= new Map()).set(BigInt(c), need); try { const ex = this._unitExeId(); if (ex) this.unitStore?.putSize?.(ex, BigInt(c).toString(16), n); } catch {} }
           return need;
         } : null,          // callees whose analysis failed once: poisoned without re-analysis (cleared per range by _invalidateCode)
         // the tiering call profile, so the inliner can pick targets by how
@@ -1045,11 +1054,12 @@ export class LinuxEngine {
       if (inst.exports.drive) this.aotDrive = inst.exports.drive;
       if (!this.aotFns.has(k)) throw new Error('entry missing from unit');
       this.stats.tiers.aot = (this.stats.tiers.aot || 0) + 1;
-    } catch (e) { if (e.deferred) { this.stats.sizeDeferred = (this.stats.sizeDeferred || 0) + 1; return; }   // size gate: not a failure, re-tiers at the count it named
+    } catch (e) { const _dt = performance.now() - _tc0; this.stats[e.deferred ? 'tuDeferMs' : 'tuFailMs'] = (this.stats[e.deferred ? 'tuDeferMs' : 'tuFailMs'] || 0) + _dt; this.stats[e.deferred ? 'tuDefers' : 'tuFails'] = (this.stats[e.deferred ? 'tuDefers' : 'tuFails'] || 0) + 1;
+      if (e.deferred) { this.stats.sizeDeferred = (this.stats.sizeDeferred || 0) + 1; return; }   // size gate: not a failure, re-tiers at the count it named
       if (globalThis.__asmTrace) console.error(e.stack);
       this.aotFailed.add(k);
       this.noteAotFail(entry, e.message);
-    } finally { if (t0c) this.tierMs += performance.now() - t0c; }
+    } finally { if (t0c) this.tierMs += performance.now() - t0c; this.stats.tuTotalMs = (this.stats.tuTotalMs || 0) + (performance.now() - _tc0); }
   }
 
   // GPRs at 0..127, fs base at 128, the 16 xmm registers at 256..511 (16B
