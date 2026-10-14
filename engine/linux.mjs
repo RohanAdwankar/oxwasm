@@ -764,7 +764,6 @@ export class LinuxEngine {
 
   tierUpAot(entry) {
     const k = entry;
-    this.stats.tierCalls = (this.stats.tierCalls | 0) + 1;
     if (this.pumpAsm) this.pumpAsm();                       // deferred units whose bytes are back register first
     if (this.aotFns.has(k) || this.aotFailed.has(k)) return;
     // Entry-keyed precompiled units (browser manifest): registering one costs

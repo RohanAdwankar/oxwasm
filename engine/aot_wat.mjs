@@ -4107,7 +4107,11 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       // every block start, not only table targets: the engine enters a unit at
       // wherever a return, a yield or a deopt landed, and each of those used to
       // compile its own full copy
+      // an ordinary large function exports only its loop heads (the entries the engine asks for); the interpreter
+      // dispatch loop exports every block start, since it is resumed at return points as well
+      const loopHead = new Set(); if (!MEGA) for (let i = 0; i < N; i++) for (const t of succs[i]) if (t >= 0 && t <= i) loopHead.add(t);
       for (let j = 0; j < N; j++) {
+        if (!MEGA && !loopHead.has(j)) continue;
         const en = 'f_' + blocks[j].start.toString(16);
         if (seen.has(en)) continue; seen.add(en);
         wat += `  (func (export "${en}") (result i64) (return_call $${name}_m (i32.const ${j})))\n`;
