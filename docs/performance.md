@@ -906,3 +906,26 @@ below rsp, so the cause was not found. Cross-page extents for translated JIT fun
 cure it. Invalidating by the exact bytes stored, rather than by page, made the baseline JIT
 fail the same way within 20 rounds (bulk copies report one address), so invalidation stays
 page-granular.
+
+### Startup (`opencode --version`) is dominated by loading units, and V8 makes that quadratic
+
+Native 0.8 s. oxwasm with a warm unit cache (the per-handler cache, default settings): 79 s,
+output correct. A CPU profile of that run (187 s of profile including sandbox boot): 55 s is
+spent loading and registering the 3,516 cached units - `WebAssembly.Instance` 24 s, `read` 11 s,
+`Table.grow` 10.6 s, `Table.set` 7.6 s, `Module` 4.7 s - and about 25 s executing.
+
+The table cost is V8's: every instance importing the shared funcref table keeps a dispatch table,
+and each `set`/`grow` updates all of them. Measured with 4,000 instances importing one table:
+7.5 us per `set` at 500 instances, 50 us at 2,000, 139 us at 4,000, and 270 ms for one `grow`
+(bench: a 10-line script, `tabq.mjs` in the scratchpad). A unit that exports hundreds of entries
+(the multi-entry functions) pays it per entry. Preallocating the table is not free either: the
+dispatch table is per instance, so 20,000 entries is 492 kB for every unit.
+
+What would fix it is fewer, larger modules (one wasm module per few hundred functions, or per
+image) rather than one per translation unit, so that the instance count stays in the dozens.
+That is an architectural change to the unit cache and the registration path, not a tuning knob,
+and it is the largest single item left for short-running workloads.
+
+The newer mega-unit configurations did not complete `--version` in 24+ minutes: cold, every
+startup path compiles its own units (about 100 per second are loaded, few are built), and the
+warm-up runs added only ~20 units per 27 minutes, so I could not get a warm number for them.
