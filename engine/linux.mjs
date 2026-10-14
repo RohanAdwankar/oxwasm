@@ -764,6 +764,7 @@ export class LinuxEngine {
 
   tierUpAot(entry) {
     const k = entry;
+    this.stats.tierCalls = (this.stats.tierCalls | 0) + 1;
     if (this.pumpAsm) this.pumpAsm();                       // deferred units whose bytes are back register first
     if (this.aotFns.has(k) || this.aotFailed.has(k)) return;
     // Entry-keyed precompiled units (browser manifest): registering one costs
@@ -6093,7 +6094,7 @@ export class LinuxEngine {
         // unit sitting in the broker's fifo (38 s against 11 s synchronous;
         // the unit came back at t=9 s and registered at t=38 s, the end).
         // Pump every 2^18 steps while anything is in flight.
-        if (CHURN && (steps & 0xFFFF) === 0) { const nw = performance.now(); if (nw - (this._churnT ?? 0) > 1000) { const st = this.stats, pv = this._churnP ?? {}; const d = (k) => (st[k] | 0) - (pv[k] | 0); console.error(`[churn] t=${(nw / 1000) | 0} interp=${d('interpreted')} disp=${d('disp')} compiles=${d('compiles')} cw=${d('codeWrites')} inval=${d('invalSlow')} volSkip=${d('volatileSkips')} quiet=${d('cwQuieted')}`); this._churnP = { ...st }; this._churnT = nw; } }
+        if (CHURN && (steps & 0xFFFF) === 0) { const nw = performance.now(); if (nw - (this._churnT ?? 0) > 1000) { const st = this.stats, pv = this._churnP ?? {}; const d = (k) => (st[k] | 0) - (pv[k] | 0); console.error(`[churn] t=${(nw / 1000) | 0} interp=${d('interpreted')} disp=${d('disp')} compiles=${d('compiles')} cw=${d('codeWrites')} inval=${d('invalSlow')} volSkip=${d('volatileSkips')} quiet=${d('cwQuieted')} tier=${d('tierCalls')} hit=${d('unitHits')} sizeDef=${d('sizeDeferred')}`); this._churnP = { ...st }; this._churnT = nw; } }
         if (RIPSAMPLE && ENV.OXWASM_DUMPDIR && (this.stats.interpreted & RIPSAMPLE) === 0 && this.cpu.rip >= 0x5a000000n && this.cpu.rip < 0x5b000000n && !(this._dumpedPg ??= new Set()).has(this.cpu.rip >> 12n)) { this._dumpedPg.add(this.cpu.rip >> 12n); const pg = this.cpu.rip & ~4095n, b = new Uint8Array(4096); for (let i = 0; i < 4096; i++) { try { b[i] = Number(this.mem.read(pg + BigInt(i), 1n)); } catch { break; } } try { process.getBuiltinModule('node:fs').writeFileSync(ENV.OXWASM_DUMPDIR + '/pg_' + pg.toString(16) + '.bin', b); } catch {} }
         if (RIPSAMPLE && (this.stats.interpreted & RIPSAMPLE) === 0) console.error(`[rip] ${this.cpu.rip.toString(16)} tid=${this.threads?.[this.ti]?.id} interp=${this.stats.interpreted}`);
         if ((steps & 0x3FFFF) === 0 && this.pumpAsm && this._inflight && this._inflight.size) this.pumpAsm();

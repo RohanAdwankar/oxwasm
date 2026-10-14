@@ -1529,6 +1529,9 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   }
   const DISP = mode === 'dispatch';
   const MEGA = DISP && hasJtab && isDispatchRoot(a0, fnAddr);
+  // any big dispatch-layout function is entered at many of its blocks (loop heads, return points): one copy with an
+  // export per block start, not one full copy per entry
+  const MULTI = MEGA || (DISP && N >= Number((typeof process !== 'undefined' && process.env?.OXWASM_MULTI_MIN) || 600));
   if (globalThis.__layoutOf) globalThis.__layoutOf.set(fnAddr.toString(16), mode + (hasJtab ? '+jtab' : '') + ' N=' + N + (globalThis.__lastStructErr ? ' (' + globalThis.__lastStructErr + ')' : ''));
   globalThis.__lastStructErr = null;
   { const st = globalThis.__inlStats = globalThis.__inlStats || { fns: 0, callees: 0 };
@@ -4016,11 +4019,11 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   // the block, and the prologue reloads every register (a target other than
   // block 0 may read any of them). One copy then serves every root that
   // reaches the table, instead of one full copy per root.
-  if (MEGA) entryKeep = null;
-  let wat = MEGA ? `  (func $${name}_m (param $pc i32) (result i64)\n` : `  (func $${name} (export "${name}") (result i64)\n`;
+  if (MULTI) entryKeep = null;
+  let wat = MULTI ? `  (func $${name}_m (param $pc i32) (result i64)\n` : `  (func $${name} (export "${name}") (result i64)\n`;
   for (let r=0;r<16;r++) wat += `    (local $r${r} ${isI32(r)?'i32':'i64'})\n`;
   wat += '    (local $fa i64) (local $fb i64) (local $fr i64) (local $cf i64) (local $fbits i64) (local $rsp0 i64) (local $rex i64)\n';
-  if ((DISP || hasJtab) && !MEGA) wat += '    (local $pc i32)\n';
+  if ((DISP || hasJtab) && !MULTI) wat += '    (local $pc i32)\n';
   if (usesFtr) wat += '    (local $fti i32)\n';
   if (usesFts) wat += '    (local $fts i32)\n';
   if (usesGa) wat += '    (local $ga i32) (local $gp i32)\n';
@@ -4098,7 +4101,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     wat += '    ))\n';                                                 // close loop + exit block
     if (usesYield) wat += '    (unreachable))\n' + yieldTail();          // close $yield; its tail follows
     wat += '    (unreachable)\n  )\n';
-    if (MEGA) {
+    if (MULTI) {
       wat += `  (func $${name} (export "${name}") (result i64) (return_call $${name}_m (i32.const 0)))\n`;
       const seen = new Set([name]);
       // every block start, not only table targets: the engine enters a unit at
