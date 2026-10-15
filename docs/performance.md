@@ -971,6 +971,7 @@ with the old-generation limit raised to 8 GB (cold run, OXWASM_HEAPMB=8192). Rev
 The 3.6M of 6M interpreted startup steps at the post-call continuation remain unaddressed.
 
 Narrower variant: a single measured continuation address (0x25c4f7c, set through an environment list) as an extra
-leader of the interpreter-loop unit also exhausted the worker JS heap at 8 GB, while the identical cold build without
-the leader stayed alive well past the point where both leader runs died. Reverted; the OXWASM_HEAPMB worker-heap knob
-stays, since the other cold builds need the headroom.
+leader of the interpreter-loop unit exhausted the worker JS heap at 8 GB. The control run (identical cold build, no
+leader, 8 GB) exhausted it too, about 13 minutes after the same point, so the leader is not what blows the heap: this
+cold configuration (unit limit 80000 instructions, empty cache) needs more than 8 GB of worker heap on its own. The
+leader edit was reverted untested for speed, because no build with it finished. The OXWASM_HEAPMB worker-heap knob stays.
