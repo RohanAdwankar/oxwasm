@@ -239,7 +239,7 @@ export class Sandbox {
     // shut down (no host files outside an allow-list, no child processes). See sdk/isolated.mjs.
     const worker = opts.isolation === 'process'
       ? new ProcessWorker(workerData, opts, CACHE_DIR)
-      : new Worker(WORKER_URL, { workerData, resourceLimits: { maxOldGenerationSizeMb: 4096, maxYoungGenerationSizeMb: 128, ...(process.env.OXWASM_STACKMB ? { stackSizeMb: +process.env.OXWASM_STACKMB } : {}) } });
+      : new Worker(WORKER_URL, { workerData, resourceLimits: { maxOldGenerationSizeMb: +(process.env.OXWASM_HEAPMB || 4096), maxYoungGenerationSizeMb: 128, ...(process.env.OXWASM_STACKMB ? { stackSizeMb: +process.env.OXWASM_STACKMB } : {}) } });
     const sbx = new Sandbox(worker, opts);
     try { await sbx._booted; }
     catch (e) { try { await worker.terminate(); } catch {} throw e; }

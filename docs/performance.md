@@ -969,3 +969,8 @@ Making the instruction after every call a block leader (so a deopt unwind can re
 inside the loop) made the analysis of the dispatch root exhaust the worker JS heap even
 with the old-generation limit raised to 8 GB (cold run, OXWASM_HEAPMB=8192). Reverted.
 The 3.6M of 6M interpreted startup steps at the post-call continuation remain unaddressed.
+
+Narrower variant: a single measured continuation address (0x25c4f7c, set through an environment list) as an extra
+leader of the interpreter-loop unit also exhausted the worker JS heap at 8 GB, while the identical cold build without
+the leader stayed alive well past the point where both leader runs died. Reverted; the OXWASM_HEAPMB worker-heap knob
+stays, since the other cold builds need the headroom.

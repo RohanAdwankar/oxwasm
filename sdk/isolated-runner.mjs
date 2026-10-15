@@ -10,7 +10,7 @@ process.on('disconnect', () => process.exit(0));
 
 process.on('message', (m) => {
   if (m.t === 'init') {
-    worker = new Worker(WORKER_URL, { workerData: m.workerData, resourceLimits: { maxOldGenerationSizeMb: 4096, maxYoungGenerationSizeMb: 128, ...(process.env.OXWASM_STACKMB ? { stackSizeMb: +process.env.OXWASM_STACKMB } : {}) } });
+    worker = new Worker(WORKER_URL, { workerData: m.workerData, resourceLimits: { maxOldGenerationSizeMb: +(process.env.OXWASM_HEAPMB || 4096), maxYoungGenerationSizeMb: 128, ...(process.env.OXWASM_STACKMB ? { stackSizeMb: +process.env.OXWASM_STACKMB } : {}) } });
     worker.on('message', (x) => process.send(x));
     worker.on('error', (e) => process.send({ t: 'fatal', message: `worker error: ${e.message}` }));
     worker.on('exit', () => process.exit(0));
