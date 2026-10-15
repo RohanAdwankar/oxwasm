@@ -975,3 +975,11 @@ leader of the interpreter-loop unit exhausted the worker JS heap at 8 GB. The co
 leader, 8 GB) exhausted it too, about 13 minutes after the same point, so the leader is not what blows the heap: this
 cold configuration (unit limit 80000 instructions, empty cache) needs more than 8 GB of worker heap on its own. The
 leader edit was reverted untested for speed, because no build with it finished. The OXWASM_HEAPMB worker-heap knob stays.
+
+## mega10 warm-up, 8 GB-class heap (negative result)
+
+`opencode --version` on the mega10 unit cache (6 GB worker heap, --no-liftoff, default unit limits) was still
+running when the 3000 s guest-side guard killed it (rc=127 secs=3019), with ~1,800 units loaded from the cache
+and 13 translation failures, one worker thread at ~100% CPU and 6.8 GB resident, and almost no new units written
+after the first few minutes. The default per-handler cache finishes the same command in 28 s. The mega
+configuration is therefore not a path to a startup number as built: it spends the time outside compiled code.
