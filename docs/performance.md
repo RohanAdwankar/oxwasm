@@ -962,3 +962,10 @@ The 82 size-gate deferrals in a startup run cost 3.7 s (45 ms each, re-analysing
 are not hot enough yet). The instruction count of each deferred root is now kept beside the cached units
 (`<entry>.size`), so a later run answers the gate without analysing: 81 of 81 deferrals answered from the
 store, `opencode --version` 30 s -> 28 s.
+
+## Call-continuation leaders in the interpreter-loop unit (negative result)
+
+Making the instruction after every call a block leader (so a deopt unwind can resume
+inside the loop) made the analysis of the dispatch root exhaust the worker JS heap even
+with the old-generation limit raised to 8 GB (cold run, OXWASM_HEAPMB=8192). Reverted.
+The 3.6M of 6M interpreted startup steps at the post-call continuation remain unaddressed.
