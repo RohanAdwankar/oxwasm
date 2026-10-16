@@ -984,10 +984,12 @@ and 13 translation failures, one worker thread at ~100% CPU and 6.8 GB resident,
 after the first few minutes. The default per-handler cache finishes the same command in 28 s. The mega
 configuration is therefore not a path to a startup number as built: it spends the time outside compiled code.
 
-## `opencode debug paths` under the JIT-on flags (negative result)
+## `opencode debug paths` did not complete on oxwasm (negative result)
 
 Native in the Firecracker VM: `--help` 0.82 s, `debug paths` 0.76 s, `models` 3.7 s (the first `--version` was 10.5 s
-once, one-off extraction). On oxwasm with the recommended JIT-on flags (OXWASM_EXEC_ANON=1 OXWASM_STOREGUARD=1
-OXWASM_NOLIFTOFF=1 OXWASM_CW_VOLATILE=4, default cache), `debug paths` did not finish: the guest-side guard killed it
-at 2438 s with no output, one worker thread at ~100% CPU and 10.3 GB resident. The 682 ms steady-state median therefore
-describes a process that is already running; a short command under these flags does not reach it.
+once, one-off extraction). On oxwasm, `debug paths` has not completed in either setup tried. With the engine flags
+OXWASM_EXEC_ANON=1 OXWASM_STOREGUARD=1 OXWASM_NOLIFTOFF=1 OXWASM_CW_VOLATILE=4 on the default cache, the guest-side
+guard killed it at 2438 s with no output (one worker thread at ~100% CPU, 10.3 GB resident). Without those flags
+(OXWASM_NOLIFTOFF=1 only), the worker ran out of JS heap at the default 4 GB after about 10 minutes. The guest runs with
+BUN_JSC_useJIT=0 in both (oc_emb.mjs sets it), so neither run was JIT-on. The 682 ms steady-state median describes a
+process that is already running; a short command does not reach it in these setups.
