@@ -983,3 +983,11 @@ running when the 3000 s guest-side guard killed it (rc=127 secs=3019), with ~1,8
 and 13 translation failures, one worker thread at ~100% CPU and 6.8 GB resident, and almost no new units written
 after the first few minutes. The default per-handler cache finishes the same command in 28 s. The mega
 configuration is therefore not a path to a startup number as built: it spends the time outside compiled code.
+
+## `opencode debug paths` under the JIT-on flags (negative result)
+
+Native in the Firecracker VM: `--help` 0.82 s, `debug paths` 0.76 s, `models` 3.7 s (the first `--version` was 10.5 s
+once, one-off extraction). On oxwasm with the recommended JIT-on flags (OXWASM_EXEC_ANON=1 OXWASM_STOREGUARD=1
+OXWASM_NOLIFTOFF=1 OXWASM_CW_VOLATILE=4, default cache), `debug paths` did not finish: the guest-side guard killed it
+at 2438 s with no output, one worker thread at ~100% CPU and 10.3 GB resident. The 682 ms steady-state median therefore
+describes a process that is already running; a short command under these flags does not reach it.
