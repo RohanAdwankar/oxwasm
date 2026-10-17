@@ -171,6 +171,41 @@ const FTR_WAT = `  (func $ftr (param $a i64) (result i32)
       (then (i32.load (i32.add (local.get $p) (i32.const 8))))
       (else (i32.const -1))))\n`;
 
+// Unsigned 128/64 -> 64 division (x86 `div r64` with rdx != 0), after Hacker's Delight divlu. th:tl is the
+// dividend, td the divisor (caller guarantees td != 0 and th < td, the cases that do not raise #DE); the
+// quotient and remainder land in tq and tr. T allocates an i64 local. 32-bit digits, at most two correction
+// steps per digit, so a call is ~60 wasm ops instead of a deopt into the BigInt interpreter.
+export function udiv128Wat(th, tl, td, tq, tr, T) {
+  const [s, vn, vn1, vn0, un32, un10, un1, un0, q1, q0, rhat, un21] = Array.from({ length: 12 }, T);
+  const g = (n) => `(local.get ${n})`, B = '(i64.const 4294967296)', M = '(i64.const 4294967295)';
+  const fix = (q, un, lo) => [
+    `(block $d${q} (loop $a${q}`,
+    `  (br_if $d${q} (i32.eqz (i32.or (i64.ge_u ${g(q)} ${B}) (i64.gt_u (i64.mul ${g(q)} ${g(vn0)}) (i64.or (i64.shl ${g(rhat)} (i64.const 32)) ${g(lo)})))))`,
+    `  (local.set ${q} (i64.sub ${g(q)} (i64.const 1)))`,
+    `  (local.set ${rhat} (i64.add ${g(rhat)} ${g(vn1)}))`,
+    `  (br_if $a${q} (i64.lt_u ${g(rhat)} ${B}))))`].join('\n');
+  return [
+    `(local.set ${s} (i64.clz ${g(td)}))`,
+    `(local.set ${vn} (i64.shl ${g(td)} ${g(s)}))`,
+    `(local.set ${vn1} (i64.shr_u ${g(vn)} (i64.const 32)))`,
+    `(local.set ${vn0} (i64.and ${g(vn)} ${M}))`,
+    `(local.set ${un32} (i64.or (i64.shl ${g(th)} ${g(s)}) (i64.shr_u (i64.shr_u ${g(tl)} (i64.const 1)) (i64.sub (i64.const 63) ${g(s)}))))`,
+    `(local.set ${un10} (i64.shl ${g(tl)} ${g(s)}))`,
+    `(local.set ${un1} (i64.shr_u ${g(un10)} (i64.const 32)))`,
+    `(local.set ${un0} (i64.and ${g(un10)} ${M}))`,
+    `(local.set ${q1} (i64.div_u ${g(un32)} ${g(vn1)}))`,
+    `(local.set ${rhat} (i64.sub ${g(un32)} (i64.mul ${g(q1)} ${g(vn1)})))`,
+    fix(q1, un32, un1),
+    `(local.set ${un21} (i64.sub (i64.add (i64.shl ${g(un32)} (i64.const 32)) ${g(un1)}) (i64.mul ${g(q1)} ${g(vn)})))`,
+    `(local.set ${q0} (i64.div_u ${g(un21)} ${g(vn1)}))`,
+    `(local.set ${rhat} (i64.sub ${g(un21)} (i64.mul ${g(q0)} ${g(vn1)})))`,
+    fix(q0, un21, un0),
+    `(local.set ${tq} (i64.add (i64.shl ${g(q1)} (i64.const 32)) ${g(q0)}))`,
+    `(local.set ${tr} (i64.shr_u (i64.sub (i64.add (i64.shl ${g(un21)} (i64.const 32)) ${g(un0)}) (i64.mul ${g(q0)} ${g(vn)})) ${g(s)}))`,
+  ].join('\n');
+}
+
+
 // A PLT/IFUNC stub as a WASM function: read the GOT slot LIVE from guest
 // memory (so ld.so rebinding the slot — even re-relocating itself — is
 // always honored), resolve the value through the shared map, and tail-call
@@ -3300,15 +3335,28 @@ function emitUnitFunction(a0, fnAddr, ctx) {
             const zeroed = prev && prev.mnem === 'xor' && prev.dst?.kind==='reg' && prev.dst.r===2 && prev.src?.kind==='reg' && prev.src.r===2;
             const cqo = prev && prev.mnem === 'cdq' && (prev.size||8) === 8;
             const patterned = sgn ? cqo : zeroed;
+            if (!patterned && !sgn) {
+              // a true 128-bit dividend (compiler-rt's __udivmodti4, dtoa, fmod): divide inline when it does not
+              // overflow; the quotient overflowing 64 bits (or a zero divisor) is #DE, which the interpreter raises
+              const th = T(), tl = T(), td = T(), tq0 = T(), tr0 = T();
+              L.push(`(local.set ${th} ${rd(rdx,8,next)})`, `(local.set ${tl} ${rd(rax,8,next)})`, `(local.set ${td} ${rd(insn.src,8,next)})`,
+                     `(if (i64.eqz (local.get ${th}))`,
+                     `  (then (local.set ${tq0} (i64.div_u (local.get ${tl}) (local.get ${td}))) (local.set ${tr0} (i64.rem_u (local.get ${tl}) (local.get ${td}))))`,
+                     `  (else`,
+                     `    (if (i64.ge_u (local.get ${th}) (local.get ${td})) (then`, SA_MARK,
+                     `      (return (call $x_deopt (i64.const ${hexs(insn.rip)}) (local.get $rsp0)))))`,
+                     udiv128Wat(th, tl, td, tq0, tr0, T),
+                     `  ))`);
+              q = `(local.get ${tq0})`; rm = `(local.get ${tr0})`;
+            } else {
             if (!patterned) {
-              const bad = sgn
-                ? `(i64.ne ${rd(rdx,8,next)} (i64.shr_s ${rd(rax,8,next)} (i64.const 63)))`
-                : `(i64.ne ${rd(rdx,8,next)} (i64.const 0))`;
+              const bad = `(i64.ne ${rd(rdx,8,next)} (i64.shr_s ${rd(rax,8,next)} (i64.const 63)))`;
               L.push(`(if ${bad} (then`, SA_MARK,
                      `(return (call $x_deopt (i64.const ${hexs(insn.rip)}) (local.get $rsp0)))))`);
             }
             const d = rd(insn.src,8,next), n = rd(rax,8,next);
             q = `(${sgn?'i64.div_s':'i64.div_u'} ${n} ${d})`; rm = `(${sgn?'i64.rem_s':'i64.rem_u'} ${n} ${d})`;
+            }
           } else if (S === 1) {
             // dividend is AX; quotient -> AL, remainder -> AH
             const num0 = rd({kind:'reg',r:0,size:2},2,next);

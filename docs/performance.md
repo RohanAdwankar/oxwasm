@@ -1286,3 +1286,27 @@ against native 43 ms, i.e. 9x: same as the earlier cache, so cold rebuilds now r
 NOACCT pricing probe, now possible (cold-built na1, hinted): STEADY 429 ms best (388 ms with counters). Removing the depth counter and fuel
 from every call site buys nothing end to end, so the per-dispatch protocol is not what limits steady state; the registers-as-params lever
 (same family) is therefore unlikely to matter either. Looking elsewhere (time split by tier, deopts, guest JIT churn).
+
+### 128-bit divide was a deopt into the BigInt interpreter (fixed): sorting 67 -> 36 ms
+A CPU profile of a sorting-only steady run (300+ rounds, JIT on) put 52 s of 214 s in the tier-0 path (interpreter step, run loop, deopt).
+The hot interpreted pages were compiler-rt's __udivmodti4 (0x253a6b3, 0x253af00) and its caller 0x537f2c0: `div r64` with rdx != 0 (a true
+128/64 divide) compiled to a deopt guard, so every call left the unit and ran in BigInt. udiv128Wat (engine/aot_wat.mjs) now divides inline
+(Hacker's Delight divlu on 32-bit digits, about 60 wasm ops); only a quotient overflow / zero divisor still deopts, as #DE must be raised by
+the interpreter. Checked standalone against BigInt (400k random + edge cases) and in engine/diff/divtest.mjs against the interpreter oracle
+(3675/3675), added to engine/test.sh; the whole suite is green.
+Phase-only steady runs (300 rounds), cold-rebuilt caches: sorting 67 -> 35-39 ms (native baseline-JIT ~7 ms), strings 14, json 28.
+The cache has to be rebuilt for the new emitter (cold19, 7,000 units in 207 s + bundling).
+
+### Pricing the counters properly (OXWASM_NOACCT, phase-only runs)
+Cache built with NOACCT (na2) against the normal one (cold19), same phase-only 300-round runs: sorting 39 vs 35 ms, strings 25 vs 14,
+json 63 vs 28. Dropping the depth counter and chain fuel does not make it faster (the unit mix is different, loops no longer yield), so the
+per-call counters are not the bottleneck of steady state. Per-phase ratios against native baseline-JIT are 4x to 7x everywhere
+(fib 4, math 7, objects 6, strings 5, sorting 5, maps 5-6, json 6): translation quality of many small tail-called units, not one outlier.
+
+### JIT-on aborts and hangs (open, reproducible in 55 s)
+A phase-only `maps` run (BUN_JSC_useJIT=0 so no generated code is involved, 100 rounds) aborts (rc 134) at round 35-36 in about 53 s on the
+default scheduler; with BUN_JSC_useConcurrentGC=0, numberOfGCMarkers=1, OXWASM_ROTATE_MS=1 or 1000, or logGC on, it passes. `objects`
+hangs at round 37; strings, json and sorting survive 300 rounds. The abort is raise(SIGABRT) from the main thread inside a JSC string helper
+(cell type check on a bad argument), so it is a thread-interleaving-dependent corruption in the concurrent collector path, not a code-cache
+problem: the JIT-off run fails too. Hypotheses not yet tested: register/ucontext contents of the signal-based thread suspension JSC uses
+(tgkill sig 30 to 3-7 threads), futex wake ordering. madvise(DONTNEED) and MAP_FIXED now invalidate translated code over the range (they did not).

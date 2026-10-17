@@ -1288,12 +1288,12 @@ export class LinuxEngine {
       if (!ok || (this._shadowDiverged ?? 0) >= 100) { st.aborted++; this._shadowBusy = false; return exitRip; }
       const ks = []; for (let i = 0; i < trace.length; i++) if (trace[i].rip === exitRip && trace[i].rsp === cpu.regs[4]) ks.push(i);
       if (!ks.length && cfN > 0) { let j = -1; for (let i = 0; i < cfN; i++) if (cfRip[i] === exitRip && cfRsp[i] === cpu.regs[4]) { j = i; break; }
-        if (j >= 0) { st.cfmatch = (st.cfmatch || 0) + 1; console.error(`<SHADOW-CFMATCH fn=0x${entryRip.toString(16)} disp=${this.stats.disp} exit=0x${exitRip.toString(16)} at-step=${CAP + j + 1}>`); this._shadowBusy = false; return exitRip; } }
+        if (j >= 0) { st.cfmatch = (st.cfmatch || 0) + 1; __dbg(`<SHADOW-CFMATCH fn=0x${entryRip.toString(16)} disp=${this.stats.disp} exit=0x${exitRip.toString(16)} at-step=${CAP + j + 1}>`); this._shadowBusy = false; return exitRip; } }
       if (!ks.length) { st.aborted++; (st.noexit ??= new Map()).set(entryRip, (st.noexit.get(entryRip) ?? 0) + 1);
         // The compiled frame left at a (rip, rsp) the interpreter never reached: either it ran past the
         // interpreter's step caps, or the two took different paths. Report where each side was.
         const same = []; for (let i = 0; i < trace.length; i++) if (trace[i].rip === exitRip) same.push(`${i}@rsp=${trace[i].rsp.toString(16)}`);
-        console.error(`<SHADOW-NOEXIT fn=0x${entryRip.toString(16)} disp=${this.stats.disp} exit=0x${exitRip.toString(16)} rsp=${cpu.regs[4].toString(16)} entry-rsp=${rsp0.toString(16)} interp-steps=${trace.length}+${cfN}${steps > CAP + CAP2 ? ' (capped)' : ''} interp-last=0x${trace[trace.length - 1].rip.toString(16)}/${trace[trace.length - 1].rsp.toString(16)} exit-rip-seen-at=[${same.slice(0, 6).join(',')}] last-rips=[${trace.slice(-24).map((t) => t.rip.toString(16)).join(' ')}]>`);
+        __dbg(`<SHADOW-NOEXIT fn=0x${entryRip.toString(16)} disp=${this.stats.disp} exit=0x${exitRip.toString(16)} rsp=${cpu.regs[4].toString(16)} entry-rsp=${rsp0.toString(16)} interp-steps=${trace.length}+${cfN}${steps > CAP + CAP2 ? ' (capped)' : ''} interp-last=0x${trace[trace.length - 1].rip.toString(16)}/${trace[trace.length - 1].rsp.toString(16)} exit-rip-seen-at=[${same.slice(0, 6).join(',')}] last-rips=[${trace.slice(-24).map((t) => t.rip.toString(16)).join(' ')}]>`);
         this._shadowBusy = false; return exitRip; }
       st.compared++;
       let best = null;
@@ -1327,8 +1327,8 @@ export class LinuxEngine {
       if (best.diffs.length) {
         st.diverged++; this._shadowDiverged = (this._shadowDiverged ?? 0) + 1;
         if (ENV.OXWASM_DUMPDIR) { const b = new Uint8Array(0x800); for (let i = 0; i < b.length; i++) { try { b[i] = Number(this.mem.read(entryRip + BigInt(i), 1n)); } catch { break; } } try { process.getBuiltinModule('node:fs').writeFileSync(ENV.OXWASM_DUMPDIR + '/div_' + entryRip.toString(16) + '.bin', b); } catch {} }
-        console.error(`<SHADOW-DIVERGE fn=0x${entryRip.toString(16)} exit=0x${exitRip.toString(16)} step=${best.k}/${trace.length} entry=[${regs0.map(v=>v.toString(16)).join(',')}]>`);
-        for (const d of best.diffs.slice(0, 20)) console.error('  ' + d);
+        __dbg(`<SHADOW-DIVERGE fn=0x${entryRip.toString(16)} exit=0x${exitRip.toString(16)} step=${best.k}/${trace.length} entry=[${regs0.map(v=>v.toString(16)).join(',')}]>`);
+        for (const d of best.diffs.slice(0, 20)) __dbg('  ' + d);
       }
       this._shadowBusy = false;
       return exitRip;
@@ -1360,8 +1360,8 @@ export class LinuxEngine {
       if (diffs.length) {
         st.diverged++;
         this._shadowDiverged = (this._shadowDiverged ?? 0) + 1;
-        console.error(`<SHADOW-DIVERGE fn=0x${entryRip.toString(16)} steps=${steps} entry=[${regs0.map(v=>v.toString(16)).join(',')}]>`);
-        for (const d of diffs.slice(0, 20)) console.error('  ' + d);
+        __dbg(`<SHADOW-DIVERGE fn=0x${entryRip.toString(16)} steps=${steps} entry=[${regs0.map(v=>v.toString(16)).join(',')}]>`);
+        for (const d of diffs.slice(0, 20)) __dbg('  ' + d);
       }
     }
     this._shadowBusy = false;
@@ -1436,12 +1436,12 @@ export class LinuxEngine {
     if (this._skipUntil !== undefined && (this.stats.disp | 0) < this._skipUntil && (this.stats.disp | 0) >= this._skipFrom && (this._skipSteps === undefined || this._skipSteps > 0)) {
       if (ENV.OXWASM_AOTSKIP_LOG) console.error(`[aotskip] disp ${this.stats.disp} rip=${this.cpu.rip.toString(16)} rsp=${this.cpu.regs[4].toString(16)} rbp=${this.cpu.regs[5].toString(16)} r8=${this.cpu.regs[8].toString(16)}`);
       this.stats.disp = (this.stats.disp | 0) + 1; this.stats.skipped = (this.stats.skipped || 0) + 1; return this._interpOne(); }
-    if (ENV.OXWASM_SHADOW_RANGE && !this.shadowRange) { const [a, b] = ENV.OXWASM_SHADOW_RANGE.split('-').map((h) => BigInt('0x' + h)); this.shadowRange = [a, b]; console.error(`<shadow armed range ${ENV.OXWASM_SHADOW_RANGE}>`); }
+    if (ENV.OXWASM_SHADOW_RANGE && !this.shadowRange) { const [a, b] = ENV.OXWASM_SHADOW_RANGE.split('-').map((h) => BigInt('0x' + h)); this.shadowRange = [a, b]; __dbg(`<shadow armed range ${ENV.OXWASM_SHADOW_RANGE}>`); }
     if (this.shadowLib && !this.shadowRange) {
       if (this.shadowLib === 'all') { this.shadowRange = [0n, 1n << 63n]; console.error('<shadow armed: every mapping>'); }
       for (const m of this.maps ?? []) if (m.path.includes(this.shadowLib)) {
         this.shadowRange = [m.at, m.at + m.len];
-        console.error(`<shadow armed ${m.path} 0x${m.at.toString(16)}+0x${m.len.toString(16)}>`);
+        __dbg(`<shadow armed ${m.path} 0x${m.at.toString(16)}+0x${m.len.toString(16)}>`);
         break;
       }
     }
@@ -2579,7 +2579,7 @@ export class LinuxEngine {
                  if (ENV.OXWASM_ERRLOG && BigInt.asIntN(64, v) < 0n && BigInt.asIntN(64, v) > -4096n && ![-2n, -11n, -110n, -4n, -17n, -20n, -21n, -25n].includes(BigInt.asIntN(64, v)) && this._ctor?.argv?.[0]?.includes('opencode')) process.getBuiltinModule('node:fs').appendFileSync(ENV.OXWASM_ERRLOG, `${this.threads[this.ti]?.id} nr=${nr} a=${a1.toString(16)},${a2.toString(16)},${a3.toString(16)} -> ${BigInt.asIntN(64, v)} rip=${cpu.rip.toString(16)}\n`);
                  if (ENV.OXWASM_MMAPLOG && (nr === 9 || nr === 11 || nr === 25 || nr === 28 || nr === 12) && this._ctor?.argv?.[0]?.includes('opencode')) process.getBuiltinModule('node:fs').appendFileSync(ENV.OXWASM_MMAPLOG, `${nr} hint=${a1.toString(16)} len=${a2.toString(16)} prot=${a3.toString(16)} flags=${cpu.regs[10].toString(16)} -> ${BigInt.asUintN(64, v).toString(16)} next=${this.mmapNext?.toString(16)}` + (nr === 9 && a2 >= 0x4000000n ? ' chain=' + (() => { const out = []; try { let bp = cpu.regs[5]; for (let i = 0; i < 20 && bp; i++) { out.push(this.mem.read(bp + 8n, 8n).toString(16)); bp = this.mem.read(bp, 8n); } } catch {} return out.join(','); })() : '') + '\n');
                  if (ENV.OXWASM_MMAPTRACE && nr === 9 && v === -12n) { const out = []; try { let bp = cpu.regs[5]; for (let i = 0; i < 24 && bp; i++) { out.push('0x' + this.mem.read(bp + 8n, 8n).toString(16)); bp = this.mem.read(bp, 8n); } } catch {} console.error(`[mmap ENOMEM] len=${a2.toString(16)} prot=${a3.toString(16)} flags=${cpu.regs[10].toString(16)} mmapNext=${this.mmapNext?.toString(16)} memEnd=${(this.base + BigInt(this.mem?.size ?? 0)).toString(16)} rbp-chain: ${out.join(' ')}`); }
-                 if (ENV.OXWASM_STRACE_SIGNAL && (nr === 234 || nr === 200 || nr === 62) && (ENV.OXWASM_STRACE_SIGNAL === 'all' || [5n, 6n, 7n, 11n].includes(nr === 234 ? a3 : a2))) console.error(`[signal syscall nr=${nr} args=${a1.toString(16)},${a2.toString(16)},${a3.toString(16)}] argv0=${this._ctor?.argv?.[0]} last:\n  ` + this.strace.slice(-(+ENV.OXWASM_STRACE_N || 3)).join('\n  ') + '\n  threads:' + this.threads.map((t, i) => { let self = '?', tid = '?'; try { self = this.mem.read(t.cpu.fsBase + 0x10n, 8n).toString(16); tid = this.mem.read(t.cpu.fsBase + 0x2d0n, 4n).toString(); } catch {} return `[${i}] id=${t.id} st=${t.state} fs=${t.cpu.fsBase?.toString(16)} self=${self} tcbtid=${tid}`; }).join(' ') + '\n  regs:' + [...cpu.regs].map((r, i) => i + '=' + r.toString(16)).join(' ') + '\n  ipbytes:' + (() => { try { let bp = cpu.regs[5]; for (let i = 0; i < 4; i++) bp = this.mem.read(bp, 8n); const off = this.mem.read(bp + 0x24n, 4n); const out = ['cfr=' + bp.toString(16), 'off=' + off.toString(16), 'callee=' + this.mem.read(bp + 0x10n, 8n).toString(16)]; const base = cpu.regs[13] + off; const b = []; for (let i = -24n; i < 16n; i++) b.push(Number(this.mem.read(base + i, 1n)).toString(16).padStart(2, '0')); return out.join(' ') + ' bytes:' + b.join(' '); } catch (e) { return String(e); } })() + '\n  rbpchain:' + (() => { const out = []; try { let bp = cpu.regs[5]; for (let i = 0; i < 16 && bp; i++) { out.push('0x' + this.mem.read(bp + 8n, 8n).toString(16)); bp = this.mem.read(bp, 8n); } } catch {} return out.join(' '); })() + '\n  stack:' + (() => { const out = []; try { const sp = cpu.regs[4]; for (let i = 0n; i < 200n; i++) { const w = this.mem.read(sp + i * 8n, 8n); const m = (this.maps ?? []).find((x) => w >= x.at && w < x.at + BigInt(x.len)); if (m) out.push(`${m.path}+0x${(w - m.at + BigInt(m.fileOff ?? 0)).toString(16)}`); else if (w >= 0x400000n && w < 0x520000n) out.push('exe 0x' + w.toString(16)); } } catch {} return '\n    ' + out.slice(0, 24).join('\n    '); })());
+                 if (ENV.OXWASM_STRACE_SIGNAL && (nr === 234 || nr === 200 || nr === 62) && (ENV.OXWASM_STRACE_SIGNAL === 'all' || [5n, 6n, 7n, 11n].includes(nr === 234 ? a3 : a2))) __dbg(`[signal syscall nr=${nr} args=${a1.toString(16)},${a2.toString(16)},${a3.toString(16)}] argv0=${this._ctor?.argv?.[0]} last:\n  ` + this.strace.slice(-(+ENV.OXWASM_STRACE_N || 3)).join('\n  ') + '\n  threads:' + this.threads.map((t, i) => { let self = '?', tid = '?'; try { self = this.mem.read(t.cpu.fsBase + 0x10n, 8n).toString(16); tid = this.mem.read(t.cpu.fsBase + 0x2d0n, 4n).toString(); } catch {} return `[${i}] id=${t.id} st=${t.state} fs=${t.cpu.fsBase?.toString(16)} self=${self} tcbtid=${tid}`; }).join(' ') + '\n  regs:' + [...cpu.regs].map((r, i) => i + '=' + r.toString(16)).join(' ') + '\n  ipbytes:' + (() => { try { let bp = cpu.regs[5]; for (let i = 0; i < 4; i++) bp = this.mem.read(bp, 8n); const off = this.mem.read(bp + 0x24n, 4n); const out = ['cfr=' + bp.toString(16), 'off=' + off.toString(16), 'callee=' + this.mem.read(bp + 0x10n, 8n).toString(16)]; const base = cpu.regs[13] + off; const b = []; for (let i = -24n; i < 16n; i++) b.push(Number(this.mem.read(base + i, 1n)).toString(16).padStart(2, '0')); return out.join(' ') + ' bytes:' + b.join(' '); } catch (e) { return String(e); } })() + '\n  rbpchain:' + (() => { const out = []; try { let bp = cpu.regs[5]; for (let i = 0; i < 16 && bp; i++) { out.push('0x' + this.mem.read(bp + 8n, 8n).toString(16)); bp = this.mem.read(bp, 8n); } } catch {} return out.join(' '); })() + '\n  stack:' + (() => { const out = []; try { const sp = cpu.regs[4]; for (let i = 0n; i < 200n; i++) { const w = this.mem.read(sp + i * 8n, 8n); const m = (this.maps ?? []).find((x) => w >= x.at && w < x.at + BigInt(x.len)); if (m) out.push(`${m.path}+0x${(w - m.at + BigInt(m.fileOff ?? 0)).toString(16)}`); else if (w >= 0x400000n && w < 0x520000n) out.push('exe 0x' + w.toString(16)); } } catch {} return '\n    ' + out.slice(0, 24).join('\n    '); })());
                  if (ENV.OXWASM_DBG_ERR && BigInt.asIntN(64, v) === BigInt(-ENV.OXWASM_DBG_ERR)) console.error(`[errno ${ENV.OXWASM_DBG_ERR}] tid=${this.threads[this.ti]?.id} nr=${nr} args=${a1.toString(16)},${a2.toString(16)},${a3.toString(16)} argv0=${this._ctor?.argv?.[0]}`);
                  let ps = '';   // decode the path argument of the fs family
                  try { if (nr === 257 || nr === 262) ps = ' "' + this.readPath(a2) + '"';
@@ -2839,6 +2839,7 @@ export class LinuxEngine {
           // the engine invalidates translations only on munmap/mremap.
           this.execRanges.push([at, at + len]); this._genCache = undefined; this._updateCodeWindow();
         }
+        if (flags & FIXED) this._invalidateCode(at, at + len);   // a fixed mapping replaces whatever was there, translated code included
         ret(at); break; }
       case 11: {                                             // munmap
         // A JIT guest (V8 writes machine code into pages at runtime, then
@@ -5056,6 +5057,7 @@ export class LinuxEngine {
     const over = (this.maps || []).filter(m => m.at < hi && m.at + m.len > lo);
     if (over.some(m => m.shared)) return;
     this.ram.fill(0, off0, off1);
+    this._invalidateCode(lo, hi);   // the bytes changed under any translation built from them (JSC decommits freed JIT pages this way)
     for (const m of over) {
       const a = m.at > lo ? m.at : lo, b = m.at + m.len < hi ? m.at + m.len : hi;
       const cur = this.files[m.path] ?? m.h.bytes; if (!cur) continue;
@@ -6166,7 +6168,7 @@ export class LinuxEngine {
         // Pump every 2^18 steps while anything is in flight.
         if (CHURN && (steps & 0xFFFF) === 0) { const nw = performance.now(); if (nw - (this._churnT ?? 0) > 1000) { const st = this.stats, pv = this._churnP ?? {}; const d = (k) => (st[k] | 0) - (pv[k] | 0); console.error(`[churn] t=${(nw / 1000) | 0} interp=${d('interpreted')} disp=${d('disp')} compiles=${d('compiles')} cw=${d('codeWrites')} inval=${d('invalSlow')} volSkip=${d('volatileSkips')} quiet=${d('cwQuieted')} tier=${d('tierCalls')} hit=${d('unitHits')} sizeDef=${d('sizeDeferred')}`); this._churnP = { ...st }; this._churnT = nw; } }
         if (RIPSAMPLE && ENV.OXWASM_DUMPDIR && (this.stats.interpreted & RIPSAMPLE) === 0 && this.cpu.rip >= 0x5a000000n && this.cpu.rip < 0x5b000000n && !(this._dumpedPg ??= new Set()).has(this.cpu.rip >> 12n)) { this._dumpedPg.add(this.cpu.rip >> 12n); const pg = this.cpu.rip & ~4095n, b = new Uint8Array(4096); for (let i = 0; i < 4096; i++) { try { b[i] = Number(this.mem.read(pg + BigInt(i), 1n)); } catch { break; } } try { process.getBuiltinModule('node:fs').writeFileSync(ENV.OXWASM_DUMPDIR + '/pg_' + pg.toString(16) + '.bin', b); } catch {} }
-        if (RIPSAMPLE && (this.stats.interpreted & RIPSAMPLE) === 0) console.error(`[rip] ${this.cpu.rip.toString(16)} tid=${this.threads?.[this.ti]?.id} interp=${this.stats.interpreted} heap=${(process.memoryUsage().heapUsed / 1048576) | 0}MB aot=${this.aotFns.size} t=${performance.now() | 0}`);
+        if (RIPSAMPLE && (this.stats.interpreted & RIPSAMPLE) === 0) __dbg(`[rip] ${this.cpu.rip.toString(16)} tid=${this.threads?.[this.ti]?.id} interp=${this.stats.interpreted} heap=${(process.memoryUsage().heapUsed / 1048576) | 0}MB aot=${this.aotFns.size} t=${performance.now() | 0}`);
         if ((steps & 0x3FFFF) === 0 && this.pumpAsm && this._inflight && this._inflight.size) this.pumpAsm();
         if ((insn.mnem === 'jcc' || insn.mnem === 'jmp') && this.cpu.rip < before && this.inExec(this.cpu.rip)) {   // jmp: rotated-loop back-edge
           const hk = this.cpu.rip;
@@ -6198,7 +6200,7 @@ export class LinuxEngine {
     }
     if (globalThis.__fnDump) { const h = BigInt(c).toString(16); if (!globalThis.__fnDump.has(h)) { globalThis.__fnDump.add(h); process.getBuiltinModule('node:fs').appendFileSync(ENV.OXWASM_FNDUMP, h + '\n'); } }
     const hx = BigInt(c).toString(16);
-    if (ENV.OXWASM_DUMPFN && ENV.OXWASM_DUMPFN.split(',').includes(hx)) { const b = new Uint8Array(0x600); for (let i = 0; i < b.length; i++) { try { b[i] = Number(this.mem.read(BigInt(c) + BigInt(i), 1n)); } catch { break; } } process.getBuiltinModule('node:fs').writeFileSync(ENV.OXWASM_DUMPDIR + '/fn_' + hx + '.bin', b); const m = (this.maps ?? []).find((x) => BigInt(c) >= x.at && BigInt(c) < x.at + BigInt(x.len)); console.error(`[dumpfn] ${hx} map=${m ? m.path + '+0x' + (BigInt(c) - m.at + BigInt(m.fileOff ?? 0)).toString(16) : 'anon'} execRanges=${(this.execRanges ?? []).filter(([x, y]) => BigInt(c) >= x && BigInt(c) < y).map(([x, y]) => x.toString(16) + '-' + y.toString(16)).join(',')}`); }
+    if (ENV.OXWASM_DUMPFN && ENV.OXWASM_DUMPFN.split(',').includes(hx)) { const b = new Uint8Array(0x1000); for (let i = 0; i < b.length; i++) { try { b[i] = Number(this.mem.read(BigInt(c) + BigInt(i), 1n)); } catch { break; } } process.getBuiltinModule('node:fs').writeFileSync(ENV.OXWASM_DUMPDIR + '/fn_' + hx + '.bin', b); const m = (this.maps ?? []).find((x) => BigInt(c) >= x.at && BigInt(c) < x.at + BigInt(x.len)); console.error(`[dumpfn] ${hx} map=${m ? m.path + '+0x' + (BigInt(c) - m.at + BigInt(m.fileOff ?? 0)).toString(16) : 'anon'} execRanges=${(this.execRanges ?? []).filter(([x, y]) => BigInt(c) >= x && BigInt(c) < y).map(([x, y]) => x.toString(16) + '-' + y.toString(16)).join(',')}`); }
     return (this._ev ? this._ev.has(hx) : false) || (this._ea ? !this._ea.has(hx) : false);
   }
 
