@@ -1212,3 +1212,12 @@ time: it is not a syscall loop and not the interpreter (no rip samples), not tie
 V8 itself is doing: the largest functions are 0.9-1.0 MB bodies compiled by TurboFan in 2.7-3.4 s using ~330-390 MB peak (530-600 MB
 total) of compile memory each, several at once on the background threads. That accounts for a few GB of the 12 GB, not all of it.
 What holds the rest during those minutes is still unidentified; emitter experiments that need a rebuilt cache remain blocked on it.
+
+### Partial rebuild of the handler range does not work as a cheap experiment
+
+Idea: keep the cache directory (OXWASM_UNITCACHE_KEY pins it), delete only the 208 unit files in the interpreter-handler range
+(entries 0x25a....-0x25c....) and rebuild just those with a changed, ABI-compatible emitter. With the emitter unchanged (the
+control), after 7.7 minutes of `steady_small.js` only 1 of the 208 units had been regenerated and no rounds had completed. The
+handler roots are the giant dispatch roots whose analysis and assembly is the expensive part (and whose .size/.fail
+answers were deleted too), so removing them is as bad as a cold start. An emitter experiment has to keep these units cached and
+change something that applies at load time, or be tested on a standalone module (tools/dispatch-bench), not by rebuilding them.
