@@ -1245,3 +1245,8 @@ or similar), about 5.5 GB of them, right at the 6 GB worker limit. They appear a
 interpretation or deopt-hook activity (OXWASM_HEAPPROF=<MB>, a same-thread sampling heap profiler triggered from the deopt hook,
 never fired in a 4-minute run, so no JS code is running while they grow). What allocates them is still unidentified; tools:
 OXWASM_MEMLOG (process memory + biggest mappings), OXWASM_SYSHIST, OXWASM_TUTRACE, and the smaps histogram script described here.
+
+Comparison point: a healthy warm bundled run (b92eb, `opencode --version`, ~22 s in) has 444 mappings of 256 KB (108 MB resident), the
+cold build round has 21,902 (5.5 GB), while the worker's own JS heap stays under ~500 MB at every tier-up (TUTRACE) and the sampling
+heap profiler never fires. So the 256 KB blocks are native memory made while a lot of fresh translation/compilation is going on
+(candidates: V8 compile zones or allocator arenas kept by the background compile threads, the assembler's memory). Not yet pinned down.
