@@ -1117,3 +1117,13 @@ a function stuck on baseline code stays there. `OXWASM_NODYNTIER=1` (sdk/index.m
 OXWASM_NOLIFTOFF. On the real workload: bundled per-handler cache `--version` 37 s -> 38 s (no change, small units);
 mega10 cache 138 s -> 117 s guest. So tiering explains part of the mega slowdown (~15%), not all: the mega configuration
 is still ~3x slower than the per-handler cache (translation was 0.34 s here, so this is execution of the mega code).
+
+### Cold unit-cache builds exhaust the worker JS heap (6 GB and 9 GB limits)
+
+A cold build of a function-profiled cache (OXWASM_FNPROF=1, key fnp2, --no-liftoff) died with "Worker terminated due to
+reaching memory limit: JS heap out of memory" at 6144 MB (cache at 3,713 units) and again at 9000 MB (4,072 units, after
+about 8 minutes), at 12 GB resident. The same happened to the earlier cold mega/noacct builds. The baseline JS heap is
+~3.9 GB for any run (childMemMB 3900), so a cold build adds 5+ GB of JS-side state before it finishes; raising the limit
+further would exceed the 16 GB container. Until that growth is found (heap snapshot of a cold build, candidates: the
+analysis memo maps, pending-unit text, per-unit registration closures) emitter experiments that need a rebuilt cache cannot
+complete in this container, which is why every measurement here is on the existing b92eb/mega10 caches.
