@@ -1138,3 +1138,8 @@ there were no more tier-ups or module compiles, yet the run stayed alive for 10+
 worker's timers not firing. So the stall is not translation, not module compilation and not an engine map: it is the guest
 running in compiled code while its memory grows, and the 3.9 GB / 9 GB JS-heap exhaustion seen in the OOM runs is reached
 at run time, not during the cold build. That moves the question to what opencode (as bun) allocates when it starts here.
+
+V8 flags that do not help the dispatch protocol (tools/dispatch-bench, ns/dispatch for full/min/params/sw):
+default 12.2/8.0/5.8/1.5; --turboshaft-wasm 13.4/8.7/6.5/1.6; + --turboshaft-wasm-load-elimination 13.4/9.0/6.2/1.7;
++ --no-liftoff --no-wasm-dynamic-tiering 14.2/8.8/5.9/1.5. The register file lives in memory across function boundaries, so
+load elimination cannot remove the spills; only changing the protocol (parameters, or one function) does.
