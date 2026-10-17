@@ -1068,3 +1068,18 @@ the same cold-start pattern as the mega10 run. Any emitter change changes every 
 full rebuild of an ~11,000-unit cache, which this container has not completed in a single run. Measuring the cost of the
 call protocol therefore needs either a warm-build path that survives restarts or a standalone microbenchmark outside the
 guest, not another cold run.
+
+## Dispatch protocol priced in isolation (tools/dispatch-bench)
+
+A standalone benchmark (no engine, no unit cache, so no rebuild) of a 64-handler chain dispatched 100M times on a
+repeating 24-entry pattern, node 22 / V8, TurboFan:
+
+    full   (current emitted protocol: spills, depth counter, fuel, hash probe, guard, return_call_indirect)  12.5 ns
+    min    (spills + return_call_indirect)                                                                    8.3 ns
+    params (registers as wasm params on the tail call)                                                        5.9 ns
+    sw     (one function, loop + br_table, registers in locals)                                               1.5 ns
+
+So the counters, probe and guard are 1.5x, passing registers as parameters is 2.1x, and keeping an interpreter's dispatch
+loop in a single function is 8.3x per dispatch against the current protocol. (With a random bytecode stream every variant
+is misprediction-bound at 10-20 ns and the differences shrink, so real speed-ups depend on how predictable the guest's
+dispatch is.) This is the shape the mega unit takes; it is the largest measured lever on dispatch-bound guest code.
