@@ -1156,3 +1156,15 @@ Dropping OXWASM_NOLIFTOFF (V8 default: baseline compile first, optimise hot func
 `opencode --version` 21, 22, 21 s guest time (32-33 s wall), correct output 1.18.35, against 37 s guest (88 s wall) with
 --no-liftoff. `opencode debug paths` 37 s -> 21 s. Against the Firecracker VM (0.8 s / 0.76 s) that is about 26x and 28x
 instead of about 44x and 49x. Steady-state (small mix) with the default tiering is being measured next.
+
+### Default tiering vs --no-liftoff: opposite answers for short commands and for the JIT-on steady state
+
+Same engine, same flags except OXWASM_NOLIFTOFF:
+- short commands, guest JIT off (oc_emb.mjs sets BUN_JSC_useJIT=0), bundled cache b92eb: `--version` 21-22 s guest / 32 s wall
+  with default tiering against 37 s / 88 s with --no-liftoff (about 26x vs 44x the Firecracker VM's 0.8 s); `debug paths` 21 s vs 37 s.
+- JIT-on steady state (steady_small.js, baseline JIT, the recommended flag set): with default tiering a 30-round run was killed
+  by the guard at 3211 s with no output, and a 3-round run at 1208 s with no output; with --no-liftoff the same script ran
+  200 rounds in 354 s. So default tiering is not usable there. (Cause not yet found; the guest JIT keeps generating code, and
+  every new function starts on Liftoff code under dynamic tiering.)
+So the right setting depends on the workload: Liftoff + dynamic tiering for short commands, --no-liftoff for long-running JIT-on
+ones. A process that starts short and runs long (a real opencode session) needs both, which V8's flags do not give per module.
