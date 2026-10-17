@@ -1168,3 +1168,29 @@ Same engine, same flags except OXWASM_NOLIFTOFF:
   every new function starts on Liftoff code under dynamic tiering.)
 So the right setting depends on the workload: Liftoff + dynamic tiering for short commands, --no-liftoff for long-running JIT-on
 ones. A process that starts short and runs long (a real opencode session) needs both, which V8's flags do not give per module.
+
+## Per-function compilation hints: TurboFan for the big functions, Liftoff for the rest (the first large steady-state win)
+
+Default tiering broke the JIT-on steady state and --no-liftoff made every function pay a full optimising compile, so neither works
+alone. V8 has a per-function answer: a `compilationHints` custom section (--experimental-wasm-compilation-hints) naming, for each
+function, a strategy and a baseline/top tier. `tools/wasm-hints.mjs in.wasm out.wasm [minBody]` adds it (functions with a body of at
+least minBody bytes, default 20,000: eager, optimised; everything else default tiering). It works on units already in the cache,
+no rebuild: copy the cache directory, run the tool over every .wasm in it (including bundle_N.wasm), pass
+OXWASM_V8FLAGS=--experimental-wasm-compilation-hints with the default tiering (no OXWASM_NOLIFTOFF).
+
+Microbenchmark (8,192-case dispatcher, 786 KB): plain module 8.15 ns/dispatch under default tiering; hinted module + flag
+2.35 ns/dispatch from the first call (1.1 s to compile up front).
+
+Real workload, per-handler cache copy (key hint1), baseline-JIT guest, 30 rounds of steady_small.js:
+- 30 rounds in 56-59 s of guest time, rc=0 (no-hints default tiering: not finished in 3,211 s; --no-liftoff: 200 rounds in 354 s)
+- STEADY (best of rounds 15..29) 232 and 277 ms; median round 368 and 492 ms; against native 43 ms that is 5.4-6.4x for the best
+  rounds and 8.6-11x for the median (before: 331 ms best / 682 ms median, 7.7x / 16x)
+- startup on the bundled hinted cache (hint2): `opencode --version` 18 s guest (against 21 s unhinted default tiering, 37 s with
+  --no-liftoff); it costs about 40 s more wall time at sandbox start, because the marked functions of the loaded units are
+  compiled eagerly then.
+
+Caveats: one of four hinted steady runs hit the guest-side `TypeError: 0 is not a function` after 12 rounds (the same family as the
+earlier JIT corruption; not reproduced on the other three); and a bug in the failure-persistence change was found by these runs:
+a `.fail` marker had been written for a root inside the guest's JIT window (0x5ad4112), and addresses there are reused with
+different bytes, so remembered state about them is wrong. Persisted failures are now only written and honoured for addresses in
+the static executable image (execRangesStatic); stale JIT-window markers were deleted.
