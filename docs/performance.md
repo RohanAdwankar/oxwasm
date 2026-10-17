@@ -1019,3 +1019,6 @@ The runs above that did not finish used the default (unbundled) unit cache. On t
 OXWASM_HEAPMB=6144, OXWASM_NOLIFTOFF=1) `opencode --version` finishes in 35 s guest time (94 s wall with sandbox boot) and
 `opencode debug paths` in 37 s guest time (89 s wall), rc=0, correct output. Against the Firecracker VM (0.8 s and
 0.76 s) that is about 44x and 49x. The earlier negative results were a cache mistake, not a property of the command.
+
+`opencode models` on the same bundled cache (b92eb): rc=0 in 504 s guest time (555 s wall) against 3.7 s in the Firecracker VM,
+about 136x. Summary of full-command ratios against the VM on the bundled cache: `--version` 44x, `debug paths` 49x, `models` 136x.
