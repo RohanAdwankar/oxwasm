@@ -1059,3 +1059,12 @@ Worker CPU profile (114 s total self time including boot of the helper processes
 So the 44x startup gap is mostly the speed of the translated code, the same thing that makes the steady-state mix 7.7x to
 16x. Closing it needs faster generated code (register file out of memory, cheaper call protocol, direct calls), not
 tier-up or deopt tweaks.
+
+### Pricing probes need a warm cache (OXWASM_NOACCT=1 attempt)
+
+A pricing run of OXWASM_NOACCT=1 (no depth counter, no chain fuel) on a fresh unit cache did not reach the benchmark in
+30 minutes: it wrote 3,300 units in the first 8 minutes, then about one unit per two minutes with one thread near 100% CPU,
+the same cold-start pattern as the mega10 run. Any emitter change changes every unit's WAT, so each experiment pays a
+full rebuild of an ~11,000-unit cache, which this container has not completed in a single run. Measuring the cost of the
+call protocol therefore needs either a warm-build path that survives restarts or a standalone microbenchmark outside the
+guest, not another cold run.
