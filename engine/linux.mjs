@@ -928,7 +928,8 @@ export class LinuxEngine {
         if (need > this.aotCallThreshold && (this.aotCalls.get(k) || 0) < need) { (this._sizeDefer ??= new Map()).set(k, need); this.stats.sizeDeferKnown = (this.stats.sizeDeferKnown | 0) + 1; return; }
       }
     }   // the key at REQUEST time: the lookup used it, so the store must
-    if (_unitEx && this.unitStore.hasFail && this.unitStore.hasFail(_unitEx, k.toString(16))) { this.aotFailed.add(k); this.stats.failKnown = (this.stats.failKnown | 0) + 1; return; }   // failed after a long analysis in an earlier run
+    const _inStatic = (this.execRangesStatic ?? []).some(([a, b]) => k >= a && k < b);   // JIT/anonymous code is reused at the same addresses with different bytes: never remember anything about it by address
+    if (_unitEx && _inStatic && this.unitStore.hasFail && this.unitStore.hasFail(_unitEx, k.toString(16))) { this.aotFailed.add(k); this.stats.failKnown = (this.stats.failKnown | 0) + 1; return; }   // failed after a long analysis in an earlier run
     try {
       const unit = compileUnitWat(this.mem, entry, { guestBase: this.base, ramBase: this.RAMOFF,
         // prune the closure at functions already in the dispatch map: calls
@@ -1063,7 +1064,7 @@ export class LinuxEngine {
       if (globalThis.__asmTrace) console.error(e.stack);
       this.aotFailed.add(k);
       this.noteAotFail(entry, e.message);
-      if (_dt > 1000 && _unitEx && this.unitStore.putFail) this.unitStore.putFail(_unitEx, k.toString(16), e.message);   // long, deterministic-looking failure: do not repeat it next run
+      if (_dt > 1000 && _unitEx && _inStatic && this.unitStore.putFail) this.unitStore.putFail(_unitEx, k.toString(16), e.message);   // long, deterministic-looking failure: do not repeat it next run
     } finally { if (ENV.OXWASM_TUTRACE) console.error(`[tu<] ${entry.toString(16)} ${(performance.now() - _tc0) | 0}ms heap=${(process.memoryUsage().heapUsed / 1048576) | 0}MB`); if (t0c) this.tierMs += performance.now() - t0c; this.stats.tuTotalMs = (this.stats.tuTotalMs || 0) + (performance.now() - _tc0); }
   }
 
