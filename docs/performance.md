@@ -1201,3 +1201,14 @@ Hint threshold (minimum function body to mark eager+optimised), per-handler cach
   100 KB    (623 functions marked)  did not finish within 7.5 minutes (killed): the many 20-100 KB dispatch handlers stay on Liftoff
 So 20 KB is the default to use. The steady state flattens at about 230-280 ms (5.4-6.4x native baseline-JIT 43 ms) however many more
 functions are marked, which says the remaining gap is the quality of the generated code, not the tier it is compiled at.
+
+### Cold-cache builds still die under default tiering (OXWASM_SYSHIST)
+
+A cold build with default tiering (no --no-liftoff) wrote units about 3x faster than with --no-liftoff (3,100 in 2 minutes) but
+still died with the worker's JS-heap limit at 6144 MB after ~10 minutes at 12.7 GB resident, 3,718 units. OXWASM_SYSHIST=<n>
+(new) prints a syscall histogram with the JS heap and RSS every n syscalls: at n=4096 (49 s) heap 371 MB, RSS 3.8 GB; no
+second sample arrived in the next 3+ minutes while RSS climbed to 12 GB, so the guest makes fewer than 8,192 syscalls in that
+time: it is not a syscall loop and not the interpreter (no rip samples), not tier-ups (no [tu>] lines). The compile trace shows what
+V8 itself is doing: the largest functions are 0.9-1.0 MB bodies compiled by TurboFan in 2.7-3.4 s using ~330-390 MB peak (530-600 MB
+total) of compile memory each, several at once on the background threads. That accounts for a few GB of the 12 GB, not all of it.
+What holds the rest during those minutes is still unidentified; emitter experiments that need a rebuilt cache remain blocked on it.

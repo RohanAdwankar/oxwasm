@@ -1624,6 +1624,7 @@ export class LinuxEngine {
           const nr = Number(this.regview[0]);
           if ((nr === 228 || nr === 39 || nr === 186 || nr === 24) && !this._sigAny && !this.strace && !this.dbgClockWatch && !(this.children !== undefined && this.children.length !== 0) && !ENV.OXWASM_SCTRACE && !ENV.OXWASM_MMAPSTAT && !ENV.OXWASM_WATCHPAGE && !ENV.OXWASM_CLOCKCHAIN) {
             this.stats.syscalls[nr] = (this.stats.syscalls[nr] || 0) + 1;
+            if (ENV.OXWASM_SYSHIST && this._ctor?.argv?.[0]?.includes('opencode') && ((this._shN = (this._shN | 0) + 1) % (+ENV.OXWASM_SYSHIST) === 0)) { const top = Object.entries(this.stats.syscalls).sort((x, y) => y[1] - x[1]).slice(0, 8).map(([k, v]) => k + ':' + v).join(' '); console.error(`[syshist] n=${this._shN} heap=${(process.memoryUsage().heapUsed / 1048576) | 0}MB rss=${(process.memoryUsage().rss / 1048576) | 0}MB t=${performance.now() | 0} ${top}`); }
             if (DUMP_AT_MS !== null && this._ctor?.argv?.[0]?.includes('opencode') && this.nowMs() > DUMP_AT_MS && (this._dumpedN = (this._dumpedN | 0)) < 3 && (this.stats.syscalls[nr] & 0xFFFF) === 0) { this._dumpedN++; console.error(`[dump-at] thread ${this.threads[this.ti]?.id} nr=${nr} t=${Math.round(this.nowMs())}`); this._onBreak(); }
             let r = 0n;
             if (nr === 228) {
@@ -2519,6 +2520,7 @@ export class LinuxEngine {
     const nr = Number(cpu.regs[0]);
     const [a1, a2, a3] = [cpu.regs[7], cpu.regs[6], cpu.regs[2]];   // rdi rsi rdx
     this.stats.syscalls[nr] = (this.stats.syscalls[nr] || 0) + 1;
+    if (ENV.OXWASM_SYSHIST && this._ctor?.argv?.[0]?.includes('opencode') && ((this._shN = (this._shN | 0) + 1) % (+ENV.OXWASM_SYSHIST) === 0)) { const top = Object.entries(this.stats.syscalls).sort((x, y) => y[1] - x[1]).slice(0, 8).map(([k, v]) => k + ':' + v).join(' '); console.error(`[syshist] n=${this._shN} heap=${(process.memoryUsage().heapUsed / 1048576) | 0}MB rss=${(process.memoryUsage().rss / 1048576) | 0}MB t=${performance.now() | 0} ${top}`); }
     if (ENV.OXWASM_WATCHPAGE && !this._watchArmed && this._ctor?.argv?.[0]?.includes('opencode')) this._armWatchPage(BigInt('0x' + ENV.OXWASM_WATCHPAGE));
     if (ENV.OXWASM_MMAPSTAT && (nr === 9 || nr === 11 || nr === 25) && this._ctor?.argv?.[0]?.includes('opencode')) {
       const ms = (this._mmapStat ??= { mmapN: 0, mmapB: 0n, munmapN: 0, munmapB: 0n, mremapN: 0, bySize: new Map() });
