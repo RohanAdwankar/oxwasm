@@ -5,6 +5,7 @@
 // is normal compiler output (musl/glibc static); nothing about it is
 // adapted for this engine.
 import { Session as __InspSession } from 'node:inspector';
+import { appendFileSync as __appendFileSync } from 'node:fs';
 import { CPU, Memory } from './interp.mjs';
 import { compileLoop } from './jit2.mjs';
 import { compileVectorLoop } from './jitsimd.mjs';
@@ -27,22 +28,27 @@ class PagedMap extends Map { constructor(pages) { super(); this.pages = pages; }
 class PagedSet extends Set { constructor(pages) { super(); this.pages = pages; } add(k) { this.pages.add(pageOf(k)); return super.add(k); } }
 // OXWASM_HEAPPROF=<MB>: V8 sampling heap profiler (live bytes by allocation site). Started at the first deopt, dumped once when the JS heap passes <MB>.
 // Inspector sessions on the same thread answer synchronously, so this works while the worker never returns to its event loop.
+const HEAPPROF = typeof process !== 'undefined' && !!ENV.OXWASM_HEAPPROF;
 let __hp = null;
 function __heapProfCheck() {
   const lim = +ENV.OXWASM_HEAPPROF; if (!lim) return;
-  if (__hp === null) { __hp = { session: null, dumped: false, n: 0 }; try { const ss = new __InspSession(); ss.connect(); ss.post('HeapProfiler.enable'); ss.post('HeapProfiler.startSampling', { samplingInterval: 262144 }); __hp.session = ss; } catch (e) { console.error('[heapprof] start failed', e.message); } return; }
+  if (__hp === null) { __hp = { session: null, dumped: false, n: 0 }; try { const ss = new __InspSession(); ss.connect(); ss.post('HeapProfiler.enable'); ss.post('HeapProfiler.startSampling', { samplingInterval: 262144 }); __hp.session = ss; } catch (e) { __dbg('[heapprof] start failed', e.message); } return; }
   if (__hp.dumped || !__hp.session) return;
-  if ((++__hp.n & 0xFFF) !== 0) return;
+  if ((++__hp.n & 0xF) !== 0) return;
   if (process.memoryUsage().heapUsed < lim * 1048576) return;
   __hp.dumped = true;
   __hp.session.post('HeapProfiler.getSamplingProfile', (err, res) => {
-    if (err) { console.error('[heapprof] failed', err.message); return; }
+    if (err) { __dbg('[heapprof] failed', err.message); return; }
     const agg = new Map(); const walk = (n) => { const cf = n.callFrame, k = (cf.functionName || '(anon)') + ' ' + cf.url.split('/').slice(-2).join('/') + ':' + cf.lineNumber; if (n.selfSize) agg.set(k, (agg.get(k) || 0) + n.selfSize); for (const c of n.children || []) walk(c); };
     walk(res.profile.head);
     const top = [...agg].sort((a, b) => b[1] - a[1]).slice(0, 14).map(([k, v]) => `${(v / 1048576) | 0}MB ${k}`);
-    console.error('[heapprof] heap=' + ((process.memoryUsage().heapUsed / 1048576) | 0) + 'MB live by site: ' + top.join(' | '));
+    let extra = 'no hook'; try { extra = globalThis.__hpExtra ? globalThis.__hpExtra() : 'no hook'; } catch (e) { extra = 'failed ' + e.message; }
+    __dbg('[heapprof] heap=' + ((process.memoryUsage().heapUsed / 1048576) | 0) + 'MB live by site: ' + top.join(' | ') + ' || EXTRA ' + extra);
   });
 }
+// Diagnostics written synchronously: a worker's console.error is delivered only when its event loop turns, which a long synchronous stretch never does.
+const __dbg = (m) => { if (ENV.OXWASM_DBGFILE) { try { __appendFileSync(ENV.OXWASM_DBGFILE, m + '\n'); } catch {} } else console.error(m); };
+const WIDE_EXT_PAGES = 4096n;   // 16 MB
 const RIPSAMPLE = typeof process !== 'undefined' && ENV.OXWASM_RIPSAMPLE ? Number(ENV.OXWASM_RIPSAMPLE) : 0;   // power of two minus one: sample the interpreter's rip every N steps
 const CHURN = typeof process !== 'undefined' && ENV.OXWASM_CHURN === '1';
 const DISPSTAT = typeof process !== 'undefined' && ENV.OXWASM_DISPSTAT === '1';
@@ -696,11 +702,11 @@ export class LinuxEngine {
   // translated functions whose source bytes overlap [wlo, whi)
   _extOverlap(wlo, whi) {
     let out = null;
-    if (!this._extPages) return out;
-    for (let q = wlo >> 12n; q <= (whi - 1n) >> 12n; q++) {
+    if (this._extPages) for (let q = wlo >> 12n; q <= (whi - 1n) >> 12n; q++) {
       const st = this._extPages.get(q); if (!st) continue;
       for (const k of st) { const e = this._extents.get(k); if (e && e[0] < whi && e[1] > wlo) (out ??= []).push(k); }
     }
+    if (this._wideExt) for (const k of this._wideExt) { const e = this._extents.get(k); if (e && e[0] < whi && e[1] > wlo) (out ??= []).push(k); }
     return out;
   }
   // `exact` = [lo, hi) of the bytes actually written: translations are dropped only if THEIR bytes overlap it
@@ -712,7 +718,7 @@ export class LinuxEngine {
     // nothing cached lives on these pages: only the structures that are not keyed by page need a look
     const p0 = lo >> 12n, p1 = (hi - 1n) >> 12n;
     let touched = true;
-    if (p1 - p0 < 64n && this.codePages) { touched = false; for (let q = p0; q <= p1; q++) if (this.codePages.has(q)) { touched = true; break; } }
+    if (p1 - p0 < 64n && this.codePages && !this._wideExt?.size) { touched = false; for (let q = p0; q <= p1; q++) if (this.codePages.has(q)) { touched = true; break; } }
     if (!touched) {
       if (this.execAnon ?? EXEC_ANON) { const n = this.execRanges.length; this.execRanges = this.execRanges.filter(([a, b]) => !(a >= lo && b <= hi)); if (this.execRanges.length !== n) { this._ieCache = undefined; this._genCache = undefined; this._updateCodeWindow(); } }
       if (this._inflight) for (const u of this._inflight) if (u.funcs.some(inR)) {
@@ -725,7 +731,7 @@ export class LinuxEngine {
     const dropped = [];
     // a translated function is stale if ANY byte it was built from changed, not only its first
     { const hitK = this._extOverlap(exact ? exact[0] : lo, exact ? exact[1] : hi);
-      if (hitK) for (const k of hitK) { if (this.aotFns.has(k)) { this.aotFns.delete(k); hit = true; dropped.push(k); } this._extents.delete(k); changed = true; } }
+      if (hitK) for (const k of hitK) { if (this.aotFns.has(k)) { this.aotFns.delete(k); hit = true; dropped.push(k); } this._extents.delete(k); this._wideExt?.delete(k); changed = true; } }
     if (exact) {
       // a store into a page of JIT memory: only translations built from the overwritten bytes go (above), plus
       // any whose extent is unknown (they were loaded from the unit cache) by the old entry-in-page rule
@@ -937,7 +943,8 @@ export class LinuxEngine {
     if (this._cwCover(entry)) { this.stats.volatileSkips = (this.stats.volatileSkips | 0) + 1; return; }   // not a failure: the page is trusted again once it has been quiet (CW_QUIET)
     const _tc0 = performance.now();
     const _unitEx = this.unitStore ? this._unitExeId() : null, _unitRs = this._exeRanges;
-    if (ENV.OXWASM_TUTRACE) { const sz = (m) => (m && (m.size ?? m._size ?? m.count)) ?? -1; console.error(`[tu>] ${entry.toString(16)} t=${(_tc0 | 0)} heap=${(process.memoryUsage().heapUsed / 1048576) | 0}MB aot=${this.aotFns.size} failed=${this.aotFailed.size} tiny=${sz(this._tinyMemo)} failMemo=${sz(this._failMemo)} sizeMemo=${sz(this._sizeMemo)} ftSeen=${sz(this._ftSeen)} ext=${sz(this._extents)} extPg=${sz(this._extPages)} prof=${sz(this.profile)} calls=${sz(this.aotCalls)} callT=${sz(this._callTargets)} inflight=${sz(this._inflight)} pend=${sz(this._pendingFns)}`); }
+    if (HEAPPROF) globalThis.__hpExtra = () => { const sz = (m) => (m && (m.size ?? m._size ?? m.count)) ?? -1; const tot = (m) => { let n = 0; if (m) for (const v of m.values()) n += v.size ?? 0; return n; }; return `engine=${this._ctor?.argv?.[0]?.slice(-24)} extPages=${sz(this._extPages)} entries=${tot(this._extPages)} noExtPg=${sz(this._noExtPg)} entries=${tot(this._noExtPg)} extents=${sz(this._extents)} aotFns=${sz(this.aotFns)} ftSeen=${sz(this._ftSeen)} failed=${sz(this.aotFailed)} tiny=${sz(this._tinyMemo)} failMemo=${sz(this._failMemo)} sizeMemo=${sz(this._sizeMemo)} profile=${sz(this.profile)} calls=${sz(this.aotCalls)} callT=${sz(this._callTargets)} pend=${sz(this._pendingFns)} inflight=${sz(this._inflight)} codePages=${sz(this.codePages)}`; };
+    if (ENV.OXWASM_TUTRACE) { const sz = (m) => (m && (m.size ?? m._size ?? m.count)) ?? -1; __dbg(`[tu>] ${entry.toString(16)} t=${(_tc0 | 0)} heap=${(process.memoryUsage().heapUsed / 1048576) | 0}MB aot=${this.aotFns.size} failed=${this.aotFailed.size} tiny=${sz(this._tinyMemo)} failMemo=${sz(this._failMemo)} sizeMemo=${sz(this._sizeMemo)} ftSeen=${sz(this._ftSeen)} ext=${sz(this._extents)} extPg=${sz(this._extPages)} prof=${sz(this.profile)} calls=${sz(this.aotCalls)} callT=${sz(this._callTargets)} inflight=${sz(this._inflight)} pend=${sz(this._pendingFns)}`); }
     // a giant root deferred by the size gate in an earlier run: its size was kept beside the cached units, so the
     // gate can answer without analysing the whole function again
     if (SIZEGATE && this._gateCalls && _unitEx && this.unitStore.getSize) {
@@ -994,9 +1001,14 @@ export class LinuxEngine {
         // closure texts — child engines cap the unit size and chain instead
         ...(this.unitMaxFuncs ? { maxFuncs: this.unitMaxFuncs } : {}),
         ...(this.unitMaxInsns ? { maxInsns: this.unitMaxInsns } : {}) });
-      if (ENV.OXWASM_TUTRACE) console.error(`[tu:wat] ${entry.toString(16)} ${unit.wat.length}B ${(performance.now() - _tc0) | 0}ms`);
+      if (ENV.OXWASM_TUTRACE) __dbg(`[tu:wat] ${entry.toString(16)} ${unit.wat.length}B ${(performance.now() - _tc0) | 0}ms`);
       if (unit.ext) { const ex = this._extents ??= new Map(); for (const [k, a, b] of unit.ext) if (a !== null) {
-        ex.set(k, [a, b]); const ep = this._extPages ??= new Map();
+        ex.set(k, [a, b]);
+        // An extent spanning more than WIDE_EXT_PAGES pages (a function whose blocks straddle distant regions) is NOT indexed page by
+        // page: one such extent made 16.7M one-entry Sets and filled the worker's JS heap (5 GB) in a cold build. Wide extents are
+        // checked linearly instead, and while any exists the "no cached code on these pages" fast path is off (see _invalidateCode).
+        if ((b - 1n >> 12n) - (a >> 12n) > WIDE_EXT_PAGES) { (this._wideExt ??= new Set()).add(k); this.stats.wideExt = (this.stats.wideExt | 0) + 1; if (ENV.OXWASM_TUTRACE) __dbg(`[wide-ext] ${k} ${a.toString(16)}-${b.toString(16)} ${((b - a) >> 20n)}MB`); continue; }
+        const ep = this._extPages ??= new Map();
         for (let q = a >> 12n; q <= (b - 1n) >> 12n; q++) { this.codePages.add(q); let st = ep.get(q); if (!st) ep.set(q, st = new Set()); st.add(k); } } }
       if (this.onUnitWat) this.onUnitWat(un, entry, unit);
       // assembleWatAsync (browser): the assembler is 65% of the on-thread
@@ -1048,7 +1060,7 @@ export class LinuxEngine {
         });
         return;
       }
-      if (ENV.OXWASM_TUTRACE) console.error(`[tu:asm] ${entry.toString(16)} start`);
+      if (ENV.OXWASM_TUTRACE) __dbg(`[tu:asm] ${entry.toString(16)} start`);
       const bytes = this.assembleWat(unit.wat);
       this._unitBytesDone(k, bytes, unit);   // manifest capture: entry -> compiled wasm
       // asyncCompile (browser): hand the bytes to the engine's off-thread
@@ -1084,7 +1096,7 @@ export class LinuxEngine {
       this.aotFailed.add(k);
       this.noteAotFail(entry, e.message);
       if (_dt > 1000 && _unitEx && _inStatic && this.unitStore.putFail) this.unitStore.putFail(_unitEx, k.toString(16), e.message);   // long, deterministic-looking failure: do not repeat it next run
-    } finally { if (ENV.OXWASM_TUTRACE) console.error(`[tu<] ${entry.toString(16)} ${(performance.now() - _tc0) | 0}ms heap=${(process.memoryUsage().heapUsed / 1048576) | 0}MB`); if (t0c) this.tierMs += performance.now() - t0c; this.stats.tuTotalMs = (this.stats.tuTotalMs || 0) + (performance.now() - _tc0); }
+    } finally { if (ENV.OXWASM_TUTRACE) __dbg(`[tu<] ${entry.toString(16)} ${(performance.now() - _tc0) | 0}ms heap=${(process.memoryUsage().heapUsed / 1048576) | 0}MB`); if (t0c) this.tierMs += performance.now() - t0c; this.stats.tuTotalMs = (this.stats.tuTotalMs || 0) + (performance.now() - _tc0); }
   }
 
   // GPRs at 0..127, fs base at 128, the 16 xmm registers at 256..511 (16B
@@ -1519,6 +1531,7 @@ export class LinuxEngine {
       // (state published, resume re-enters interp at this rip); the host sees
       // an immediately-due blocked deadline and re-pumps on the next task.
       this._itc = (this._itc | 0) + 1;            // persistent across nested interpUntil calls
+      if (HEAPPROF && (this._itc & 0xFFF) === 0) __heapProfCheck();
       if ((this._itc & 0x3FFFF) === 0 && this.pumpAsm && this._inflight && this._inflight.size) this.pumpAsm();   // see run(): deferred units register here too
       if ((this._itc & 0xFFF) === 0 && ((this.sliceDeadline != null && performance.now() > this.sliceDeadline) || this._kidsDue() || this._rotateDue())) {
         this.syncOut();
@@ -6142,6 +6155,7 @@ export class LinuxEngine {
         if (this.blocked) { this.cpu.rip = before;            // re-execute the syscall on resume
                             branched = true;
                             if (this.park()) continue; break; }
+        if (HEAPPROF && (steps & 0xFFF) === 0) __heapProfCheck();
         if ((steps & 0xFFF) === 0 && this.sliceDeadline != null && performance.now() > this.sliceDeadline) break;
         // Deferred units register from pumpAsm(), which ran only at run()
         // entry and at the next tier-up: once every hot root was submitted,

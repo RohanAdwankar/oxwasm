@@ -1254,3 +1254,22 @@ heap profiler never fires. So the 256 KB blocks are native memory made while a l
 glibc allocator tuning does not help (MALLOC_ARENA_MAX=1 MALLOC_TRIM_THRESHOLD_=65536 MALLOC_MMAP_THRESHOLD_=4194304 on a fresh cold
 build): 8.6 GB at 1:50 and 10.3 GB at 3:57 against 9-10.9 GB at similar points without it, still climbing, 3,062 units. The 256 KB
 blocks are live native memory, not arena slack left behind by freed allocations.
+
+## Root cause of the cold-build memory: a per-page index of huge extents (fixed)
+
+The 5 GB of 256 KB blocks was the worker's JS heap. A sampling heap profile (OXWASM_HEAPPROF=<MB>, now run from the interpreter
+loops too) showed 3.2 GB of Set/Map entries, and the engine's collection sizes at the same moment showed the cause:
+`_extPages` (page -> set of functions built from it) had 16,777,197 entries and `codePages` 16,777,216, from only 17 recorded
+extents. A function's extent is the span of source bytes it was built from; some functions' blocks straddle the static binary and
+the guest JIT region, so their extents are tens of MB (255bcf0-5bad976 = 54 MB, 4642180-5b6c56d = 21 MB), and registering
+each one page by page made a Set per page in `_extPages`.
+Fix: an extent spanning more than 4,096 pages is kept in `_wideExt` and checked linearly in `_extOverlap`, and the
+"no cached code on these pages" fast path of `_invalidateCode` is off while a wide extent exists (it was already effectively off,
+as every page was in codePages). Result on a fresh cold build: JS heap 1.1 GB at 100 s (11,047 functions registered) instead of ~5 GB,
+and 7,200 units written in 4 minutes instead of ~3,000. Engine suite green.
+
+Also found with this: a worker's console.error is delivered only when its event loop turns, so long synchronous stretches show
+no log output at all. Several earlier "nothing happens after N seconds" readings in this file were that, not inactivity.
+OXWASM_DBGFILE=<path> now routes the TUTRACE/HEAPPROF diagnostics through synchronous file appends.
+The cold build still dies (silently, killed by the container's OOM) after ~4 minutes: with the JS heap down to 1-2 GB the rest of
+the ~9-14 GB resident is native memory (still being measured); ~54 KB of heap per registered function (registerAotFn) is next.
