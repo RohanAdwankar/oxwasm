@@ -1127,3 +1127,14 @@ about 8 minutes), at 12 GB resident. The same happened to the earlier cold mega/
 further would exceed the 16 GB container. Until that growth is found (heap snapshot of a cold build, candidates: the
 analysis memo maps, pending-unit text, per-unit registration closures) emitter experiments that need a rebuilt cache cannot
 complete in this container, which is why every measurement here is on the existing b92eb/mega10 caches.
+
+### What the cold-build stall is not (OXWASM_TUTRACE)
+
+OXWASM_TUTRACE=1 now logs each tier-up (`[tu>]`/`[tu<]`, with the sizes of the engine's memo and registry maps and the JS heap)
+and each cached-unit compile (`[wm>]`/`[wm:mod]`/`[wm<]`). On a cold build (key cold1, --no-liftoff, 9000 MB limit) the
+JS heap stayed at 120-500 MB through 2,644 tier-ups and 3,300 registered functions, the map sizes grew linearly with the
+unit count (no runaway structure), and all 281 cached-module compiles finished instantly. After about 84 s of worker time
+there were no more tier-ups or module compiles, yet the run stayed alive for 10+ minutes at 11-14 GB resident, with the
+worker's timers not firing. So the stall is not translation, not module compilation and not an engine map: it is the guest
+running in compiled code while its memory grows, and the 3.9 GB / 9 GB JS-heap exhaustion seen in the OOM runs is reached
+at run time, not during the cold build. That moves the question to what opencode (as bun) allocates when it starts here.

@@ -814,7 +814,7 @@ export class LinuxEngine {
           this.stats.tiers.aot = (this.stats.tiers.aot || 0) + 1;
         };
         if (!this.asyncCompile && typeof process !== 'undefined') {
-          try { registerAll(new WebAssembly.Instance(new WebAssembly.Module(bytes), this.aotImports())); }
+          try { const _m0 = performance.now(); if (ENV.OXWASM_TUTRACE) console.error(`[wm>] ${entry.toString(16)} ${bytes.length}B`); const _mod = new WebAssembly.Module(bytes); if (ENV.OXWASM_TUTRACE) console.error(`[wm:mod] ${entry.toString(16)} ${(performance.now() - _m0) | 0}ms`); registerAll(new WebAssembly.Instance(_mod, this.aotImports())); if (ENV.OXWASM_TUTRACE) console.error(`[wm<] ${entry.toString(16)} ${(performance.now() - _m0) | 0}ms`); }
           catch (e) { this.aotFailed.add(k); this.noteAotFail(entry, e.message); }
           return;
         }
@@ -918,7 +918,7 @@ export class LinuxEngine {
     if (this._cwCover(entry)) { this.stats.volatileSkips = (this.stats.volatileSkips | 0) + 1; return; }   // not a failure: the page is trusted again once it has been quiet (CW_QUIET)
     const _tc0 = performance.now();
     const _unitEx = this.unitStore ? this._unitExeId() : null, _unitRs = this._exeRanges;
-    if (ENV.OXWASM_TUTRACE) console.error(`[tu>] ${entry.toString(16)} t=${(_tc0 | 0)} heap=${(process.memoryUsage().heapUsed / 1048576) | 0}MB`);
+    if (ENV.OXWASM_TUTRACE) { const sz = (m) => (m && (m.size ?? m._size ?? m.count)) ?? -1; console.error(`[tu>] ${entry.toString(16)} t=${(_tc0 | 0)} heap=${(process.memoryUsage().heapUsed / 1048576) | 0}MB aot=${this.aotFns.size} failed=${this.aotFailed.size} tiny=${sz(this._tinyMemo)} failMemo=${sz(this._failMemo)} sizeMemo=${sz(this._sizeMemo)} ftSeen=${sz(this._ftSeen)} ext=${sz(this._extents)} extPg=${sz(this._extPages)} prof=${sz(this.profile)} calls=${sz(this.aotCalls)} callT=${sz(this._callTargets)} inflight=${sz(this._inflight)} pend=${sz(this._pendingFns)}`); }
     // a giant root deferred by the size gate in an earlier run: its size was kept beside the cached units, so the
     // gate can answer without analysing the whole function again
     if (SIZEGATE && this._gateCalls && _unitEx && this.unitStore.getSize) {
