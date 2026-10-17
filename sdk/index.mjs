@@ -15,6 +15,8 @@ import v8 from 'node:v8';
 if (process.env.OXWASM_NOLIFTOFF === '1') v8.setFlagsFromString('--no-liftoff');
 // OXWASM_NODYNTIER=1: no dynamic tiering either (with NOLIFTOFF every function is compiled once, fully optimised, and not recompiled)
 if (process.env.OXWASM_NODYNTIER === '1') v8.setFlagsFromString('--no-wasm-dynamic-tiering');
+// OXWASM_V8FLAGS="--flag --flag2": any other V8 flags (diagnosis; NODE_OPTIONS does not allow V8 options)
+if (process.env.OXWASM_V8FLAGS) for (const f of process.env.OXWASM_V8FLAGS.split(/\s+/).filter(Boolean)) v8.setFlagsFromString(f);
 import { ProcessWorker } from './isolated.mjs';
 import { CACHE_DIR } from './image.mjs';
 import { randomBytes } from 'node:crypto';

@@ -1143,3 +1143,16 @@ V8 flags that do not help the dispatch protocol (tools/dispatch-bench, ns/dispat
 default 12.2/8.0/5.8/1.5; --turboshaft-wasm 13.4/8.7/6.5/1.6; + --turboshaft-wasm-load-elimination 13.4/9.0/6.2/1.7;
 + --no-liftoff --no-wasm-dynamic-tiering 14.2/8.8/5.9/1.5. The register file lives in memory across function boundaries, so
 load elimination cannot remove the spills; only changing the protocol (parameters, or one function) does.
+
+## Startup: V8's own compile time was a large share, and --no-liftoff makes it worse (measured)
+
+`OXWASM_V8FLAGS="--trace-wasm-compilation-times"` (new generic V8-flag passthrough in sdk/index.mjs) shows what V8 does with the cached
+units on the fast bundled cache (b92eb, `opencode --version`, --no-liftoff): 9,966 functions compiled with TurboFan, 65 s of
+compile time summed over threads, 75 MB of function bodies, the biggest single functions 1-1.7 s each. Nothing caches
+compiled wasm between runs, so every run pays it. OXWASM_NOLIFTOFF=1 was introduced to cut memory peaks of huge functions,
+but it forces this full optimizing compile of every function that is ever called.
+
+Dropping OXWASM_NOLIFTOFF (V8 default: baseline compile first, optimise hot functions in the background), same cache, 3 runs:
+`opencode --version` 21, 22, 21 s guest time (32-33 s wall), correct output 1.18.35, against 37 s guest (88 s wall) with
+--no-liftoff. `opencode debug paths` 37 s -> 21 s. Against the Firecracker VM (0.8 s / 0.76 s) that is about 26x and 28x
+instead of about 44x and 49x. Steady-state (small mix) with the default tiering is being measured next.
