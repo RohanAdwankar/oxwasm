@@ -1194,3 +1194,10 @@ earlier JIT corruption; not reproduced on the other three); and a bug in the fai
 a `.fail` marker had been written for a root inside the guest's JIT window (0x5ad4112), and addresses there are reused with
 different bytes, so remembered state about them is wrong. Persisted failures are now only written and honoured for addresses in
 the static executable image (execRangesStatic); stale JIT-window markers were deleted.
+
+Hint threshold (minimum function body to mark eager+optimised), per-handler cache, baseline-JIT guest, 30 rounds of steady_small.js:
+  5 KB   (10,942 functions marked)  30 rounds in 73 s guest;  STEADY 274 ms, median 472 ms
+  20 KB   (3,590 functions marked)  30 rounds in 56-59 s;     STEADY 232 and 277 ms, median 368 and 492 ms
+  100 KB    (623 functions marked)  did not finish within 7.5 minutes (killed): the many 20-100 KB dispatch handlers stay on Liftoff
+So 20 KB is the default to use. The steady state flattens at about 230-280 ms (5.4-6.4x native baseline-JIT 43 ms) however many more
+functions are marked, which says the remaining gap is the quality of the generated code, not the tier it is compiled at.
