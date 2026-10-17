@@ -1250,3 +1250,7 @@ Comparison point: a healthy warm bundled run (b92eb, `opencode --version`, ~22 s
 cold build round has 21,902 (5.5 GB), while the worker's own JS heap stays under ~500 MB at every tier-up (TUTRACE) and the sampling
 heap profiler never fires. So the 256 KB blocks are native memory made while a lot of fresh translation/compilation is going on
 (candidates: V8 compile zones or allocator arenas kept by the background compile threads, the assembler's memory). Not yet pinned down.
+
+glibc allocator tuning does not help (MALLOC_ARENA_MAX=1 MALLOC_TRIM_THRESHOLD_=65536 MALLOC_MMAP_THRESHOLD_=4194304 on a fresh cold
+build): 8.6 GB at 1:50 and 10.3 GB at 3:57 against 9-10.9 GB at similar points without it, still climbing, 3,062 units. The 256 KB
+blocks are live native memory, not arena slack left behind by freed allocations.
