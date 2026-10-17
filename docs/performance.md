@@ -1012,3 +1012,10 @@ minute), so it is a baseline of any run with `childMemMB: 3900`, not something `
 (OXWASM_NOLIFTOFF=1, 8 GB worker heap, default cache) `--version` had also not finished after about 5 minutes, whereas
 the earlier 28 s `--version` result came from a different flag set; I have not pinned down which flag makes the
 difference.
+
+### Correction: `debug paths` completes on the bundled cache
+
+The runs above that did not finish used the default (unbundled) unit cache. On the bundled copy (OXWASM_UNITCACHE_KEY=b92eb,
+OXWASM_HEAPMB=6144, OXWASM_NOLIFTOFF=1) `opencode --version` finishes in 35 s guest time (94 s wall with sandbox boot) and
+`opencode debug paths` in 37 s guest time (89 s wall), rc=0, correct output. Against the Firecracker VM (0.8 s and
+0.76 s) that is about 44x and 49x. The earlier negative results were a cache mistake, not a property of the command.
