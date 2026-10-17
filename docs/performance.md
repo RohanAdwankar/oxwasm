@@ -1273,3 +1273,11 @@ no log output at all. Several earlier "nothing happens after N seconds" readings
 OXWASM_DBGFILE=<path> now routes the TUTRACE/HEAPPROF diagnostics through synchronous file appends.
 The cold build still dies (silently, killed by the container's OOM) after ~4 minutes: with the JS heap down to 1-2 GB the rest of
 the ~9-14 GB resident is native memory (still being measured); ~54 KB of heap per registered function (registerAotFn) is next.
+
+Cold-build memory: glibc malloc arenas
+--------------------------------------
+After the extent fix the cold build still died at ~4 min with the cgroup OOM killer (dmesg: anon-rss 13.7 GB). The smaps
+breakdown showed ~60 mappings of ~64 MB (glibc per-thread arenas, ~3 GB resident) beside the V8 heap pages: V8's
+compile threads and the worker allocate zone memory in separate arenas that never return to the OS.
+Run with MALLOC_ARENA_MAX=2 and the same cold build completes in one run: rc=0, 173 s, 4133 AOT units, peak RSS ~9 GB
+(was killed at 13.7 GB). Set it in the environment of the node process that hosts the sandbox (it cannot be set from inside).
