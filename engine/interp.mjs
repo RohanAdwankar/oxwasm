@@ -1045,6 +1045,7 @@ export class CPU {
           const overlapUp = this.regs[7] > this.regs[6] && this.regs[7] < this.regs[6] + len;
           if (src && dst && !overlapUp) {
             if (this.mem.jrnl) this.mem.jrnl.push([this.regs[7], 0n, null, dst.slice()]);
+            if (this.mem.watch !== null && this.regs[7] < this.mem.watchHi && this.regs[7] + len > this.mem.watchLo) this.mem.watch(this.regs[7], len, 0n);   // a bulk store into watched memory is still a store
             dst.set(src);
             this.regs[6] = (this.regs[6] + len) & MASK[8];
             this.regs[7] = (this.regs[7] + len) & MASK[8];
@@ -1110,6 +1111,7 @@ export class CPU {
           const dst = this.mem.view(this.regs[7], len);
           if (dst) {
             if (this.mem.jrnl) this.mem.jrnl.push([this.regs[7], 0n, null, dst.slice()]);
+            if (this.mem.watch !== null && this.regs[7] < this.mem.watchHi && this.regs[7] + len > this.mem.watchLo) this.mem.watch(this.regs[7], len, 0n);
             if (S === 1) dst.fill(Number(v));
             else { const b = []; for (let i = 0n; i < n; i++) b.push(Number((v >> (8n*i)) & 0xFFn));
                    for (let o = 0; o < dst.length; o += S) for (let i = 0; i < S; i++) dst[o+i] = b[i]; }

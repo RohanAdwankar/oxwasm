@@ -1310,3 +1310,22 @@ hangs at round 37; strings, json and sorting survive 300 rounds. The abort is ra
 (cell type check on a bad argument), so it is a thread-interleaving-dependent corruption in the concurrent collector path, not a code-cache
 problem: the JIT-off run fails too. Hypotheses not yet tested: register/ucontext contents of the signal-based thread suspension JSC uses
 (tgkill sig 30 to 3-7 threads), futex wake ordering. madvise(DONTNEED) and MAP_FIXED now invalidate translated code over the range (they did not).
+
+### Writes into JIT pages: exact ranges, and the stores that were never guarded (interpreted steps 6.4M -> 1.5M)
+An interpreter-rip histogram of steady state (delta of two runs, OXWASM_IHIST) showed 38% of the interpreted steps in one 10-instruction
+JSC thunk (string length, 0x5a234540) and most of the rest in other JIT-pool pages. They were interpreted because the pool is written
+all the time (the JIT emitting its next function beside thunks it has already built) and every store into a watched page dropped every
+translation on the page and, after four, made the page volatile (never translated again until 2M interpreted steps passed quietly).
+- The store guard now passes the byte count (`$x_cw (addr, next, size)`); `_codeWrite` asks `_cwDisjoint` whether any translation (built,
+  in flight, or of unknown extent) depends on a byte of the range and does nothing, and does not count towards volatility, when none does.
+  The interpreter's own write watch is exact the same way. OXWASM_CW_PAGE=1 restores the old page-wide behaviour.
+- Stores that were never guarded now are: SSE stores (movdqu/movups/movq/movhps), movs/stos (scalar and rep, range-checked), and the
+  interpreter's bulk rep movs/stos (they went through a typed-array view and never reached the watch). OXWASM_CWVERIFY=1 snapshots the
+  bytes of every JIT-range translation and reports any that changed without being invalidated; it found the interpreter case (a
+  translation built over still-zero pool bytes, the thunks then written by an unwatched rep movs).
+- A unit still being assembled whose extent is hit is now cancelled (it was only cancelled if one of its entries was on the page).
+- madvise(DONTNEED) and MAP_FIXED invalidate translations over the range.
+Phase mix (fib, math, strings, sorting, json; 200 rounds): STEADY 141 ms -> 104 ms, interpreted steps 6.4M -> 1.5M (strings 19 -> 10 ms).
+The cache must be rebuilt (the import signature changed); engine suite green.
+The abort/hang is NOT explained by any of this: with the verifier on no stale translation is reported any more and the run still aborts at
+round 5 in about half the runs, with page-wide invalidation (OXWASM_CW_PAGE=1) as well.

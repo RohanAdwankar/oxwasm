@@ -62,6 +62,8 @@ const CW_VOLATILE = Number(ENV.OXWASM_CW_VOLATILE || 8);
 // A volatile page that has gone this many interpreted steps without a write is trusted again: JSC patches an inline
 // cache once and the code then runs for good, and a page that stays interpreted for the life of the process is
 // a 100x tax on exactly the loops that matter.
+const CWVERIFY = ENV.OXWASM_CWVERIFY === '1';
+const EXACT_CW_OFF = ENV.OXWASM_CW_PAGE === '1';   // old behaviour: every store into a watched page drops the whole page
 const CW_QUIET = Number(ENV.OXWASM_CW_QUIET || 2_000_000);
 const BREAKS = typeof process !== 'undefined' && ENV.OXWASM_BREAK ? new Set(ENV.OXWASM_BREAK.split(',').map((h) => BigInt('0x' + h))) : null;   // interpreter breakpoints: print the thread, registers and [rdi+0x340..] (diagnosis)
 const ROTATE_MS = Number(ENV.OXWASM_ROTATE_MS || 10);   // wall-clock quantum: a thread that has run this long yields to a runnable sibling (see _rotateDue)
@@ -731,7 +733,12 @@ export class LinuxEngine {
     const dropped = [];
     // a translated function is stale if ANY byte it was built from changed, not only its first
     { const hitK = this._extOverlap(exact ? exact[0] : lo, exact ? exact[1] : hi);
-      if (hitK) for (const k of hitK) { if (this.aotFns.has(k)) { this.aotFns.delete(k); hit = true; dropped.push(k); } this._extents.delete(k); this._wideExt?.delete(k); changed = true; } }
+      if (hitK) for (const k of hitK) { if (this.aotFns.has(k)) { this.aotFns.delete(k); hit = true; dropped.push(k); } this._extents.delete(k); this._wideExt?.delete(k); changed = true; }
+      // a unit still being assembled was built from the old bytes too, whichever page its entries sit on
+      if (hitK && this._inflight) for (const u of this._inflight) if (!u.cancelled && u.funcs.some((f) => hitK.includes(f))) {
+        u.cancelled = true;
+        if (this._pendingFns) for (const a of u.funcs) this._pendingFns.delete(a.toString());
+      } }
     if (exact) {
       // a store into a page of JIT memory: only translations built from the overwritten bytes go (above), plus
       // any whose extent is unknown (they were loaded from the unit cache) by the old entry-in-page rule
@@ -742,7 +749,7 @@ export class LinuxEngine {
     }
     // a byte store beside translated code (the common case: the JIT emitting its next function) leaves every table alone
     for (const k of this.aotFailed) if (inR(k)) this.aotFailed.delete(k);          // a few hundred at most
-    if (!exact || changed) {
+    if (true) {
     if (this.compiled) for (const k of this.compiled.keys()) if (inR(k)) this.compiled.delete(k);
     if (this.profile) for (const k of this.profile.keys()) if (inR(k)) this.profile.delete(k);
     for (const k of this.aotCalls.keys()) if (inR(k)) { this.aotCalls.delete(k); this._callTargets?.delete(k.toString()); }
@@ -1004,6 +1011,7 @@ export class LinuxEngine {
       if (ENV.OXWASM_TUTRACE) __dbg(`[tu:wat] ${entry.toString(16)} ${unit.wat.length}B ${(performance.now() - _tc0) | 0}ms`);
       if (unit.ext) { const ex = this._extents ??= new Map(); for (const [k, a, b] of unit.ext) if (a !== null) {
         ex.set(k, [a, b]);
+        if (CWVERIFY && b - a < 65536n && !(this.execRangesStatic ?? []).some(([x, y]) => a >= x && a < y)) { try { const bytes = new Uint8Array(Number(b - a)); for (let i = 0; i < bytes.length; i++) bytes[i] = Number(this.mem.read(a + BigInt(i), 1n)); (this._extSnap ??= new Map()).set(k, { a, bytes }); } catch {} }
         // An extent spanning more than WIDE_EXT_PAGES pages (a function whose blocks straddle distant regions) is NOT indexed page by
         // page: one such extent made 16.7M one-entry Sets and filled the worker's JS heap (5 GB) in a cold build. Wide extents are
         // checked linearly instead, and while any exists the "no cached code on these pages" fast path is off (see _invalidateCode).
@@ -1560,26 +1568,54 @@ export class LinuxEngine {
   // covering that page - the guest is patching its own code, which is the
   // thing the engine could not see and the reason anonymous executable memory
   // is not translatable by default.
-  _codeWrite(waddr, next) {
+  _cwVerify(why) {
+    if (!this._extSnap) return;
+    for (const [k, sn] of this._extSnap) {
+      if (!this.aotFns.has(k)) { this._extSnap.delete(k); continue; }
+      let bad = -1;
+      for (let i = 0; i < sn.bytes.length; i++) if (Number(this.mem.read(sn.a + BigInt(i), 1n)) !== sn.bytes[i]) { bad = i; break; }
+      if (bad >= 0) {
+        __dbg(`[cwverify] ${why} STALE fn=${k.toString(16)} ext=${sn.a.toString(16)}+${sn.bytes.length} first diff at +${bad} (${(sn.a + BigInt(bad)).toString(16)}) old=${Buffer.from(sn.bytes.subarray(bad, bad + 16)).toString('hex')} new=${(() => { let h = ''; for (let i = 0; i < 16; i++) h += Number(this.mem.read(sn.a + BigInt(bad + i), 1n)).toString(16).padStart(2, '0'); return h; })()} tid=${this.threads[this.ti]?.id} rip=${this.cpu.rip.toString(16)} recent writes: ${(this._cwRing ?? []).slice(-12).map((r) => r.join(':')).join(' ')}`);
+        this._extSnap.delete(k); this.stats.cwStale = (this.stats.cwStale | 0) + 1;
+      }
+    }
+  }
+  _codeWrite(waddr, next, size) {
     const g = this.base + BigInt((waddr >>> 0) - this.RAMOFF);
+    if (CWVERIFY) { if (((this._cwN = (this._cwN | 0) + 1) & 255) === 0) this._cwVerify('write'); (this._cwRing ??= []).push([g.toString(16), size, next === undefined ? '?' : BigInt.asUintN(64, next).toString(16), this._cwDisjoint(g, g + BigInt(size >>> 0 || 1)) ? 'D' : 'X']); if (this._cwRing.length > 64) this._cwRing.shift(); }
     if (this._watchArmed) { this._watchLog(g, 0, 0n, 'compiled next=' + (next === undefined ? '?' : BigInt.asUintN(64, next).toString(16))); return; }
-    const lo = g & ~4095n;
+    const n = BigInt(size >>> 0 || 1), end = g + n;
+    const lo = g & ~4095n, hi = (end + 4095n) & ~4095n;
     this.stats.codeWrites = (this.stats.codeWrites || 0) + 1;
-    this._invalidateCode(lo, lo + 4096n);
+    // Translations record the bytes they were built from, so a store that touches none of them (the JIT emitting its
+    // next function beside a thunk it already translated) changes nothing and does not make the page volatile.
+    if (!EXACT_CW_OFF && this._cwDisjoint(g, end)) { this.stats.cwDisjoint = (this.stats.cwDisjoint | 0) + 1; return; }
+    const changed = this._invalidateCode(lo, hi, EXACT_CW_OFF ? undefined : [g, end]);
+    if (!changed && !EXACT_CW_OFF) return;
     // A page that keeps being rewritten is VOLATILE: the guest is using it as
     // a scratchpad for code, and re-translating it on every patch costs more
     // than interpreting it ever will. HotSpot with C1/C2 on does exactly this,
     // and invalidate-on-every-write alone did not finish a case that takes 110
     // seconds interpreted. Past the limit the page stops being watched and
     // stops being translated, and the rest of the region carries on.
-    const n = (this._cwCount ??= new Map()).get(lo) ?? 0;
-    this._cwCount.set(lo, n + 1);
+    const cnt = (this._cwCount ??= new Map()).get(lo) ?? 0;
+    this._cwCount.set(lo, cnt + 1);
     (this._cwLast ??= new Map()).set(lo, this.stats.interpreted);
-    if (n + 1 >= CW_VOLATILE) {
+    if (cnt + 1 >= CW_VOLATILE) {
       (this._volatilePages ??= new Set()).add(lo);
       this._cwMark(lo, 0);
       this.stats.volatilePages = this._volatilePages.size;
     }
+  }
+  // True when no translation, in flight or finished, depends on a byte of [a, b).
+  _cwDisjoint(a, b) {
+    if (this._wideExt?.size) return false;
+    const p0 = a >> 12n, p1 = (b - 1n) >> 12n;
+    if (p1 - p0 > 64n) return false;
+    if (this._noExtPg) for (let q = p0; q <= p1; q++) { const st = this._noExtPg.get(q); if (st && st.size) return false; }
+    if (this._inflight) for (const u of this._inflight) if (u.funcs.some((k) => (k >> 12n) >= p0 - 1n && (k >> 12n) <= p1)) return false;
+    const hit = this._extOverlap(a, b);
+    return !hit || hit.length === 0;
   }
   // The per-page byte the guard reads. Out-of-window pages are simply not
   // representable, which is the same as not watched.
@@ -1637,12 +1673,17 @@ export class LinuxEngine {
     new Uint8Array(this.wmem.buffer).fill(0, CWMAP, CWMAP + CWMAP_PAGES);
     for (const a of this.aotFns.keys()) this._cwCover(a);
     this.mem.watchLo = lo; this.mem.watchHi = hi;
-    this.mem.watch = (addr) => { const p = addr & ~4095n; this._invalidateCode(p, p + 4096n); };
+    this.mem.watch = (addr, n) => {
+      if (CWVERIFY) (this._cwRing ??= []).push(['I' + addr.toString(16), Number(n), this.cpu.rip.toString(16), '']);
+      const end = addr + BigInt(n || 1), p = addr & ~4095n, pe = (end + 4095n) & ~4095n;
+      if (!EXACT_CW_OFF) { if (this._cwDisjoint(addr, end)) return; this._invalidateCode(p, pe, [addr, end]); return; }
+      this._invalidateCode(p, p + 4096n);
+    };
   }
 
   aotEnv() {
     return {
-      codewrite: (a, next) => this._codeWrite(a, next),
+      codewrite: (a, next, size) => this._codeWrite(a, next, size),
       loophot: (a) => this._loopHot(BigInt.asUintN(64, a)),
       // rip = guest address of the syscall instruction (an emit-time constant)
       // so a blocking syscall can suspend: state is spilled, frames unwind,
@@ -2545,6 +2586,7 @@ export class LinuxEngine {
   }
 
   syscall(cpu) {
+    if (CWVERIFY && ((this._cwSys = (this._cwSys | 0) + 1) & 7) === 0) this._cwVerify("sys");
     // shadow interp must stay side-effect free: only the idempotent, read-only syscalls run in it
     // (clock_gettime, gettimeofday, time, getpid, gettid, the uid/gid family, sched_yield) - a
     // dispatch that reads the clock was otherwise never compared, and a JS engine's handler loop
@@ -3283,7 +3325,7 @@ export class LinuxEngine {
         if (ENV.OXWASM_DUMPMEM && this._ctor?.argv?.[0]?.includes('opencode')) { try { for (const spec of ENV.OXWASM_DUMPMEM.split(';')) { const [ah, lh, file] = spec.split(':'); const at = BigInt('0x' + ah), len = parseInt(lh, 16); const out = new Uint8Array(len); for (let i = 0; i < len; i++) out[i] = Number(this.mem.read(at + BigInt(i), 1n)); process.getBuiltinModule('node:fs').writeFileSync(file, out); } } catch (e) { console.error('[dumpmem]', e.message); } }   // ';' separates several address:length:file ranges
         if (this._mmapStat) { const ms = this._mmapStat; console.error(`[mmapstat] mmap n=${ms.mmapN} ${ms.mmapB >> 20n}MB munmap n=${ms.munmapN} ${ms.munmapB >> 20n}MB mremap=${ms.mremapN} mmapNext=${this.mmapNext?.toString(16)} base=${this._mmapBase?.toString(16)} holes=${this._mmapHoles?.length} holeMB=${(this._mmapHoles ?? []).reduce((t, [l, h]) => t + (h - l), 0n) >> 20n} bySize=${[...ms.bySize].sort((x, y) => y[1] - x[1]).slice(0, 14).map(([k, v]) => k + 'x' + v).join(' ')}`); }
         if (ENV.OXWASM_SCTRACE && this._sct?.length) { process.getBuiltinModule('node:fs').appendFileSync(ENV.OXWASM_SCTRACE, this._sct.join('\n') + '\n'); this._sct.length = 0; }
-        if (ENV.OXWASM_IHIST && globalThis.__ihist && this._ctor?.argv?.[0]?.includes(ENV.OXWASM_IHIST)) { const b = new Map(); for (const [k, v] of globalThis.__ihist) { const kk = (BigInt(k) >> 6n << 6n).toString(16); b.set(kk, (b.get(kk) || 0) + v); } console.error('[ihist] ' + [...b].sort((x, y) => y[1] - x[1]).slice(0, 60).map(([k, v]) => k + '=' + v).join(' ')); }
+        if (ENV.OXWASM_IHIST && globalThis.__ihist && this._ctor?.argv?.[0]?.includes(ENV.OXWASM_IHIST)) { const b = new Map(); for (const [k, v] of globalThis.__ihist) { const kk = (BigInt(k) >> 6n << 6n).toString(16); b.set(kk, (b.get(kk) || 0) + v); } __dbg('[ihist] ' + [...b].sort((x, y) => y[1] - x[1]).slice(0, 60).map(([k, v]) => k + '=' + v).join(' ')); }
         if (this.calloutLog && ENV.OXWASM_STATS && this._ctor?.argv?.[0]?.includes(ENV.OXWASM_STATS)) console.error('[callouts] ' + [...this.calloutLog].sort((x, y) => y[1] - x[1]).slice(0, 30).map(([k, v]) => k + ' x' + v).join(' | '));
         if (this.deoptLog && ENV.OXWASM_STATS && this._ctor?.argv?.[0]?.includes(ENV.OXWASM_STATS)) console.error('[deopts] ' + [...this.deoptLog].sort((x, y) => y[1] - x[1]).slice(0, 40).map(([k, v]) => k.toString(16) + ' x' + v).join(' '));
         if (ENV.OXWASM_STATS && this._ctor?.argv?.[0]?.includes(ENV.OXWASM_STATS)) console.error('[aotfail] ' + this.hotFailures(30).slice(0, 40).map((f) => f.addr.toString(16) + ' x' + f.calls + ' ' + f.why).join(' | '));
@@ -5052,6 +5094,7 @@ export class LinuxEngine {
   // from the file); shared mappings keep their pages, they hold dirty data
   // this engine writes back lazily.
   _madvDontneed(lo, hi) {
+    if (CWVERIFY) (this._cwRing ??= []).push(['madv' + lo.toString(16), Number(hi - lo), '', '']);
     const off0 = Number(lo - this.base), off1 = Number(hi - this.base);
     if (off0 < 0 || off1 > this.ram.length || off1 <= off0) return;
     const over = (this.maps || []).filter(m => m.at < hi && m.at + m.len > lo);

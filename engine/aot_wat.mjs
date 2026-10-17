@@ -1943,6 +1943,29 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   const nmask = (e, bits) => cleanBits(e) <= bits
     ? e : `(i64.and ${e} (i64.const 0x${((1n << BigInt(bits)) - 1n).toString(16).toUpperCase()}))`;
   let usesGa = false;                 // a guarded store needs an i32 local for the address
+  // A store into guest memory that may be generated code: one unsigned subtract and compare against a window the engine
+  // owns. The address is computed once into a local so the guard and the store share it, which keeps the evaluation
+  // order the unguarded form already has: address first, then the value. `size` is the byte count written, so the engine
+  // can tell a store beside translated code (the JIT emitting its next function) from one into it. Outer test first and
+  // alone: with an empty window the page index would be enormous and the byte load would trap rather than answer false.
+  const gstore = (addr, size, next, mk) => {
+    if (!STOREGUARD) return mk(addr);
+    usesGa = true;
+    return `(local.set $ga ${addr}) ` +
+           `(local.set $gp (i32.sub (local.get $ga) (i32.load (i32.const ${CWLO_SLOT})))) ` +
+           `(if (i32.lt_u (local.get $gp) (i32.load (i32.const ${CWLEN_SLOT}))) ` +
+           `(then (if (i32.load8_u (i32.add (i32.const ${CWMAP}) (i32.shr_u (local.get $gp) (i32.const 12)))) ` +
+           `(then (call $x_cw (local.get $ga) (i64.const ${next === undefined ? 0 : next}) (i32.const ${size})))))) ` +
+           mk('(local.get $ga)');
+  };
+  // The same for a run of `len` bytes (rep movs/stos, bulk copy): any overlap with the window reports the whole range.
+  const gstoreRange = (addr, len, next) => {
+    if (!STOREGUARD) return '';
+    usesGa = true;
+    return `(local.set $ga ${addr}) ` +
+           `(if (i32.lt_u (i32.sub (local.get $ga) (i32.load (i32.const ${CWLO_SLOT}))) (i32.add (i32.load (i32.const ${CWLEN_SLOT})) ${len})) ` +
+           `(then (call $x_cw (local.get $ga) (i64.const ${next === undefined ? 0 : next}) ${len}))) `;
+  };
   const wr = (op, size, expr, next) => {
     if (op.kind === 'reg') {
       if (isI32(op.r)) {
@@ -1962,15 +1985,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     // address is computed once into a local so the guard and the store share
     // it, which keeps the evaluation order the unguarded form already has:
     // address first, then the value.
-    usesGa = true;
-    // Outer test first and alone: with an empty window the page index would
-    // be enormous and the byte load would trap rather than answer false.
-    return `(local.set $ga ${wasmAddr(op, next)}) ` +
-           `(local.set $gp (i32.sub (local.get $ga) (i32.load (i32.const ${CWLO_SLOT})))) ` +
-           `(if (i32.lt_u (local.get $gp) (i32.load (i32.const ${CWLEN_SLOT}))) ` +
-           `(then (if (i32.load8_u (i32.add (i32.const ${CWMAP}) (i32.shr_u (local.get $gp) (i32.const 12)))) ` +
-           `(then (call $x_cw (local.get $ga) (i64.const ${next === undefined ? 0 : next})))))) ` +
-           `(${ST[size]} (local.get $ga) ${expr})`;
+    return gstore(wasmAddr(op, next), size, next, (a) => `(${ST[size]} ${a} ${expr})`);
   };
   const ALU = { add:'i64.add', sub:'i64.sub', and:'i64.and', or:'i64.or', xor:'i64.xor' };
   const ALU32 = { add:'i32.add', sub:'i32.sub', and:'i32.and', or:'i32.or', xor:'i32.xor' };
@@ -2099,8 +2114,8 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     const dst = `(local.get ${xreg(xr)})`;
     const put = (e) => L.push(setx(xr, e));
     const storeRm = (bytes, e) => { if (rm.kind === 'xmm') L.push(setx(rm.r, e));
-      else if (bytes === 16) L.push(`(v128.store ${wasmAddr(rm, next)} ${e})`);
-      else L.push(`(${ {4:'v128.store32_lane',8:'v128.store64_lane'}[bytes] } 0 ${wasmAddr(rm, next)} ${e})`); };   // (storeN_lane LANE addr value)
+      else if (bytes === 16) L.push(gstore(wasmAddr(rm, next), 16, next, (a) => `(v128.store ${a} ${e})`));
+      else L.push(gstore(wasmAddr(rm, next), bytes, next, (a) => `(${ {4:'v128.store32_lane',8:'v128.store64_lane'}[bytes] } 0 ${a} ${e})`)); };   // (storeN_lane LANE addr value)
     if (LANE_BIN[op] && op !== 0xEF && op !== 0xDB && op !== 0xEB && op !== 0x57 && op !== 0x54 && op !== 0x56) {
       put(`(${LANE_BIN[op]} ${dst} ${xv(rm, next)})`); return; }
     switch (op) {
@@ -2138,7 +2153,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       case 0x16:
         if (insn.pF3) { const v = xv(rm, next); put(`(i8x16.shuffle 4 5 6 7 4 5 6 7 12 13 14 15 12 13 14 15 ${v} ${v})`); break; }   // movshdup: lanes [1,1,3,3]
         put(`(i64x2.replace_lane 1 ${dst} ${rm.kind==='xmm'?xlo(rm,next):`(i64.load ${wasmAddr(rm,next)})`})`); break;  // movhps load high
-      case 0x17: L.push(`(v128.store64_lane 1 ${wasmAddr(rm, next)} ${dst})`); break;   // movhps store high (lane, addr, value)
+      case 0x17: L.push(gstore(wasmAddr(rm, next), 8, next, (a) => `(v128.store64_lane 1 ${a} ${dst})`)); break;   // movhps store high (lane, addr, value)
       case 0x6E:                                                              // movd/movq gpr/mem -> xmm (zero upper)
         if (insn.W) put(`(i64x2.replace_lane 0 ${ZERO} ${rm.kind==='xmm'?rd({kind:'reg',r:rm.r,size:8},8,next):`(i64.load ${wasmAddr(rm,next)})`})`);
         else put(`(i32x4.replace_lane 0 ${ZERO} ${rm.kind==='xmm'?rd32({kind:'reg',r:rm.r,size:4},next):`(i32.load ${wasmAddr(rm,next)})`})`);
@@ -2147,8 +2162,8 @@ function emitUnitFunction(a0, fnAddr, ctx) {
         if (insn.pF3) put(`(i64x2.replace_lane 0 ${ZERO} ${xlo(rm, next)})`); // movq xmm<-xmm/m64, zero upper
         else if (rm.kind === 'xmm') L.push(insn.W ? wr({kind:'reg',r:rm.r,size:8},8,`(i64x2.extract_lane 0 ${dst})`,next)
                                                   : wr32reg(rm.r, `(i32x4.extract_lane 0 ${dst})`));
-        else L.push(insn.W ? `(i64.store ${wasmAddr(rm,next)} (i64x2.extract_lane 0 ${dst}))`
-                           : `(i32.store ${wasmAddr(rm,next)} (i32x4.extract_lane 0 ${dst}))`);
+        else L.push(gstore(wasmAddr(rm, next), insn.W ? 8 : 4, next, (a) => insn.W ? `(i64.store ${a} (i64x2.extract_lane 0 ${dst}))`
+                                                                                  : `(i32.store ${a} (i32x4.extract_lane 0 ${dst}))`));
         break;
       case 0xC2: {                                                            // cmpps/pd/ss/sd: predicate -> lane masks
         const dbl = insn.pF2 || insn.p66, scalar = insn.pF3 || insn.pF2;
@@ -3478,15 +3493,17 @@ function emitUnitFunction(a0, fnAddr, ctx) {
             // up written - the value is a constant from al, not memory - so
             // backward only moves the range's base and the sign of the rdi
             // update.
+            L.push(gstoreRange(`(i32.add (i32.wrap_i64 ${lo(7)}) (i32.const ${woffc}))`, `(i32.wrap_i64 (local.get $r1))`, next));
             L.push(`(memory.fill (i32.add (i32.wrap_i64 ${lo(7)}) (i32.const ${woffc})) (i32.wrap_i64 (i64.and (local.get $r0) (i64.const 0xFF))) (i32.wrap_i64 (local.get $r1)))`);
             L.push(`(local.set $r7 (i64.add (local.get $r7) (i64.mul (local.get $r1) ${step})))`, `(local.set $r1 (i64.const 0))`);
           } else if (insn.rep) {                                             // strided: wasm loop
             const e = '$se_'+insn.rip.toString(16), lp = '$sl_'+insn.rip.toString(16);
+            L.push(gstoreRange(`(i32.add (i32.wrap_i64 ${lo(7)}) (i32.const ${woffc}))`, `(i32.mul (i32.wrap_i64 (local.get $r1)) (i32.const ${S}))`, next));
             L.push(`(block ${e} (loop ${lp} (br_if ${e} (i64.eqz (local.get $r1)))`,
                    `(${ST[S]} ${wasmAddr({base:7,index:-1,disp:0n},next)} ${rd({kind:'reg',r:0,size:S},S,next)})`,
                    `(local.set $r7 (i64.add (local.get $r7) ${step})) (local.set $r1 (i64.sub (local.get $r1) (i64.const 1))) (br ${lp})))`);
           } else {
-            L.push(`(${ST[S]} ${wasmAddr({base:7,index:-1,disp:0n},next)} ${rd({kind:'reg',r:0,size:S},S,next)})`,
+            L.push(gstore(wasmAddr({base:7,index:-1,disp:0n},next), S, next, (a) => `(${ST[S]} ${a} ${rd({kind:'reg',r:0,size:S},S,next)})`),
                    `(local.set $r7 (i64.add (local.get $r7) ${step}))`);
           }
           break; }
@@ -3504,6 +3521,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
             // run time and take the exact loop when it holds; the interpreter
             // has always made the same distinction.
             const d = T(), e = '$moe_'+insn.rip.toString(16), lp = '$mol_'+insn.rip.toString(16);
+            L.push(gstoreRange(`(i32.add (i32.wrap_i64 ${lo(7)}) (i32.const ${woffc}))`, `(i32.wrap_i64 (local.get $r1))`, next));
             L.push(`(local.set ${d} ${away(7, 6)})`);
             L.push(`(if (i32.and (i64.ne (local.get ${d}) (i64.const 0)) (i64.lt_u (local.get ${d}) (local.get $r1)))`,
                    `  (then (block ${e} (loop ${lp} (br_if ${e} (i64.eqz (local.get $r1)))`,
@@ -3515,11 +3533,12 @@ function emitUnitFunction(a0, fnAddr, ctx) {
                    `        (local.set $r1 (i64.const 0))))`);
           } else if (insn.rep) {
             const e = '$me_'+insn.rip.toString(16), lp = '$ml_'+insn.rip.toString(16);
+            L.push(gstoreRange(`(i32.add (i32.wrap_i64 ${lo(7)}) (i32.const ${woffc}))`, `(i32.mul (i32.wrap_i64 (local.get $r1)) (i32.const ${S}))`, next));
             L.push(`(block ${e} (loop ${lp} (br_if ${e} (i64.eqz (local.get $r1)))`,
                    `(${ST[S]} ${wasmAddr({base:7,index:-1,disp:0n},next)} (${LD[S]} ${wasmAddr({base:6,index:-1,disp:0n},next)}))`,
                    `(local.set $r6 (i64.add (local.get $r6) ${step})) (local.set $r7 (i64.add (local.get $r7) ${step})) (local.set $r1 (i64.sub (local.get $r1) (i64.const 1))) (br ${lp})))`);
           } else {
-            L.push(`(${ST[S]} ${wasmAddr({base:7,index:-1,disp:0n},next)} (${LD[S]} ${wasmAddr({base:6,index:-1,disp:0n},next)}))`,
+            L.push(gstore(wasmAddr({base:7,index:-1,disp:0n},next), S, next, (a) => `(${ST[S]} ${a} (${LD[S]} ${wasmAddr({base:6,index:-1,disp:0n},next)}))`),
                    `(local.set $r6 (i64.add (local.get $r6) ${step}))`, `(local.set $r7 (i64.add (local.get $r7) ${step}))`);
           }
           break; }
@@ -4459,7 +4478,7 @@ export function compileUnitWat(mem, entry, opts = {}) {
   wat += '  (import "env" "loophot" (func $x_loophot (param i64)))\n';   // a loop head that ran long without a unit of its own (see FTLOOP)
   // Only when the guard is on, so a module built without it keeps exactly the
   // imports every existing consumer supplies.
-  if (STOREGUARD) wat += '  (import "env" "codewrite" (func $x_cw (param i32 i64)))\n';   // (address, guest rip after the storing instruction)
+  if (STOREGUARD) wat += '  (import "env" "codewrite" (func $x_cw (param i32 i64 i32)))\n';   // (address, guest rip after the storing instruction)
   // the global dispatch table + its in-wasm resolver, iff some site chains
   // through it (indirect call, out-of-unit static call, indirect tail jump)
   const tf0 = PHASE ? performance.now() : 0;
