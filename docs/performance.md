@@ -1234,3 +1234,14 @@ own dispatch table, ~0.5 MB at 20,000 entries): a cold build makes one instance 
 linearly with units until the container or the worker limit is hit. Bundled caches (a few dozen linked modules) do not pay it,
 which is why b92eb runs in ~7 GB. So the cold-build problem is the instance count, and the fix is to bundle as units are produced
 (link new units into a rolling bundle module instead of instantiating each separately), not a leak or a tier-up problem.
+
+### The cold-build memory is 256 KB pages, not per-unit instances (and the rolling-bundle idea did not change it)
+
+Round 2 of a rolling cold build (coldbuild.sh in the scratchpad: build, link the units into bundles with tools/bundle-units.mjs,
+restart) started from 2,243 bundled units and still reached 10.2 GB resident within 2 minutes with only 13 new units. So the
+per-instance dispatch-table explanation above is not the main cost. /proc/<pid>/smaps of that process: 21,902 mappings of exactly
+256 KB (rw-p), 5.5 GB resident; everything else is small. 256 KB is V8's heap page size, so the memory is V8-managed pages (JS heap
+or similar), about 5.5 GB of them, right at the 6 GB worker limit. They appear after the tier-up phase and without syscalls,
+interpretation or deopt-hook activity (OXWASM_HEAPPROF=<MB>, a same-thread sampling heap profiler triggered from the deopt hook,
+never fired in a 4-minute run, so no JS code is running while they grow). What allocates them is still unidentified; tools:
+OXWASM_MEMLOG (process memory + biggest mappings), OXWASM_SYSHIST, OXWASM_TUTRACE, and the smaps histogram script described here.

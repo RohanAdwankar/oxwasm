@@ -4,6 +4,7 @@
 // tier-0 interpreter, with the tiering JIT compiling hot loops. The binary
 // is normal compiler output (musl/glibc static); nothing about it is
 // adapted for this engine.
+import { Session as __InspSession } from 'node:inspector';
 import { CPU, Memory } from './interp.mjs';
 import { compileLoop } from './jit2.mjs';
 import { compileVectorLoop } from './jitsimd.mjs';
@@ -24,6 +25,24 @@ if (ENV.OXWASM_IHIST) globalThis.__ihist = new Map();   // sampled histogram of 
 const pageOf = (k) => (typeof k === 'bigint' ? k : BigInt(k)) >> 12n;
 class PagedMap extends Map { constructor(pages) { super(); this.pages = pages; } set(k, v) { this.pages.add(pageOf(k)); return super.set(k, v); } }
 class PagedSet extends Set { constructor(pages) { super(); this.pages = pages; } add(k) { this.pages.add(pageOf(k)); return super.add(k); } }
+// OXWASM_HEAPPROF=<MB>: V8 sampling heap profiler (live bytes by allocation site). Started at the first deopt, dumped once when the JS heap passes <MB>.
+// Inspector sessions on the same thread answer synchronously, so this works while the worker never returns to its event loop.
+let __hp = null;
+function __heapProfCheck() {
+  const lim = +ENV.OXWASM_HEAPPROF; if (!lim) return;
+  if (__hp === null) { __hp = { session: null, dumped: false, n: 0 }; try { const ss = new __InspSession(); ss.connect(); ss.post('HeapProfiler.enable'); ss.post('HeapProfiler.startSampling', { samplingInterval: 262144 }); __hp.session = ss; } catch (e) { console.error('[heapprof] start failed', e.message); } return; }
+  if (__hp.dumped || !__hp.session) return;
+  if ((++__hp.n & 0xFFF) !== 0) return;
+  if (process.memoryUsage().heapUsed < lim * 1048576) return;
+  __hp.dumped = true;
+  __hp.session.post('HeapProfiler.getSamplingProfile', (err, res) => {
+    if (err) { console.error('[heapprof] failed', err.message); return; }
+    const agg = new Map(); const walk = (n) => { const cf = n.callFrame, k = (cf.functionName || '(anon)') + ' ' + cf.url.split('/').slice(-2).join('/') + ':' + cf.lineNumber; if (n.selfSize) agg.set(k, (agg.get(k) || 0) + n.selfSize); for (const c of n.children || []) walk(c); };
+    walk(res.profile.head);
+    const top = [...agg].sort((a, b) => b[1] - a[1]).slice(0, 14).map(([k, v]) => `${(v / 1048576) | 0}MB ${k}`);
+    console.error('[heapprof] heap=' + ((process.memoryUsage().heapUsed / 1048576) | 0) + 'MB live by site: ' + top.join(' | '));
+  });
+}
 const RIPSAMPLE = typeof process !== 'undefined' && ENV.OXWASM_RIPSAMPLE ? Number(ENV.OXWASM_RIPSAMPLE) : 0;   // power of two minus one: sample the interpreter's rip every N steps
 const CHURN = typeof process !== 'undefined' && ENV.OXWASM_CHURN === '1';
 const DISPSTAT = typeof process !== 'undefined' && ENV.OXWASM_DISPSTAT === '1';
@@ -1790,6 +1809,7 @@ export class LinuxEngine {
       // Profile the landing so an indirect jump that only runs inside AOT code
       // (a compiled trampoline, a jump table) still tiers up its target.
       deopt: (rip, _rsp0) => {
+        if (ENV.OXWASM_HEAPPROF) __heapProfCheck();
         if (DISPRING) this._dr('deopt', BigInt.asUintN(64, rip), _rsp0 === undefined ? 0n : BigInt.asUintN(64, _rsp0));
         if (this._loopHotSeen?.has(BigInt.asUintN(64, rip))) this.stats.loopYieldNested = (this.stats.loopYieldNested || 0) + 1;   // a nested frame's yield arrives as a deopt to a loop head
         const t = BigInt.asUintN(64, rip);
