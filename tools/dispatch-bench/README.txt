@@ -7,3 +7,4 @@ full   = current emitted protocol: spill 5 regs, depth counter, fuel, hash probe
 min    = spill 5 regs + return_call_indirect
 params = registers passed as wasm params on the tail call
 sw     = one function, loop + br_table, registers in locals (the mega-unit shape)
+gen3.mjs/runbig.mjs: one br_table dispatcher with N cases (node gen3.mjs <cases> <locals> <body ops>; wat2wasm big.wat -o big.wasm; node runbig.mjs)

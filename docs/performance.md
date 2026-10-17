@@ -1092,3 +1092,19 @@ A mega10 `--version` run spent 28-62 s of its first 100-160 s in a handful of ti
 answered from the store next time (stat `failKnown`). Two successive runs with the same cache: syscalls reached in the
 200 s guest guard 13,029 -> 58,792, interpreted steps 1.0M -> 24.7M (the run goes much further), tuFails 7 -> 360 short ones.
 Each warm round gets further; it still did not finish `--version`. The engine suite (engine/test.sh) is green with this change.
+
+## The mega configuration finished `--version` once, and was slower: big single functions fall off a cliff
+
+With failures remembered (above), an 8 GB-class heap and 9000 MB limit, `opencode --version` on the mega10 cache finished for the first
+time: correct output (1.18.35), 138 s guest time, 86,874 syscalls, 4.1M interpreted steps, only 6,165 deopts (against 165k
+on the per-handler cache). The worker CPU profile of that run: 104 s of 183 s in the compiled code (js-to-wasm), against
+41 s for the per-handler cache, so the compiled mega code is about 2.5x slower in aggregate, not faster. Earlier runs on this
+cache ran out of worker heap or sat in one synchronous tier-up (root 0x143be2e, the log shows `[tu>]` with no `[tu<]`
+or `[tu:wat]`, so the time is inside compileUnitWat; set OXWASM_TUTRACE=1 to see this).
+
+Why: the same br_table dispatch loop (tools/dispatch-bench/gen3.mjs, 16 locals, 8 ops per case) gets slower as the one
+function grows:  64 cases (3 KB) 1.85 ns/dispatch, 512 cases (49 KB) 2.6, 2,048 cases (196 KB) 3.25, 8,192 cases (786 KB)
+11.9. The largest units in the mega10 cache are 1.0-1.4 MB of wasm, past that cliff. So the per-dispatch win of one
+function (8.3x over the current table-chained protocol at 64 cases) is lost when the function is too large for V8 to
+optimise well. Next: split the dispatch region into several functions of about 150 KB each, joined by tail calls only
+where control crosses a partition, and re-measure on a warm cache.

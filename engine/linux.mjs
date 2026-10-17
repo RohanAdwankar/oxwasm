@@ -918,6 +918,7 @@ export class LinuxEngine {
     if (this._cwCover(entry)) { this.stats.volatileSkips = (this.stats.volatileSkips | 0) + 1; return; }   // not a failure: the page is trusted again once it has been quiet (CW_QUIET)
     const _tc0 = performance.now();
     const _unitEx = this.unitStore ? this._unitExeId() : null, _unitRs = this._exeRanges;
+    if (ENV.OXWASM_TUTRACE) console.error(`[tu>] ${entry.toString(16)} t=${(_tc0 | 0)} heap=${(process.memoryUsage().heapUsed / 1048576) | 0}MB`);
     // a giant root deferred by the size gate in an earlier run: its size was kept beside the cached units, so the
     // gate can answer without analysing the whole function again
     if (SIZEGATE && this._gateCalls && _unitEx && this.unitStore.getSize) {
@@ -973,6 +974,7 @@ export class LinuxEngine {
         // closure texts — child engines cap the unit size and chain instead
         ...(this.unitMaxFuncs ? { maxFuncs: this.unitMaxFuncs } : {}),
         ...(this.unitMaxInsns ? { maxInsns: this.unitMaxInsns } : {}) });
+      if (ENV.OXWASM_TUTRACE) console.error(`[tu:wat] ${entry.toString(16)} ${unit.wat.length}B ${(performance.now() - _tc0) | 0}ms`);
       if (unit.ext) { const ex = this._extents ??= new Map(); for (const [k, a, b] of unit.ext) if (a !== null) {
         ex.set(k, [a, b]); const ep = this._extPages ??= new Map();
         for (let q = a >> 12n; q <= (b - 1n) >> 12n; q++) { this.codePages.add(q); let st = ep.get(q); if (!st) ep.set(q, st = new Set()); st.add(k); } } }
@@ -1026,6 +1028,7 @@ export class LinuxEngine {
         });
         return;
       }
+      if (ENV.OXWASM_TUTRACE) console.error(`[tu:asm] ${entry.toString(16)} start`);
       const bytes = this.assembleWat(unit.wat);
       this._unitBytesDone(k, bytes, unit);   // manifest capture: entry -> compiled wasm
       // asyncCompile (browser): hand the bytes to the engine's off-thread
@@ -1061,7 +1064,7 @@ export class LinuxEngine {
       this.aotFailed.add(k);
       this.noteAotFail(entry, e.message);
       if (_dt > 1000 && _unitEx && this.unitStore.putFail) this.unitStore.putFail(_unitEx, k.toString(16), e.message);   // long, deterministic-looking failure: do not repeat it next run
-    } finally { if (t0c) this.tierMs += performance.now() - t0c; this.stats.tuTotalMs = (this.stats.tuTotalMs || 0) + (performance.now() - _tc0); }
+    } finally { if (ENV.OXWASM_TUTRACE) console.error(`[tu<] ${entry.toString(16)} ${(performance.now() - _tc0) | 0}ms heap=${(process.memoryUsage().heapUsed / 1048576) | 0}MB`); if (t0c) this.tierMs += performance.now() - t0c; this.stats.tuTotalMs = (this.stats.tuTotalMs || 0) + (performance.now() - _tc0); }
   }
 
   // GPRs at 0..127, fs base at 128, the 16 xmm registers at 256..511 (16B
