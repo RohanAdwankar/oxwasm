@@ -1281,3 +1281,5 @@ breakdown showed ~60 mappings of ~64 MB (glibc per-thread arenas, ~3 GB resident
 compile threads and the worker allocate zone memory in separate arenas that never return to the OS.
 Run with MALLOC_ARENA_MAX=2 and the same cold build completes in one run: rc=0, 173 s, 4133 AOT units, peak RSS ~9 GB
 (was killed at 13.7 GB). Set it in the environment of the node process that hosts the sandbox (it cannot be set from inside).
+A cache rebuilt from nothing under MALLOC_ARENA_MAX=2 (cold18: bundled, hinted at 20 KB) gives STEADY 388 ms best of rounds 15..29 (median ~740 ms)
+against native 43 ms, i.e. 9x: same as the earlier cache, so cold rebuilds now reproduce and emitter changes can be A/B tested end to end.
