@@ -1108,3 +1108,12 @@ function grows:  64 cases (3 KB) 1.85 ns/dispatch, 512 cases (49 KB) 2.6, 2,048 
 function (8.3x over the current table-chained protocol at 64 cases) is lost when the function is too large for V8 to
 optimise well. Next: split the dispatch region into several functions of about 150 KB each, joined by tail calls only
 where control crosses a partition, and re-measure on a warm cache.
+
+### The size cliff is mostly V8 tiering (OXWASM_NODYNTIER=1)
+
+The 8,192-case dispatcher (786 KB) runs at 11.3 ns/dispatch under default flags, 4.7 with --no-liftoff, and 2.9 with
+--no-liftoff --no-wasm-dynamic-tiering (the 64-case function: 1.85). A dispatch loop never returns, and wasm has no OSR, so
+a function stuck on baseline code stays there. `OXWASM_NODYNTIER=1` (sdk/index.mjs) adds --no-wasm-dynamic-tiering to
+OXWASM_NOLIFTOFF. On the real workload: bundled per-handler cache `--version` 37 s -> 38 s (no change, small units);
+mega10 cache 138 s -> 117 s guest. So tiering explains part of the mega slowdown (~15%), not all: the mega configuration
+is still ~3x slower than the per-handler cache (translation was 0.34 s here, so this is execution of the mega code).

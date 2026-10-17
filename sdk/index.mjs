@@ -13,6 +13,8 @@ import v8 from 'node:v8';
 // spends about 2 GB on one multi-MB interpreter unit where TurboFan spends 0.4 GB, and that
 // transient is what takes a 16 GB host over the edge while a large guest warms up.
 if (process.env.OXWASM_NOLIFTOFF === '1') v8.setFlagsFromString('--no-liftoff');
+// OXWASM_NODYNTIER=1: no dynamic tiering either (with NOLIFTOFF every function is compiled once, fully optimised, and not recompiled)
+if (process.env.OXWASM_NODYNTIER === '1') v8.setFlagsFromString('--no-wasm-dynamic-tiering');
 import { ProcessWorker } from './isolated.mjs';
 import { CACHE_DIR } from './image.mjs';
 import { randomBytes } from 'node:crypto';
