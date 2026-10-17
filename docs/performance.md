@@ -1283,3 +1283,6 @@ Run with MALLOC_ARENA_MAX=2 and the same cold build completes in one run: rc=0, 
 (was killed at 13.7 GB). Set it in the environment of the node process that hosts the sandbox (it cannot be set from inside).
 A cache rebuilt from nothing under MALLOC_ARENA_MAX=2 (cold18: bundled, hinted at 20 KB) gives STEADY 388 ms best of rounds 15..29 (median ~740 ms)
 against native 43 ms, i.e. 9x: same as the earlier cache, so cold rebuilds now reproduce and emitter changes can be A/B tested end to end.
+NOACCT pricing probe, now possible (cold-built na1, hinted): STEADY 429 ms best (388 ms with counters). Removing the depth counter and fuel
+from every call site buys nothing end to end, so the per-dispatch protocol is not what limits steady state; the registers-as-params lever
+(same family) is therefore unlikely to matter either. Looking elsewhere (time split by tier, deopts, guest JIT churn).
