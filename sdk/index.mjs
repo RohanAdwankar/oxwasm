@@ -7,6 +7,7 @@
 // The code runs on an unmodified CPython inside a worker thread of YOUR
 // process, not on someone else's machine. Where a feature is not built, the
 // call throws `NotSupportedError` saying so; nothing is a silent no-op.
+import { readFileSync } from 'node:fs';
 import { Worker } from 'node:worker_threads';
 import v8 from 'node:v8';
 // OXWASM_NOLIFTOFF=1: compile every wasm function with TurboFan only. V8's baseline compiler
@@ -16,6 +17,9 @@ if (process.env.OXWASM_NOLIFTOFF === '1') v8.setFlagsFromString('--no-liftoff');
 // OXWASM_NODYNTIER=1: no dynamic tiering either (with NOLIFTOFF every function is compiled once, fully optimised, and not recompiled)
 if (process.env.OXWASM_NODYNTIER === '1') v8.setFlagsFromString('--no-wasm-dynamic-tiering');
 // OXWASM_V8FLAGS="--flag --flag2": any other V8 flags (diagnosis; NODE_OPTIONS does not allow V8 options)
+// OXWASM_MEMLOG=<seconds>: main-thread timer printing process-wide memory (works while the worker is busy): rss, V8 heap, external, ArrayBuffers
+if (process.env.OXWASM_MEMLOG) setInterval(() => { const m = process.memoryUsage(); console.error('[mem] rss=' + (m.rss / 1048576 | 0) + 'MB heapTotal=' + (m.heapTotal / 1048576 | 0) + 'MB external=' + (m.external / 1048576 | 0) + 'MB arrayBuffers=' + (m.arrayBuffers / 1048576 | 0) + 'MB');   try { const sm = readFileSync('/proc/self/smaps', 'utf8').split('\n'); const maps = []; let cur = null; for (const l of sm) { if (/^[0-9a-f]+-[0-9a-f]+ /.test(l)) { cur = { hdr: l.split(' ').slice(0, 2).join(' ') + ' ' + (l.split(/\s+/)[5] || ''), rss: 0 }; maps.push(cur); } else if (cur && l.startsWith('Rss:')) cur.rss = +l.split(/\s+/)[1]; } maps.sort((a, b) => b.rss - a.rss); console.error('[maps] ' + maps.slice(0, 5).map((x) => (x.rss / 1024 | 0) + 'MB ' + x.hdr).join(' | ')); } catch {}
+}, +process.env.OXWASM_MEMLOG * 1000).unref();
 if (process.env.OXWASM_V8FLAGS) for (const f of process.env.OXWASM_V8FLAGS.split(/\s+/).filter(Boolean)) v8.setFlagsFromString(f);
 import { ProcessWorker } from './isolated.mjs';
 import { CACHE_DIR } from './image.mjs';

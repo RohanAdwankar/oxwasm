@@ -1221,3 +1221,16 @@ control), after 7.7 minutes of `steady_small.js` only 1 of the 208 units had bee
 handler roots are the giant dispatch roots whose analysis and assembly is the expensive part (and whose .size/.fail
 answers were deleted too), so removing them is as bad as a cold start. An emitter experiment has to keep these units cached and
 change something that applies at load time, or be tested on a standalone module (tools/dispatch-bench), not by rebuilding them.
+
+### Where a cold build's 12 GB goes: thousands of small per-instance allocations (OXWASM_MEMLOG)
+
+OXWASM_MEMLOG=<seconds> (sdk/index.mjs) samples process-wide memory on the main thread (its own V8 heap is irrelevant: 6-104 MB) and
+prints the largest /proc/self/smaps mappings. During a cold `--version` build at 10.5 GB resident:
+  - 29,259 mappings in total; 23,485 of them anonymous rw-p, 2,887 rwx (generated code, 88 MB)
+  - the 25 mappings over 50 MB hold 3.6 GB (guest RAM is one of them: 908 MB resident of a 1 GB mapping)
+  - the 29,200 mappings of 4 MB or less hold 5.9 GB, about 200 KB each
+This is the per-instance cost measured earlier in this file (every WebAssembly.Instance that imports the shared funcref table keeps its
+own dispatch table, ~0.5 MB at 20,000 entries): a cold build makes one instance per translated unit, ~3,700 by then, so memory grows
+linearly with units until the container or the worker limit is hit. Bundled caches (a few dozen linked modules) do not pay it,
+which is why b92eb runs in ~7 GB. So the cold-build problem is the instance count, and the fix is to bundle as units are produced
+(link new units into a rolling bundle module instead of instantiating each separately), not a leak or a tier-up problem.
