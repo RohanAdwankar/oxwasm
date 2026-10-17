@@ -1083,3 +1083,12 @@ So the counters, probe and guard are 1.5x, passing registers as parameters is 2.
 loop in a single function is 8.3x per dispatch against the current protocol. (With a random bytecode stream every variant
 is misprediction-bound at 10-20 ns and the differences shrink, so real speed-ups depend on how predictable the guest's
 dispatch is.) This is the shape the mega unit takes; it is the largest measured lever on dispatch-bound guest code.
+
+## Failed giant tier-ups are remembered (mega10 warm-up)
+
+A mega10 `--version` run spent 28-62 s of its first 100-160 s in a handful of tier-ups that fail after a long analysis
+(5.7 s each for the giant dispatch roots), and repeated them on every run. A root whose translation fails after more than
+1 s of analysis is now written as `<entry>.fail` beside the unit files (unitStore.hasFail/putFail, per executable) and
+answered from the store next time (stat `failKnown`). Two successive runs with the same cache: syscalls reached in the
+200 s guest guard 13,029 -> 58,792, interpreted steps 1.0M -> 24.7M (the run goes much further), tuFails 7 -> 360 short ones.
+Each warm round gets further; it still did not finish `--version`. The engine suite (engine/test.sh) is green with this change.

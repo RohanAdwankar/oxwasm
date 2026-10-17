@@ -65,6 +65,9 @@ function makeUnitStore(cacheDir) {
     },
     // the instruction count of a function the size gate deferred: kept so a later run need not analyse it again
     getSize(ex, k) { try { return Number(readFileSync(join(root, ex, k + '.size'), 'utf8')); } catch { return undefined; } },
+    // a root whose translation failed after a long analysis: remembered so a later run does not redo the work
+    hasFail(ex, k) { try { readFileSync(join(root, ex, k + '.fail')); return true; } catch { return false; } },
+    putFail(ex, k, why) { try { const d = join(root, ex); mkdirSync(d, { recursive: true }); writeFileSync(join(d, k + '.fail'), String(why).slice(0, 200)); } catch {} },
     putSize(ex, k, n) { try { const d = join(root, ex); mkdirSync(d, { recursive: true }); writeFileSync(join(d, k + '.size'), String(n)); } catch {} },
     put(ex, k, bytes) {
       const d = join(root, ex); mkdirSync(d, { recursive: true });
