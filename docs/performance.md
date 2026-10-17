@@ -997,3 +997,12 @@ process that is already running; a short command does not reach it in these setu
 Third attempt, `debug paths` with OXWASM_HEAPMB=8192 and OXWASM_NOLIFTOFF=1 only (no extra engine flags): the guest-side
 guard killed it at 1515 s with no output, 7.5 GB resident, one worker thread near 100% CPU. So `debug paths` has not
 completed on oxwasm in any of the three setups (flags on / 4 GB heap / 8 GB heap), against 0.76 s in the Firecracker VM.
+
+### Where the `debug paths` JS heap goes (OXWASM_HEAPLOG)
+
+`OXWASM_HEAPLOG=<seconds>` (sdk/worker.mjs) prints the worker's V8 heap spaces. During `debug paths` the worker's JS heap
+reaches 4.5 GB within about 3 minutes (old space ~3.0 GB, large-object space ~1.2 GB, 304 MB external buffers) and then
+stays at about 3.9 GB: it is a large fixed footprint that sits right at the default 4096 MB old-generation limit, not
+unbounded growth. That explains the OOM at the default heap, and means the 8 GB runs that did not finish were not
+memory-bound but running (one worker thread at ~100% CPU) for 25+ minutes with the interpreter idle (51 rip samples in
+4 minutes, then none). What owns the 3.9 GB is not yet identified.

@@ -7,6 +7,9 @@
 // affected.
 import { parentPort, workerData } from 'node:worker_threads';
 import { EngineHost } from './host.mjs';
+import v8 from 'node:v8';
+// OXWASM_HEAPLOG=<seconds>: print the worker's V8 heap spaces so unbounded growth shows which space it is in
+if (process.env.OXWASM_HEAPLOG) setInterval(() => { const m = process.memoryUsage(); console.error('[heap] ' + (m.heapUsed / 1048576 | 0) + 'MB used, ' + (m.arrayBuffers / 1048576 | 0) + 'MB buffers, ' + v8.getHeapSpaceStatistics().map((x) => x.space_name.replace('_space', '') + '=' + (x.space_used_size / 1048576 | 0)).join(' ')); }, +process.env.OXWASM_HEAPLOG * 1000).unref();
 
 let host = null;
 let outstanding = 0;          // requests sent to the guest and not yet closed by a done/error frame
