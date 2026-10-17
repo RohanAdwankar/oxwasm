@@ -1006,3 +1006,9 @@ stays at about 3.9 GB: it is a large fixed footprint that sits right at the defa
 unbounded growth. That explains the OOM at the default heap, and means the 8 GB runs that did not finish were not
 memory-bound but running (one worker thread at ~100% CPU) for 25+ minutes with the interpreter idle (51 rip samples in
 4 minutes, then none). What owns the 3.9 GB is not yet identified.
+
+The same ~3.9 GB JS heap appears for `opencode --version` (old space 2.9 GB, large objects 0.8 GB, steady from the first
+minute), so it is a baseline of any run with `childMemMB: 3900`, not something `debug paths` grows. With these flags
+(OXWASM_NOLIFTOFF=1, 8 GB worker heap, default cache) `--version` had also not finished after about 5 minutes, whereas
+the earlier 28 s `--version` result came from a different flag set; I have not pinned down which flag makes the
+difference.
