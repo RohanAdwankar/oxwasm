@@ -1043,3 +1043,19 @@ Translation is no longer the cost: tuTotalMs 101, unit loads from the bundle. Wh
 
 Lead for next time: make the return into a mid-function continuation not need an unwind (a compiled entry for the
 continuation reached through the shared table, or resuming the interpreter without throwing), measured on b92eb.
+
+### Correction and the real split of the 37 s startup (CPU profile of the worker, `--cpu-prof`, b92eb)
+
+Two earlier estimates in this file were wrong and are superseded:
+- Frame-gone unwinds cost 576 ms in total (3.5 us each, measured with a timer around throw -> catch), not ~16 s.
+- The interpreter is not the startup bottleneck. A run-start tier-up (compile a bounded unit at any interpreted
+  straight-line run that ends in a branch N times, including the 0x25c4f7c dispatch tail) cut interpreted steps from
+  6.0M to 2.6M and left the guest time at 37 s (tuTotalMs 81 ms). With an unbounded closure the same tier-up cost 59 s of
+  failed compiles, so the unit has to be bounded (maxInsns 64) for it to be free. Reverted: no gain.
+
+Worker CPU profile (114 s total self time including boot of the helper processes):
+- 41 s `js-to-wasm` under dispatchAot: the compiled guest code itself (tail-called functions show up as the wrapper)
+- 5.4 s syscall handling (85k syscalls, ~64 us each), 4.9 s interpreter step, 3.3 s _run1, 1.6 s GC, ~1 s translation
+So the 44x startup gap is mostly the speed of the translated code, the same thing that makes the steady-state mix 7.7x to
+16x. Closing it needs faster generated code (register file out of memory, cheaper call protocol, direct calls), not
+tier-up or deopt tweaks.
