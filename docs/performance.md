@@ -1022,3 +1022,24 @@ OXWASM_HEAPMB=6144, OXWASM_NOLIFTOFF=1) `opencode --version` finishes in 35 s gu
 
 `opencode models` on the same bundled cache (b92eb): rc=0 in 504 s guest time (555 s wall) against 3.7 s in the Firecracker VM,
 about 136x. Summary of full-command ratios against the VM on the bundled cache: `--version` 44x, `debug paths` 49x, `models` 136x.
+
+## Where `opencode --version` spends its 37 s now (bundled cache b92eb, measured)
+
+Translation is no longer the cost: tuTotalMs 101, unit loads from the bundle. What is left, from one instrumented run
+(guest 37 s, 6.0M interpreted steps, 352k compiled-unit runs, 165k deopts, 163,869 of them "frame gone"):
+
+- 62% of sampled interpreter steps (RIPSAMPLE=4095, 1500 samples) sit in one 16-instruction window, 0x25c4f7c-0x25c4fbf:
+  straight-line decode of the next opcode ending in an indirect jump (the JSC LLInt dispatch tail), reached by a guest
+  `ret` into mid-function code. About 3.7M of the 6M interpreted steps.
+- Nearly every deopt takes the frame-gone path (guest rsp above the unit's entry rsp), which unwinds with a DeoptUnwind
+  exception (~100 us each by the code's own comment: up to ~16 s of the 37 s). At those events the shared wasm depth
+  counter is 2-6 and the deopt-chain depth is 0, so there are real wasm frames below and a plain "return the rip as the
+  exit value" is not equivalent to the unwind.
+- The callout path (compiled code calling a non-compiled function) is not the source: its per-target counters total only
+  thousands of interpreted steps.
+- Tried: compiling a unit at any rip that deopts N times through the dispatch catch (OXWASM_DEOPTTIER). No effect: that
+  catch sees only a few thousand events in the opencode process; the volume is in the frame-gone branch of the deopt hook.
+  Reverted.
+
+Lead for next time: make the return into a mid-function continuation not need an unwind (a compiled entry for the
+continuation reached through the shared table, or resuming the interpreter without throwing), measured on b92eb.
