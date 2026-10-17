@@ -993,3 +993,7 @@ guard killed it at 2438 s with no output (one worker thread at ~100% CPU, 10.3 G
 (OXWASM_NOLIFTOFF=1 only), the worker ran out of JS heap at the default 4 GB after about 10 minutes. The guest runs with
 BUN_JSC_useJIT=0 in both (oc_emb.mjs sets it), so neither run was JIT-on. The 682 ms steady-state median describes a
 process that is already running; a short command does not reach it in these setups.
+
+Third attempt, `debug paths` with OXWASM_HEAPMB=8192 and OXWASM_NOLIFTOFF=1 only (no extra engine flags): the guest-side
+guard killed it at 1515 s with no output, 7.5 GB resident, one worker thread near 100% CPU. So `debug paths` has not
+completed on oxwasm in any of the three setups (flags on / 4 GB heap / 8 GB heap), against 0.76 s in the Firecracker VM.
