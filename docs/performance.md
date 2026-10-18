@@ -1353,3 +1353,14 @@ Still open: the full mix (fib, math, objects, strings, sorting, maps, json) abor
 phase; no pair or triple of phases does it (objects+strings+json passes 5/5), five or more do. No stale translation is reported by
 OXWASM_CWVERIFY in those runs, and it is not the function table growing (OXWASM_FTAB_INIT=20000 fails the same way).
 Engine suite green.
+
+### Where the full-mix abort stands (bisect notes)
+- It needs breadth: phase pairs and the triple objects+strings+json never fail (5/5 each); sets of five or more phases abort in about
+  40% of runs at round 5-8, always inside the json phase, as raise(SIGABRT) from the main thread in a JSC string helper. JIT off,
+  stale-translation verifier, function table growth, loop yield, concurrent JIT and zero-on-free all fail to explain or cure it.
+- Vetoing the JIT function root 5a261a00 (the `strings` loop with the inline allocator) passed 6/6 once, but escaping every
+  instruction in 5a261a00-5a262400 (OXWASM_ESC_RANGES) still aborts, so that was timing, not a miscompile. A random-state
+  differential of that function (AOT vs interpreter, engine fuzz harness, 20,000 states) found no divergence.
+- Diagnostics left in: OXWASM_ESC_RANGES, OXWASM_IDLEDIAG, OXWASM_CWHIST, OXWASM_CWVERIFY, OXWASM_DUMPFN (24 KB, needs OXWASM_FNDUMP set).
+Good-case numbers now (cold23, phase-only 60-300 rounds): objects 15-18 ms, strings 9-14, sorting 35, json 23-28, fib 4, math 21,
+maps 53-73; against native baseline-JIT 3 / 2-3 / 7 / 4-5 / 1 / 3 / 8-13 that is 4x to 7x per phase.

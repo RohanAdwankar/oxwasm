@@ -63,6 +63,7 @@ const CW_VOLATILE = Number(ENV.OXWASM_CW_VOLATILE || 8);
 // cache once and the code then runs for good, and a page that stays interpreted for the life of the process is
 // a 100x tax on exactly the loops that matter.
 const CW_ALLPAGES = ENV.OXWASM_CW_ALLPAGES === '1';
+const IDLEDIAG = ENV.OXWASM_IDLEDIAG === '1';
 const CWHIST = ENV.OXWASM_CWHIST === '1';
 const CWVERIFY = ENV.OXWASM_CWVERIFY === '1';
 const EXACT_CW_OFF = ENV.OXWASM_CW_PAGE === '1';   // old behaviour: every store into a watched page drops the whole page
@@ -2629,6 +2630,11 @@ export class LinuxEngine {
     for (const x of this.threads) if (x.state === 'blk' && x.dl != null) dl = dl == null ? x.dl : Math.min(dl, x.dl);
     if (this.itimer?.at != null) dl = dl == null ? this.itimer.at : Math.min(dl, this.itimer.at);   // SIGALRM due
     this.blocked = { deadline: dl };
+    if (IDLEDIAG) {   // every thread is blocked: say on what, at most every 5 s, so a livelock/deadlock can be read from the log
+      const now = performance.now();
+      if (now - (this._idleDiagT ?? 0) > 5000) { this._idleDiagT = now;
+        __dbg(`[idle t=${now | 0}] deadline=${dl == null ? 'none' : (dl - this.nowMs()) | 0}ms ` + this.threads.map((x) => `${x.id}:${x.state}${x.futex != null ? ' futex=' + x.futex.toString(16) : ''}${x.dl != null ? ' dl=' + ((x.dl - this.nowMs()) | 0) : ''} sys=${x.lastSys ?? '?'}`).join(' | ') + ' | strace: ' + (this.strace ? this.strace.slice(-6).join(' ; ') : '-')); }
+    }
     return false;
   }
   // Has the current thread used its wall-clock quantum while a sibling is
@@ -6313,7 +6319,7 @@ export class LinuxEngine {
     }
     if (globalThis.__fnDump) { const h = BigInt(c).toString(16); if (!globalThis.__fnDump.has(h)) { globalThis.__fnDump.add(h); process.getBuiltinModule('node:fs').appendFileSync(ENV.OXWASM_FNDUMP, h + '\n'); } }
     const hx = BigInt(c).toString(16);
-    if (ENV.OXWASM_DUMPFN && ENV.OXWASM_DUMPFN.split(',').includes(hx)) { const b = new Uint8Array(0x1000); for (let i = 0; i < b.length; i++) { try { b[i] = Number(this.mem.read(BigInt(c) + BigInt(i), 1n)); } catch { break; } } process.getBuiltinModule('node:fs').writeFileSync(ENV.OXWASM_DUMPDIR + '/fn_' + hx + '.bin', b); const m = (this.maps ?? []).find((x) => BigInt(c) >= x.at && BigInt(c) < x.at + BigInt(x.len)); console.error(`[dumpfn] ${hx} map=${m ? m.path + '+0x' + (BigInt(c) - m.at + BigInt(m.fileOff ?? 0)).toString(16) : 'anon'} execRanges=${(this.execRanges ?? []).filter(([x, y]) => BigInt(c) >= x && BigInt(c) < y).map(([x, y]) => x.toString(16) + '-' + y.toString(16)).join(',')}`); }
+    if (ENV.OXWASM_DUMPFN && ENV.OXWASM_DUMPFN.split(',').includes(hx)) { const b = new Uint8Array(0x6000); for (let i = 0; i < b.length; i++) { try { b[i] = Number(this.mem.read(BigInt(c) + BigInt(i), 1n)); } catch { break; } } process.getBuiltinModule("node:fs").writeFileSync(ENV.OXWASM_DUMPDIR + "/fn_" + hx + '.bin', b); const m = (this.maps ?? []).find((x) => BigInt(c) >= x.at && BigInt(c) < x.at + BigInt(x.len)); console.error(`[dumpfn] ${hx} map=${m ? m.path + '+0x' + (BigInt(c) - m.at + BigInt(m.fileOff ?? 0)).toString(16) : 'anon'} execRanges=${(this.execRanges ?? []).filter(([x, y]) => BigInt(c) >= x && BigInt(c) < y).map(([x, y]) => x.toString(16) + '-' + y.toString(16)).join(',')}`); }
     return (this._ev ? this._ev.has(hx) : false) || (this._ea ? !this._ea.has(hx) : false);
   }
 

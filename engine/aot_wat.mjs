@@ -81,6 +81,8 @@ const WATCOMMENTS = typeof process !== 'undefined' && process.env?.OXWASM_WATCOM
 const MAXWAT = Number(process.env.OXWASM_MAXWAT || 5_000_000);
 // A computed goto with a table this wide is an interpreter's dispatch: the one kind of
 // function worth compiling whole, however large (JavaScriptCore's LLInt has 272 per site).
+// OXWASM_ESC_RANGES=lo-hi[,lo-hi] (hex guest addresses): instructions there are never translated (they escape to the interpreter) - for bisecting a miscompile
+const ESC_RANGES = typeof process !== 'undefined' && process.env?.OXWASM_ESC_RANGES ? process.env.OXWASM_ESC_RANGES.split(',').map((r) => { const [a, b] = r.split('-'); return [BigInt('0x' + a), BigInt('0x' + b)]; }) : null;
 const MEGA_SITE = Number((typeof process !== 'undefined' && process.env?.OXWASM_MEGA_SITE) || 256);
 // ... and the root has to be one of its handlers: a small function whose tail jump
 // happens to reach some unrelated big switch is not an interpreter.
@@ -536,6 +538,10 @@ export function analyze(mem, entry, { maxInsns = 20000, noJtab = false, entries 
     // and that fnstcw being an escape made it an `entry undecodable`
     // refusal - mawk ran the whole function interpreted 1,996 times.
     if (insn.mnem === 'x87' && insn.op === 0xD9 && (insn.sub === 5 || insn.sub === 7) && insn.rm) insn.mnem = 'fcw';
+    if (ESC_RANGES && ESC_RANGES.some(([lo, hi]) => rip >= lo && rip < hi) && insn.mnem !== 'ret') {   // bisect aid: this instruction runs in the interpreter
+      insnAt.set(key, { mnem: 'udec', rip, next: rip + BigInt(insn.len), len: insn.len });
+      continue;
+    }
     if (['hlt','ud2','int3','int','cpuid','loopx','fxsave','fxrstor','x87','rcl','rcr','emms','popf'].includes(insn.mnem)) {   // rcl/rcr: rare, interpreter-only
       insnAt.set(key, { mnem: 'udec', rip, next: rip + BigInt(insn.len), len: insn.len });
       continue;
