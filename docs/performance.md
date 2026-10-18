@@ -1369,3 +1369,7 @@ maps 53-73; against native baseline-JIT 3 / 2-3 / 7 / 4-5 / 1 / 3 / 8-13 that is
 Objects-only runs were bimodal: 15-18 ms, or 70-100 ms when a page holding the hot loop became volatile (four real patches) and stayed
 untranslated until 2M interpreted steps passed without a write. OXWASM_CW_QUIET=100000 (now the default; 20000 churns more) gave
 16-19 ms in 5 of 6 runs. The full seven-phase mix still aborts (3 of 4 runs at round 5-26 with the new default), so the crash is unrelated.
+
+### GC threading and the abort
+Full mix with BUN_JSC_useConcurrentGC=0 BUN_JSC_numberOfGCMarkers=1: 8 of 9 runs finished (STEADY 191, 233, 260 ms in the 30-round ones), against about 40% finishing
+with the defaults; BUN_JSC_useBaselineJITCodeSharing=0 does nothing (1 of 5). So the collector's threads are involved in the abort but not the whole story; one run still aborted at round 5.
