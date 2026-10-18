@@ -1329,3 +1329,27 @@ Phase mix (fib, math, strings, sorting, json; 200 rounds): STEADY 141 ms -> 104 
 The cache must be rebuilt (the import signature changed); engine suite green.
 The abort/hang is NOT explained by any of this: with the verifier on no stale translation is reported any more and the run still aborts at
 round 5 in about half the runs, with page-wide invalidation (OXWASM_CW_PAGE=1) as well.
+
+### The store guard: what was wrong with it, and what it costs now (objects phase 150 ms -> 15-18 ms in the good case)
+Measured with phase-only runs (`objects`, 60 rounds): the guard host call (`$x_cw`) was being made 10-20 million times per run, about the
+entire cost of the phase (150 ms per round against 15 ms with the guard off). Causes, in the order found:
+- The map marked every 4 KB page of the whole anonymous-executable range; the JIT pool shares pages with data (hash tables). The guard now
+  reads a bitmap with one bit per 64-byte line (CWBM past the end of guest RAM, base in regfile slot 176) and only lines holding bytes
+  a translation was built from are set: `compileUnitWat` returns the merged block spans per function next to the hull. Lines are
+  widened 15 bytes to the left so a store that starts just before a span and runs into it is seen. Stack (rsp/rbp-based) and fs-relative
+  stores skip the guard (OXWASM_GUARD_STACK=1 guards them).
+- Marks were never cleared: a translation that was dropped left its lines marked, so memory the pool later reused for data kept calling
+  into the engine. `_invalidateCode` now unmarks the lines no other translation covers.
+- A page that became volatile stopped being watched but its remaining translations were kept; a later patch to one of them went unseen
+  and stale code ran (found with OXWASM_CWVERIFY: a call's rel32 changed under a live translation). The transition now drops every
+  translation on the page first.
+- Static units cached before this change had no guards at all (the unit cache only gets STOREGUARD code if it was built with
+  OXWASM_STOREGUARD=1). coldbuild.sh now takes EXTRA="OXWASM_STOREGUARD=1 OXWASM_EXEC_ANON=1" and the steady runs must use a cache built that way.
+- The first version of the bitmap code walked every 64-byte line of a static function's span (megabytes) on each invalidation; spans are
+  clipped to the window first. (A cold build with the guard on took 1000+ s and did not finish before that.)
+Objects-only runs (6): no aborts, 15-18 ms in the good runs and 70-98 ms in the others (the others still make 0.2-2M host calls: a line
+shared by code and data, or a volatile page whose hot code stays interpreted).
+Still open: the full mix (fib, math, objects, strings, sorting, maps, json) aborts in about 40% of runs at round 5-8 inside the json
+phase; no pair or triple of phases does it (objects+strings+json passes 5/5), five or more do. No stale translation is reported by
+OXWASM_CWVERIFY in those runs, and it is not the function table growing (OXWASM_FTAB_INIT=20000 fails the same way).
+Engine suite green.

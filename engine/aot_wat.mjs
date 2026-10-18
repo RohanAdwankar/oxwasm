@@ -66,6 +66,8 @@ export const FCW_SLOT = 164;      // regfile slot: the x87 control word, so fnst
 // nothing else, so the price can be measured before the mechanism is designed.
 // Slots: the guarded window's base and length, and where a hit is recorded.
 export const CWLO_SLOT = 168, CWLEN_SLOT = 172;
+// Where the line bitmap lives (a wasm offset, past the end of guest RAM): one bit per 64-byte line of the window.
+export const CWBM_SLOT = 176;
 // One byte per 4K page of the guarded window, in the dead space between the
 // dispatch hash and guest RAM. A single interval could not say "this page is
 // volatile, stop watching it" without dropping its neighbours too, and a page
@@ -1948,13 +1950,18 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   // order the unguarded form already has: address first, then the value. `size` is the byte count written, so the engine
   // can tell a store beside translated code (the JIT emitting its next function) from one into it. Outer test first and
   // alone: with an empty window the page index would be enormous and the byte load would trap rather than answer false.
-  const gstore = (addr, size, next, mk) => {
+  // Stack and TLS accesses (rsp/rbp based, or fs-relative) never land in generated code, and they are most of a C++ function's
+  // stores: they skip the guard (OXWASM_GUARD_STACK=1 guards them too).
+  const GUARD_STACK = typeof process !== 'undefined' && process.env?.OXWASM_GUARD_STACK === '1';
+  const gstore = (addr, size, next, mk, op) => {
     if (!STOREGUARD) return mk(addr);
+    if (!GUARD_STACK && op && (op.fs || ((op.base === 4 || op.base === 5) && !(op.index >= 0)))) return mk(addr);
     usesGa = true;
     return `(local.set $ga ${addr}) ` +
            `(local.set $gp (i32.sub (local.get $ga) (i32.load (i32.const ${CWLO_SLOT})))) ` +
            `(if (i32.lt_u (local.get $gp) (i32.load (i32.const ${CWLEN_SLOT}))) ` +
-           `(then (if (i32.load8_u (i32.add (i32.const ${CWMAP}) (i32.shr_u (local.get $gp) (i32.const 12)))) ` +
+           `(then (if (i32.and (i32.load8_u (i32.add (i32.load (i32.const ${CWBM_SLOT})) (i32.shr_u (local.get $gp) (i32.const 9)))) ` +
+           `(i32.shl (i32.const 1) (i32.and (i32.shr_u (local.get $gp) (i32.const 6)) (i32.const 7)))) ` +
            `(then (call $x_cw (local.get $ga) (i64.const ${next === undefined ? 0 : next}) (i32.const ${size})))))) ` +
            mk('(local.get $ga)');
   };
@@ -1985,7 +1992,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     // address is computed once into a local so the guard and the store share
     // it, which keeps the evaluation order the unguarded form already has:
     // address first, then the value.
-    return gstore(wasmAddr(op, next), size, next, (a) => `(${ST[size]} ${a} ${expr})`);
+    return gstore(wasmAddr(op, next), size, next, (a) => `(${ST[size]} ${a} ${expr})`, op);
   };
   const ALU = { add:'i64.add', sub:'i64.sub', and:'i64.and', or:'i64.or', xor:'i64.xor' };
   const ALU32 = { add:'i32.add', sub:'i32.sub', and:'i32.and', or:'i32.or', xor:'i32.xor' };
@@ -2114,8 +2121,8 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     const dst = `(local.get ${xreg(xr)})`;
     const put = (e) => L.push(setx(xr, e));
     const storeRm = (bytes, e) => { if (rm.kind === 'xmm') L.push(setx(rm.r, e));
-      else if (bytes === 16) L.push(gstore(wasmAddr(rm, next), 16, next, (a) => `(v128.store ${a} ${e})`));
-      else L.push(gstore(wasmAddr(rm, next), bytes, next, (a) => `(${ {4:'v128.store32_lane',8:'v128.store64_lane'}[bytes] } 0 ${a} ${e})`)); };   // (storeN_lane LANE addr value)
+      else if (bytes === 16) L.push(gstore(wasmAddr(rm, next), 16, next, (a) => `(v128.store ${a} ${e})`, rm));
+      else L.push(gstore(wasmAddr(rm, next), bytes, next, (a) => `(${ {4:'v128.store32_lane',8:'v128.store64_lane'}[bytes] } 0 ${a} ${e})`, rm)); };   // (storeN_lane LANE addr value)
     if (LANE_BIN[op] && op !== 0xEF && op !== 0xDB && op !== 0xEB && op !== 0x57 && op !== 0x54 && op !== 0x56) {
       put(`(${LANE_BIN[op]} ${dst} ${xv(rm, next)})`); return; }
     switch (op) {
@@ -2153,7 +2160,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       case 0x16:
         if (insn.pF3) { const v = xv(rm, next); put(`(i8x16.shuffle 4 5 6 7 4 5 6 7 12 13 14 15 12 13 14 15 ${v} ${v})`); break; }   // movshdup: lanes [1,1,3,3]
         put(`(i64x2.replace_lane 1 ${dst} ${rm.kind==='xmm'?xlo(rm,next):`(i64.load ${wasmAddr(rm,next)})`})`); break;  // movhps load high
-      case 0x17: L.push(gstore(wasmAddr(rm, next), 8, next, (a) => `(v128.store64_lane 1 ${a} ${dst})`)); break;   // movhps store high (lane, addr, value)
+      case 0x17: L.push(gstore(wasmAddr(rm, next), 8, next, (a) => `(v128.store64_lane 1 ${a} ${dst})`, rm)); break;   // movhps store high (lane, addr, value)
       case 0x6E:                                                              // movd/movq gpr/mem -> xmm (zero upper)
         if (insn.W) put(`(i64x2.replace_lane 0 ${ZERO} ${rm.kind==='xmm'?rd({kind:'reg',r:rm.r,size:8},8,next):`(i64.load ${wasmAddr(rm,next)})`})`);
         else put(`(i32x4.replace_lane 0 ${ZERO} ${rm.kind==='xmm'?rd32({kind:'reg',r:rm.r,size:4},next):`(i32.load ${wasmAddr(rm,next)})`})`);
@@ -2163,7 +2170,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
         else if (rm.kind === 'xmm') L.push(insn.W ? wr({kind:'reg',r:rm.r,size:8},8,`(i64x2.extract_lane 0 ${dst})`,next)
                                                   : wr32reg(rm.r, `(i32x4.extract_lane 0 ${dst})`));
         else L.push(gstore(wasmAddr(rm, next), insn.W ? 8 : 4, next, (a) => insn.W ? `(i64.store ${a} (i64x2.extract_lane 0 ${dst}))`
-                                                                                  : `(i32.store ${a} (i32x4.extract_lane 0 ${dst}))`));
+                                                                                  : `(i32.store ${a} (i32x4.extract_lane 0 ${dst}))`, rm));
         break;
       case 0xC2: {                                                            // cmpps/pd/ss/sd: predicate -> lane masks
         const dbl = insn.pF2 || insn.p66, scalar = insn.pF3 || insn.pF2;
@@ -4522,9 +4529,14 @@ export function compileUnitWat(mem, entry, opts = {}) {
            funcs: [...texts.keys()].map(k => BigInt(k)),
            // the guest bytes each function was translated from: a patch anywhere in them stales the translation
            ext: [...texts.keys()].map(k => { let lo = null, hi = null;
+             const spans = [];
              for (const b of funcs.get(k).blocks) { const e = b.insns.length ? b.insns[b.insns.length - 1].next : b.start;
-               if (lo === null || b.start < lo) lo = b.start; if (hi === null || e > hi) hi = e; }
-             return [BigInt(k), lo, hi]; }),
+               if (lo === null || b.start < lo) lo = b.start; if (hi === null || e > hi) hi = e; spans.push([b.start, e]); }
+             // the bytes actually decoded (blocks, merged), as opposed to the hull lo..hi that also spans whatever lies between them
+             spans.sort((x, y) => (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0));
+             const merged = [];
+             for (const sp of spans) { const t = merged[merged.length - 1]; if (t && sp[0] <= t[1]) { if (sp[1] > t[1]) t[1] = sp[1]; } else merged.push([sp[0], sp[1]]); }
+             return [BigInt(k), lo, hi, merged]; }),
            poisoned: [...poisoned].map(k => BigInt(k)),
            blocks };
 }

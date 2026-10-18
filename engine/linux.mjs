@@ -11,7 +11,7 @@ import { compileLoop } from './jit2.mjs';
 import { compileVectorLoop } from './jitsimd.mjs';
 import { fnprofSlot } from './aot_wat.mjs';
 import { compileUnitWat, pltStubWat, FTMAP, FTMAP_MAX, FTENTRY, FTDLIMIT, FTFUEL, FTLOOP, FTNEST, LOOPYIELD_N,
-         FTHASH, FTHBITS, FTHMASK, FTHBYTES, CWLO_SLOT, CWLEN_SLOT, CWMAP, CWMAP_PAGES } from './aot_wat.mjs';
+         FTHASH, FTHBITS, FTHMASK, FTHBYTES, CWLO_SLOT, CWLEN_SLOT, CWBM_SLOT } from './aot_wat.mjs';
 // OXWASM_DISPSTAT=1: count the rips that HAD a compiled unit and were not
 // dispatched anyway. Off by default - it costs a map lookup per instruction.
 // the environment, where there is one: the engine also runs in a browser tab, which has no `process`
@@ -62,6 +62,8 @@ const CW_VOLATILE = Number(ENV.OXWASM_CW_VOLATILE || 8);
 // A volatile page that has gone this many interpreted steps without a write is trusted again: JSC patches an inline
 // cache once and the code then runs for good, and a page that stays interpreted for the life of the process is
 // a 100x tax on exactly the loops that matter.
+const CW_ALLPAGES = ENV.OXWASM_CW_ALLPAGES === '1';
+const CWHIST = ENV.OXWASM_CWHIST === '1';
 const CWVERIFY = ENV.OXWASM_CWVERIFY === '1';
 const EXACT_CW_OFF = ENV.OXWASM_CW_PAGE === '1';   // old behaviour: every store into a watched page drops the whole page
 const CW_QUIET = Number(ENV.OXWASM_CW_QUIET || 2_000_000);
@@ -256,7 +258,9 @@ export class LinuxEngine {
     // one contiguous guest region backed by wasm memory -> interpreter and
     // JIT share it with zero copying
     this.RAMOFF = 1 << 20;
-    const pages = Math.max(256, Math.ceil((this.RAMOFF + Number(total)) / 65536) + 16);
+    const ramPages = Math.ceil((this.RAMOFF + Number(total)) / 65536);
+    this.CWBM = ramPages * 65536;          // the store guard's line bitmap lives in the spare pages past guest RAM
+    const pages = Math.max(256, ramPages + 32);
     this.wmem = new WebAssembly.Memory({ initial: pages });
     // global dispatch table: every registered compiled function gets a slot
     // here plus a sorted (addr -> slot) entry in wasm memory at FTMAP, so
@@ -732,13 +736,15 @@ export class LinuxEngine {
     this.stats.invalSlow = (this.stats.invalSlow | 0) + 1;
     const dropped = [];
     // a translated function is stale if ANY byte it was built from changed, not only its first
+    let gone = null;
     { const hitK = this._extOverlap(exact ? exact[0] : lo, exact ? exact[1] : hi);
-      if (hitK) for (const k of hitK) { if (this.aotFns.has(k)) { this.aotFns.delete(k); hit = true; dropped.push(k); } this._extents.delete(k); this._wideExt?.delete(k); changed = true; }
+      if (hitK) for (const k of hitK) { if (this.aotFns.has(k)) { this.aotFns.delete(k); hit = true; dropped.push(k); } const sp0 = this._extSpans?.get(k); this._extents.delete(k); this._extSpans?.delete(k); this._wideExt?.delete(k); changed = true; (gone ??= []).push(sp0 || null); }
       // a unit still being assembled was built from the old bytes too, whichever page its entries sit on
       if (hitK && this._inflight) for (const u of this._inflight) if (!u.cancelled && u.funcs.some((f) => hitK.includes(f))) {
         u.cancelled = true;
         if (this._pendingFns) for (const a of u.funcs) this._pendingFns.delete(a.toString());
       } }
+    if (gone) for (const sp of gone) if (sp) for (const [x, y] of sp) this._cwUnmarkSpan(x, y);
     if (exact) {
       // a store into a page of JIT memory: only translations built from the overwritten bytes go (above), plus
       // any whose extent is unknown (they were loaded from the unit cache) by the old entry-in-page rule
@@ -1009,15 +1015,16 @@ export class LinuxEngine {
         ...(this.unitMaxFuncs ? { maxFuncs: this.unitMaxFuncs } : {}),
         ...(this.unitMaxInsns ? { maxInsns: this.unitMaxInsns } : {}) });
       if (ENV.OXWASM_TUTRACE) __dbg(`[tu:wat] ${entry.toString(16)} ${unit.wat.length}B ${(performance.now() - _tc0) | 0}ms`);
-      if (unit.ext) { const ex = this._extents ??= new Map(); for (const [k, a, b] of unit.ext) if (a !== null) {
+      if (unit.ext) { const ex = this._extents ??= new Map(); for (const [k, a, b, spans] of unit.ext) if (a !== null) {
         ex.set(k, [a, b]);
-        if (CWVERIFY && b - a < 65536n && !(this.execRangesStatic ?? []).some(([x, y]) => a >= x && a < y)) { try { const bytes = new Uint8Array(Number(b - a)); for (let i = 0; i < bytes.length; i++) bytes[i] = Number(this.mem.read(a + BigInt(i), 1n)); (this._extSnap ??= new Map()).set(k, { a, bytes }); } catch {} }
+        if (CWVERIFY && !(this.execRangesStatic ?? []).some(([x, y]) => a >= x && a < y)) { try { for (const [sx, sy] of (spans || [[a, b]])) { if (sy - sx > 65536n) continue; const v = this.mem.view(sx, sy - sx); if (v) (this._extSnap ??= new Map()).set(k + ':' + sx, { k, a: sx, bytes: Uint8Array.from(v) }); } } catch {} }
         // An extent spanning more than WIDE_EXT_PAGES pages (a function whose blocks straddle distant regions) is NOT indexed page by
         // page: one such extent made 16.7M one-entry Sets and filled the worker's JS heap (5 GB) in a cold build. Wide extents are
         // checked linearly instead, and while any exists the "no cached code on these pages" fast path is off (see _invalidateCode).
-        if ((b - 1n >> 12n) - (a >> 12n) > WIDE_EXT_PAGES) { (this._wideExt ??= new Set()).add(k); this.stats.wideExt = (this.stats.wideExt | 0) + 1; if (ENV.OXWASM_TUTRACE) __dbg(`[wide-ext] ${k} ${a.toString(16)}-${b.toString(16)} ${((b - a) >> 20n)}MB`); continue; }
+        if ((b - 1n >> 12n) - (a >> 12n) > WIDE_EXT_PAGES) { (this._wideExt ??= new Set()).add(k); this.stats.wideExt = (this.stats.wideExt | 0) + 1; if (spans) { (this._extSpans ??= new Map()).set(k, spans); for (const [x, y] of spans) this._cwMarkSpan(x, y); } else this._cwCoverAll(a); if (ENV.OXWASM_TUTRACE) __dbg(`[wide-ext] ${k} ${a.toString(16)}-${b.toString(16)} ${((b - a) >> 20n)}MB`); continue; }
         const ep = this._extPages ??= new Map();
-        for (let q = a >> 12n; q <= (b - 1n) >> 12n; q++) { this.codePages.add(q); let st = ep.get(q); if (!st) ep.set(q, st = new Set()); st.add(k); } } }
+        for (let q = a >> 12n; q <= (b - 1n) >> 12n; q++) { this.codePages.add(q); let st = ep.get(q); if (!st) ep.set(q, st = new Set()); st.add(k); }
+        if (spans) { (this._extSpans ??= new Map()).set(k, spans); for (const [x, y] of spans) this._cwMarkSpan(x, y); } else this._cwMarkSpan(a, b); } }
       if (this.onUnitWat) this.onUnitWat(un, entry, unit);
       // assembleWatAsync (browser): the assembler is 65% of the on-thread
       // tier-up cost and is a pure text -> bytes transform with no engine
@@ -1570,13 +1577,16 @@ export class LinuxEngine {
   // is not translatable by default.
   _cwVerify(why) {
     if (!this._extSnap) return;
-    for (const [k, sn] of this._extSnap) {
-      if (!this.aotFns.has(k)) { this._extSnap.delete(k); continue; }
+    for (const [kk, sn] of this._extSnap) {
+      const k = sn.k;
+      if (!this.aotFns.has(k)) { this._extSnap.delete(kk); continue; }
       let bad = -1;
+      const cur = this.mem.view(sn.a, BigInt(sn.bytes.length));
+      if (cur && Buffer.compare(cur, sn.bytes) === 0) continue;
       for (let i = 0; i < sn.bytes.length; i++) if (Number(this.mem.read(sn.a + BigInt(i), 1n)) !== sn.bytes[i]) { bad = i; break; }
       if (bad >= 0) {
         __dbg(`[cwverify] ${why} STALE fn=${k.toString(16)} ext=${sn.a.toString(16)}+${sn.bytes.length} first diff at +${bad} (${(sn.a + BigInt(bad)).toString(16)}) old=${Buffer.from(sn.bytes.subarray(bad, bad + 16)).toString('hex')} new=${(() => { let h = ''; for (let i = 0; i < 16; i++) h += Number(this.mem.read(sn.a + BigInt(bad + i), 1n)).toString(16).padStart(2, '0'); return h; })()} tid=${this.threads[this.ti]?.id} rip=${this.cpu.rip.toString(16)} recent writes: ${(this._cwRing ?? []).slice(-12).map((r) => r.join(':')).join(' ')}`);
-        this._extSnap.delete(k); this.stats.cwStale = (this.stats.cwStale | 0) + 1;
+        this._extSnap.delete(kk); this.stats.cwStale = (this.stats.cwStale | 0) + 1;
       }
     }
   }
@@ -1585,6 +1595,8 @@ export class LinuxEngine {
     if (CWVERIFY) { if (((this._cwN = (this._cwN | 0) + 1) & 255) === 0) this._cwVerify('write'); (this._cwRing ??= []).push([g.toString(16), size, next === undefined ? '?' : BigInt.asUintN(64, next).toString(16), this._cwDisjoint(g, g + BigInt(size >>> 0 || 1)) ? 'D' : 'X']); if (this._cwRing.length > 64) this._cwRing.shift(); }
     if (this._watchArmed) { this._watchLog(g, 0, 0n, 'compiled next=' + (next === undefined ? '?' : BigInt.asUintN(64, next).toString(16))); return; }
     const n = BigInt(size >>> 0 || 1), end = g + n;
+    if (CWHIST) { const h = (this._cwHist ??= new Map()); const pg = g >> 12n; h.set(pg, (h.get(pg) | 0) + 1); if ((this.stats.codeWrites + 1) % 500000 === 0) __dbg('[cwhist] ' + [...h].sort((x, y) => y[1] - x[1]).slice(0, 12).map(([k, v]) => (k << 12n).toString(16) + '=' + v).join(' ') + ' size=' + size + ' next=' + (next === undefined ? '?' : BigInt.asUintN(64, next).toString(16)));
+      if ((this.stats.codeWrites + 1) % 500000 === 0) for (const [pgk] of [...h].sort((x, y) => y[1] - x[1]).slice(0, 3)) { const lo2 = pgk << 12n; const hk = this._extOverlap(lo2, lo2 + 4096n) || []; __dbg('[cwhist] page ' + lo2.toString(16) + ' vol=' + !!this._volatilePages?.has(lo2) + ' extents: ' + hk.map((k) => { const e = this._extents.get(k); const sp = (this._extSpans?.get(k) || []).filter(([x, y]) => x < lo2 + 4096n && y > lo2).map(([x, y]) => x.toString(16) + '-' + y.toString(16)).join('|'); return k.toString(16) + '[' + e[0].toString(16) + '-' + e[1].toString(16) + ' spans ' + sp + ']'; }).join(' ')); } }
     const lo = g & ~4095n, hi = (end + 4095n) & ~4095n;
     this.stats.codeWrites = (this.stats.codeWrites || 0) + 1;
     // Translations record the bytes they were built from, so a store that touches none of them (the JIT emitting its
@@ -1603,13 +1615,13 @@ export class LinuxEngine {
     (this._cwLast ??= new Map()).set(lo, this.stats.interpreted);
     if (cnt + 1 >= CW_VOLATILE) {
       (this._volatilePages ??= new Set()).add(lo);
+      this._invalidateCode(lo, lo + 4096n);   // the page stops being watched, so nothing translated from it may survive
       this._cwMark(lo, 0);
       this.stats.volatilePages = this._volatilePages.size;
     }
   }
   // True when no translation, in flight or finished, depends on a byte of [a, b).
   _cwDisjoint(a, b) {
-    if (this._wideExt?.size) return false;
     const p0 = a >> 12n, p1 = (b - 1n) >> 12n;
     if (p1 - p0 > 64n) return false;
     if (this._noExtPg) for (let q = p0; q <= p1; q++) { const st = this._noExtPg.get(q); if (st && st.size) return false; }
@@ -1617,17 +1629,60 @@ export class LinuxEngine {
     const hit = this._extOverlap(a, b);
     return !hit || hit.length === 0;
   }
-  // The per-page byte the guard reads. Out-of-window pages are simply not
-  // representable, which is the same as not watched.
-  _cwMark(page, on) {
-    if (!STOREGUARD || !this.wmem) return;
+  // The guard reads one bit per 64-byte line of the window, at CWBM. Out-of-window lines are simply not representable, which is the
+  // same as not watched. Lines are widened 15 bytes to the left so a store that starts in the line before a span and runs into it
+  // (stores are at most 16 bytes) is still seen.
+  // [x, y) clipped to the guarded window, in guest addresses (null when disjoint): spans of static code are huge and never watched
+  _cwClip(x, y) {
     const dv = new DataView(this.wmem.buffer);
     const lo = dv.getUint32(CWLO_SLOT, true), len = dv.getUint32(CWLEN_SLOT, true);
-    const off = this.RAMOFF + Number(page - this.base) - lo;
+    if (len === 0) return null;
+    const wlo = this.base + BigInt(lo - this.RAMOFF), whi = wlo + BigInt(len);
+    const a = x > wlo ? x : wlo, b = y < whi ? y : whi;
+    return a < b ? [a, b] : null;
+  }
+  _cwBits(x, y, on, skipVolatile) {
+    if (!STOREGUARD || !this.wmem) return;
+    const clip = this._cwClip(x >= 15n && on ? x - 15n : x, y); if (!clip) return; x = clip[0]; y = clip[1];
+    const dv = new DataView(this.wmem.buffer);
+    const lo = dv.getUint32(CWLO_SLOT, true), len = dv.getUint32(CWLEN_SLOT, true);
+    const u8 = new Uint8Array(this.wmem.buffer), bm = this.CWBM;
+    const x2 = x;
+    for (let g = x2 >> 6n; g <= (y - 1n) >> 6n; g++) {
+      if (skipVolatile && this._volatilePages?.has((g << 6n) & ~4095n)) continue;
+      const off = this.RAMOFF + Number((g << 6n) - this.base) - lo;
+      if (off < 0 || off >= len) continue;
+      const li = off >>> 6;
+      if ((li >>> 3) >= 0x200000) continue;
+      if (on) u8[bm + (li >>> 3)] |= 1 << (li & 7); else u8[bm + (li >>> 3)] &= ~(1 << (li & 7));
+    }
+  }
+  _cwMark(page, on) { this._cwBits(page, page + 4096n, on, false); }
+  // Set the guard bit of every line of [x, y), except on volatile pages.
+  _cwMarkSpan(x, y) { this._cwBits(x, y, true, true); }
+  // A translation is gone: clear the guard bit of each line of its bytes that no other translation still covers, so memory the
+  // JIT pool later hands out for data stops calling into the engine on every store.
+  _cwUnmarkSpan(x, y) {
+    if (!STOREGUARD || !this.wmem) return;
+    const clip = this._cwClip(x >= 15n ? x - 15n : 0n, y); if (!clip) return;
+    const x2 = clip[0]; y = clip[1];
+    for (let g = x2 >> 6n; g <= (y - 1n) >> 6n; g++) {
+      const ls = g << 6n, le = ls + 64n;
+      const hk = this._extOverlap(ls, le + 15n);
+      if (hk && hk.some((k) => (this._extSpans?.get(k) ?? [[0n, 1n << 64n]]).some(([sx, sy]) => sx < le + 15n && sy > ls))) continue;
+      if (this._noExtPg?.get(ls >> 12n)?.size) continue;
+      this._cwBitsOne(g, false);
+    }
+  }
+  _cwBitsOne(g, on) {
+    const dv = new DataView(this.wmem.buffer);
+    const lo = dv.getUint32(CWLO_SLOT, true), len = dv.getUint32(CWLEN_SLOT, true);
+    const off = this.RAMOFF + Number((g << 6n) - this.base) - lo;
     if (off < 0 || off >= len) return;
-    const idx = off >>> 12;
-    if (idx >= CWMAP_PAGES) return;
-    new Uint8Array(this.wmem.buffer)[CWMAP + idx] = on;
+    const li = off >>> 6;
+    if ((li >>> 3) >= 0x200000) return;
+    const u8 = new Uint8Array(this.wmem.buffer);
+    if (on) u8[this.CWBM + (li >>> 3)] |= 1 << (li & 7); else u8[this.CWBM + (li >>> 3)] &= ~(1 << (li & 7));
   }
   // Mark every page of the anonymous executable region holding `a`, because a
   // translated function's extent is not recorded anywhere and a patch lands in
@@ -1644,11 +1699,17 @@ export class LinuxEngine {
         this._volatilePages.delete(pg); this._cwCount.set(pg, 0);                       // quiet for long enough: translate again
         this.stats.volatilePages = this._volatilePages.size; this.stats.cwQuieted = (this.stats.cwQuieted | 0) + 1;
       }
-      for (let p = x & ~4095n; p < y; p += 4096n)
-        if (!this._volatilePages?.has(p)) this._cwMark(p, 1);
+      if (CW_ALLPAGES) this._cwCoverAll(a);   // the old blanket marking; now only lines holding translated bytes are marked (see the extent registration)
       return false;
     }
     return false;
+  }
+  _cwCoverAll(a) {
+    for (const [x, y] of this.execRanges) {
+      if (!(a >= x && a < y)) continue;
+      for (let p = x & ~4095n; p < y; p += 4096n) if (!this._volatilePages?.has(p)) this._cwMark(p, 1);
+      return;
+    }
   }
   // The window the guard compares against: the anonymous executable ranges,
   // as one interval in WASM offsets. The interpreter watches the same span,
@@ -1670,8 +1731,17 @@ export class LinuxEngine {
     // and re-mark from what is actually translated rather than trying to shift
     // the bytes: a stale map watches the wrong pages, which is worse than
     // watching none.
-    new Uint8Array(this.wmem.buffer).fill(0, CWMAP, CWMAP + CWMAP_PAGES);
-    for (const a of this.aotFns.keys()) this._cwCover(a);
+    dv.setUint32(CWBM_SLOT, this.CWBM, true);
+    new Uint8Array(this.wmem.buffer).fill(0, this.CWBM, this.CWBM + Math.min(0x200000, (Number(hi - lo) >>> 9) + 1));
+    if (CW_ALLPAGES) for (const a of this.aotFns.keys()) this._cwCover(a);
+    else {
+      if (this._extents) for (const [k, [a, b]] of this._extents) {
+        const sp = this._extSpans?.get(k);
+        if (this._wideExt?.has(k) && !sp) { this._cwCoverAll(a); continue; }
+        if (sp) for (const [x, y] of sp) this._cwMarkSpan(x, y); else this._cwMarkSpan(a, b);
+      }
+      if (this._noExtPg) for (const [q, st] of this._noExtPg) if (st.size && !this._volatilePages?.has(q << 12n)) this._cwMark(q << 12n, 1);
+    }
     this.mem.watchLo = lo; this.mem.watchHi = hi;
     this.mem.watch = (addr, n) => {
       if (CWVERIFY) (this._cwRing ??= []).push(['I' + addr.toString(16), Number(n), this.cpu.rip.toString(16), '']);
@@ -2586,7 +2656,7 @@ export class LinuxEngine {
   }
 
   syscall(cpu) {
-    if (CWVERIFY && ((this._cwSys = (this._cwSys | 0) + 1) & 7) === 0) this._cwVerify("sys");
+    if (CWVERIFY && ((this._cwSys = (this._cwSys | 0) + 1) & 31) === 0) this._cwVerify("sys");
     // shadow interp must stay side-effect free: only the idempotent, read-only syscalls run in it
     // (clock_gettime, gettimeofday, time, getpid, gettid, the uid/gid family, sched_yield) - a
     // dispatch that reads the clock was otherwise never compared, and a JS engine's handler loop
@@ -6298,8 +6368,9 @@ export class LinuxEngine {
     const dv = new DataView(this.wmem.buffer);
     dv.setUint32(CWLO_SLOT, this.RAMOFF + Number(this._watchPage - this.base), true);
     dv.setUint32(CWLEN_SLOT, 4096, true);
-    new Uint8Array(this.wmem.buffer).fill(0, CWMAP, CWMAP + CWMAP_PAGES);
-    new Uint8Array(this.wmem.buffer)[CWMAP] = 1;
+    dv.setUint32(CWBM_SLOT, this.CWBM, true);
+    new Uint8Array(this.wmem.buffer).fill(0, this.CWBM, this.CWBM + 512);
+    new Uint8Array(this.wmem.buffer).fill(0xFF, this.CWBM, this.CWBM + 8);
     this.mem.watchLo = this._watchPage; this.mem.watchHi = this._watchPage + 4096n;
     this.mem.watch = (addr, n, v) => this._watchLog(addr, n, v, 'interp rip=' + this.cpu.rip.toString(16));
     console.error(`[watch armed] page=${this._watchPage.toString(16)} storeguard=${STOREGUARD}`);
