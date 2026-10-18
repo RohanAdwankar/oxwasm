@@ -67,7 +67,7 @@ const IDLEDIAG = ENV.OXWASM_IDLEDIAG === '1';
 const CWHIST = ENV.OXWASM_CWHIST === '1';
 const CWVERIFY = ENV.OXWASM_CWVERIFY === '1';
 const EXACT_CW_OFF = ENV.OXWASM_CW_PAGE === '1';   // old behaviour: every store into a watched page drops the whole page
-const CW_QUIET = Number(ENV.OXWASM_CW_QUIET || 2_000_000);
+const CW_QUIET = Number(ENV.OXWASM_CW_QUIET || 100_000);
 const BREAKS = typeof process !== 'undefined' && ENV.OXWASM_BREAK ? new Set(ENV.OXWASM_BREAK.split(',').map((h) => BigInt('0x' + h))) : null;   // interpreter breakpoints: print the thread, registers and [rdi+0x340..] (diagnosis)
 const ROTATE_MS = Number(ENV.OXWASM_ROTATE_MS || 10);   // wall-clock quantum: a thread that has run this long yields to a runnable sibling (see _rotateDue)
 // OXWASM_ANON_HEAT: calls required before GENERATED code is translated, as
@@ -1596,8 +1596,8 @@ export class LinuxEngine {
     if (CWVERIFY) { if (((this._cwN = (this._cwN | 0) + 1) & 255) === 0) this._cwVerify('write'); (this._cwRing ??= []).push([g.toString(16), size, next === undefined ? '?' : BigInt.asUintN(64, next).toString(16), this._cwDisjoint(g, g + BigInt(size >>> 0 || 1)) ? 'D' : 'X']); if (this._cwRing.length > 64) this._cwRing.shift(); }
     if (this._watchArmed) { this._watchLog(g, 0, 0n, 'compiled next=' + (next === undefined ? '?' : BigInt.asUintN(64, next).toString(16))); return; }
     const n = BigInt(size >>> 0 || 1), end = g + n;
-    if (CWHIST) { const h = (this._cwHist ??= new Map()); const pg = g >> 12n; h.set(pg, (h.get(pg) | 0) + 1); if ((this.stats.codeWrites + 1) % 500000 === 0) __dbg('[cwhist] ' + [...h].sort((x, y) => y[1] - x[1]).slice(0, 12).map(([k, v]) => (k << 12n).toString(16) + '=' + v).join(' ') + ' size=' + size + ' next=' + (next === undefined ? '?' : BigInt.asUintN(64, next).toString(16)));
-      if ((this.stats.codeWrites + 1) % 500000 === 0) for (const [pgk] of [...h].sort((x, y) => y[1] - x[1]).slice(0, 3)) { const lo2 = pgk << 12n; const hk = this._extOverlap(lo2, lo2 + 4096n) || []; __dbg('[cwhist] page ' + lo2.toString(16) + ' vol=' + !!this._volatilePages?.has(lo2) + ' extents: ' + hk.map((k) => { const e = this._extents.get(k); const sp = (this._extSpans?.get(k) || []).filter(([x, y]) => x < lo2 + 4096n && y > lo2).map(([x, y]) => x.toString(16) + '-' + y.toString(16)).join('|'); return k.toString(16) + '[' + e[0].toString(16) + '-' + e[1].toString(16) + ' spans ' + sp + ']'; }).join(' ')); } }
+    if (CWHIST) { const h = (this._cwHist ??= new Map()); const pg = g >> 3n; h.set(pg, (h.get(pg) | 0) + 1); if ((this.stats.codeWrites + 1) % 500000 === 0) __dbg('[cwhist] ' + [...h].sort((x, y) => y[1] - x[1]).slice(0, 12).map(([k, v]) => (k << 3n).toString(16) + '=' + v).join(' ') + ' size=' + size + ' next=' + (next === undefined ? '?' : BigInt.asUintN(64, next).toString(16)));
+      if ((this.stats.codeWrites + 1) % 500000 === 0) for (const [pgk] of [...h].sort((x, y) => y[1] - x[1]).slice(0, 3)) { const lo2 = (pgk << 3n) & ~63n; const hk = this._extOverlap(lo2 - 64n, lo2 + 128n) || []; __dbg('[cwhist] page ' + lo2.toString(16) + ' vol=' + !!this._volatilePages?.has(lo2) + ' extents: ' + hk.map((k) => { const e = this._extents.get(k); const sp = (this._extSpans?.get(k) || []).filter(([x, y]) => x < lo2 + 128n && y > lo2 - 64n).map(([x, y]) => x.toString(16) + '-' + y.toString(16)).join('|'); return k.toString(16) + '[' + e[0].toString(16) + '-' + e[1].toString(16) + ' spans ' + sp + ']'; }).join(' ')); } }
     const lo = g & ~4095n, hi = (end + 4095n) & ~4095n;
     this.stats.codeWrites = (this.stats.codeWrites || 0) + 1;
     // Translations record the bytes they were built from, so a store that touches none of them (the JIT emitting its

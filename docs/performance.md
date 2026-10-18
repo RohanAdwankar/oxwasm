@@ -1364,3 +1364,8 @@ Engine suite green.
 - Diagnostics left in: OXWASM_ESC_RANGES, OXWASM_IDLEDIAG, OXWASM_CWHIST, OXWASM_CWVERIFY, OXWASM_DUMPFN (24 KB, needs OXWASM_FNDUMP set).
 Good-case numbers now (cold23, phase-only 60-300 rounds): objects 15-18 ms, strings 9-14, sorting 35, json 23-28, fib 4, math 21,
 maps 53-73; against native baseline-JIT 3 / 2-3 / 7 / 4-5 / 1 / 3 / 8-13 that is 4x to 7x per phase.
+
+### Re-translating a volatile page sooner (objects 70-100 ms -> 16-19 ms)
+Objects-only runs were bimodal: 15-18 ms, or 70-100 ms when a page holding the hot loop became volatile (four real patches) and stayed
+untranslated until 2M interpreted steps passed without a write. OXWASM_CW_QUIET=100000 (now the default; 20000 churns more) gave
+16-19 ms in 5 of 6 runs. The full seven-phase mix still aborts (3 of 4 runs at round 5-26 with the new default), so the crash is unrelated.
