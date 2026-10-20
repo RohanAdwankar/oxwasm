@@ -1373,3 +1373,8 @@ untranslated until 2M interpreted steps passed without a write. OXWASM_CW_QUIET=
 ### GC threading and the abort
 Full mix with BUN_JSC_useConcurrentGC=0 BUN_JSC_numberOfGCMarkers=1: 8 of 9 runs finished (STEADY 191, 233, 260 ms in the 30-round ones), against about 40% finishing
 with the defaults; BUN_JSC_useBaselineJITCodeSharing=0 does nothing (1 of 5). So the collector's threads are involved in the abort but not the whole story; one run still aborted at round 5.
+
+### Not memory, not growth factor
+Guest RAM 1024 vs 3000 vs 3800 MB: the full mix aborts at every size (3800 MB: 4 aborts + 1 hang in 5). mmap totals at abort show only the 128 GB reservation and a few 1 GB arenas, no failed mmap.
+BUN_JSC_*HeapGrowthFactor 3/8/16 with or without single-threaded GC: any mix containing `objects` aborts. Runtime-only flag changes (LOOPYIELD, NOACCT, NOXMMCALL) change the unit-cache key and so measure
+an empty cache, not the flag; those numbers (127 ms) are invalid, only caches built with the flag count.

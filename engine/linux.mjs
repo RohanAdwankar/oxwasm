@@ -1026,6 +1026,7 @@ export class LinuxEngine {
         const ep = this._extPages ??= new Map();
         for (let q = a >> 12n; q <= (b - 1n) >> 12n; q++) { this.codePages.add(q); let st = ep.get(q); if (!st) ep.set(q, st = new Set()); st.add(k); }
         if (spans) { (this._extSpans ??= new Map()).set(k, spans); for (const [x, y] of spans) this._cwMarkSpan(x, y); } else this._cwMarkSpan(a, b); } }
+      if (ENV.OXWASM_WATDIR && !(this.execRangesStatic ?? []).some(([x, y]) => entry >= x && entry < y)) { try { process.getBuiltinModule('node:fs').writeFileSync(ENV.OXWASM_WATDIR + '/u_' + entry.toString(16) + '.wat', unit.wat); } catch {} }
       if (this.onUnitWat) this.onUnitWat(un, entry, unit);
       // assembleWatAsync (browser): the assembler is 65% of the on-thread
       // tier-up cost and is a pure text -> bytes transform with no engine
@@ -2679,7 +2680,7 @@ export class LinuxEngine {
       else if (nr === 11) { ms.munmapN++; ms.munmapB += a2; } else ms.mremapN++;
     }
     if (ENV.OXWASM_CLOCKCHAIN && nr === 228 && this._ctor?.argv?.[0]?.includes('opencode') && ((this._ccN = (this._ccN | 0) + 1) % (+ENV.OXWASM_CLOCKCHAIN) === 0)) { const out = []; try { let bp = cpu.regs[5]; for (let i = 0; i < 24 && bp; i++) { out.push(this.mem.read(bp + 8n, 8n).toString(16)); bp = this.mem.read(bp, 8n); } } catch {} console.error(`[clock#${this._ccN}] rip=${cpu.rip.toString(16)} chain=${out.join(',')}`); }
-    if (this._mmapStat && nr === 234) { const ms = this._mmapStat; console.error(`[mmapstat@tgkill] mmap n=${ms.mmapN} ${ms.mmapB >> 20n}MB munmap n=${ms.munmapN} ${ms.munmapB >> 20n}MB mmapNext=${this.mmapNext?.toString(16)} base=${this._mmapBase?.toString(16)} holes=${(this._mmapHoles ?? []).map(([l, h]) => l.toString(16) + '+' + ((h - l) >> 20n) + 'MB').join(',')} bySize=${[...ms.bySize].sort((x, y) => y[1] - x[1]).slice(0, 16).map(([k, v]) => k + 'x' + v).join(' ')}`); }
+    if (this._mmapStat && nr === 234) { const ms = this._mmapStat; __dbg(`[mmapstat@tgkill] mmap n=${ms.mmapN} ${ms.mmapB >> 20n}MB munmap n=${ms.munmapN} ${ms.munmapB >> 20n}MB mmapNext=${this.mmapNext?.toString(16)} base=${this._mmapBase?.toString(16)} holes=${(this._mmapHoles ?? []).map(([l, h]) => l.toString(16) + '+' + ((h - l) >> 20n) + 'MB').join(',')} bySize=${[...ms.bySize].sort((x, y) => y[1] - x[1]).slice(0, 16).map(([k, v]) => k + 'x' + v).join(' ')}`); }
     if (ENV.OXWASM_SCTRACE && this._ctor?.argv?.[0]?.includes(TRACE_ARGV)) {
       const t = this.threads[this.ti], r = cpu.regs;
       const line = `${t?.id} ${nr} ${a1.toString(16)} ${a2.toString(16)} ${a3.toString(16)} d=${this.stats.disp} sp=${r[4].toString(16)} bp=${r[5].toString(16)} bx=${r[3].toString(16)} r12=${r[12].toString(16)} r13=${r[13].toString(16)} r14=${r[14].toString(16)} r15=${r[15].toString(16)}`;
