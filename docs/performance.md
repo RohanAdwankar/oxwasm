@@ -1378,3 +1378,9 @@ with the defaults; BUN_JSC_useBaselineJITCodeSharing=0 does nothing (1 of 5). So
 Guest RAM 1024 vs 3000 vs 3800 MB: the full mix aborts at every size (3800 MB: 4 aborts + 1 hang in 5). mmap totals at abort show only the 128 GB reservation and a few 1 GB arenas, no failed mmap.
 BUN_JSC_*HeapGrowthFactor 3/8/16 with or without single-threaded GC: any mix containing `objects` aborts. Runtime-only flag changes (LOOPYIELD, NOACCT, NOXMMCALL) change the unit-cache key and so measure
 an empty cache, not the flag; those numbers (127 ms) are invalid, only caches built with the flag count.
+
+### Abort vs JIT code lifetime
+BUN_JSC_forceCodeBlockLiveness=true (JSC never frees compiled code) cuts the 4-phase abort rate from ~50% to 0 of 6 (one hang): the abort needs JIT memory to be freed and reused.
+Gaps found with OXWASM_CWVERIFY and fixed: (1) a translation entered in one page that spans into a volatile page lost its guard bits there (bits are now set regardless of volatility);
+(2) functions of one wasm module call each other directly, so invalidating one now drops its unit siblings. Verifier runs after the fixes show a stale translation in only some runs and
+the abort still happens without one (run 5 of 6), so there is at least one more path by which freed/reused JIT memory breaks a translation. Suite green.

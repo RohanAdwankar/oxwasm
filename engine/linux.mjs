@@ -738,7 +738,9 @@ export class LinuxEngine {
     const dropped = [];
     // a translated function is stale if ANY byte it was built from changed, not only its first
     let gone = null;
-    { const hitK = this._extOverlap(exact ? exact[0] : lo, exact ? exact[1] : hi);
+    { let hitK = this._extOverlap(exact ? exact[0] : lo, exact ? exact[1] : hi);
+      // functions translated into one wasm module may call each other directly, so one going stale takes its siblings with it
+      if (hitK && this._unitSibs) { const seen = new Set(hitK); for (let i = 0; i < hitK.length; i++) { const sibs = this._unitSibs.get(hitK[i]); if (sibs) for (const f of sibs) if (!seen.has(f)) { seen.add(f); hitK.push(f); } } }
       if (hitK) for (const k of hitK) { if (this.aotFns.has(k)) { this.aotFns.delete(k); hit = true; dropped.push(k); } const sp0 = this._extSpans?.get(k); this._extents.delete(k); this._extSpans?.delete(k); this._wideExt?.delete(k); changed = true; (gone ??= []).push(sp0 || null); }
       // a unit still being assembled was built from the old bytes too, whichever page its entries sit on
       if (hitK && this._inflight) for (const u of this._inflight) if (!u.cancelled && u.funcs.some((f) => hitK.includes(f))) {
@@ -1016,6 +1018,7 @@ export class LinuxEngine {
         ...(this.unitMaxFuncs ? { maxFuncs: this.unitMaxFuncs } : {}),
         ...(this.unitMaxInsns ? { maxInsns: this.unitMaxInsns } : {}) });
       if (ENV.OXWASM_TUTRACE) __dbg(`[tu:wat] ${entry.toString(16)} ${unit.wat.length}B ${(performance.now() - _tc0) | 0}ms`);
+      if (unit.funcs && unit.funcs.length > 1) { const sb = this._unitSibs ??= new Map(); for (const f of unit.funcs) sb.set(f, unit.funcs); }
       if (unit.ext) { const ex = this._extents ??= new Map(); for (const [k, a, b, spans] of unit.ext) if (a !== null) {
         ex.set(k, [a, b]);
         if (CWVERIFY && !(this.execRangesStatic ?? []).some(([x, y]) => a >= x && a < y)) { try { for (const [sx, sy] of (spans || [[a, b]])) { if (sy - sx > 65536n) continue; const v = this.mem.view(sx, sy - sx); if (v) (this._extSnap ??= new Map()).set(k + ':' + sx, { k, a: sx, bytes: Uint8Array.from(v) }); } } catch {} }
@@ -1587,6 +1590,8 @@ export class LinuxEngine {
       if (cur && Buffer.compare(cur, sn.bytes) === 0) continue;
       for (let i = 0; i < sn.bytes.length; i++) if (Number(this.mem.read(sn.a + BigInt(i), 1n)) !== sn.bytes[i]) { bad = i; break; }
       if (bad >= 0) {
+        const bitOf = (addr) => { const dv = new DataView(this.wmem.buffer); const off = this.RAMOFF + Number(addr - this.base) - dv.getUint32(CWLO_SLOT, true); if (off < 0 || off >= dv.getUint32(CWLEN_SLOT, true)) return 'outwin'; const li = off >>> 6; return (new Uint8Array(this.wmem.buffer)[this.CWBM + (li >>> 3)] >> (li & 7)) & 1; };
+        __dbg(`[cwverify] bit@span=${bitOf(sn.a)} bit@diff=${bitOf(sn.a + BigInt(bad))} vol=${!!this._volatilePages?.has((sn.a + BigInt(bad)) & ~4095n)} inExt=${this._extents?.has(k)} win=${this.mem.watchLo?.toString(16)}-${this.mem.watchHi?.toString(16)}`);
         __dbg(`[cwverify] ${why} STALE fn=${k.toString(16)} ext=${sn.a.toString(16)}+${sn.bytes.length} first diff at +${bad} (${(sn.a + BigInt(bad)).toString(16)}) old=${Buffer.from(sn.bytes.subarray(bad, bad + 16)).toString('hex')} new=${(() => { let h = ''; for (let i = 0; i < 16; i++) h += Number(this.mem.read(sn.a + BigInt(bad + i), 1n)).toString(16).padStart(2, '0'); return h; })()} tid=${this.threads[this.ti]?.id} rip=${this.cpu.rip.toString(16)} recent writes: ${(this._cwRing ?? []).slice(-12).map((r) => r.join(':')).join(' ')}`);
         this._extSnap.delete(kk); this.stats.cwStale = (this.stats.cwStale | 0) + 1;
       }
@@ -1661,7 +1666,7 @@ export class LinuxEngine {
   }
   _cwMark(page, on) { this._cwBits(page, page + 4096n, on, false); }
   // Set the guard bit of every line of [x, y), except on volatile pages.
-  _cwMarkSpan(x, y) { this._cwBits(x, y, true, true); }
+  _cwMarkSpan(x, y) { this._cwBits(x, y, true, false); }   // volatile pages included: a translation entered elsewhere may span into one
   // A translation is gone: clear the guard bit of each line of its bytes that no other translation still covers, so memory the
   // JIT pool later hands out for data stops calling into the engine on every store.
   _cwUnmarkSpan(x, y) {
