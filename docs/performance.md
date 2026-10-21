@@ -1390,3 +1390,6 @@ the abort still happens without one (run 5 of 6), so there is at least one more 
 - BUN_JSC_forceCodeBlockToJettisonDueToOldAge=true makes it fail early and deterministically (TypeError on `for (const [k, v] of m)` in maps at round 1, or abort); native is fine with the same option. It needs the full mix (maps alone, or maps after any one other phase, passes).
 - Not invalidation granularity (OXWASM_CW_PAGE=1 fails the same), not stale bytes (the verifier reports none), not inlining (OXWASM_INLINE=0 fails), not memory size.
 - Escaping (interpreting) either the thunk half 5a000000-5a240000 or the code-block half 5a240000-5b000000 of the JIT window alone lets 4 rounds finish under the jettison stress (rounds are 120-210 s each), so both halves have to be translated for it to fail.
+
+Root-veto bisect under the jettison stress (50 JIT roots, groups of five, up to 3-6 runs each): one group passed 3 of 3 once and then failed in a re-run, and every single root, pair and subset tried also failed,
+so the per-run failure rate is too high and too noisy (~60% or more) for run-count bisecting to separate roots; it needs a deterministic replay, not more runs.
