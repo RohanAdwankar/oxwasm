@@ -1411,3 +1411,6 @@ Jettison-stress full-mix shadow run over the whole JIT window (5a000000-5b000000
 - Shadow compare, whole JIT window and bun text slices, with clock reads replayed and rflags in r11 ignored: no real divergence. The recurring "differences" are dead callee frames (the AOT elides callee-saved push/pop slots) and clock values.
 - The opcode-table initializer 25a632c-25a9c9a (the code the first noisy bisect pointed at) matches the interpreter on 30 random states.
 - NARROW=0 (spill/reload narrowing off): 1 failure in 6 runs, baseline 1 in 6: no signal.
+
+### Invalidation walked tables of tens of thousands of keys per code write (objects 64 ms -> 23 ms)
+A CPU profile of a 200-round objects run put 121 s of 320 s in `_invalidateCode` itself: every store that hit translated JIT code walked `_ftSeen`, `aotCalls`, `compiled`, `profile`, `aotFailed` and the four memo tables in full to find the few keys in the written range. These tables are now indexed by page (`PagedMap`/`PagedSet.keysIn`), and a write of a few pages looks only at the keys on them (a range wider than 64 pages still scans). Same run afterwards: 190 s total CPU, `_invalidateCode` out of the profile, objects steady state 23 ms (it was 64 ms in the same configuration). Suite green.

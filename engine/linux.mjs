@@ -24,8 +24,25 @@ if (ENV.OXWASM_IHIST) globalThis.__ihist = new Map();   // sampled histogram of 
 // before scanning the tables: JSC emitting a function is thousands of stores, and the scan was
 // half of a JIT-on run (591 s of 1212 s in one profile).
 const pageOf = (k) => (typeof k === 'bigint' ? k : BigInt(k)) >> 12n;
-class PagedMap extends Map { constructor(pages) { super(); this.pages = pages; } set(k, v) { this.pages.add(pageOf(k)); return super.set(k, v); } }
-class PagedSet extends Set { constructor(pages) { super(); this.pages = pages; } add(k) { this.pages.add(pageOf(k)); return super.add(k); } }
+// Each also indexes its keys by page, so an invalidation of a few pages looks only at the keys that live there
+// instead of walking tables that grow to tens of thousands of entries (the walk was 40% of an objects-phase run).
+class PagedMap extends Map {
+  constructor(pages) { super(); this.pages = pages; this.byPage = new Map(); }
+  set(k, v) { if (!super.has(k)) { const p = pageOf(k); this.pages.add(p); let s = this.byPage.get(p); if (!s) this.byPage.set(p, s = new Set()); s.add(k); } return super.set(k, v); }
+  delete(k) { if (super.has(k)) { const p = pageOf(k), s = this.byPage.get(p); if (s) { s.delete(k); if (!s.size) this.byPage.delete(p); } } return super.delete(k); }
+  clear() { this.byPage.clear(); super.clear(); }
+  keysIn(lo, hi) { const out = []; for (let q = lo >> 12n; q <= (hi - 1n) >> 12n; q++) { const s = this.byPage.get(q); if (s) for (const k of s) out.push(k); } return out; }
+}
+class PagedSet extends Set {
+  constructor(pages) { super(); this.pages = pages; this.byPage = new Map(); }
+  add(k) { if (!super.has(k)) { const p = pageOf(k); this.pages.add(p); let s = this.byPage.get(p); if (!s) this.byPage.set(p, s = new Set()); s.add(k); } return super.add(k); }
+  delete(k) { if (super.has(k)) { const p = pageOf(k), s = this.byPage.get(p); if (s) { s.delete(k); if (!s.size) this.byPage.delete(p); } } return super.delete(k); }
+  clear() { this.byPage.clear(); super.clear(); }
+  keysIn(lo, hi) { const out = []; for (let q = lo >> 12n; q <= (hi - 1n) >> 12n; q++) { const s = this.byPage.get(q); if (s) for (const k of s) out.push(k); } return out; }
+}
+const pagedMap = () => new PagedMap(new Set());
+// the keys of `t` that may lie in [lo, hi): a snapshot, so the caller may delete while it walks
+const keysIn = (t, lo, hi) => (t.keysIn && hi - lo <= 0x40000n ? t.keysIn(lo, hi) : [...(t instanceof Map ? t.keys() : t)]);
 // OXWASM_HEAPPROF=<MB>: V8 sampling heap profiler (live bytes by allocation site). Started at the first deopt, dumped once when the JS heap passes <MB>.
 // Inspector sessions on the same thread answer synchronously, so this works while the worker never returns to its event loop.
 const HEAPPROF = typeof process !== 'undefined' && !!ENV.OXWASM_HEAPPROF;
@@ -332,7 +349,7 @@ export class LinuxEngine {
     this.ti = 0; this.nextTid = 2; this._futexAddr = null;
     this.argv0 = argv[0]; this.setupStack(argv);
     this.cpu.rip = this.entry;
-    this.profile = new Map(); this.compiled = new PagedMap(this.codePages ??= new Set());
+    this.profile = pagedMap(); this.compiled = new PagedMap(this.codePages ??= new Set());
     this.threshold = threshold;
     this.stats = { interpreted: 0, compiledRuns: 0, aotRuns: 0, tiers: {}, syscalls: {} };
     this._ftFull = 0;                         // functions refused by the FTMAP_MAX ceiling
@@ -346,7 +363,7 @@ export class LinuxEngine {
     this.aotFns = new PagedMap(this.codePages ??= new Set());                  // ripStr -> wasm export
     this.aotFailed = new PagedSet(this.codePages ??= new Set());
     this.tierMs = 0;                          // sync translation time this slice (host zeroes; see tierMsMax)
-    this.aotCalls = new Map();                // call-target profile
+    this.aotCalls = pagedMap();                // call-target profile
     this._unprune = UNPRUNE;
     this.aotCallThreshold = aotCallThreshold;
     this.aotLoopThreshold = aotLoopThreshold;
@@ -757,19 +774,19 @@ export class LinuxEngine {
       for (const k of this.aotFns.keys()) if (inR(k)) { this.aotFns.delete(k); hit = true; dropped.push(k); changed = true; }
     }
     // a byte store beside translated code (the common case: the JIT emitting its next function) leaves every table alone
-    for (const k of this.aotFailed) if (inR(k)) this.aotFailed.delete(k);          // a few hundred at most
+    for (const k of keysIn(this.aotFailed, lo, hi)) if (inR(k)) this.aotFailed.delete(k);
     if (true) {
-    if (this.compiled) for (const k of this.compiled.keys()) if (inR(k)) this.compiled.delete(k);
-    if (this.profile) for (const k of this.profile.keys()) if (inR(k)) this.profile.delete(k);
-    for (const k of this.aotCalls.keys()) if (inR(k)) { this.aotCalls.delete(k); this._callTargets?.delete(k.toString()); }
+    if (this.compiled) for (const k of keysIn(this.compiled, lo, hi)) if (inR(k)) this.compiled.delete(k);
+    if (this.profile) for (const k of keysIn(this.profile, lo, hi)) if (inR(k)) this.profile.delete(k);
+    for (const k of keysIn(this.aotCalls, lo, hi)) if (inR(k)) { this.aotCalls.delete(k); this._callTargets?.delete(k.toString()); }
     // dispatch-hash entries of everything that is gone from aotFns; _ftDrop takes them out of the hash (and out of
     // _ftSeen) - deleting them from _ftSeen here first would leave stale entries in the hash that still run the old code
-    for (const k of this._ftSeen) if (inR(k) && !this.aotFns.has(k)) { dropped.push(k); this._entries?.delete(k.toString()); }
-    if (this._failMemo) for (const k of this._failMemo.keys()) if (inR(BigInt(k))) this._failMemo.delete(k);
-    if (this._sizeDefer) for (const k of this._sizeDefer.keys()) if (inR(k)) this._sizeDefer.delete(k);
-    if (this._sizeMemo) for (const k of this._sizeMemo.keys()) if (inR(BigInt(k))) this._sizeMemo.delete(k);
+    for (const k of keysIn(this._ftSeen, lo, hi)) if (inR(k) && !this.aotFns.has(k)) { dropped.push(k); this._entries?.delete(k.toString()); }
+    if (this._failMemo) for (const k of keysIn(this._failMemo, lo, hi)) if (inR(BigInt(k))) this._failMemo.delete(k);
+    if (this._sizeDefer) for (const k of keysIn(this._sizeDefer, lo, hi)) if (inR(BigInt(k))) this._sizeDefer.delete(k);
+    if (this._sizeMemo) for (const k of keysIn(this._sizeMemo, lo, hi)) if (inR(BigInt(k))) this._sizeMemo.delete(k);
     if (!exact && (this.execAnon ?? EXEC_ANON)) { const n = this.execRanges.length; this.execRanges = this.execRanges.filter(([a, b]) => !(a >= lo && b <= hi)); if (this.execRanges.length !== n) { this._ieCache = undefined; this._genCache = undefined; this._updateCodeWindow(); } }
-    if (this._tinyMemo) for (const k of this._tinyMemo.keys()) if (inR(BigInt(k))) this._tinyMemo.delete(k);
+    if (this._tinyMemo) for (const k of keysIn(this._tinyMemo, lo, hi)) if (inR(BigInt(k))) this._tinyMemo.delete(k);
     }
     if (this._inflight) for (const u of this._inflight) if (u.funcs.some(inR)) {
       u.cancelled = true;
@@ -967,7 +984,7 @@ export class LinuxEngine {
       const n = this.unitStore.getSize(_unitEx, k.toString(16));
       if (n !== undefined) {
         const need = Math.min(256, Math.max(this.aotCallThreshold, n >> SIZEGATE_SHIFT));
-        if (need > this.aotCallThreshold && (this.aotCalls.get(k) || 0) < need) { (this._sizeDefer ??= new Map()).set(k, need); this.stats.sizeDeferKnown = (this.stats.sizeDeferKnown | 0) + 1; return; }
+        if (need > this.aotCallThreshold && (this.aotCalls.get(k) || 0) < need) { (this._sizeDefer ??= pagedMap()).set(k, need); this.stats.sizeDeferKnown = (this.stats.sizeDeferKnown | 0) + 1; return; }
       }
     }   // the key at REQUEST time: the lookup used it, so the store must
     const _inStatic = (this.execRangesStatic ?? []).some(([a, b]) => k >= a && k < b);   // JIT/anonymous code is reused at the same addresses with different bytes: never remember anything about it by address
@@ -993,7 +1010,7 @@ export class LinuxEngine {
         veto: (c) => this._isVforkStub(BigInt(c)) || (this.fnVeto?.has(c) ?? false) || (this.fnAllow ? !this.fnAllow.has(c) : false) || this._envVeto(c),   // a vfork stub is never compiled, as a root or inside a closure
         tinyMemo: (this._tinyMemo ??= new PagedMap(this.codePages ??= new Set())),
         failMemo: (this._failMemo ??= new PagedMap(this.codePages ??= new Set())),
-        sizeMemo: (this._sizeMemo ??= new Map()),          // sizes of callees the size gate refused (cleared per range by _invalidateCode)
+        sizeMemo: (this._sizeMemo ??= pagedMap()),          // sizes of callees the size gate refused (cleared per range by _invalidateCode)
         // size gate (see SIZEGATE): giant callees need the calls whatever rooted
         // the unit; a giant ROOT is gated only when the call profile asked for it
         sizeGate: SIZEGATE ? (c, n, isRoot) => {
@@ -1002,7 +1019,7 @@ export class LinuxEngine {
           if (need <= this.aotCallThreshold) return 0;
           const have = this.aotCalls.get(BigInt(c)) || 0;
           if (have >= need) return 0;
-          if (isRoot) { (this._sizeDefer ??= new Map()).set(BigInt(c), need); try { const ex = this._unitExeId(); if (ex) this.unitStore?.putSize?.(ex, BigInt(c).toString(16), n); } catch {} }
+          if (isRoot) { (this._sizeDefer ??= pagedMap()).set(BigInt(c), need); try { const ex = this._unitExeId(); if (ex) this.unitStore?.putSize?.(ex, BigInt(c).toString(16), n); } catch {} }
           return need;
         } : null,          // callees whose analysis failed once: poisoned without re-analysis (cleared per range by _invalidateCode)
         // the tiering call profile, so the inliner can pick targets by how
