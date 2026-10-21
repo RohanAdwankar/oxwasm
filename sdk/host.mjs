@@ -158,7 +158,7 @@ export class EngineHost {
     // restore took 4.8 s, 4.0 s and 1.8 s against ~200 ms once hot.
     const wdir = join(CACHE_DIR, 'wat');
     try { mkdirSync(wdir, { recursive: true }); } catch {}
-    const wpath = (wat) => join(wdir, createHash('sha1').update(wat).digest('hex') + '.wasm');
+    const wpath = (wat) => join(wdir, createHash('sha1').update(wat).digest('hex') + (process.env.OXWASM_DEBUGNAMES ? '.names' : '') + '.wasm');
     const assembleWat = (wat) => {
       const cp = wpath(wat);
       if (existsSync(cp)) return new Uint8Array(readFileSync(cp));

@@ -1621,11 +1621,22 @@ export class LinuxEngine {
     if (CWVERIFY) { if (((this._cwN = (this._cwN | 0) + 1) & 255) === 0) this._cwVerify('write'); (this._cwRing ??= []).push([g.toString(16), size, next === undefined ? '?' : BigInt.asUintN(64, next).toString(16), this._cwDisjoint(g, g + BigInt(size >>> 0 || 1)) ? 'D' : 'X']); if (this._cwRing.length > 64) this._cwRing.shift(); }
     if (this._watchArmed) { this._watchLog(g, 0, 0n, 'compiled next=' + (next === undefined ? '?' : BigInt.asUintN(64, next).toString(16))); return; }
     const n = BigInt(size >>> 0 || 1), end = g + n;
-    if (ENV.OXWASM_CWLOG && (this._cwLogN = (this._cwLogN | 0) + 1) <= +ENV.OXWASM_CWLOG) __dbg(`[cwlog] #${this._cwLogN} g=${g.toString(16)} size=${size} next=${next === undefined ? '?' : BigInt.asUintN(64, next).toString(16)} disjoint=${this._cwDisjoint(g, end)}`);
+    if (ENV.OXWASM_CWLOG && (this._cwLogN = (this._cwLogN | 0) + 1) <= +ENV.OXWASM_CWLOG) __dbg(`[cwlog] #${this._cwLogN} g=${g.toString(16)} size=${size} next=${next === undefined ? '?' : BigInt.asUintN(64, next).toString(16)} disjoint=${this._cwDisjoint(g, end)} noExt=${this._noExtPg?.get(g >> 12n)?.size | 0} extPg=${this._extPages?.get(g >> 12n)?.size | 0} inExec=${this.execRanges.some(([x, y]) => g >= x && g < y)} vol=${!!this._volatilePages?.has(g & ~4095n)} fns=${[...this.aotFns.keys()].filter((k) => (k >> 12n) === (g >> 12n)).length}`);
     if (CWHIST) { const h = (this._cwHist ??= new Map()); const pg = g >> 3n; h.set(pg, (h.get(pg) | 0) + 1); if ((this.stats.codeWrites + 1) % 500000 === 0) __dbg('[cwhist] ' + [...h].sort((x, y) => y[1] - x[1]).slice(0, 12).map(([k, v]) => (k << 3n).toString(16) + '=' + v).join(' ') + ' size=' + size + ' next=' + (next === undefined ? '?' : BigInt.asUintN(64, next).toString(16)));
       if ((this.stats.codeWrites + 1) % 500000 === 0) for (const [pgk] of [...h].sort((x, y) => y[1] - x[1]).slice(0, 3)) { const lo2 = (pgk << 3n) & ~63n; const hk = this._extOverlap(lo2 - 64n, lo2 + 128n) || []; __dbg('[cwhist] page ' + lo2.toString(16) + ' vol=' + !!this._volatilePages?.has(lo2) + ' extents: ' + hk.map((k) => { const e = this._extents.get(k); const sp = (this._extSpans?.get(k) || []).filter(([x, y]) => x < lo2 + 128n && y > lo2 - 64n).map(([x, y]) => x.toString(16) + '-' + y.toString(16)).join('|'); return k.toString(16) + '[' + e[0].toString(16) + '-' + e[1].toString(16) + ' spans ' + sp + ']'; }).join(' ')); } }
     const lo = g & ~4095n, hi = (end + 4095n) & ~4095n;
     this.stats.codeWrites = (this.stats.codeWrites || 0) + 1;
+    if (ENV.OXWASM_CWSTAT) {
+      const why = (() => { const p0 = g >> 12n, p1 = (end - 1n) >> 12n;
+        if (p1 - p0 > 64n) return 'wide-range';
+        if (this._noExtPg) for (let q = p0; q <= p1; q++) { const st = this._noExtPg.get(q); if (st && st.size) return 'noext'; }
+        if (this._inflight) for (const u of this._inflight) if (u.funcs.some((k) => (k >> 12n) >= p0 - 1n && (k >> 12n) <= p1)) return 'inflight';
+        const hit = this._extOverlap(g, end); return hit && hit.length ? 'ext' : 'none'; })();
+      const t = (this._cwWhy ??= new Map()); t.set(why, (t.get(why) | 0) + 1);
+      const pg = (this._cwPg ??= new Map()); const kk = (g >> 6n) << 6n; pg.set(kk, (pg.get(kk) | 0) + 1);
+      if (this.stats.codeWrites % +ENV.OXWASM_CWSTAT === 0) { __dbg(`[cwwhy] ${[...t].map(([a, b]) => a + '=' + b).join(' ')} top=${[...pg].sort((x, y) => y[1] - x[1]).slice(0, 4).map(([a, b]) => a.toString(16) + 'x' + b).join(' ')}`); }
+    }
+    if (ENV.OXWASM_CWSTAT && this.stats.codeWrites % +ENV.OXWASM_CWSTAT === 0) __dbg(`[cwstat] t=${(this.nowMs() / 1000) | 0}s writes=${this.stats.codeWrites} disjoint=${this.stats.cwDisjoint | 0} invalSlow=${this.stats.invalSlow | 0} volatile=${this.stats.volatilePages | 0} aotFns=${this.aotFns.size} ext=${this._extents?.size} wide=${this._wideExt?.size | 0}`);
     // Translations record the bytes they were built from, so a store that touches none of them (the JIT emitting its
     // next function beside a thunk it already translated) changes nothing and does not make the page volatile.
     if (!EXACT_CW_OFF && this._cwDisjoint(g, end)) { this.stats.cwDisjoint = (this.stats.cwDisjoint | 0) + 1; return; }
