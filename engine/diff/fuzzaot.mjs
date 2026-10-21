@@ -72,7 +72,7 @@ function program(id) {
   let lab = 0;
   const n = 10 + rnd(14);
   for (let i = 0; i < n; i++) {
-    switch (rnd(34)) {
+    switch (rnd(35)) {
       case 0: L.push(`mov ${pick(R64)}, ${(rnd(2) ? -1 : 1) * rnd(0x7fffffff)}`); break;
       case 1: L.push(`${pick(['add','sub','and','or','xor','cmp','test'])} ${pick(R64)}, ${pick(R64)}`); break;
       case 2: L.push(`${pick(['add','sub','and','or','xor','cmp'])} ${pick(R32)}, ${pick(R32)}`); break;
@@ -163,6 +163,18 @@ function program(id) {
                             `inc qword [r12+${rnd(SPAN-8)}]`, `dec qword [r12+${rnd(SPAN-8)}]`,
                             `xadd [r12+${rnd(SPAN-8)}], ${pick(R64)}`,
                             `lock xadd [r12+${rnd(SPAN-8)}], ${pick(R64)}`])); break;
+      // scalar float: arithmetic, the int<->float conversions (overflow, NaN and tie rules live here), compares that feed a branch
+      case 33: { const xa = pick(XR), xb = pick(XR), src = rnd(3) ? xb : `[r12+${rnd(SPAN - 16)}]`;
+        switch (rnd(8)) {
+          case 0: L.push(`${pick(['addsd','subsd','mulsd','divsd','minsd','maxsd','sqrtsd','addss','subss','mulss','divss','minss','maxss','sqrtss'])} ${xa}, ${src}`); break;
+          case 1: L.push(`${pick(['cvtsi2sd','cvtsi2ss'])} ${xa}, ${rnd(2) ? pick(R64) : pick(R32)}`); break;
+          case 2: L.push(`${pick(['cvttsd2si','cvtsd2si','cvttss2si','cvtss2si'])} ${rnd(2) ? pick(R64) : pick(R32)}, ${xb}`); break;
+          case 3: L.push(`${pick(['cvtsd2ss','cvtss2sd'])} ${xa}, ${src}`); break;
+          case 4: { const t = `F${id}_${lab++}`; L.push(`${pick(['ucomisd','comisd','ucomiss','comiss'])} ${xa}, ${xb}`, `j${pick(['e','ne','b','ae','be','a','p','np'])} ${t}`, `${pick(['add','xor'])} ${pick(R64)}, ${pick(R64)}`, `${t}:`); break; }
+          case 5: L.push(`${pick(['ucomisd','comisd','ucomiss','comiss'])} ${xa}, ${xb}`, `set${pick(['e','ne','b','ae','be','a','p','np'])} ${pick(R8)}`); break;
+          case 6: L.push(`${pick(['andpd','orpd','xorpd','andnpd','unpcklpd','unpckhpd'])} ${xa}, ${src}`); break;
+          default: L.push(`${pick(['movsd','movss'])} ${xa}, ${xb}`); }
+        break; }
       case 15: { const off = rnd(SPAN - 96), d = rnd(33) - 16;
         L.push(`lea rsi, [r12+${off}]`, `lea rdi, [r12+${Math.max(0, off + d)}]`, `mov rcx, ${rnd(12)}`,
                `cld`, pick(['rep movsb', 'rep stosb', 'rep movsq', 'repe cmpsb', 'repne scasb',
