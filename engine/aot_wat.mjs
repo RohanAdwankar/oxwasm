@@ -2283,7 +2283,15 @@ function emitUnitFunction(a0, fnAddr, ctx) {
         const trunc = insn.W ? (insn.pF2?'i64.trunc_sat_f64_s':'i64.trunc_sat_f32_s') : (insn.pF2?'i32.trunc_sat_f64_s':'i32.trunc_sat_f32_s');
         // 0x2D rounds-to-nearest; wasm trunc_sat truncates. Add nearest rounding via f*.nearest.
         const fr = insn.op===0x2D ? (insn.pF2?`(f64.nearest ${f})`:`(f32.nearest ${f})`) : f;
-        L.push(insn.W ? wr({kind:'reg',r:xr,size:8},8,`(${trunc} ${fr})`,next) : wr32reg(xr, `(${trunc} ${fr})`));
+        // x86 answers the "integer indefinite" (0x80000000 / 0x8000000000000000) for NaN and for anything outside the integer range;
+        // wasm's trunc_sat gives 0 for NaN and clamps, so JSC's `cvttsd2si; cmp eax, 0x80000000` overflow test never fired for +overflow.
+        const F = insn.pF2 ? 'f64' : 'f32';
+        const lo = insn.W ? (insn.pF2 ? '-9223372036854775808' : '-9223372036854775808') : (insn.pF2 && insn.op === 0x2C ? '-2147483649' : '-2147483648');
+        const loOp = (insn.pF2 && !insn.W && insn.op === 0x2C) ? 'gt' : 'ge';
+        const hi = insn.W ? '9223372036854775808' : '2147483648';
+        const inR = `(i32.and (${F}.${loOp} ${fr} (${F}.const ${lo})) (${F}.lt ${fr} (${F}.const ${hi})))`;
+        const guarded = insn.W ? `(select (${trunc} ${fr}) (i64.const -9223372036854775808) ${inR})` : `(select (${trunc} ${fr}) (i32.const -2147483648) ${inR})`;
+        L.push(insn.W ? wr({kind:'reg',r:xr,size:8},8,guarded,next) : wr32reg(xr, guarded));
         break; }
       case 0x51: case 0x58: case 0x59: case 0x5C: case 0x5D: case 0x5E: case 0x5F: {   // sqrt/add/mul/sub/min/max/div
         // Which prefix means "double" depends on whether the form is scalar or

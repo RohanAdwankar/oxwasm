@@ -457,7 +457,9 @@ export class CPU {
             const x = insn.rm.kind === 'xmm' ? this.xmm[insn.rm.r] : this.mem.read(this.ea(insn.rm), insn.pF2 ? 8n : 4n);
             const f = insn.pF2 ? FP.getF64(x & 0xFFFFFFFFFFFFFFFFn) : FP.getF32(x & 0xFFFFFFFFn);
             const w = insn.W ? 64 : 32;
-            const g = insn.op === 0x2C ? Math.trunc(f) : Math.round(f);
+            // 0x2D rounds to nearest-EVEN (the default MXCSR mode); Math.round breaks ties upward (0.5 -> 1, 2.5 -> 3, -1.5 -> -1)
+            const rne = (x) => { if (!Number.isFinite(x)) return x; const fl = Math.floor(x), d = x - fl; return d < 0.5 ? fl : d > 0.5 ? fl + 1 : (fl % 2 === 0 ? fl : fl + 1); };
+            const g = insn.op === 0x2C ? Math.trunc(f) : rne(f);
             const r = (!Number.isFinite(g) || g >= 2**(w-1) || g < -(2**(w-1)))
               ? 1n << BigInt(w-1)                       // x86 "integer indefinite"
               : BigInt.asUintN(w, BigInt(g));

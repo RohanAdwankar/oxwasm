@@ -1393,3 +1393,10 @@ the abort still happens without one (run 5 of 6), so there is at least one more 
 
 Root-veto bisect under the jettison stress (50 JIT roots, groups of five, up to 3-6 runs each): one group passed 3 of 3 once and then failed in a re-run, and every single root, pair and subset tried also failed,
 so the per-run failure rate is too high and too noisy (~60% or more) for run-count bisecting to separate roots; it needs a deterministic replay, not more runs.
+
+### A real translation bug found by the shadow compare: cvttsd2si overflow
+With the shadow comparator told to ignore the callee's dead stack frame (stores below the entry rsp), a jettison-stress run finally reported a live divergence: in a JIT function that converts the
+LCG value `x*1103515245+12345` (about 2^61) to int32, AOT produced INT_MAX as a double and the interpreter produced -2147483648.0. The scalar `cvtt(s|d)s2si` / `cvt(s|d)2si` forms were
+emitted with wasm `trunc_sat`, which clamps; x86 answers the "integer indefinite" (0x80000000, or 0x8000000000000000 for 64-bit) for NaN and anything out of range, and JSC's overflow test
+(`cmp eax, 0x80000000`) therefore never fired. Fixed with a range select; engine/diff/cvtsi2test.mjs checks 156 cases (the interpreter oracle also got the cvtsd2si round-to-nearest-EVEN fix:
+Math.round broke ties upward). The abort is NOT cured by this alone (cold26, rebuilt: 2 of 4 full-mix runs still abort), but this class of bug is exactly what the shadow compare finds; more remain.

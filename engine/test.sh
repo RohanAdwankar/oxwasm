@@ -15,6 +15,7 @@ node simdtest.mjs
 node simdbench.mjs
 node multest.mjs
 node divtest.mjs
+node cvtsi2test.mjs
 node disptest.mjs
 node jtabtest.mjs
 node shelltest.mjs

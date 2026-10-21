@@ -1335,11 +1335,11 @@ export class LinuxEngine {
           else for (let b = 0; b < v.length; b++) img.set(a + BigInt(b), v[b]);
         }
         let shown = 0;
-        for (const [a, v] of img) { const cur = Number(this.mem.read(a, 1n)); if (cur !== v) { if (shown++ < 12) diffs.push(`mem 0x${a.toString(16)} aot=${cur.toString(16)} interp=${v.toString(16)}`); } }
+        for (const [a, v] of img) { if (a < rsp0 && a >= rsp0 - 0x100000n) continue; /* below the entry rsp: the callee's dead frame */ const cur = Number(this.mem.read(a, 1n)); if (cur !== v) { if (shown++ < 12) diffs.push(`mem 0x${a.toString(16)} aot=${cur.toString(16)} interp=${v.toString(16)}`); } }
         if (shown > 12) diffs.push(`... ${shown} bytes differ`);
         if (snap !== null) {
           const cur = this.mem.view(snapLo, BigInt(snap.length)); let stray = 0;
-          for (let i = 0; i < snap.length; i++) if (cur[i] !== snap[i] && !img.has(snapLo + BigInt(i))) { if (stray++ < 12) diffs.push(`stray 0x${(snapLo + BigInt(i)).toString(16)} was=${snap[i].toString(16)} aot=${cur[i].toString(16)} (rsp0-${(rsp0 - snapLo - BigInt(i)).toString(16)})`); }
+          for (let i = 0; i < snap.length; i++) if (cur[i] !== snap[i] && !img.has(snapLo + BigInt(i)) && !(snapLo + BigInt(i) < rsp0)) { if (stray++ < 12) diffs.push(`stray 0x${(snapLo + BigInt(i)).toString(16)} was=${snap[i].toString(16)} aot=${cur[i].toString(16)} (rsp0-${(rsp0 - snapLo - BigInt(i)).toString(16)})`); }
           if (stray > 12) diffs.push(`... ${stray} stray bytes`);
         }
         if (best === null || diffs.length < best.diffs.length) best = { k, diffs };
