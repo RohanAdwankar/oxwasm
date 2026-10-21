@@ -1320,7 +1320,7 @@ export class LinuxEngine {
       let best = null;
       for (const k of ks) {                                 // a loop revisits (rip, rsp): report only if no visit matches
         const T = trace[k], diffs = [], o = k * 48;
-        for (let r = 0; r < 16; r++) { const v = BigInt.asUintN(64, TB[o + r]); if (cpu.regs[r] !== v) diffs.push(`r${r} aot=${cpu.regs[r].toString(16)} interp=${v.toString(16)}`); }
+        for (let r = 0; r < 16; r++) { const v = BigInt.asUintN(64, TB[o + r]); if (r === 11 && cpu.regs[r] < 0x10000n && v < 0x10000n) continue; /* syscall leaves rflags in r11, flag bits differ by lazy-flag materialisation */ if (cpu.regs[r] !== v) diffs.push(`r${r} aot=${cpu.regs[r].toString(16)} interp=${v.toString(16)}`); }
         for (let r = 0; r < 16; r++) { const v = BigInt.asUintN(64, TB[o + 16 + 2 * r]) | (BigInt.asUintN(64, TB[o + 17 + 2 * r]) << 64n); const a = cpu.xmm[r] ?? 0n; if (a !== v) diffs.push(`xmm${r} aot=${a.toString(16)} interp=${v.toString(16)}`); }
         // Flags are usually dead where a unit leaves (a call, a return, a jump the condition of
         // which was consumed): exit-matched mode ignores them unless OXWASM_SHADOW_FLAGS=1, so a
