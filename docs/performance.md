@@ -1384,3 +1384,9 @@ BUN_JSC_forceCodeBlockLiveness=true (JSC never frees compiled code) cuts the 4-p
 Gaps found with OXWASM_CWVERIFY and fixed: (1) a translation entered in one page that spans into a volatile page lost its guard bits there (bits are now set regardless of volatility);
 (2) functions of one wasm module call each other directly, so invalidating one now drops its unit siblings. Verifier runs after the fixes show a stale translation in only some runs and
 the abort still happens without one (run 5 of 6), so there is at least one more path by which freed/reused JIT memory breaks a translation. Suite green.
+
+### Abort: what is established (single-threaded JSC, deterministic enough to bisect)
+- BUN_JSC_useConcurrentJIT=0 BUN_JSC_useConcurrentGC=0 BUN_JSC_numberOfGCMarkers=1 (no JSC helper threads at all): the full mix still aborts at round 5 in 4 of 4 runs; with BUN_JSC_useJIT=0 it finishes 30 rounds in 3 of 3 (STEADY 620-680 ms). So it is the baseline JIT's code, not threads and not the collector.
+- BUN_JSC_forceCodeBlockToJettisonDueToOldAge=true makes it fail early and deterministically (TypeError on `for (const [k, v] of m)` in maps at round 1, or abort); native is fine with the same option. It needs the full mix (maps alone, or maps after any one other phase, passes).
+- Not invalidation granularity (OXWASM_CW_PAGE=1 fails the same), not stale bytes (the verifier reports none), not inlining (OXWASM_INLINE=0 fails), not memory size.
+- Escaping (interpreting) either the thunk half 5a000000-5a240000 or the code-block half 5a240000-5b000000 of the JIT window alone lets 4 rounds finish under the jettison stress (rounds are 120-210 s each), so both halves have to be translated for it to fail.

@@ -1196,6 +1196,7 @@ export class LinuxEngine {
       if (this.aotDrive) exit = this.aotDrive(exit);
       if (DISPRING) this._dr('driven', entry, BigInt.asUintN(64, exit));
       this.syncIn(); this.stats.aotRuns++;
+      if (CWVERIFY) { (this._dispRing ??= []).push(entry.toString(16) + '>' + BigInt.asUintN(64, exit).toString(16) + '@t' + (this.threads[this.ti]?.id)); if (this._dispRing.length > 12) this._dispRing.shift(); if ((this.stats.aotRuns & 3) === 0) this._cwVerify('disp[' + this._dispRing.join(' ') + ']'); }
       if (this.onProgress && this.stats.aotRuns % 4e6 === 0) this.onProgress('aot');
       return BigInt.asUintN(64, exit); }
     catch (e) { if (DISPRING) this._dr(e instanceof DeoptUnwind ? 'unwind' : e instanceof BlockUnwind ? 'block' : 'throw', entry, e.rip ?? 0n); if (e instanceof DeoptUnwind) { this.syncIn(); if (globalThis.__frameTrace) console.error(`<dispatch-catch entry=${entry.toString(16)} erip=${e.rip.toString(16)} rsp=${this.cpu.regs[4].toString(16)} iu=${this._iuDepth | 0}>`);
