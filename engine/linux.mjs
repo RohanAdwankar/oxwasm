@@ -540,6 +540,7 @@ export class LinuxEngine {
         ranges.push({ lo: m.at, hi: m.at + BigInt(m.len), map: m });
       }
       if (ranges.length) { id = st.exeId(parts, this.base.toString(16) + ':' + this.RAMOFF); this._exeRanges = ranges; }
+      if (ENV.OXWASM_UNITLOG) __dbg(`[unitstore exeId] ${id} maps=${nm} ${parts.map((x) => x.split(':').slice(0, 3).join(':')).join(' ')}`);
     } catch { id = null; }
     this._exeMapsN = nm;
     return (this._exeIdV = id);
@@ -761,7 +762,7 @@ export class LinuxEngine {
       if (CWTRACE !== null && (exact ? exact[0] <= CWTRACE && exact[1] > CWTRACE : lo <= CWTRACE && hi > CWTRACE)) __dbg(`[cwtrace] invalidate exact=${exact ? exact[0].toString(16) + '-' + exact[1].toString(16) : 'page'} hitK=${(hitK || []).map((k) => k.toString(16)).join(',')}`);
       // functions translated into one wasm module may call each other directly, so one going stale takes its siblings with it
       if (hitK && this._unitSibs) { const seen = new Set(hitK); for (let i = 0; i < hitK.length; i++) { const sibs = this._unitSibs.get(hitK[i]); if (sibs) for (const f of sibs) if (!seen.has(f)) { seen.add(f); hitK.push(f); } } }
-      if (hitK) for (const k of hitK) { if (this.aotFns.has(k)) { this.aotFns.delete(k); hit = true; dropped.push(k); } const sp0 = this._extSpans?.get(k); this._extents.delete(k); this._extSpans?.delete(k); this._wideExt?.delete(k); changed = true; (gone ??= []).push(sp0 || null); }
+      if (hitK) for (const k of hitK) { if (this.aotFns.has(k)) { this.aotFns.delete(k); hit = true; dropped.push(k); } const sp0 = this._extSpans?.get(k); if (CWTRACE !== null && (sp0 || [this._extents.get(k) || [0n, 0n]]).some(([x, y]) => x <= CWTRACE && y > CWTRACE)) __dbg(`[cwtrace] drop fn=${k.toString(16)} inAot=${this.aotFns.has(k)} write=${lo.toString(16)}-${hi.toString(16)} exact=${exact ? exact[0].toString(16) + '-' + exact[1].toString(16) : '-'} disp=${this.stats.disp}`); this._extents.delete(k); this._extSpans?.delete(k); this._wideExt?.delete(k); changed = true; (gone ??= []).push(sp0 || null); }
       // a unit still being assembled was built from the old bytes too, whichever page its entries sit on
       if (hitK && this._inflight) for (const u of this._inflight) if (!u.cancelled && u.funcs.some((f) => hitK.includes(f))) {
         u.cancelled = true;
@@ -1048,9 +1049,9 @@ export class LinuxEngine {
         if ((b - 1n >> 12n) - (a >> 12n) > WIDE_EXT_PAGES) { (this._wideExt ??= new Set()).add(k); this.stats.wideExt = (this.stats.wideExt | 0) + 1; if (spans) { (this._extSpans ??= new Map()).set(k, spans); for (const [x, y] of spans) this._cwMarkSpan(x, y); } else this._cwCoverAll(a); if (ENV.OXWASM_TUTRACE) __dbg(`[wide-ext] ${k} ${a.toString(16)}-${b.toString(16)} ${((b - a) >> 20n)}MB`); continue; }
         const ep = this._extPages ??= new Map();
         for (let q = a >> 12n; q <= (b - 1n) >> 12n; q++) { this.codePages.add(q); let st = ep.get(q); if (!st) ep.set(q, st = new Set()); st.add(k); }
-        if (CWTRACE !== null && a <= CWTRACE && b > CWTRACE) { let cov = (spans || [[a, b]]).some(([x, y]) => x <= CWTRACE && y > CWTRACE); let bb = ''; try { bb = Buffer.from(this.mem.view(CWTRACE - 2n, 8n)).toString('hex'); } catch {} __dbg(`[cwtrace] register fn=${k.toString(16)} hull=${a.toString(16)}-${b.toString(16)} spanCovers=${cov} bytes@-2=${bb} disp=${this.stats.disp} unit=${entry.toString(16)}`); }
+        if (CWTRACE !== null && a <= CWTRACE && b > CWTRACE) { let cov = (spans || [[a, b]]).some(([x, y]) => x <= CWTRACE && y > CWTRACE); let bb = ''; try { bb = Buffer.from(this.mem.view(CWTRACE - 2n, 8n)).toString('hex'); } catch {} __dbg(`[cwtrace] register fn=${k.toString(16)} hull=${a.toString(16)}-${b.toString(16)} spanCovers=${cov} bytes@-2=${bb} mapByte=${new Uint8Array(this.wmem.buffer)[this.CWBM + ((this.RAMOFF + Number(CWTRACE - this.base)) >>> 6)]} disp=${this.stats.disp} unit=${entry.toString(16)}`); }
         if (spans) { (this._extSpans ??= new Map()).set(k, spans); for (const [x, y] of spans) this._cwMarkSpan(x, y); } else this._cwMarkSpan(a, b); } }
-      if (ENV.OXWASM_WATDIR && !(this.execRangesStatic ?? []).some(([x, y]) => entry >= x && entry < y)) { try { process.getBuiltinModule('node:fs').writeFileSync(ENV.OXWASM_WATDIR + '/u_' + entry.toString(16) + '.wat', unit.wat); } catch {} }
+      if (ENV.OXWASM_WATDIR && (ENV.OXWASM_WATDIR_ALL || !(this.execRangesStatic ?? []).some(([x, y]) => entry >= x && entry < y))) { try { process.getBuiltinModule('node:fs').writeFileSync(ENV.OXWASM_WATDIR + '/u_' + entry.toString(16) + '.wat', unit.wat); } catch {} }
       if (this.onUnitWat) this.onUnitWat(un, entry, unit);
       // assembleWatAsync (browser): the assembler is 65% of the on-thread
       // tier-up cost and is a pure text -> bytes transform with no engine
@@ -1627,7 +1628,7 @@ export class LinuxEngine {
     if (this._watchArmed) this._watchLog(g, BigInt(size >>> 0 || 1), 0n, 'compiled next=' + (next === undefined ? '?' : BigInt.asUintN(64, next).toString(16)));   // log, then invalidate as usual (the early return made watched runs skip invalidation)
     const n = BigInt(size >>> 0 || 1), end = g + n;
     if (CWTRACE !== null && g <= CWTRACE && end > CWTRACE) { const hit = this._extOverlap(g, end); __dbg(`[cwtrace] write g=${g.toString(16)} n=${n} next=${next === undefined ? '?' : BigInt.asUintN(64, next).toString(16)} tid=${this.threads[this.ti]?.id} disp=${this.stats.disp} disjoint=${this._cwDisjoint(g, end)} overlap=${(hit || []).map((k) => k.toString(16) + (this.aotFns.has(k) ? '(reg)' : '(unreg)')).join(',')} noExt=${this._noExtPg?.get(g >> 12n)?.size | 0} inflight=${this._inflight?.size | 0}`); }
-    if (ENV.OXWASM_CWLOG && (this._cwLogN = (this._cwLogN | 0) + 1) <= +ENV.OXWASM_CWLOG) __dbg(`[cwlog] #${this._cwLogN} g=${g.toString(16)} size=${size} next=${next === undefined ? '?' : BigInt.asUintN(64, next).toString(16)} disjoint=${this._cwDisjoint(g, end)} noExt=${this._noExtPg?.get(g >> 12n)?.size | 0} extPg=${this._extPages?.get(g >> 12n)?.size | 0} inExec=${this.execRanges.some(([x, y]) => g >= x && g < y)} vol=${!!this._volatilePages?.has(g & ~4095n)} fns=${[...this.aotFns.keys()].filter((k) => (k >> 12n) === (g >> 12n)).length}`);
+    if (ENV.OXWASM_CWLOG && (this._cwLogN = (this._cwLogN | 0) + 1) <= +ENV.OXWASM_CWLOG) __dbg(`[cwlog] #${this._cwLogN} g=${g.toString(16)} size=${size} next=${next === undefined ? '?' : BigInt.asUintN(64, next).toString(16)} code@-16=${(() => { try { return Buffer.from(this.mem.view(BigInt.asUintN(64, next ?? 0n) - 16n, 16n)).toString('hex'); } catch { return '?'; } })()} covered=${this._cwLineCovered(g & ~63n)} disjoint=${this._cwDisjoint(g, end)} noExt=${this._noExtPg?.get(g >> 12n)?.size | 0} extPg=${this._extPages?.get(g >> 12n)?.size | 0} inExec=${this.execRanges.some(([x, y]) => g >= x && g < y)} vol=${!!this._volatilePages?.has(g & ~4095n)} fns=${[...this.aotFns.keys()].filter((k) => (k >> 12n) === (g >> 12n)).length}`);
     if (CWHIST) { const h = (this._cwHist ??= new Map()); const pg = g >> 3n; h.set(pg, (h.get(pg) | 0) + 1); if ((this.stats.codeWrites + 1) % 500000 === 0) __dbg('[cwhist] ' + [...h].sort((x, y) => y[1] - x[1]).slice(0, 12).map(([k, v]) => (k << 3n).toString(16) + '=' + v).join(' ') + ' size=' + size + ' next=' + (next === undefined ? '?' : BigInt.asUintN(64, next).toString(16)));
       if ((this.stats.codeWrites + 1) % 500000 === 0) for (const [pgk] of [...h].sort((x, y) => y[1] - x[1]).slice(0, 3)) { const lo2 = (pgk << 3n) & ~63n; const hk = this._extOverlap(lo2 - 64n, lo2 + 128n) || []; __dbg('[cwhist] page ' + lo2.toString(16) + ' vol=' + !!this._volatilePages?.has(lo2) + ' extents: ' + hk.map((k) => { const e = this._extents.get(k); const sp = (this._extSpans?.get(k) || []).filter(([x, y]) => x < lo2 + 128n && y > lo2 - 64n).map(([x, y]) => x.toString(16) + '-' + y.toString(16)).join('|'); return k.toString(16) + '[' + e[0].toString(16) + '-' + e[1].toString(16) + ' spans ' + sp + ']'; }).join(' ')); } }
     const lo = g & ~4095n, hi = (end + 4095n) & ~4095n;
@@ -1645,7 +1646,16 @@ export class LinuxEngine {
     if (ENV.OXWASM_CWSTAT && this.stats.codeWrites % +ENV.OXWASM_CWSTAT === 0) __dbg(`[cwstat] t=${(this.nowMs() / 1000) | 0}s writes=${this.stats.codeWrites} disjoint=${this.stats.cwDisjoint | 0} invalSlow=${this.stats.invalSlow | 0} volatile=${this.stats.volatilePages | 0} aotFns=${this.aotFns.size} ext=${this._extents?.size} wide=${this._wideExt?.size | 0}`);
     // Translations record the bytes they were built from, so a store that touches none of them (the JIT emitting its
     // next function beside a thunk it already translated) changes nothing and does not make the page volatile.
-    if (!EXACT_CW_OFF && this._cwDisjoint(g, end)) { this.stats.cwDisjoint = (this.stats.cwDisjoint | 0) + 1; return; }
+    if (!EXACT_CW_OFF && this._cwDisjoint(g, end)) {
+      this.stats.cwDisjoint = (this.stats.cwDisjoint | 0) + 1;
+      // The guard fires on every store into a marked line; a line holds code and the JIT's data side by side (JSC's
+      // inline-cache slots and counters sit right after a function's code), and a line whose translations are all
+      // gone stays marked until something unmarks it. 170k-270k of these a round made a 60 ms objects round take 800.
+      // A line no translation covers any more is cleared here, on the store that found it; a line still shared with
+      // live code keeps paying. Units still being assembled are in _extents already (they register at creation).
+      if (!this._cwLineCovered(g & ~63n)) { this._cwBitsOne(g >> 6n, false); this.stats.cwHeal = (this.stats.cwHeal | 0) + 1; }
+      return;
+    }
     const changed = this._invalidateCode(lo, hi, EXACT_CW_OFF ? undefined : [g, end]);
     if (!changed && !EXACT_CW_OFF) return;
     // A page that keeps being rewritten is VOLATILE: the guest is using it as
@@ -1685,8 +1695,9 @@ export class LinuxEngine {
     const a = x > wlo ? x : wlo, b = y < whi ? y : whi;
     return a < b ? [a, b] : null;
   }
-  _cwBits(x, y, on, skipVolatile) {
+  _cwBits(x, y, on, skipVolatile, why) {
     if (!STOREGUARD || !this.wmem) return;
+    if (CWTRACE !== null && x - 15n <= CWTRACE && y > CWTRACE) __dbg(`[cwtrace] lines ${on ? 'SET' : 'CLEAR'} [${x.toString(16)},${y.toString(16)}) by=${why || '?'} skipVolatile=${!!skipVolatile} vol=${!!this._volatilePages?.has(CWTRACE & ~4095n)} disp=${this.stats.disp}`);
     const clip = this._cwClip(x >= 15n && on ? x - 15n : x, y); if (!clip) return; x = clip[0]; y = clip[1];
     const u8 = new Uint8Array(this.wmem.buffer), bm = this.CWBM;
     for (let g = x >> 6n; g <= (y - 1n) >> 6n; g++) {
@@ -1696,9 +1707,9 @@ export class LinuxEngine {
       u8[bm + li] = on ? 1 : 0;
     }
   }
-  _cwMark(page, on) { this._cwBits(page, page + 4096n, on, false); }
+  _cwMark(page, on) { this._cwBits(page, page + 4096n, on, false, 'page'); }
   // Set the guard bit of every line of [x, y), except on volatile pages.
-  _cwMarkSpan(x, y) { this._cwBits(x, y, true, false); }   // volatile pages included: a translation entered elsewhere may span into one
+  _cwMarkSpan(x, y) { this._cwBits(x, y, true, false, 'span'); }   // volatile pages included: a translation entered elsewhere may span into one
   // A translation is gone: clear the guard bit of each line of its bytes that no other translation still covers, so memory the
   // JIT pool later hands out for data stops calling into the engine on every store.
   _cwUnmarkSpan(x, y) {
@@ -1706,12 +1717,18 @@ export class LinuxEngine {
     const clip = this._cwClip(x >= 15n ? x - 15n : 0n, y); if (!clip) return;
     const x2 = clip[0]; y = clip[1];
     for (let g = x2 >> 6n; g <= (y - 1n) >> 6n; g++) {
-      const ls = g << 6n, le = ls + 64n;
-      const hk = this._extOverlap(ls, le + 15n);
-      if (hk && hk.some((k) => (this._extSpans?.get(k) ?? [[0n, 1n << 64n]]).some(([sx, sy]) => sx < le + 15n && sy > ls))) continue;
-      if (this._noExtPg?.get(ls >> 12n)?.size) continue;
+      if (this._cwLineCovered(g << 6n)) continue;
+      if (CWTRACE !== null && (g << 6n) <= CWTRACE && (g << 6n) + 64n > CWTRACE) __dbg(`[cwtrace] line CLEAR by=unmark ${(g << 6n).toString(16)} (dropped span ${x.toString(16)}-${y.toString(16)}) disp=${this.stats.disp}`);
       this._cwBitsOne(g, false);
     }
+  }
+  // Does a registered translation (or a cached unit of unknown extent on the page) still cover any byte the guard line at
+  // `ls` watches? Spans are marked 15 bytes wide to the left, so a span starting up to 15 bytes past the line's end counts.
+  _cwLineCovered(ls) {
+    const le = ls + 64n;
+    const hk = this._extOverlap(ls, le + 15n);
+    if (hk && hk.some((k) => (this._extSpans?.get(k) ?? [[0n, 1n << 64n]]).some(([sx, sy]) => sx < le + 15n && sy > ls))) return true;
+    return !!this._noExtPg?.get(ls >> 12n)?.size;
   }
   _cwBitsOne(g, on) {
     const li = (this.RAMOFF + Number((g << 6n) - this.base)) >>> 6;
@@ -1766,6 +1783,7 @@ export class LinuxEngine {
     // the bytes: a stale map watches the wrong pages, which is worse than
     // watching none.
     dv.setUint32(CWBM_SLOT, this.CWBM, true);
+    if (CWTRACE !== null) __dbg(`[cwtrace] window ${lo.toString(16)}-${hi.toString(16)}: map cleared and re-marked disp=${this.stats.disp}`);
     { const o = this.RAMOFF + Number(lo - this.base); new Uint8Array(this.wmem.buffer).fill(0, this.CWBM + (o >>> 6), Math.min(this.CWBM + this.CWBMLEN, this.CWBM + ((o + Number(hi - lo)) >>> 6) + 1)); }
     if (CW_ALLPAGES) for (const a of this.aotFns.keys()) this._cwCover(a);
     else {
@@ -2704,7 +2722,9 @@ export class LinuxEngine {
     const nr = Number(cpu.regs[0]);
     const [a1, a2, a3] = [cpu.regs[7], cpu.regs[6], cpu.regs[2]];   // rdi rsi rdx
     this.stats.syscalls[nr] = (this.stats.syscalls[nr] || 0) + 1;
-    if (ENV.OXWASM_COUNTCALLS === '1' && nr === 1 && this._ctor?.argv?.[0]?.includes('opencode')) { const c = new DataView(this.wmem.buffer).getBigUint64(FTMAP + 32, true); __dbg(`[calls-w] n=${c} d=${c - (this._lastCallsW ?? 0n)} interp=${this.stats.interpreted - (this._lastInterpW ?? 0)} disp=${this.stats.disp - (this._lastDispW ?? 0)}`); this._lastCallsW = c; this._lastInterpW = this.stats.interpreted; this._lastDispW = this.stats.disp; }
+    if (ENV.OXWASM_COUNTCALLS === '1' && nr === 1 && this._ctor?.argv?.[0]?.includes('opencode')) { const c = new DataView(this.wmem.buffer).getBigUint64(FTMAP + 32, true); const st = this.stats, pv = this._lastStW ?? {}, d = (k) => (st[k] | 0) - (pv[k] | 0), sysSum = Object.values(st.sysMs ?? {}).reduce((x, y) => x + y, 0), sysN = Object.values(st.syscalls ?? {}).reduce((x, y) => x + y, 0), now = performance.now();
+      __dbg(`[calls-w] n=${c} d=${c - (this._lastCallsW ?? 0n)} interp=${d('interpreted')} disp=${d('disp')} ms=${(now - (pv.now ?? now)) | 0} tu=${(st.tuTotalMs - (pv.tuTotalMs || 0)) | 0}ms/${d('tiers_aot')} inval=${d('invalSlow')} cw=${d('codeWrites')} deopt=${d('deopts')} callout=${d('coNoF')} vol=${d('volatilePages')} sys=${sysN - (pv.sysN || 0)}/${(sysSum - (pv.sysSum || 0)) | 0}ms heap=${(process.memoryUsage().heapUsed / 1048576) | 0}MB v8gc=${(() => { try { const h = process.getBuiltinModule('node:v8').getHeapStatistics(); return ((h.total_heap_size / 1048576) | 0) + 'MB/' + ((h.malloced_memory / 1048576) | 0) + 'MBm'; } catch { return '?'; } })()} ext=${(process.memoryUsage().external / 1048576) | 0}MB`);
+      this._lastCallsW = c; this._lastStW = { ...st, tiers_aot: st.tiers?.aot | 0, now, sysSum, sysN }; st.tiers_aot = st.tiers?.aot | 0; }
     if (ENV.OXWASM_JITSYS && (nr === 9 || nr === 10 || nr === 11 || nr === 25 || nr === 28) && this._ctor?.argv?.[0]?.includes('opencode')) {
       const lo = BigInt('0x' + (ENV.OXWASM_JITSYS === '1' ? '5a000000' : ENV.OXWASM_JITSYS.split('-')[0])), hi = BigInt('0x' + (ENV.OXWASM_JITSYS === '1' ? '5b000000' : ENV.OXWASM_JITSYS.split('-')[1]));
       const len = nr === 9 ? cpu.regs[6] : nr === 25 ? cpu.regs[6] : cpu.regs[6];
@@ -3234,6 +3254,7 @@ export class LinuxEngine {
           for (let i = 0n; ; i += 8n) { const sp = this.mem.read(p + i, 8n); if (sp === 0n) break;
             out.push(this.readPath(sp)); } return out; };
         let argv = a2 ? readVec(a2) : [path];
+        if (ENV.OXWASM_EXECLOG) __dbg(`[exec] pid=${t?.pid ?? '?'} ${path} ${argv.slice(0, 4).join(' ')}`);
         const envp = a3 ? readVec(a3) : [];
         let bytes = this.lookup(path);
         if (!bytes) { ret(-2n); break; }                     // ENOENT

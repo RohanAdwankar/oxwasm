@@ -1600,6 +1600,21 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   // SSE ops that name a GPR (not xmm) via xr or rm — see sseXrIsGpr/sseRmIsGpr below
   const sseGprXr = (insn) => [0x2C, 0x2D, 0xD7, 0x50, 0xC5].includes(insn.op);   // 0xC5 pextrw writes a GPR
   const sseGprRm = (insn) => insn.op === 0x6E || insn.op === 0x2A || insn.op === 0xC4 || (insn.op === 0x7E && !insn.pF3);   // 0xC4 pinsrw reads a GPR/m16
+  // rbp is a frame pointer only in a function that sets it up as one (`mov rbp, rsp`, or a `leave`) and never
+  // writes it otherwise. C++ built with frame-pointer omission - libJavaScriptCore included - uses rbp as a general
+  // register, and its `mov [rbp+disp], r32` is how JSC's jump repatch reached translated code past the store guard
+  // (the guard skipped every rbp-based store): three to eighteen stale translations per run, caught by CWVERIFY.
+  // An inlined callee that uses rbp as a scratch register counts as a write, so the skip stays off for the whole copy.
+  let rbpFrame = false, rbpGpr = false;
+  for (const b of blocks) for (const insn of b.insns) {
+    if (insn.mnem === 'leave') { rbpFrame = true; continue; }
+    const d = insn.dst, sr = insn.src;
+    if (insn.mnem === 'mov' && d?.kind === 'reg' && d.r === 5 && (insn.size || 8) === 8 && sr?.kind === 'reg' && sr.r === 4) { rbpFrame = true; continue; }
+    if (insn.mnem === 'pop' && d?.kind === 'reg' && d.r === 5) continue;
+    if (d?.kind === 'reg' && d.r === 5 && insn.mnem !== 'cmp' && insn.mnem !== 'test' && insn.mnem !== 'bt') rbpGpr = true;
+    if ((insn.mnem === 'xchg' || insn.mnem === 'xadd') && sr?.kind === 'reg' && sr.r === 5) rbpGpr = true;
+  }
+  const fpRbp = rbpFrame && !rbpGpr;
   for (const b of blocks) for (const insn of b.insns) {
     const S = insn.size || 8;
     switch (insn.mnem) {
@@ -1956,12 +1971,12 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   // order the unguarded form already has: address first, then the value. `size` is the byte count written, so the engine
   // can tell a store beside translated code (the JIT emitting its next function) from one into it. Outer test first and
   // alone: with an empty window the page index would be enormous and the byte load would trap rather than answer false.
-  // Stack and TLS accesses (rsp/rbp based, or fs-relative) never land in generated code, and they are most of a C++ function's
-  // stores: they skip the guard (OXWASM_GUARD_STACK=1 guards them too).
+  // Stack and TLS accesses (rsp based, rbp based where rbp is this function's frame pointer, or fs-relative) never land in
+  // generated code, and they are most of a C++ function's stores: they skip the guard (OXWASM_GUARD_STACK=1 guards them too).
   const GUARD_STACK = typeof process !== 'undefined' && process.env?.OXWASM_GUARD_STACK === '1';
   const gstore = (addr, size, next, mk, op) => {
     if (!STOREGUARD) return mk(addr);
-    if (!GUARD_STACK && op && (op.fs || ((op.base === 4 || op.base === 5) && !(op.index >= 0)))) return mk(addr);
+    if (!GUARD_STACK && op && (op.fs || ((op.base === 4 || (op.base === 5 && fpRbp)) && !(op.index >= 0)))) return mk(addr);
     usesGa = true;
     // One byte per 64-byte line of the whole guest memory, indexed by the store's wasm address: a load and a
     // branch per store. (The window-relative bitmap it replaces cost two slot loads, a subtract, a compare and

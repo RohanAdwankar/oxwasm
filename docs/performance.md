@@ -1576,3 +1576,54 @@ found nothing real in the JIT window; the stale translations the verifier report
 With OXWASM_CHILD_ERRORS=1: "memory access out of bounds" at rip c598b00 (the dynamic linker's mapping) within 4 s of `--version`.
 The larger inline budgets (TINY=160, TOTAL=2000, BUDGET=200) miscompile an inlined site in ld.so; the default budgets do not reach
 it. Deterministic, so bisectable with OXWASM_INLINE_ONLY when the inliner is next worked on; not the default-configuration bug.
+
+### Found: the unguarded store was an rbp-based store from frame-pointer-omitting C++
+Tracing every set and clear of the guard line holding 5a260a01 (OXWASM_CWTRACE) showed the line marked at the time of the patch
+and no x_cw call for it: the store never reached the guard. The emitter skipped the guard on every rsp- or rbp-based store
+without an index (stack and frame slots never hold code), but C++ built with frame-pointer omission - libJavaScriptCore's
+repatching code included - uses rbp as a general register, and JSC's `mov [rbp+disp], r32` of a jump's rel32 went straight
+through. Fix (aot_wat.mjs): rbp counts as a frame pointer only in a function that sets it up as one (`mov rbp, rsp` or a
+`leave`) and never writes it otherwise; an inlined callee using rbp as scratch counts as a write, so the skip is off for the
+whole copy. On a cache built with the rule (cold68) CWVERIFY reports stale=0 across every run; before, 3-18 per run.
+
+Two more things turned up on the way:
+- The unit store wrote and later read empty .wasm files (23 of 8,021 in cold68, 6 in cold42): an assembler that answered with
+  no bytes. Each failed every later run with "WebAssembly.Module(): BufferSource argument is empty" and stayed interpreted
+  (278e310 x341 was the hottest). The store now refuses to write an empty unit and treats one on disk as a miss and unlinks it.
+- The harness's own tail (sh, date, tail, kill after the rounds) and the guest's processes before bun (python, the shell)
+  translate 300-400 units per run under program ids that change every run (their file mappings land at different addresses),
+  so a whole-run profile is dominated by their translation and must be windowed to the rounds. The bench now takes an optional
+  trailing Bun.sleepSync so the rounds end at a visible idle gap in the profile (proftl.mjs / profwin.mjs --to=).
+
+### Where a steady objects round goes now (cold68, V8 CPU profile windowed to the rounds)
+Rounds are 90% wasm self time; the engine's dispatch, translation, interpretation and V8 GC are the remaining 10%. The entries
+per round are 150k (down from 678k; the stale translations were bouncing between old and new code). But the rounds are still
+150-400 ms against a native phase of a few ms, and a single translated function (index 3633 of one module) is 22% of the
+window by itself. The cached units carry no names, so the next step is a cache built with OXWASM_DEBUGNAMES=1 (cold69) and the
+same profile, to name that function and the hot single-function JIT units (wasm-function[7] of a dozen small modules).
+
+### The objects round is JSC's garbage collector, 43x slower per pause than native
+Native objects(30000): 6 ms a round (3-13), 45 GC pauses over 12 rounds totalling 31 ms (0.68 ms each, BUN_JSC_logGC=1).
+oxwasm (cold68): 140-700 ms a round, and the GC log's last 30 KB alone holds 101 pauses totalling 2,998 ms (29.7 ms each).
+The named profile (cold69) agrees: the hottest translated functions in the rounds are JSC heap routines (f_50eee60,
+f_5109300, f_47be830, f_478c050: 1,000-byte frames, bitmap and block-walking loops), not the JIT'd JS. Turning off the parallel
+markers and the concurrent GC/JIT (BUN_JSC_numberOfGCMarkers=1, useConcurrentGC=0, useConcurrentJIT=0) changes nothing, so it is
+not helper threads spinning under the time slicer; the marking and sweeping code itself runs ~40x slower than native, against
+the 3-8x a translated C++ loop should cost. Queued: the deopt/callout log for those functions and their emitted WAT (a cold
+cache with OXWASM_WATDIR), to find the instruction forms they hit that leave compiled code.
+
+### Per-round engine counters, and what the variance is not
+`[calls-w]` (OXWASM_COUNTCALLS=1) now prints, at every write syscall of the opencode process, the deltas since the last one:
+wall ms, translation ms and count, invalidations, guarded stores reaching the engine (cw), deopts, callouts without a unit,
+volatile pages, syscalls and their ms, and the V8 heap. On cold68 (objects, 12 rounds) a round reads for example
+`ms=60 tu=0 inval=0 cw=0 deopt=2 callout=9 sys=128/0ms` - and that round took 60 ms, ten times native and the floor so far -
+while `ms=796 cw=270001` was a round in which 270k guarded stores reached the engine: the JIT writes data (inline-cache slots,
+counters) into lines that also hold code it no longer has a translation for, and a line stays marked until something unmarks
+it. _codeWrite now clears a line on the disjoint store that finds it, when no registered translation covers the line
+(`_cwLineCovered`, the same test the unmark path uses); after that cw is 0-4 a round.
+What the counters rule out for the remaining 120-1,900 ms rounds: not translation (0-35 ms), not interpretation (hundreds to
+a few thousand instructions), not syscalls (0-12 ms), not V8's GC (--trace-gc: 2.2 s in a 30 s run, --max-semi-space-size=128
+changes nothing), not Liftoff (--no-liftoff and eager TurboFan change nothing), not JSC's helper threads. The slow rounds are
+JSC's own collections: count per run matches native (12 vs 8), cost per pause is 40x. The indirect-call protocol in the
+collector's visit loop (u_5109300, V8 machine code) is ~75 instructions plus the callee's entry against native's three, and
+the straight-line code is ~8-12 machine instructions per guest instruction, so the marking code pays both.

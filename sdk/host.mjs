@@ -8,7 +8,7 @@
 // be abandoned when that happens.
 import { makeNet } from './net.mjs';
 import { loadRootfs, resolveIn } from './rootfs.mjs';
-import { readFileSync, statSync, existsSync, mkdirSync, renameSync, rmSync, writeFileSync, readdirSync } from 'node:fs';
+import { readFileSync, statSync, existsSync, mkdirSync, renameSync, rmSync, unlinkSync, writeFileSync, readdirSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { LinuxEngine } from '../engine/linux.mjs';
@@ -56,7 +56,9 @@ function makeUnitStore(cacheDir) {
   return {
     digest(chunks) { const h = createHash('sha1'); for (const c of chunks) h.update(c); return h.digest('hex').slice(0, 16); },
     exeId(chunks, extra) { const h = createHash('sha1'); for (const c of chunks) h.update(c); h.update(String(extra)); return h.digest('hex').slice(0, 20); },
-    get(ex, k) { try { const b = readFileSync(join(root, ex, k + '.wasm')); if (process.env.OXWASM_UNITLOG) console.error('[unitstore hit]', ex, k); return new Uint8Array(b.buffer, b.byteOffset, b.length); } catch { if (process.env.OXWASM_UNITLOG) console.error('[unitstore miss]', ex, k); return undefined; } },
+    // An empty file is a miss, not a unit: 23 of them in one cold build (an assembler that answered with no bytes) each
+    // failed every later run with "BufferSource argument is empty" and left their functions interpreted for good.
+    get(ex, k) { try { const f = join(root, ex, k + '.wasm'), b = readFileSync(f); if (b.length === 0) { try { unlinkSync(f); } catch {} throw new Error('empty'); } if (process.env.OXWASM_UNITLOG) console.error('[unitstore hit]', ex, k); return new Uint8Array(b.buffer, b.byteOffset, b.length); } catch { if (process.env.OXWASM_UNITLOG) console.error('[unitstore miss]', ex, k); return undefined; } },
     // bundle_N.wasm files of one program id: many units linked into a few modules (tools/bundle-units.mjs)
     bundles(ex) {
       const d = join(root, ex); let names;
@@ -71,6 +73,7 @@ function makeUnitStore(cacheDir) {
     putSize(ex, k, n) { try { const d = join(root, ex); mkdirSync(d, { recursive: true }); writeFileSync(join(d, k + '.size'), String(n)); } catch {} },
     put(ex, k, bytes) {
       const d = join(root, ex); mkdirSync(d, { recursive: true });
+      if (!bytes || bytes.length === 0) return;
       const f = join(d, k + '.wasm'), t = f + '.' + process.pid + '.tmp';
       writeFileSync(t, bytes); renameSync(t, f);
     },
