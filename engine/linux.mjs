@@ -1367,6 +1367,7 @@ export class LinuxEngine {
         st.diverged++; this._shadowDiverged = (this._shadowDiverged ?? 0) + 1;
         if (ENV.OXWASM_DUMPDIR) { const b = new Uint8Array(0x800); for (let i = 0; i < b.length; i++) { try { b[i] = Number(this.mem.read(entryRip + BigInt(i), 1n)); } catch { break; } } try { process.getBuiltinModule('node:fs').writeFileSync(ENV.OXWASM_DUMPDIR + '/div_' + entryRip.toString(16) + '.bin', b); } catch {} }
         __dbg(`<SHADOW-DIVERGE fn=0x${entryRip.toString(16)} exit=0x${exitRip.toString(16)} step=${best.k}/${trace.length} entry=[${regs0.map(v=>v.toString(16)).join(',')}]>`);
+        try { __dbg(`<SHADOW-CODE fn=0x${entryRip.toString(16)} ${Buffer.from(this.mem.view(entryRip, 512n)).toString('hex')}>`); __dbg(`<SHADOW-TRACE ${trace.slice(0, Math.min(trace.length, best.k + 1)).map((t) => t.rip.toString(16)).join(' ')}>`); } catch {}
         for (const d of best.diffs.slice(0, 20)) __dbg('  ' + d);
       }
       this._shadowBusy = false;
@@ -3568,6 +3569,7 @@ export class LinuxEngine {
           const rsp = this.cpu.regs[4], words = [];
           for (let i = 0n; i < 400n && words.length < 40; i++) { let w; try { w = this.mem.read(rsp + 8n * i, 8n); } catch { break; } if (w > 0x200000n && w < 0x6000000n) words.push(w.toString(16)); }
           __dbg(`[abort] tid=${this.threads[this.ti]?.id} rip=${this.cpu.rip.toString(16)} stack-code=${words.join(' ')}`);
+          try { __dbg(`[abort-thunk2] base=5a224000 ${Buffer.from(this.mem.view(0x5a224000n, 2048n)).toString('hex')}`); } catch {}
           try { __dbg(`[abort-thunk] base=5a2315c0 ${Buffer.from(this.mem.view(0x5a2315c0n, 1024n)).toString('hex')}`); } catch {}
           __dbg(`[abort-stats] aotFns=${this.aotFns.size} ftFull=${this._ftFull} ftCount=${this._ftCount} extents=${this._extents?.size} noExtPg=${this._noExtPg?.size} wide=${this._wideExt?.size | 0} volatile=${this._volatilePages?.size | 0} codeWrites=${this.stats.codeWrites | 0} invalSlow=${this.stats.invalSlow | 0} execRanges=${this.execRanges.map(([x, y]) => x.toString(16) + '-' + y.toString(16)).join(',')} interpreted=${this.stats.interpreted} disp=${this.stats.disp}`);
           { const raw = []; for (let i = 0n; i < 70n; i++) { let w; try { w = this.mem.read(rsp + 8n * i, 8n); } catch { break; }
