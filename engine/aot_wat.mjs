@@ -1963,12 +1963,14 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     if (!STOREGUARD) return mk(addr);
     if (!GUARD_STACK && op && (op.fs || ((op.base === 4 || op.base === 5) && !(op.index >= 0)))) return mk(addr);
     usesGa = true;
+    // One byte per 64-byte line of the whole guest memory, indexed by the store's wasm address: a load and a
+    // branch per store. (The window-relative bitmap it replaces cost two slot loads, a subtract, a compare and
+    // a bit test on top: 29% of the machine code of the hot JSC functions.) A line is set only while a
+    // translation built from its bytes is registered; the engine widens marks 15 bytes to the left so a wide
+    // store that starts just before a span is seen too.
     return `(local.set $ga ${addr}) ` +
-           `(local.set $gp (i32.sub (local.get $ga) (i32.load (i32.const ${CWLO_SLOT})))) ` +
-           `(if (i32.lt_u (local.get $gp) (i32.load (i32.const ${CWLEN_SLOT}))) ` +
-           `(then (if (i32.and (i32.load8_u (i32.add (i32.load (i32.const ${CWBM_SLOT})) (i32.shr_u (local.get $gp) (i32.const 9)))) ` +
-           `(i32.shl (i32.const 1) (i32.and (i32.shr_u (local.get $gp) (i32.const 6)) (i32.const 7)))) ` +
-           `(then (call $x_cw (local.get $ga) (i64.const ${next === undefined ? 0 : next}) (i32.const ${size})))))) ` +
+           `(if (i32.load8_u (i32.add (i32.load (i32.const ${CWBM_SLOT})) (i32.shr_u (local.get $ga) (i32.const 6)))) ` +
+           `(then (call $x_cw (local.get $ga) (i64.const ${next === undefined ? 0 : next}) (i32.const ${size})))) ` +
            mk('(local.get $ga)');
   };
   // The same for a run of `len` bytes (rep movs/stos, bulk copy): any overlap with the window reports the whole range.
@@ -2659,6 +2661,9 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   // OXWASM_NOACCT=1 is a PRICING PROBE: drops the nest counter and the chain
   // fuel from every call site (unsound for slicing; node-only measurement)
   const NOACCT = typeof process !== 'undefined' && process.env?.OXWASM_NOACCT === '1';
+  // OXWASM_NOFUEL=1: no chain fuel (a host without slice deadlines never needs it); the nest counter stays, so
+  // the loop yield's nested-frame rule is intact. Sound on node, unlike NOACCT.
+  const NOFUEL = NOACCT || (typeof process !== 'undefined' && process.env?.OXWASM_NOFUEL === '1');
   const nestUp = (LOOPYIELD && !NOACCT) ? `(i32.store (i32.const ${FTNEST}) (i32.add (i32.load (i32.const ${FTNEST})) (i32.const 1))) ` : '';
   const nestDn = (LOOPYIELD && !NOACCT) ? ` (i32.store (i32.const ${FTNEST}) (i32.sub (i32.load (i32.const ${FTNEST})) (i32.const 1)))` : '';
   // Stack accounting is entry-tax-only: a function bumps FTDEPTH by its
@@ -2674,10 +2679,14 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   // dispatch thereafter was refused — 99.5% of residual interp ran with the
   // budget word saturated (measured).
   const ftW = Math.min(96, Math.max(1, blocks.reduce((s, b) => s + b.insns.length, 0) >> 9));
-  const ftOk  = NOACCT ? `(i32.lt_u (i32.load (i32.const ${FTDEPTH})) (i32.const ${FTDLIMIT}))`
-    : `(i32.and (i32.lt_u (i32.load (i32.const ${FTDEPTH})) (i32.const ${FTDLIMIT})) (i32.ne (i32.load (i32.const ${FTFUEL})) (i32.const 0)))`;
-  const ftHit = `(i32.and (i32.ge_s (local.get $fti) (i32.const 0)) ${ftOk})`;
-  const ftBurn = NOACCT ? '' : `(i32.store (i32.const ${FTFUEL}) (i32.sub (i32.load (i32.const ${FTFUEL})) (i32.const 1)))`;
+  // One unsigned compare for all the conditions: a word that is the depth when every condition holds and has its
+  // top bit set otherwise (an unresolved slot is fti = -1, whose sign fills a word; an empty tank is eqz = 1,
+  // negated). V8 compiled the and-of-comparisons form as three setcc chains (12 instructions a call site).
+  const fuelBad = NOFUEL ? '' : `(i32.sub (i32.const 0) (i32.eqz (i32.load (i32.const ${FTFUEL}))))`;
+  const ftWord = NOFUEL ? `(i32.load (i32.const ${FTDEPTH}))` : `(i32.or (i32.load (i32.const ${FTDEPTH})) ${fuelBad})`;
+  const ftOk  = `(i32.lt_u ${ftWord} (i32.const ${FTDLIMIT}))`;
+  const ftHit = `(i32.lt_u (i32.or (i32.shr_s (local.get $fti) (i32.const 31)) ${ftWord}) (i32.const ${FTDLIMIT}))`;
+  const ftBurn = NOFUEL ? '' : `(i32.store (i32.const ${FTFUEL}) (i32.sub (i32.load (i32.const ${FTFUEL})) (i32.const 1)))`;
   const ftInc = `(i32.store (i32.const ${FTDEPTH}) (i32.add (i32.load (i32.const ${FTDEPTH})) (i32.const ${ftW})))`;
   const ftDec = `(i32.store (i32.const ${FTDEPTH}) (i32.sub (i32.load (i32.const ${FTDEPTH})) (i32.const ${ftW})))`;
   const ftSave = () => { usesFts = true; return `(local.set $fts (i32.load (i32.const ${FTDEPTH})))`; };
@@ -2831,18 +2840,30 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           case 'g':return `(i32.and (i32.eqz ${ZF}) (i32.eq ${SF} ${OF}))`; }
         throw new Error('cond '+cc+'/bits');
       }
-      const zf=`(i64.eqz ${r})`, nz=`(i64.ne ${r} (i64.const 0))`;
-      const sf=`(i64.ne (i64.and ${r} (i64.const ${sgn})) (i64.const 0))`, nsf=`(i64.eq (i64.and ${r} (i64.const ${sgn})) (i64.const 0))`;
+      // Narrow sizes compare as i32: the materialized operands and result are already masked to S bytes, so a
+      // wrap is exact, a signed compare sign-extends with extend8_s/extend16_s, and V8 emits one cmpl where the
+      // i64 forms with masks and shifts cost 5-10 instructions (`cmp edx,imm; jne` and `add ecx,1; jo` in JSC's
+      // baseline code were the two most expanded instructions in the hot functions).
+      const N = S < 8, w = (e) => `(i32.wrap_i64 ${e})`;
+      const sxN = (e) => S === 4 ? e : S === 2 ? `(i32.extend16_s ${e})` : `(i32.extend8_s ${e})`;
+      const sgnN = Number(sgn), signN = (e) => S === 4 ? `(i32.lt_s ${e} (i32.const 0))` : `(i32.ne (i32.and ${e} (i32.const ${sgnN})) (i32.const 0))`;
+      const zf = N ? `(i32.eqz ${w(r)})` : `(i64.eqz ${r})`, nz = N ? `(i32.ne ${w(r)} (i32.const 0))` : `(i64.ne ${r} (i64.const 0))`;
+      const sf = N ? signN(w(r)) : `(i64.ne (i64.and ${r} (i64.const ${sgn})) (i64.const 0))`;
+      const nsf = N ? `(i32.eqz ${sf})` : `(i64.eq (i64.and ${r} (i64.const ${sgn})) (i64.const 0))`;
       // OF for sub (a-b=r) and add (a+b=r), matching the interpreter's flag rules
-      const ofSub=`(i64.ne (i64.and (i64.and (i64.xor ${a} ${b}) (i64.xor ${a} ${r})) (i64.const ${sgn})) (i64.const 0))`;
-      const ofAdd=`(i64.ne (i64.and (i64.and (i64.xor ${a} ${r}) (i64.xor ${b} ${r})) (i64.const ${sgn})) (i64.const 0))`;
-      const cfAdd=`(i64.lt_u ${r} ${a})`;             // add carry: result wrapped below an operand
+      const ofSub = N ? signN(`(i32.and (i32.xor ${w(a)} ${w(b)}) (i32.xor ${w(a)} ${w(r)}))`)
+                      : `(i64.ne (i64.and (i64.and (i64.xor ${a} ${b}) (i64.xor ${a} ${r})) (i64.const ${sgn})) (i64.const 0))`;
+      const ofAdd = N ? signN(`(i32.and (i32.xor ${w(a)} ${w(r)}) (i32.xor ${w(b)} ${w(r)}))`)
+                      : `(i64.ne (i64.and (i64.and (i64.xor ${a} ${r}) (i64.xor ${b} ${r})) (i64.const ${sgn})) (i64.const 0))`;
+      const cfAdd = N ? `(i32.lt_u ${w(r)} ${w(a)})` : `(i64.lt_u ${r} ${a})`;             // add carry: result wrapped below an operand
+      const cmpU = (op) => N ? `(i32.${op} ${w(a)} ${w(b)})` : `(i64.${op} ${a} ${b})`;
+      const cmpS = (op) => N ? `(i32.${op} ${sxN(w(a))} ${sxN(w(b))})` : `(i64.${op} ${sx(a,S)} ${sx(b,S)})`;
       if (fs.kind === 'sub') switch (cc) {
         case 'e':return zf; case 'ne':return nz;
-        case 'b':return `(i64.lt_u ${a} ${b})`; case 'ae':return `(i64.ge_u ${a} ${b})`;
-        case 'be':return `(i64.le_u ${a} ${b})`; case 'a':return `(i64.gt_u ${a} ${b})`;
-        case 'l':return `(i64.lt_s ${sx(a,S)} ${sx(b,S)})`; case 'ge':return `(i64.ge_s ${sx(a,S)} ${sx(b,S)})`;
-        case 'le':return `(i64.le_s ${sx(a,S)} ${sx(b,S)})`; case 'g':return `(i64.gt_s ${sx(a,S)} ${sx(b,S)})`;
+        case 'b':return cmpU('lt_u'); case 'ae':return cmpU('ge_u');
+        case 'be':return cmpU('le_u'); case 'a':return cmpU('gt_u');
+        case 'l':return cmpS('lt_s'); case 'ge':return cmpS('ge_s');
+        case 'le':return cmpS('le_s'); case 'g':return cmpS('gt_s');
         case 'o':return ofSub; case 'no':return `(i32.eqz ${ofSub})`;
         case 's':return sf; case 'ns':return nsf; }
       else if (fs.kind === 'add') switch (cc) {
@@ -2900,7 +2921,8 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       // there, so jl is taken and the AOT did not take it. CF is not
       // materialized, so b/ae/be/a still refuse.
       else if (fs.kind === 'inc' || fs.kind === 'dec') {
-        const OF = fs.kind === 'inc' ? `(i64.eq ${r} (i64.const ${sgn}))`
+        const OF = S < 8 ? (fs.kind === 'inc' ? `(i32.eq (i32.wrap_i64 ${r}) (i32.const ${Number(sgn)}))` : `(i32.eq (i32.wrap_i64 ${r}) (i32.const ${Number(sgn - 1n)}))`)
+                 : fs.kind === 'inc' ? `(i64.eq ${r} (i64.const ${sgn}))`
                                      : `(i64.eq ${r} (i64.const ${sgn - 1n}))`;
         switch (cc) {
           case 'e':return zf; case 'ne':return nz; case 's':return sf; case 'ns':return nsf;
@@ -4251,6 +4273,33 @@ const inlineBudget = () => Number(
 const inlineTotal = () => Number(
   (typeof process !== 'undefined' && process.env?.OXWASM_INLINE_TOTAL) || 640);
 
+
+// Text peephole over a finished module: `(i64.and X (i64.const 0xFFFFFFFF))` becomes `(i64.extend_i32_u (i32.wrap_i64 X))`.
+// Both truncate to 32 bits, but V8 compiles the and as a mask load and an andq, and the wrap/extend pair as a plain
+// movl (a 32-bit move zero-extends for free). The emitter writes the mask form at every 32-bit operand read, ALU
+// result and flag materialization, which is most of what a baseline-JIT function does.
+export function narrow32(wat) {
+  const TAILS = [' (i64.const 4294967295))', ' (i64.const 0xFFFFFFFF))'];
+  const rewrite = (s) => {
+    let out = '', i = 0;
+    for (;;) {
+      const j = s.indexOf('(i64.and ', i);
+      if (j < 0) break;
+      const xs = j + 9;
+      if (s[xs] !== '(') { out += s.slice(i, xs); i = xs; continue; }
+      let d = 0, k = xs;
+      for (; k < s.length; k++) { const c = s[k]; if (c === '(') d++; else if (c === ')') { d--; if (d === 0) break; } }
+      const xe = k + 1;
+      const tail = TAILS.find((t) => s.startsWith(t, xe));
+      if (tail === undefined) { out += s.slice(i, xs); i = xs; continue; }
+      out += s.slice(i, j) + '(i64.extend_i32_u (i32.wrap_i64 ' + rewrite(s.slice(xs, xe)) + '))';
+      i = xe + tail.length;
+    }
+    return out + s.slice(i);
+  };
+  return rewrite(wat);
+}
+
 export function compileUnitWat(mem, entry, opts = {}) {
   const INLINE = inlineEnabled(), INLINE_BUDGET = inlineBudget(), INLINE_TOTAL = inlineTotal();
   // OXWASM_PHASE=1 attributes tier-up time to the phases that spend it. The
@@ -4538,6 +4587,7 @@ export function compileUnitWat(mem, entry, opts = {}) {
     blocks += funcs.get(k).blocks.length;
   }
   wat += ')\n';
+  wat = narrow32(wat);
   return { wat,
            entryName: 'f_' + entry.toString(16),
            funcs: [...texts.keys()].map(k => BigInt(k)),

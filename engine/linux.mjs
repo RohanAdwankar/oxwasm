@@ -277,8 +277,9 @@ export class LinuxEngine {
     // JIT share it with zero copying
     this.RAMOFF = 1 << 20;
     const ramPages = Math.ceil((this.RAMOFF + Number(total)) / 65536);
-    this.CWBM = ramPages * 65536;          // the store guard's line bitmap lives in the spare pages past guest RAM
-    const pages = Math.max(256, ramPages + 32);
+    this.CWBM = ramPages * 65536;          // the store guard's line map (one byte per 64-byte line of the whole memory below it) lives past guest RAM
+    this.CWBMLEN = ramPages * 1024;
+    const pages = Math.max(256, ramPages + Math.ceil(this.CWBMLEN / 65536) + 1);
     this.wmem = new WebAssembly.Memory({ initial: pages });
     // global dispatch table: every registered compiled function gets a slot
     // here plus a sorted (addr -> slot) entry in wasm memory at FTMAP, so
@@ -1366,7 +1367,7 @@ export class LinuxEngine {
       if (best.diffs.length) {
         st.diverged++; this._shadowDiverged = (this._shadowDiverged ?? 0) + 1;
         if (ENV.OXWASM_DUMPDIR) { const b = new Uint8Array(0x800); for (let i = 0; i < b.length; i++) { try { b[i] = Number(this.mem.read(entryRip + BigInt(i), 1n)); } catch { break; } } try { process.getBuiltinModule('node:fs').writeFileSync(ENV.OXWASM_DUMPDIR + '/div_' + entryRip.toString(16) + '.bin', b); } catch {} }
-        __dbg(`<SHADOW-DIVERGE fn=0x${entryRip.toString(16)} exit=0x${exitRip.toString(16)} step=${best.k}/${trace.length} entry=[${regs0.map(v=>v.toString(16)).join(',')}]>`);
+        __dbg(`<SHADOW-DIVERGE disp=${this.stats.disp} fn=0x${entryRip.toString(16)} exit=0x${exitRip.toString(16)} step=${best.k}/${trace.length} entry=[${regs0.map(v=>v.toString(16)).join(',')}]>`);
         try { __dbg(`<SHADOW-CODE fn=0x${entryRip.toString(16)} ${Buffer.from(this.mem.view(entryRip, 512n)).toString('hex')}>`); __dbg(`<SHADOW-TRACE ${trace.slice(0, Math.min(trace.length, best.k + 1)).map((t) => t.rip.toString(16)).join(' ')}>`); } catch {}
         for (const d of best.diffs.slice(0, 20)) __dbg('  ' + d);
       }
@@ -1610,7 +1611,7 @@ export class LinuxEngine {
       if (cur && Buffer.compare(cur, sn.bytes) === 0) continue;
       for (let i = 0; i < sn.bytes.length; i++) if (Number(this.mem.read(sn.a + BigInt(i), 1n)) !== sn.bytes[i]) { bad = i; break; }
       if (bad >= 0) {
-        const bitOf = (addr) => { const dv = new DataView(this.wmem.buffer); const off = this.RAMOFF + Number(addr - this.base) - dv.getUint32(CWLO_SLOT, true); if (off < 0 || off >= dv.getUint32(CWLEN_SLOT, true)) return 'outwin'; const li = off >>> 6; return (new Uint8Array(this.wmem.buffer)[this.CWBM + (li >>> 3)] >> (li & 7)) & 1; };
+        const bitOf = (addr) => { const li = (this.RAMOFF + Number(addr - this.base)) >>> 6; return li >= this.CWBMLEN ? 'outmap' : new Uint8Array(this.wmem.buffer)[this.CWBM + li]; };
         __dbg(`[cwverify] bit@span=${bitOf(sn.a)} bit@diff=${bitOf(sn.a + BigInt(bad))} vol=${!!this._volatilePages?.has((sn.a + BigInt(bad)) & ~4095n)} inExt=${this._extents?.has(k)} win=${this.mem.watchLo?.toString(16)}-${this.mem.watchHi?.toString(16)}`);
         __dbg(`[cwverify] ${why} STALE fn=${k.toString(16)} ext=${sn.a.toString(16)}+${sn.bytes.length} first diff at +${bad} (${(sn.a + BigInt(bad)).toString(16)}) old=${Buffer.from(sn.bytes.subarray(bad, bad + 16)).toString('hex')} new=${(() => { let h = ''; for (let i = 0; i < 16; i++) h += Number(this.mem.read(sn.a + BigInt(bad + i), 1n)).toString(16).padStart(2, '0'); return h; })()} tid=${this.threads[this.ti]?.id} rip=${this.cpu.rip.toString(16)} recent writes: ${(this._cwRing ?? []).slice(-12).map((r) => r.join(':')).join(' ')}`);
         this._extSnap.delete(kk); this.stats.cwStale = (this.stats.cwStale | 0) + 1;
@@ -1668,8 +1669,8 @@ export class LinuxEngine {
     const hit = this._extOverlap(a, b);
     return !hit || hit.length === 0;
   }
-  // The guard reads one bit per 64-byte line of the window, at CWBM. Out-of-window lines are simply not representable, which is the
-  // same as not watched. Lines are widened 15 bytes to the left so a store that starts in the line before a span and runs into it
+  // The guard reads one byte per 64-byte line of the whole memory, at CWBM, indexed by the store's wasm address; only lines inside
+  // the window (the anonymous executable ranges) are ever marked. Lines are widened 15 bytes to the left so a store that starts in the line before a span and runs into it
   // (stores are at most 16 bytes) is still seen.
   // [x, y) clipped to the guarded window, in guest addresses (null when disjoint): spans of static code are huge and never watched
   _cwClip(x, y) {
@@ -1683,17 +1684,12 @@ export class LinuxEngine {
   _cwBits(x, y, on, skipVolatile) {
     if (!STOREGUARD || !this.wmem) return;
     const clip = this._cwClip(x >= 15n && on ? x - 15n : x, y); if (!clip) return; x = clip[0]; y = clip[1];
-    const dv = new DataView(this.wmem.buffer);
-    const lo = dv.getUint32(CWLO_SLOT, true), len = dv.getUint32(CWLEN_SLOT, true);
     const u8 = new Uint8Array(this.wmem.buffer), bm = this.CWBM;
-    const x2 = x;
-    for (let g = x2 >> 6n; g <= (y - 1n) >> 6n; g++) {
+    for (let g = x >> 6n; g <= (y - 1n) >> 6n; g++) {
       if (skipVolatile && this._volatilePages?.has((g << 6n) & ~4095n)) continue;
-      const off = this.RAMOFF + Number((g << 6n) - this.base) - lo;
-      if (off < 0 || off >= len) continue;
-      const li = off >>> 6;
-      if ((li >>> 3) >= 0x200000) continue;
-      if (on) u8[bm + (li >>> 3)] |= 1 << (li & 7); else u8[bm + (li >>> 3)] &= ~(1 << (li & 7));
+      const li = (this.RAMOFF + Number((g << 6n) - this.base)) >>> 6;
+      if (li >= this.CWBMLEN) continue;
+      u8[bm + li] = on ? 1 : 0;
     }
   }
   _cwMark(page, on) { this._cwBits(page, page + 4096n, on, false); }
@@ -1714,14 +1710,9 @@ export class LinuxEngine {
     }
   }
   _cwBitsOne(g, on) {
-    const dv = new DataView(this.wmem.buffer);
-    const lo = dv.getUint32(CWLO_SLOT, true), len = dv.getUint32(CWLEN_SLOT, true);
-    const off = this.RAMOFF + Number((g << 6n) - this.base) - lo;
-    if (off < 0 || off >= len) return;
-    const li = off >>> 6;
-    if ((li >>> 3) >= 0x200000) return;
-    const u8 = new Uint8Array(this.wmem.buffer);
-    if (on) u8[this.CWBM + (li >>> 3)] |= 1 << (li & 7); else u8[this.CWBM + (li >>> 3)] &= ~(1 << (li & 7));
+    const li = (this.RAMOFF + Number((g << 6n) - this.base)) >>> 6;
+    if (li >= this.CWBMLEN) return;
+    new Uint8Array(this.wmem.buffer)[this.CWBM + li] = on ? 1 : 0;
   }
   // Mark every page of the anonymous executable region holding `a`, because a
   // translated function's extent is not recorded anywhere and a patch lands in
@@ -1771,7 +1762,7 @@ export class LinuxEngine {
     // the bytes: a stale map watches the wrong pages, which is worse than
     // watching none.
     dv.setUint32(CWBM_SLOT, this.CWBM, true);
-    new Uint8Array(this.wmem.buffer).fill(0, this.CWBM, this.CWBM + Math.min(0x200000, (Number(hi - lo) >>> 9) + 1));
+    { const o = this.RAMOFF + Number(lo - this.base); new Uint8Array(this.wmem.buffer).fill(0, this.CWBM + (o >>> 6), Math.min(this.CWBM + this.CWBMLEN, this.CWBM + ((o + Number(hi - lo)) >>> 6) + 1)); }
     if (CW_ALLPAGES) for (const a of this.aotFns.keys()) this._cwCover(a);
     else {
       if (this._extents) for (const [k, [a, b]] of this._extents) {
@@ -2709,6 +2700,7 @@ export class LinuxEngine {
     const nr = Number(cpu.regs[0]);
     const [a1, a2, a3] = [cpu.regs[7], cpu.regs[6], cpu.regs[2]];   // rdi rsi rdx
     this.stats.syscalls[nr] = (this.stats.syscalls[nr] || 0) + 1;
+    if (ENV.OXWASM_COUNTCALLS === '1' && nr === 1 && this._ctor?.argv?.[0]?.includes('opencode')) { const c = new DataView(this.wmem.buffer).getBigUint64(FTMAP + 32, true); __dbg(`[calls-w] n=${c} d=${c - (this._lastCallsW ?? 0n)} interp=${this.stats.interpreted - (this._lastInterpW ?? 0)} disp=${this.stats.disp - (this._lastDispW ?? 0)}`); this._lastCallsW = c; this._lastInterpW = this.stats.interpreted; this._lastDispW = this.stats.disp; }
     if (ENV.OXWASM_JITSYS && (nr === 9 || nr === 10 || nr === 11 || nr === 25 || nr === 28) && this._ctor?.argv?.[0]?.includes('opencode')) {
       const lo = BigInt('0x' + (ENV.OXWASM_JITSYS === '1' ? '5a000000' : ENV.OXWASM_JITSYS.split('-')[0])), hi = BigInt('0x' + (ENV.OXWASM_JITSYS === '1' ? '5b000000' : ENV.OXWASM_JITSYS.split('-')[1]));
       const len = nr === 9 ? cpu.regs[6] : nr === 25 ? cpu.regs[6] : cpu.regs[6];
@@ -6441,8 +6433,7 @@ export class LinuxEngine {
     dv.setUint32(CWLO_SLOT, this.RAMOFF + Number(this._watchPage - this.base), true);
     dv.setUint32(CWLEN_SLOT, 4096, true);
     dv.setUint32(CWBM_SLOT, this.CWBM, true);
-    new Uint8Array(this.wmem.buffer).fill(0, this.CWBM, this.CWBM + 512);
-    new Uint8Array(this.wmem.buffer).fill(0xFF, this.CWBM, this.CWBM + 8);
+    { const o = (this.RAMOFF + Number(this._watchPage - this.base)) >>> 6; new Uint8Array(this.wmem.buffer).fill(1, this.CWBM + o, this.CWBM + o + 64); }
     this.mem.watchLo = this._watchPage; this.mem.watchHi = this._watchPage + 4096n;
     this.mem.watch = (addr, n, v) => this._watchLog(addr, n, v, 'interp rip=' + this.cpu.rip.toString(16));
     console.error(`[watch armed] page=${this._watchPage.toString(16)} storeguard=${STOREGUARD}`);
