@@ -3481,6 +3481,7 @@ export class LinuxEngine {
         this.block(null); ret(0n); break; }                  // park() skips dead threads
       case 228: {                                            // clock_gettime(clk, ts*)
         const clk = Number(a1), o = this.RAMOFF + Number(a2 - this.base);
+        this.jsnap(a2, 16);   // the shadow compare's journal must see this write, or the timespec on the caller's stack reads as a stray store
         const v = new DataView(this.wmem.buffer);
         let ms = (clk === 0 || clk === 5 || clk === 6) ? Date.now() : this.nowMs();
         if (ENV.OXWASM_COUNTCALLS === '1') { const c = new DataView(this.wmem.buffer).getBigUint64(FTMAP + 32, true); __dbg(`[calls] ${(this.nowMs() | 0)}ms n=${c} d=${c - (this._lastCalls ?? 0n)}`); this._lastCalls = c; }
@@ -3643,6 +3644,7 @@ export class LinuxEngine {
       case 96: {                                              // gettimeofday(tv*, tz)
         if (a1 !== 0n) {
           const o = this.RAMOFF + Number(a1 - this.base);
+          this.jsnap(a1, 16);
           const v = new DataView(this.wmem.buffer);
           const ms = Date.now();
           v.setBigUint64(o, BigInt(Math.floor(ms / 1000)), true);

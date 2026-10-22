@@ -1563,3 +1563,11 @@ the interpreter (every size watched), the inline-cache probe (it reads the hash 
 are not reused until a full rebuild), CPUID (baseline/v2, so glibc's memcpy uses SSE stores the guard covers). Still open: the
 guard skips rsp/rbp-based stores without an index (OXWASM_GUARD_STACK=0), and anything else is unknown. Queued: a watch on the
 4 bytes at 5a260a01 on the normal cache and on one built with OXWASM_GUARD_STACK=1, logging every store with its rip.
+
+### The JIT-window "divergence" withdrawn: it was clock_gettime's timespec
+With stack stores guarded too (cold67, OXWASM_GUARD_STACK=1) the watch on the diverging slot still logged no compiled store in the
+divergent dispatch; the slot's old bytes were 0x288b4f86 = 680,480,646, a tv_nsec, written by the interpreter's clock_gettime in
+the previous dispatch. clock_gettime and gettimeofday wrote their results into the wasm buffer directly, outside the memory journal
+the shadow comparator replays, so the clock's own output read as a stray store. Both now journal their destination (jsnap). The
+other divergence in that run (rdi/r8/r9 at a C++ allocation) is the replay re-executing an allocation. So the shadow comparator has
+found nothing real in the JIT window; the stale translations the verifier reports are the lead.
