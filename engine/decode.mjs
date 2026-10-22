@@ -132,6 +132,7 @@ export function decode(fetch, rip) {
   if (op === 0x99) return fin({ mnem: 'cdq', size: osz });    // cwd/cdq/cqo
   if (op === 0x9C) return fin({ mnem: 'pushf' });          // HotSpot's CPUID-presence probe toggles the ID bit through pushf/popf
   if (op === 0x9D) return fin({ mnem: 'popf' });
+  if (op === 0xCC) return fin({ mnem: 'int3' });        // breakpoint: SIGTRAP, rip past it (JSC's VMTraps plants these in JIT code)
   if (op === 0xF4) return fin({ mnem: 'hlt' });
   if (op === 0xFC) return fin({ mnem: 'cld' });
   if (op === 0xFD) return fin({ mnem: 'std' });

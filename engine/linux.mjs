@@ -340,6 +340,7 @@ export class LinuxEngine {
     this.cpu = new CPU(this.mem);
     this.cpu.fsBase = 0n;
     this.cpu.onSyscall = (cpu) => this.syscall(cpu);
+    this.cpu.onTrap = (cpu) => this._int3(cpu);
     if (ENV.OXWASM_DEOPTLOG) this.deoptLog = new Map();   // rip -> count of deopts from compiled code, printed with the exit stats
     if (ENV.OXWASM_STATS) {            // per-syscall wall time, printed with the exit stats
       const orig = this.syscall.bind(this);
@@ -2726,8 +2727,8 @@ export class LinuxEngine {
     const [a1, a2, a3] = [cpu.regs[7], cpu.regs[6], cpu.regs[2]];   // rdi rsi rdx
     this.stats.syscalls[nr] = (this.stats.syscalls[nr] || 0) + 1;
     if (ENV.OXWASM_COUNTCALLS === '1' && nr === 1 && this._ctor?.argv?.[0]?.includes('opencode')) { const c = new DataView(this.wmem.buffer).getBigUint64(FTMAP + 32, true); const st = this.stats, pv = this._lastStW ?? {}, d = (k) => (st[k] | 0) - (pv[k] | 0), sysSum = Object.values(st.sysMs ?? {}).reduce((x, y) => x + y, 0), sysN = Object.values(st.syscalls ?? {}).reduce((x, y) => x + y, 0), now = performance.now();
-      __dbg(`[calls-w] hr=${process.hrtime.bigint() / 1000n} n=${c} d=${c - (this._lastCallsW ?? 0n)} interp=${d('interpreted')} disp=${d('disp')} ms=${(now - (pv.now ?? now)) | 0} tu=${(st.tuTotalMs - (pv.tuTotalMs || 0)) | 0}ms/${d('tiers_aot')} inval=${d('invalSlow')} cw=${d('codeWrites')} deopt=${d('deopts')} callout=${d('coNoF')} vol=${d('volatilePages')} sys=${sysN - (pv.sysN || 0)}/${(sysSum - (pv.sysSum || 0)) | 0}ms heap=${(process.memoryUsage().heapUsed / 1048576) | 0}MB v8gc=${(() => { try { const h = process.getBuiltinModule('node:v8').getHeapStatistics(); return ((h.total_heap_size / 1048576) | 0) + 'MB/' + ((h.malloced_memory / 1048576) | 0) + 'MBm'; } catch { return '?'; } })()} ext=${(process.memoryUsage().external / 1048576) | 0}MB`);
-      this._lastCallsW = c; this._lastStW = { ...st, tiers_aot: st.tiers?.aot | 0, now, sysSum, sysN }; st.tiers_aot = st.tiers?.aot | 0; }
+      __dbg(`[calls-w] hr=${process.hrtime.bigint() / 1000n} n=${c} d=${c - (this._lastCallsW ?? 0n)} interp=${d('interpreted')} disp=${d('disp')} ms=${(now - (pv.now ?? now)) | 0} tu=${(st.tuTotalMs - (pv.tuTotalMs || 0)) | 0}ms/${d('tiers_aot')} inval=${d('invalSlow')} cw=${d('codeWrites')} deopt=${d('deopts')} callout=${d('coNoF')} vol=${d('volatilePages')} sys=${sysN - (pv.sysN || 0)}/${(sysSum - (pv.sysSum || 0)) | 0}ms sig=${Object.entries(this._sigN ?? {}).map(([k, v]) => k + ':' + (v - ((pv._sigN ?? {})[k] | 0))).join(',')} heap=${(process.memoryUsage().heapUsed / 1048576) | 0}MB v8gc=${(() => { try { const h = process.getBuiltinModule('node:v8').getHeapStatistics(); return ((h.total_heap_size / 1048576) | 0) + 'MB/' + ((h.malloced_memory / 1048576) | 0) + 'MBm'; } catch { return '?'; } })()} ext=${(process.memoryUsage().external / 1048576) | 0}MB`);
+      this._lastCallsW = c; this._lastStW = { ...st, tiers_aot: st.tiers?.aot | 0, now, sysSum, sysN, _sigN: { ...(this._sigN ?? {}) } }; st.tiers_aot = st.tiers?.aot | 0; }
     if (ENV.OXWASM_JITSYS && (nr === 9 || nr === 10 || nr === 11 || nr === 25 || nr === 28) && this._ctor?.argv?.[0]?.includes('opencode')) {
       const lo = BigInt('0x' + (ENV.OXWASM_JITSYS === '1' ? '5a000000' : ENV.OXWASM_JITSYS.split('-')[0])), hi = BigInt('0x' + (ENV.OXWASM_JITSYS === '1' ? '5b000000' : ENV.OXWASM_JITSYS.split('-')[1]));
       const len = nr === 9 ? cpu.regs[6] : nr === 25 ? cpu.regs[6] : cpu.regs[6];
@@ -3177,7 +3178,7 @@ export class LinuxEngine {
         break;
       case 218: { const t = this.threads[this.ti]; t.ctid = a1; ret(BigInt(t.id)); break; }  // set_tid_address
       case 56: case 57: case 58: {                           // clone / fork / vfork
-        if (ENV.OXWASM_CLONETRACE && this._ctor?.argv?.[0]?.includes('opencode')) console.error(`[clone] nr=${nr} flags=${a1.toString(16)} stack=${a2.toString(16)} disp=${this.stats.disp} rip=${this.cpu.rip.toString(16)}`);
+        if (ENV.OXWASM_CLONETRACE && this._ctor?.argv?.[0]?.includes('opencode')) console.error(`[clone] t=${this.nowMs() | 0}ms nr=${nr} flags=${a1.toString(16)} stack=${a2.toString(16)} disp=${this.stats.disp} rip=${this.cpu.rip.toString(16)}`);
         const flags = nr === 56 ? Number(a1 & 0xffffffffn) : 0;
         // posix_spawn is clone(CLONE_VM|CLONE_VFORK|SIGCHLD): a vfork child
         // on its own small stack, not a thread — CLONE_VFORK decides
@@ -3204,6 +3205,7 @@ export class LinuxEngine {
           const pid = this._allocPid();
           const c = new CPU(this.mem);
           c.onSyscall = (cc) => this.syscall(cc);
+          c.onTrap = (cc) => this._int3(cc);
           for (let r = 0; r < 16; r++) c.regs[r] = cpu.regs[r];
           for (let r = 0; r < 16; r++) c.xmm[r] = cpu.xmm[r] ?? 0n;
           c.rip = cpu.rip; c.fsBase = cpu.fsBase;
@@ -3233,6 +3235,7 @@ export class LinuxEngine {
         const tid = this.nextTid++;
         const c = new CPU(this.mem);
         c.onSyscall = (cc) => this.syscall(cc);
+        c.onTrap = (cc) => this._int3(cc);
         for (let r = 0; r < 16; r++) c.regs[r] = cpu.regs[r];
         for (let r = 0; r < 16; r++) c.xmm[r] = cpu.xmm[r] ?? 0n;
         c.rip = cpu.rip;                                     // resumes after the syscall insn
@@ -3457,6 +3460,7 @@ export class LinuxEngine {
         new DataView(this.wmem.buffer).setUint8(o, (1 << Math.min(this.ncpu, 8)) - 1);
         ret(8n); break; }
       case 60: case 231: {                                   // exit / exit_group
+        if (ENV.OXWASM_CLONETRACE && this._ctor?.argv?.[0]?.includes('opencode')) console.error(`[exit] nr=${nr} tid=${this.threads[this.ti]?.id} threads=${this.threads.filter((x) => x.state !== 'dead').length} t=${this.nowMs() | 0}ms disp=${this.stats.disp}`);
         // OXWASM_STRACE_EXIT=1 (with OXWASM_STRACE=1): a guest that exits non-zero without a word shows its last syscalls
         if (ENV.OXWASM_STRACE_EXIT && this.strace && (a1 & 0xffn) !== 0n && this._ctor?.argv?.[0]?.includes('opencode')) console.error(`[exit ${nr} code=${a1 & 0xffn} tid=${this.threads[this.ti]?.id} rip=${cpu.rip.toString(16)}] last:\n  ` + this.strace.slice(-(+ENV.OXWASM_STRACE_N || 40)).join('\n  '));
         if ((ENV.OXWASM_AOTSTOP || AOTSKIP) && this._ctor?.argv?.[0]?.includes('opencode')) console.error('[aotstop] exit total disp', this.stats.disp, 'skipped', this.stats.skipped || 0);
@@ -5583,6 +5587,22 @@ export class LinuxEngine {
     this._sigDeliver(this.cpu, t, sig, this.cpu.rip);
     return true;
   }
+  // int3 (0xCC): the kernel's do_int3 raises SIGTRAP with si_code SI_KERNEL and the frame's rip at the byte after
+  // the trap. JSC's VMTraps - signal-based by default on x86-64 Linux, not polling - plants int3 over the first byte
+  // of an instruction in JIT code to stop the mutator at a safepoint; its handler restores the bytes and rewinds rip.
+  // With no SIGTRAP the rest of the overwritten instruction ran as code and the stop never happened: objects aborted
+  // on round ~37 in jsAddSlowCase with a freed cell in a frame slot, the mix on round 5, and only with the concurrent
+  // collector (the one that asks for the stop). BUN_JSC_usePollingTraps=1 cured both, which is what pointed here.
+  // Delivered here, before the next instruction: the nested interpreter polls pending signals only at its top loop.
+  _int3(cpu) {
+    const t = this._ts(this.threads[this.ti]);
+    this.stats.int3 = (this.stats.int3 | 0) + 1;
+    const act = this.sigact.get(5);
+    if (ENV.OXWASM_ABORTDIAG && this.stats.int3 <= 40) __dbg(`[int3] #${this.stats.int3} tid=${t.id} at=${(cpu.rip - 1n).toString(16)} handler=${act ? act.handler.toString(16) : 'none'} masked=${(t.sigmask >> 4n) & 1n} t=${this.nowMs() | 0}ms`);
+    if (!act || act.handler === 0n || act.handler === 1n || ((t.sigmask >> 4n) & 1n)) { this._sigDefault(t, 5); return; }
+    (t.siginfo ??= new Map()).set(5, { code: 128 });
+    this._sigDeliver(cpu, t, 5, cpu.rip);
+  }
   // push the rt_sigframe and enter the handler
   _sigDeliver(cpu, t, sig, savedRip) {
     if (cpu === this.cpu) this.xmmFresh();                                       // the frame save below reads cpu.xmm
@@ -5592,6 +5612,7 @@ export class LinuxEngine {
     if (!act.restorer) {                                                        // no SA_RESTORER: cannot return
       this.exitCode = 128 + sig; cpu.halted = true; return;
     }
+    { const m = (this._sigN ??= {}); m[sig] = (m[sig] | 0) + 1; }
     const FRAME = 1072n;                                                        // pretcode + ucontext(936) + siginfo(128)
     const onAlt = (act.flags & 0x08000000n) && t.altstack && !(cpu.regs[4] >= t.altstack.sp && cpu.regs[4] < t.altstack.sp + t.altstack.size);
     const base = onAlt ? t.altstack.sp + t.altstack.size : BigInt.asUintN(64, cpu.regs[4] - 128n);   // red zone
@@ -5749,7 +5770,7 @@ export class LinuxEngine {
     // threads the child created inside the window move with it
     for (const x of this.threads) {
       if (x === t || x.proc !== t.proc || x.state === 'dead') continue;
-      const xc = new CPU(ceng.mem); xc.onSyscall = (cc) => ceng.syscall(cc);
+      const xc = new CPU(ceng.mem); xc.onSyscall = (cc) => ceng.syscall(cc); xc.onTrap = (cc) => ceng._int3(cc);
       for (let r = 0; r < 16; r++) xc.regs[r] = x.cpu.regs[r];
       for (let r = 0; r < 16; r++) xc.xmm[r] = x.cpu.xmm[r] ?? 0n;
       xc.rip = x.cpu.rip; xc.fsBase = x.cpu.fsBase; Object.assign(xc.f, x.cpu.f);

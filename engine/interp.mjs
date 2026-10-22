@@ -190,6 +190,7 @@ export class CPU {
     switch (insn.mnem) {
       case 'nop': break;
       case 'hlt': this.halted = true; break;
+      case 'int3': if (this.onTrap) this.onTrap(this); else throw new Error('int3 with no handler'); break;   // rip is already past the 0xCC
       case 'syscall':
         this.regs[1] = next;                      // rcx = return rip (arch behavior)
         this.regs[11] = this.flagsValue();        // r11 = rflags
