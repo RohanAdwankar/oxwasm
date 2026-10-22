@@ -1511,3 +1511,9 @@ Solo phases, 60 rounds, 2 runs each: sorting 45/46 ms (cold62: 48/50), maps 67/7
 objects 21 (good mode; the other run aborted), fib 4, math 23. Full mix 268 ms (fib 5, math 23, objects 22, strings 11, sorting 45,
 maps 85, json 31) against 272. Each 60-round solo run completed in 52-62 s against 69-89 s: with no loop yield the warm-up
 re-dispatches far less. A 5-10% steady-state gain, and the configuration to use on node. Aborts: 3 of 17 runs, as before.
+
+### cold64: + OXWASM_UNPRUNE_TINY=64 (callees up to 64 instructions duplicated into their callers' units and inlined in loops)
+Build: 310 s for the first round (5,320 units; the duplication is cheap at this size). Solo phases as cold63 except maps 65/71 ms
+(67/76). Full mix 215 ms (fib 4, math 23, objects 21, strings 12, sorting 47, maps 63, json 34), the best so far against 268 (cold63)
+and 272 (cold62). fib stays at 4 ms, so the calls that cost in the call-bound phase were not inlined (JIT function to JIT function
+calls are bigger than the tiny threshold); cold66 counts the entries under this configuration. Aborts 3 of 17 runs, as before.
