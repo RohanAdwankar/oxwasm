@@ -1656,3 +1656,7 @@ header 500200a1/00020800 (one structure, JSType 2, the bench's strings); the bad
 
 Next angle: the shadow comparator (OXWASM_SHADOW_RANGE over the JIT region) on rounds 4-5 only, now that its known false
 positives (clocks, r11, timespec writes, re-executed allocations) are handled; and why 5a265200 is never translated.
+The shadow comparator over the JIT region (OXWASM_SHADOW_RANGE=5a221000-5a400000, exit-matched, dispatches 24000-40000)
+reached round 1 in 15 minutes - a shadowed JIT dispatch replays a whole loop iteration in the interpreter - with no
+divergence in the 11 dispatches it compared. As a tool for round 5 it needs a trigger that arms it at the round, not a
+dispatch count, and a cap per dispatch; parked.
