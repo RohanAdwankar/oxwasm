@@ -1698,3 +1698,12 @@ Next: log the writers of that storm (OXWASM_CWLOG_FROM=<n> OXWASM_CWLOG=<k>) to 
 address-keyed table the engine keeps across a JIT region's reuse.
 Measured with polling traps and the non-concurrent collector (cold73, 40 rounds): objects median 415 ms (p25 211, min 91),
 strings+json+math median 102 (p25 86, min 76; phase floors math 24, strings 14, json 34). Native: objects 6, the three ~10.
+
+### The abort is a miscompiled JIT-region function: interpreted JIT code never aborts
+objects for 60 rounds with the JIT region left to the interpreter (OXWASM_EXEC_ANON=0): 980 s, 60 rounds, no abort.
+Translated: abort at round 34-39 in most runs. So it is the translation of some baseline-JIT'd code or thunk, not JSC
+and not the interpreter. Bisecting with OXWASM_FNDUMP (the entries considered) and OXWASM_FNVETO_FILE (entries left
+interpreted) on objects pointed at the truthiness thunk at 5a2312c0 (r15/r14 tag tests, cell-type checks, ucomisd against
+zero), but one of two confirmation runs with only it vetoed still aborted, so objects' 60-80% abort rate is too weak a
+signal; the bisect now runs on the full mix (aborts at round 5 every time, 63 JIT entries), with vetoed runs allowed to be
+slow (a vetoed hot function is interpreted at ~16 s a round) and "reached round 6" as the pass.
