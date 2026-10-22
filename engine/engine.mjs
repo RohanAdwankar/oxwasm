@@ -23,7 +23,7 @@ const CODE_BASE = 0x10000000n;
 
 export class Engine {
   constructor(codeBytes, { entry, guestBase, ramBytes, threshold = 8 }) {
-    this.RAMOFF = 1 << 20;                       // guest RAM at 1MB into wasm mem
+    this.RAMOFF = 4 << 20;                       // guest RAM at 4MB into wasm mem (regfile, dispatch map and hash below it)
     const need = this.RAMOFF + ramBytes;
     const pages = Math.max(256, Math.ceil(need / 65536) + 16);
     this.wmem = new WebAssembly.Memory({ initial: pages });

@@ -12,7 +12,7 @@ const SIGN = { 1: 0x80n, 2: 0x8000n, 4: 0x80000000n, 8: 0x8000000000000000n };
 // Global function-dispatch map, shared by ALL translation units of an engine:
 // an open-addressed hash table of (guest address i64, funcref-table index
 // i32) 16-byte slots living in wasm-memory scratch below the guest RAM base
-// (RAMOFF is 1MB; the regfile ends at 512). The engine inserts a slot per
+// (RAMOFF is 4MB; the regfile ends at 512). The engine inserts a slot per
 // registered compiled function; every unit's $ftr hashes into it and
 // call_indirect's through the shared imported table — so indirect calls,
 // cross-unit static calls, and indirect tail jumps chain wasm-to-wasm with no
@@ -33,12 +33,12 @@ const SIGN = { 1: 0x80n, 2: 0x8000n, 4: 0x80000000n, 8: 0x8000000000000000n };
 // one step.
 export const FTMAP = 0x10000;        // u32 count at +0, u32 chain depth at +8, u32 fuel at +12
 export const FTHASH = 0x60000;       // hash slots: i64 key (guest addr, 0 = empty), i32 table slot, pad
-export const FTHBITS = 15, FTSLOTS = 1 << FTHBITS;   // 32768 slots * 16B = 512KB, ends below RAMOFF
+export const FTHBITS = 17, FTSLOTS = 1 << FTHBITS;   // 131072 slots * 16B = 2MB, 0x60000..0x260000, below RAMOFF (4MB)
 export const FTHMASK = FTSLOTS * 16 - 1;
 export const FTHBYTES = FTSLOTS * 16;
 // registered entries, capped to keep the load factor (here 61%) low enough
 // that linear probing stays short
-export const FTMAP_MAX = 20000;
+export const FTMAP_MAX = 60000;   // 46% of the slots at most; FTENTRY keeps a byte per slot (0x18000 + 60000 < FTHASH)
 // One byte per table slot (FTMAP_MAX of them): 1 when the slot's function is a real function ENTRY, i.e. an
 // address the guest has CALLED. A tail jump to one may chain from a nested unit whose stack is above its
 // entry rsp (a landing unit entered mid-function has its whole frame above rsp0, so every epilogue-and-jump
@@ -72,7 +72,7 @@ export const CWBM_SLOT = 176;
 // dispatch hash and guest RAM. A single interval could not say "this page is
 // volatile, stop watching it" without dropping its neighbours too, and a page
 // that is patched over and over is exactly what has to leave the set.
-export const CWMAP = 0xE0000, CWMAP_PAGES = 0x20000;   // 128KB: 512MB of window span
+export const CWMAP = 0x260000, CWMAP_PAGES = 0x20000;   // 128KB: 512MB of window span
 const STOREGUARD = typeof process !== 'undefined' && process.env?.OXWASM_STOREGUARD === '1';
 // Largest wat text this emitter will hand the runtime for ONE function; see
 // the refusal at the end of the function emitter for the two measurements

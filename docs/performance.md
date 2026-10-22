@@ -1660,3 +1660,25 @@ The shadow comparator over the JIT region (OXWASM_SHADOW_RANGE=5a221000-5a400000
 reached round 1 in 15 minutes - a shadowed JIT dispatch replays a whole loop iteration in the interpreter - with no
 divergence in the 11 dispatches it compared. As a tool for round 5 it needs a trigger that arms it at the round, not a
 dispatch count, and a cap per dispatch; parked.
+
+### Where a steady objects round goes, by V8 tick (cold69, rounds 8-15, 3.2 s, 2,594 ticks)
+`--prof` on the node command line (NODE_OPTIONS refuses it), ticks aligned to the rounds by the host-clock stamps.
+60% of ticks attribute to code objects; the rest is V8/C++ (GC, runtime). Of the attributed: JSC's collector functions
+f_50eee60 101, f_5109300 88, f_47be830 57, f_478c050 36, f_47ae960 36 (~20%); the engine's own JS ~23%: LoadIC /
+LoadIC_Megamorphic / FindOrderedHashMapEntry / StrictEqual under `step` (the interpreter's per-instruction Map lookups and
+compares: ~7 µs an interpreted instruction, a few thousand a round), `ftr` under dispatchAot 59 (the in-wasm hash probe:
+32,768 slots for ~16k functions, so the inline first-slot probe misses about half the time and the linear walk runs),
+DataView under registerAotFn 15. Inside f_5109300 the hot offsets are the indirect-call site: the table bounds and
+signature checks, `call rbx`, and the regfile reloads after it.
+The hash cannot grow in place: FTHASH at 0x60000 with 2^15 16-byte slots ends at 0xE0000, just under RAMOFF (1 MB); a
+bigger table means moving RAMOFF, which every cached unit bakes into its address arithmetic (a cold rebuild either way).
+
+### A 4x dispatch hash (cold73) changes nothing; the objects floor is 22 ms; the abort is allocation-driven
+RAMOFF moved to 4 MB so the hash can hold 2^17 slots (FTMAP_MAX 60,000, which also lifts the unit ceiling). 40-round medians,
+cold73 on this engine against cold68 on the previous one (git worktree): objects 460/443 vs 353/200 ms, strings+json+math
+421 vs 382 - no gain, inside the noise, so the probe walk was not the cost it looked like in the tick profile. Kept for the
+ceiling. One cold68 run reached 22 ms on round 36 (native 6 ms: 3.7x) before aborting: the floor is close; the rounds
+around it are 10-20x because of the collections.
+Both 40-round objects runs abort at round 37, 13-26 s after round 0, so the abort is not wall-time; objects allocates about a
+seventh of what the mix does per round and the mix dies at round 5: the trigger is cumulative allocation - a particular
+collection, or a heap threshold JSC crosses. Queued: BUN_JSC_logGC counts at the abort with and without doubled heap growth.

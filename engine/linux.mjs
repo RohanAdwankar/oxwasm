@@ -278,7 +278,7 @@ export class LinuxEngine {
 
     // one contiguous guest region backed by wasm memory -> interpreter and
     // JIT share it with zero copying
-    this.RAMOFF = 1 << 20;
+    this.RAMOFF = 4 << 20;
     const ramPages = Math.ceil((this.RAMOFF + Number(total)) / 65536);
     this.CWBM = ramPages * 65536;          // the store guard's line map (one byte per 64-byte line of the whole memory below it) lives past guest RAM
     this.CWBMLEN = ramPages * 1024;
