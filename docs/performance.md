@@ -1551,3 +1551,15 @@ call's return-address push, LLInt's `mov [rsp],rdx` at 25c4f71 while setting up 
 same chain executes those same instructions and writes elsewhere, so rsp or rbp differed between the two mid-chain and agreed
 again by the exit (LLInt resets rsp from the CodeBlock at 25c4f9b, which hides an earlier drift). Next: a cache built with
 OXWASM_GUARD_STACK=1 so the watch log names the compiled stack store, and the shadow trace now carries rsp per step.
+
+### The slow mode is a stale translation, and there is a store the guard does not see
+objects alone on the counting cache with OXWASM_CWVERIFY=1, five runs: the verifier reports 3-18 stale translations in EVERY run
+(translations still registered whose source bytes have changed), and the slow mode (entries jumping from 0.68M to 6-9.7M a round
+mid-run) appears in the runs where a hot one goes stale. The example repeats at the same address in three runs: translation
+fn=5a2601f3 (extent 5a2600f9+2316), the last 4 bytes, a jump's rel32 patched from +0x735 to -0x10a05 (JSC relinking a jump to a
+stub). The engine's recent-writes ring never saw a write there, but the ring is a dozen entries and the verifier runs every 256
+writes, so that is inconclusive. Excluded by reading: the loop tier (inactive: compiledRuns=0), the bulk copies (range-guarded),
+the interpreter (every size watched), the inline-cache probe (it reads the hash table that _ftDrop tombstones), slot reuse (slots
+are not reused until a full rebuild), CPUID (baseline/v2, so glibc's memcpy uses SSE stores the guard covers). Still open: the
+guard skips rsp/rbp-based stores without an index (OXWASM_GUARD_STACK=0), and anything else is unknown. Queued: a watch on the
+4 bytes at 5a260a01 on the normal cache and on one built with OXWASM_GUARD_STACK=1, logging every store with its rip.
