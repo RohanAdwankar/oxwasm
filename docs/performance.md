@@ -1707,3 +1707,20 @@ interpreted) on objects pointed at the truthiness thunk at 5a2312c0 (r15/r14 tag
 zero), but one of two confirmation runs with only it vetoed still aborted, so objects' 60-80% abort rate is too weak a
 signal; the bisect now runs on the full mix (aborts at round 5 every time, 63 JIT entries), with vetoed runs allowed to be
 slow (a vetoed hot function is interpreted at ~16 s a round) and "reached round 6" as the pass.
+
+### Found: JavaScriptCore's slow-path call thunks, translated, are what aborts the mix
+The bisect over the JIT region's entries (OXWASM_FNDUMP + OXWASM_FNVETO_FILE, the full mix as the oracle since it aborts
+at round 5 every time) converged on the 0x40-aligned stub block at 5a234000: 13 entries of three shapes - ArithAdd IC fast
+paths (`cmp rsi,r14; jb; cmp rdx,r14; jb; add; jo; or rax,r14; jmp done`), a getter stub, and JSC's slow-path call
+thunks (`push rbp; mov [rbp+0x24],ecx; mov rdi,rbp; mov rsi,[rbp+0x10]; mov rsi,[rsi+0x50]; add rsi,rcx; movabs r11,C++;
+call r11; pop rbp; jmp <exception check; ret>`). Vetoing the whole block: 5/5 clean. Vetoing only the three thunks: 2/2
+clean; only the add ICs: aborts. So the thunk shape is miscompiled. Escaping its instructions one at a time with
+OXWASM_ESC_RANGES (jmp, pop, call, store, push) did not isolate one: every variant still fails, mostly as the hang rather
+than the abort, so the fault is in how a unit enters or leaves this shape (a called entry whose body is push / C++ call /
+pop / tail jump into a `ret` continuation), not in one instruction's translation. Two things were fixed on the way and
+stay: a call site now treats its callee as returned only when the exit rip is the return address as well as rsp being
+back (JSC's continuation leaves with `add rsp,8; jmp handler` when an exception is pending, which the rsp test alone read
+as a return), and int3 raises SIGTRAP. A mitigation that recognised the shape by bytes and kept it interpreted (as root and closure member) did not hold:
+with 10 thunks so vetoed the mix aborted, hung, and once completed at 1.4 s a round (sorting 811 ms: the vetoed thunks
+are hot), so the two clean thunks-only veto runs were luck and the block-veto result rests on the whole block. Reverted.
+The root cause is open; what is established: interpreted JIT region = never aborts; the 13-entry block vetoed = clean 5/5.

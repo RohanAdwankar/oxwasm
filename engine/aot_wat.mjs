@@ -2731,7 +2731,12 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   // a turndown feature test). Hand the callee's exit up instead: every stale frame above does the
   // same, and the top-level dispatch honours the rip where the guest actually is. The locals were
   // just reloaded from the regfile, so no spill is needed before leaving.
-  const retCheck = (rb) => `(if (i64.ne (local.get $r4) (local.get ${rb})) (then (return (local.get $rex))))`;
+  // A callee has RETURNED only if the guest rsp is back at its pre-push value AND its exit rip is the return address.
+  // JSC's slow-path continuation leaves with rsp at exactly that value and control elsewhere: `add rsp, 8; jmp handler`
+  // discards the return address when an exception is pending. With the rsp test alone the caller carried on after the
+  // call as if the callee had returned, the throw was swallowed, and the JS state it left behind crashed JSC at a later
+  // slow path (jsAddSlowCase on a freed cell, round 5 of the mix / round ~37 of objects, bisected to those thunks).
+  const retCheck = (rb, next) => `(if (i32.or (i64.ne (local.get $r4) (local.get ${rb})) (i64.ne (local.get $rex) (i64.const ${hexs(next)}))) (then (return (local.get $rex))))`;
   const tailJmp = () => { usesFtr = true; return [
     icResolve('(local.get $rex)'),
     `(if (i32.and ${ftHit} (i32.or (i64.le_u (local.get $r4) (local.get $rsp0)) (i32.or (i32.eqz (i32.load (i32.const ${FTNEST}))) (i32.load8_u (i32.add (i32.const ${FTENTRY}) (local.get $fti))))))`,
@@ -3513,7 +3518,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
                    `  (then ${ftBurn} ${nestUp}(local.set $rex (call_indirect $ft (type $uft) (local.get $fti)))${nestDn} ${ftRestore})`,
                    `  (else (local.set $rex (call $x_callout (i64.const ${hexs(target)})))))`);
           }
-          L.push(RC_MARK, retCheck(rb));
+          L.push(RC_MARK, retCheck(rb, next));
           break; }
         case 'callind': {   // compute target BEFORE the push moves rsp
           const t = T(); L.push(`(local.set ${t} ${rd(insn.src,8,next)})`);
@@ -3527,7 +3532,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
                  `(if ${ftHit}`,
                  `  (then ${ftBurn} ${nestUp}(local.set $rex (call_indirect $ft (type $uft) (local.get $fti)))${nestDn} ${ftRestore})`,
                  `  (else (local.set $rex (call $x_callout (local.get ${t})))))`);
-          L.push(RC_MARK, retCheck(rb));
+          L.push(RC_MARK, retCheck(rb, next));
           break; }
         case 'syscall':
           // pass this syscall's guest rip: a BLOCKING syscall (poll/select/
