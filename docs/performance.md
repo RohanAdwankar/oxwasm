@@ -1530,3 +1530,15 @@ The objects phase does the same work in both modes; the slow mode makes 150 tran
 11, which is what every property access taking its slow path looks like, i.e. an inline cache that never hits. A translation built
 from an IC's old immediate would do exactly that; the stale-translation verifier (OXWASM_CWVERIFY) can confirm or exclude it.
 Clearing stale guard marks (the "heal") did not change the mode (control: 24, 112, 129 ms and one abort in 4 runs).
+
+### Un-pruning does not cut the entries; larger inline budgets miscompile
+- cold66 (cold64's knobs + OXWASM_COUNTCALLS): 7.1-7.8M entries per full-mix round, against 7.3-13.3M on the old cache (the spread
+  there is the objects slow mode), full mix 268 ms. The 64-instruction un-prune inlines few of the calls that cost: the JIT code's
+  calls go to other JIT functions and to thunks that themselves call into C++, neither of which inlining removes.
+- cold65 (OXWASM_UNPRUNE_TINY=160 OXWASM_INLINE_TOTAL=2000 OXWASM_INLINE_BUDGET=200): `opencode --version` exits 127 within 6 s on
+  every build round; the aggressive inlining miscompiles something. Not usable as is.
+- Where that leaves the gap: at ~7.3M entries a round and ~15 ns a translated call, the call protocol is ~110 ms of a 215-268 ms
+  round and the body expansion (2-3x) is most of the rest. Halving the protocol with a register-passing ABI is a large refactor
+  worth ~25% of the round; neither it nor inlining reaches 1.2x native from here. The two items that still move the number are
+  the objects slow mode (13x the entries, worth 5x on that phase and the mix variance) and the corruption bug, which also blocks
+  DFG, the tier that would remove most of the thunk calls at the source.
