@@ -2708,6 +2708,11 @@ export class LinuxEngine {
     const nr = Number(cpu.regs[0]);
     const [a1, a2, a3] = [cpu.regs[7], cpu.regs[6], cpu.regs[2]];   // rdi rsi rdx
     this.stats.syscalls[nr] = (this.stats.syscalls[nr] || 0) + 1;
+    if (ENV.OXWASM_JITSYS && (nr === 9 || nr === 10 || nr === 11 || nr === 25 || nr === 28) && this._ctor?.argv?.[0]?.includes('opencode')) {
+      const lo = BigInt('0x' + (ENV.OXWASM_JITSYS === '1' ? '5a000000' : ENV.OXWASM_JITSYS.split('-')[0])), hi = BigInt('0x' + (ENV.OXWASM_JITSYS === '1' ? '5b000000' : ENV.OXWASM_JITSYS.split('-')[1]));
+      const len = nr === 9 ? cpu.regs[6] : nr === 25 ? cpu.regs[6] : cpu.regs[6];
+      if (a1 < hi && a1 + len > lo) __dbg(`[jitsys] t=${this.nowMs() | 0} nr=${nr} addr=${a1.toString(16)} len=${len.toString(16)} a3=${a3.toString(16)} r10=${cpu.regs[10].toString(16)} rip=${cpu.rip.toString(16)}`);
+    }
     if (ENV.OXWASM_SYSHIST && this._ctor?.argv?.[0]?.includes('opencode') && ((this._shN = (this._shN | 0) + 1) % (+ENV.OXWASM_SYSHIST) === 0)) { const top = Object.entries(this.stats.syscalls).sort((x, y) => y[1] - x[1]).slice(0, 8).map(([k, v]) => k + ':' + v).join(' '); console.error(`[syshist] n=${this._shN} heap=${(process.memoryUsage().heapUsed / 1048576) | 0}MB rss=${(process.memoryUsage().rss / 1048576) | 0}MB t=${performance.now() | 0} ${top}`); }
     if (ENV.OXWASM_WATCHPAGE && !this._watchArmed && this._ctor?.argv?.[0]?.includes('opencode')) this._armWatchPage(BigInt('0x' + ENV.OXWASM_WATCHPAGE));
     if (ENV.OXWASM_MMAPSTAT && (nr === 9 || nr === 11 || nr === 25) && this._ctor?.argv?.[0]?.includes('opencode')) {
@@ -3485,6 +3490,7 @@ export class LinuxEngine {
         const clk = Number(a1), o = this.RAMOFF + Number(a2 - this.base);
         const v = new DataView(this.wmem.buffer);
         let ms = (clk === 0 || clk === 5 || clk === 6) ? Date.now() : this.nowMs();
+        if (ENV.OXWASM_COUNTCALLS === '1') { const c = new DataView(this.wmem.buffer).getBigUint64(FTMAP + 32, true); __dbg(`[calls] ${(this.nowMs() | 0)}ms n=${c} d=${c - (this._lastCalls ?? 0n)}`); this._lastCalls = c; }
         // shadow compare: the interpreted replay must see the clock value the compiled run saw, or every
         // timer-derived double and ns delta reports as a divergence
         if (this._shadowTB !== undefined || ENV.OXWASM_SHADOW_EXIT) { if (this._shadowInterp) { if (this._clkSeen !== undefined && this._clkClk === clk) ms = this._clkSeen; } else { this._clkSeen = ms; this._clkClk = clk; } }
@@ -3561,7 +3567,19 @@ export class LinuxEngine {
         if (ENV.OXWASM_ABORTDIAG && sig === 6) {          // who aborted: the guest return addresses on the stack at the call
           const rsp = this.cpu.regs[4], words = [];
           for (let i = 0n; i < 400n && words.length < 40; i++) { let w; try { w = this.mem.read(rsp + 8n * i, 8n); } catch { break; } if (w > 0x200000n && w < 0x6000000n) words.push(w.toString(16)); }
-          console.error(`[abort] tid=${this.threads[this.ti]?.id} rip=${this.cpu.rip.toString(16)} stack-code=${words.join(' ')}`);
+          __dbg(`[abort] tid=${this.threads[this.ti]?.id} rip=${this.cpu.rip.toString(16)} stack-code=${words.join(' ')}`);
+          { const raw = []; for (let i = 0n; i < 70n; i++) { let w; try { w = this.mem.read(rsp + 8n * i, 8n); } catch { break; }
+              let ty = ''; if ((w & 0xfffe000000000002n) === 0n && w > 0x1000000n) { try { ty = ':t' + this.mem.read(w + 5n, 1n).toString(16); } catch {} }
+              raw.push(w.toString(16) + ty); }
+            __dbg(`[abort-raw] rsp=${rsp.toString(16)} ${raw.join(' ')}`);
+            { let jr = null; for (let i = 1n; i < 70n; i++) { let w; try { w = this.mem.read(rsp + 8n * i, 8n); } catch { break; } if (w >= 0x5a000000n && w < 0x5b000000n) { jr = this.mem.read(rsp + 8n * (i - 1n), 8n); break; } }
+              if (jr !== null) { const sl = []; for (let o = -0xc0n; o <= 0x40n; o += 8n) { let w; try { w = this.mem.read(jr + o, 8n); } catch { w = null; } sl.push(`${o < 0n ? '-' : '+'}${(o < 0n ? -o : o).toString(16)}=${w === null ? '?' : w.toString(16)}`); }
+                __dbg(`[abort-frame] jitrbp=${jr.toString(16)} ${sl.join(' ')}`);
+                for (let o = -0x70n; o <= -0x10n; o += 8n) { let c; try { c = this.mem.read(jr + o, 8n); } catch { continue; } if ((c & 0xfffe000000000002n) !== 0n || c < 0x1000000n || c > 0x7fffffffn) continue;
+                  try { const v = this.mem.view(c, 48n); const bf = this.mem.read(c + 8n, 8n); let bs = ''; if (bf > 0x1000000n && bf < 0x7fffffffn) { try { bs = ' BF[-8..+64]=' + Buffer.from(this.mem.view(bf - 8n, 72n)).toString('hex'); } catch {} } __dbg(`[abort-slot] ${o < 0n ? '-' : '+'}${(o < 0n ? -o : o).toString(16)} cell=${c.toString(16)} hdr=${Buffer.from(v).toString('hex')}${bs}`); } catch {} }
+                for (const o of [-0x40n, -0x80n, -0x88n]) { let e; try { e = this.mem.read(jr + o, 8n); } catch { continue; } if ((e & 0xfffe000000000002n) === 0n && e > 0x1000000n) { try { const v = this.mem.view(e - 16n, 112n); __dbg(`[abort-obj] slot${o} cell=${e.toString(16)} -16..+96: ${Buffer.from(v).toString('hex')}`); } catch {} } } } }
+            let nj = 0; for (let i = 0n; i < 70n && nj < 3; i++) { let w; try { w = this.mem.read(rsp + 8n * i, 8n); } catch { break; }
+              if (w >= 0x5a000000n && w < 0x5b000000n) { nj++; try { const b = this.mem.view(w - 6144n, 6400n); __dbg(`[abort-jit] ret=${w.toString(16)} base=${(w - 6144n).toString(16)} ${Buffer.from(b).toString('hex')}`); } catch {} } } }
         }
         if (sig < 1 || sig > 64) { ret(-22n); break; }
         if (nr === 62) {
@@ -6368,6 +6386,10 @@ export class LinuxEngine {
     // OXWASM_BREAK_RANGEADDR=hex: report only when [vm.lastStackTop, rsp) (JSC sanitizeStackForVM's zeroing range,
     // rdi = VM) covers that address - the one call that wipes a live frame among tens of thousands
     if (ENV.OXWASM_BREAK_RANGEADDR) { const X = BigInt('0x' + ENV.OXWASM_BREAK_RANGEADDR); let lst; try { lst = this.mem.read(r[7] + 0x1f830n, 8n); } catch { return; } if (!(lst <= X && X < r[4])) return; }
+    // OXWASM_BREAK_BADCELL=1: report only when rsi is a cell pointer whose JSType (byte +5) is an internal, non-object type
+    if (ENV.OXWASM_BREAK_BADCELL) { const bad = (v) => { if ((v & 0xfffe000000000002n) !== 0n || v === 0n) return false; let ty; try { ty = Number(this.mem.read(v + 5n, 1n)); } catch { return false; } return ty > 6 && ty < 0x20; }; if (!bad(r[6]) && !bad(r[2])) return; }
+    // OXWASM_BREAK_RSIRANGE=lo-hi: report only when rsi lies in [lo, hi) (hex)
+    if (ENV.OXWASM_BREAK_RSIRANGE) { const [x, y] = ENV.OXWASM_BREAK_RSIRANGE.split('-').map((h) => BigInt('0x' + h)); if (!(r[6] >= x && r[6] < y)) return; }
     // OXWASM_BREAK_VMTOP=1: report only when vm.topCallFrame (VM+0x20, rdi = VM) lies BELOW rsp - a live JS
     // frame under the stack pointer, which sanitizeStackForVM then zeroes. Legit calls have it above.
     if (ENV.OXWASM_BREAK_VMTOP) { let top; try { top = this.mem.read(r[7] + 0x20n, 8n); } catch { return; } if (!(top !== 0n && top < r[4])) return; }
@@ -6376,7 +6398,7 @@ export class LinuxEngine {
     if (ENV.OXWASM_BREAK_GREP) try { const pat = new TextEncoder().encode(ENV.OXWASM_BREAK_GREP), ram = new Uint8Array(this.wmem.buffer, this.RAMOFF, this.ram.length); let n = 0, i = 0; const out = []; while (n < 40 && (i = ram.indexOf(pat[0], i)) >= 0) { let ok = true; for (let j = 1; j < pat.length; j++) if (ram[i + j] !== pat[j]) { ok = false; break; } if (ok && i < +(ENV.OXWASM_BREAK_GREP_MIN || 0x8000000)) { i += pat.length; continue; }   // skip the static image: error-message templates
         if (ok) { n++; const lo = Math.max(0, i - 80), hi = Math.min(ram.length, i + 160); let txt = ''; for (let k = lo; k < hi; k++) { const b = ram[k]; txt += (b >= 32 && b < 127) ? String.fromCharCode(b) : (b === 0 ? '' : '.'); } out.push(`${(this.base + BigInt(i)).toString(16)}: ${txt}`); i += pat.length; } else i++; } console.error(`[grep "${ENV.OXWASM_BREAK_GREP}"] ${n} hits\n  ` + out.join('\n  ')); } catch (e) { console.error('[grep] failed: ' + e.message); }
     const names = ['rax','rcx','rdx','rbx','rsp','rbp','rsi','rdi','r8','r9','r10','r11','r12','r13','r14','r15'];
-    let out = `[break ${c.rip.toString(16)}] tid=${this.threads[this.ti]?.id} disp=${this.stats.disp} ` + names.map((n, i) => `${n}=${r[i].toString(16)}`).join(' ') + ` [rdi+1f830]=${q(r[7] + 0x1f830n)} vmtop=${q(r[7] + 0x20n)} [rsp]=${q(r[4])} [rsp+8]=${q(r[4] + 8n)} fs=${c.fsBase?.toString(16)}\n`;
+    let out = `[break ${c.rip.toString(16)}] tid=${this.threads[this.ti]?.id} disp=${this.stats.disp} ` + names.map((n, i) => `${n}=${r[i].toString(16)}`).join(' ') + ` [rsi]=${q(r[6])} [rsi+8]=${q(r[6] + 8n)} [rsi+10]=${q(r[6] + 16n)} [rdi]=${q(r[7])} [rdx]=${q(r[2])}` + ` [rdi+1f830]=${q(r[7] + 0x1f830n)} vmtop=${q(r[7] + 0x20n)} [rsp]=${q(r[4])} [rsp+8]=${q(r[4] + 8n)} fs=${c.fsBase?.toString(16)}\n`;
     // JSC call frames up the rbp chain: return pc, CodeBlock slot (+0x10), callee (+0x18), argc/callSiteIndex (+0x20/+0x24)
     let f = r[5];
     for (let k = 0; k < 14 && f > 0x1000n; k++) {
