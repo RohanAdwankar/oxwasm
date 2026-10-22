@@ -1517,3 +1517,16 @@ Build: 310 s for the first round (5,320 units; the duplication is cheap at this 
 (67/76). Full mix 215 ms (fib 4, math 23, objects 21, strings 12, sorting 47, maps 63, json 34), the best so far against 268 (cold63)
 and 272 (cold62). fib stays at 4 ms, so the calls that cost in the call-bound phase were not inlined (JIT function to JIT function
 calls are bigger than the tiny threshold); cold66 counts the entries under this configuration. Aborts 3 of 17 runs, as before.
+
+### Entries per round by phase (cold42, OXWASM_COUNTCALLS), and the objects slow mode is 13x the entries
+    fib      150k entries   5 ms  (native 1)    2 entries per JS call, 33 ns an entry
+    math     900k          24 ms  (5)           3 entries per iteration of a typed-array loop: the baseline JIT calls a thunk per arithmetic op
+    strings  430k          15 ms  (3)
+    json     665k          44 ms  (5)
+    sorting  1.62M         51 ms  (9)
+    maps     2.12M         79 ms  (13)
+    objects  678k or 8.5-9.6M     46 ms in this run (3)
+The objects phase does the same work in both modes; the slow mode makes 150 translated-function entries per loop iteration against
+11, which is what every property access taking its slow path looks like, i.e. an inline cache that never hits. A translation built
+from an IC's old immediate would do exactly that; the stale-translation verifier (OXWASM_CWVERIFY) can confirm or exclude it.
+Clearing stale guard marks (the "heal") did not change the mode (control: 24, 112, 129 ms and one abort in 4 runs).
