@@ -1268,7 +1268,7 @@ export class LinuxEngine {
     // its writes stored), runs the compiled side, and compares at the first
     // recorded state whose rip and rsp are where the compiled frame actually
     // left. Costly (a snapshot per step); for hunting, not for sweeps.
-    const exitMatch = !!ENV.OXWASM_SHADOW_EXIT, trace = exitMatch ? [] : null, CAP = exitMatch ? 200000 : 5e6;
+    const exitMatch = !!ENV.OXWASM_SHADOW_EXIT, trace = exitMatch ? [] : null, CAP = exitMatch ? +(ENV.OXWASM_SHADOW_CAP || 200000) : 5e6;
     // Registers and xmm per step go into one preallocated buffer (48 words a step): the
     // per-step slices were most of the cost of a shadowed dispatch.
     const TB = exitMatch ? (this._shadowTB ??= new BigInt64Array((CAP + 2) * 48)) : null;
@@ -1277,7 +1277,7 @@ export class LinuxEngine {
     // exits, and the full per-step snapshot cannot stretch that far. A tail match proves the compiled
     // exit lies on the interpreter's path (control flow agrees, state not compared); no match at all
     // within CAP + CAP2 steps is the control-flow divergence signal.
-    const CAP2 = exitMatch ? +(ENV.OXWASM_SHADOW_CAP2 || 4e6) : 0;
+    const CAP2 = exitMatch ? +(ENV.OXWASM_SHADOW_CAP2 ?? 4e6) : 0;
     const cfRip = CAP2 ? (this._shadowCfRip ??= new BigUint64Array(CAP2)) : null, cfRsp = CAP2 ? (this._shadowCfRsp ??= new BigUint64Array(CAP2)) : null;
     let cfN = 0;
     const rec = () => {
