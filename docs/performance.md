@@ -1448,3 +1448,33 @@ With the shadow compare limited to short dispatches (OXWASM_SHADOW_CAP=3000 OXWA
 - fn 0x5a224060 is the JIT function epilogue thunk (`mov r12,[rbp-0x20]; mov r13,[rbp-0x18]; mov r14,[rbp-0x10]; mov r15,[rbp-8]; mov rsp,rbp; pop rbp; ret`). The `ret` returns into the LLInt `op_call` continuation at 25c4f7c, and the chain runs through about 190 interpreter steps of LLInt handlers to the exit 0x49598a7f.
 - At that exit the compiled run has changed 4 bytes at rsp0+0x60..0x63 (f3dd5b90, i.e. rbp-0x30 of the calling JIT frame, the argument-count slot of the callee frame header that the next LLInt `op_call` writes with `mov [rcx+0x20], edx`) to a value that is not a small count (0x3573507d, 0x...), and the interpreter's replay did not write those bytes at all although its trace passes through 25c4f3c, the store.
 - Both the old content and the new content look like random 32-bit values, so the AOT run writes a stale register or an uninitialised value there. This is the first divergence located in the translated JIT/LLInt chain and is the lead for the abort (the corrupted frame slots seen at the abort are of exactly this kind). Not yet root-caused: the next step is a store-by-store trace of this chain (the engine's page watch on f3dd5b90) comparing the AOT and the interpreter.
+
+## Pricing the generated code by its machine code (tools: scratch watsize/snip), and the guard redesign
+V8's `--print-wasm-code` gives the TurboFan machine code for a unit, so an emitter change can be priced in seconds instead of a
+6-minute cache rebuild. Six hot functions of the objects/maps phases (50eee60, 5109300, 47ae960, 51069e0, 28f8220, 6d02b5; 8,100
+bytes of x86 between them) compile to:
+
+    base emitter (window bitmap guard)                     113,708 bytes   (14x the x86)
+    guard off (pricing only, unsafe)                        80,804
+    narrowing off (OXWASM_NARROW=0)                        132,604         (narrowing is worth 14%)
+    NOACCT (fuel and nest off, unsound for yields)         104,796
+    byte-map guard (one load and branch per store)         105,284
+      + folded call check (one unsigned compare)           104,616
+      + OXWASM_NOFUEL=1 (no chain fuel: node has no slices) 99,692
+      + OXWASM_LOOPYIELD=0 (no back-edge budget, no nest)   85,648
+      + i32 flag conditions for 32/16/8-bit sizes           85,676         (conditions were not the cost)
+      + mask peephole (and 0xFFFFFFFF -> wrap/extend)       84,432         (V8 folded most masks already)
+
+- Byte-map guard: one byte per 64-byte line over the whole guest memory, indexed by the store's wasm address (`CWBM` region past
+  guest RAM, `CWBMLEN = ramPages * 1024`), replacing the window-relative bit map: a store costs `load8_u(map + (addr >> 6))` and a
+  branch instead of two slot loads, a subtract, a compare and a bit test. The engine's marking and the interpreter's watch window are
+  unchanged in meaning; only lines inside the anonymous executable ranges are ever marked. Suite green.
+- The folded call check: `(fti >> 31) | depth | -(fuel == 0)` compared unsigned against the limit, one compare instead of three setcc chains.
+- A 16-instruction JSC-style snippet (loads, a structure check, `add ecx,1; jo`, a guarded store) is 58 bytes of x86 and 404 bytes of
+  machine code: a V8 frame and stack check, 8 regfile loads at entry, the depth tax, 4-8 regfile stores and the frame teardown at each
+  `ret`, and the guard's deferred call block are most of it; the straight-line body itself is 2-3 machine instructions per x86 instruction.
+- A cross-unit call site is about 60 machine instructions (regfile spills, inline-cache probe, the check, fuel/nest/depth updates, the
+  indirect call's bounds and signature checks, reloads, the return-address check) plus the callee's ~20 of entry and exit, against
+  `call`/`ret` natively. JSC's baseline code calls a thunk for almost everything, so this is the lever that is left: either inline the
+  small callees into their callers (un-pruning, `OXWASM_UNPRUNE_TINY`) or change the ABI so registers stay in wasm locals across calls.
+Runtime measurements of each build (cold61 byte-map guard, cold62 current emitter, cold63 node-mode knobs, cold64 un-prune 64) follow.
