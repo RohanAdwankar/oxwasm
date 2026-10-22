@@ -3568,6 +3568,8 @@ export class LinuxEngine {
           const rsp = this.cpu.regs[4], words = [];
           for (let i = 0n; i < 400n && words.length < 40; i++) { let w; try { w = this.mem.read(rsp + 8n * i, 8n); } catch { break; } if (w > 0x200000n && w < 0x6000000n) words.push(w.toString(16)); }
           __dbg(`[abort] tid=${this.threads[this.ti]?.id} rip=${this.cpu.rip.toString(16)} stack-code=${words.join(' ')}`);
+          try { __dbg(`[abort-thunk] base=5a2315c0 ${Buffer.from(this.mem.view(0x5a2315c0n, 1024n)).toString('hex')}`); } catch {}
+          __dbg(`[abort-stats] aotFns=${this.aotFns.size} ftFull=${this._ftFull} ftCount=${this._ftCount} extents=${this._extents?.size} noExtPg=${this._noExtPg?.size} wide=${this._wideExt?.size | 0} volatile=${this._volatilePages?.size | 0} codeWrites=${this.stats.codeWrites | 0} invalSlow=${this.stats.invalSlow | 0} execRanges=${this.execRanges.map(([x, y]) => x.toString(16) + '-' + y.toString(16)).join(',')} interpreted=${this.stats.interpreted} disp=${this.stats.disp}`);
           { const raw = []; for (let i = 0n; i < 70n; i++) { let w; try { w = this.mem.read(rsp + 8n * i, 8n); } catch { break; }
               let ty = ''; if ((w & 0xfffe000000000002n) === 0n && w > 0x1000000n) { try { ty = ':t' + this.mem.read(w + 5n, 1n).toString(16); } catch {} }
               raw.push(w.toString(16) + ty); }
