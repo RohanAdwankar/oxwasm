@@ -1571,3 +1571,8 @@ the previous dispatch. clock_gettime and gettimeofday wrote their results into t
 the shadow comparator replays, so the clock's own output read as a stray store. Both now journal their destination (jsnap). The
 other divergence in that run (rdi/r8/r9 at a C++ allocation) is the replay re-executing an allocation. So the shadow comparator has
 found nothing real in the JIT window; the stale translations the verifier reports are the lead.
+
+### cold65's failure is a wasm trap in ld.so
+With OXWASM_CHILD_ERRORS=1: "memory access out of bounds" at rip c598b00 (the dynamic linker's mapping) within 4 s of `--version`.
+The larger inline budgets (TINY=160, TOTAL=2000, BUDGET=200) miscompile an inlined site in ld.so; the default budgets do not reach
+it. Deterministic, so bisectable with OXWASM_INLINE_ONLY when the inliner is next worked on; not the default-configuration bug.
