@@ -1682,3 +1682,19 @@ around it are 10-20x because of the collections.
 Both 40-round objects runs abort at round 37, 13-26 s after round 0, so the abort is not wall-time; objects allocates about a
 seventh of what the mix does per round and the mix dies at round 5: the trigger is cumulative allocation - a particular
 collection, or a heap threshold JSC crosses. Queued: BUN_JSC_logGC counts at the abort with and without doubled heap growth.
+
+### The abort reproduces on objects alone at round 34-39; int3 was a real hole but not this one
+objects with 40-60 rounds aborts at round 34-39 in ~80% of runs (the mix at round 5), identical signature. JSC's VM traps
+are signal-based on x86-64 Linux and plant int3 in JIT code; the engine had no int3 at all (0xCC undecoded), which is now
+fixed (SIGTRAP, rip past the trap, si_code SI_KERNEL) - but no int3 ever executes in these runs (JSC polls at the baseline
+tier), so that was not the mechanism. BUN_JSC_usePollingTraps=1 and BUN_JSC_useConcurrentGC=0 each let objects run 60-120
+rounds, yet the full mix aborts 3/3 with both set, so they shift the odds rather than remove the cause. The per-round
+counters show the shape: three to four rounds before the abort, interpreted instructions jump from hundreds to 20-30k a
+round and deopts from 1-6 to 17-35, and one round carries 112k guarded stores that each invalidate a translation (1 s) -
+JSC rewriting its JIT memory wholesale (a mass jettison and re-JIT), after which the crash follows. Ruled out this round:
+a stale decode cache (JIT pages carry 8/16-byte signatures), unwritten tids on clone, thread exit and stack reuse, SIGPWR
+traffic (none in steady rounds), the quantum, xmm staleness, the line heal, volatile pages, table rebuilds.
+Next: log the writers of that storm (OXWASM_CWLOG_FROM=<n> OXWASM_CWLOG=<k>) to name the JSC path, and check every
+address-keyed table the engine keeps across a JIT region's reuse.
+Measured with polling traps and the non-concurrent collector (cold73, 40 rounds): objects median 415 ms (p25 211, min 91),
+strings+json+math median 102 (p25 86, min 76; phase floors math 24, strings 14, json 34). Native: objects 6, the three ~10.
