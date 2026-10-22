@@ -1478,3 +1478,12 @@ bytes of x86 between them) compile to:
   `call`/`ret` natively. JSC's baseline code calls a thunk for almost everything, so this is the lever that is left: either inline the
   small callees into their callers (un-pruning, `OXWASM_UNPRUNE_TINY`) or change the ABI so registers stay in wasm locals across calls.
 Runtime measurements of each build (cold61 byte-map guard, cold62 current emitter, cold63 node-mode knobs, cold64 un-prune 64) follow.
+
+### Call density in JSC's baseline code, and the guard at run time
+- 6 KB of baseline-JIT code captured at an abort (1,321 instructions) holds 80 calls, one every 16 instructions, most to a dozen thunks
+  (10 to 5a224220 alone). At the ~80 machine instructions a translated call costs, the calls are most of what the translated JIT code
+  executes, which is why the per-instruction expansion of 2-3x in straight-line code does not explain the 6-9x.
+- The store guard at run time: a cache built without it (unsafe; it does not even finish `--version` reliably) ran sorting at 50-51 ms and
+  maps at 73 ms, the same as with the guard. Its 29% of the machine code is the deferred slow-path blocks, which are cold.
+- Suite runs for this round: suite 2 (byte-map guard) green; suite 3 one failure in an isolation test that asserts a sandbox timeout,
+  during the disk-full outage; suite 4 (same code, after the outage) green. Committed as efe513b.
