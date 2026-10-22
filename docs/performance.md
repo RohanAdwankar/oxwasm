@@ -1542,3 +1542,12 @@ Clearing stale guard marks (the "heal") did not change the mode (control: 24, 11
   worth ~25% of the round; neither it nor inlining reaches 1.2x native from here. The two items that still move the number are
   the objects slow mode (13x the entries, worth 5x on that phase and the mix variance) and the corruption bug, which also blocks
   DFG, the tier that would remove most of the thunk calls at the source.
+
+### The JIT-window divergence, captured with a store watch: the extra write is an unguarded stack store
+Shadow compare over the thunk half with OXWASM_WATCHPAGE/WATCHADDR on the diverging slot (f3dd5b90): in the divergent dispatch
+(disp 26197, entry 5a224060, 199 interpreter steps to the exit) the watch log holds NO compiled store to the slot, so the bytes the
+compiled run changed were written by a store the guard does not cover: an rsp- or rbp-relative store without an index (a push, a
+call's return-address push, LLInt's `mov [rsp],rdx` at 25c4f71 while setting up the callee frame). The interpreter's replay of the
+same chain executes those same instructions and writes elsewhere, so rsp or rbp differed between the two mid-chain and agreed
+again by the exit (LLInt resets rsp from the CodeBlock at 25c4f9b, which hides an earlier drift). Next: a cache built with
+OXWASM_GUARD_STACK=1 so the watch log names the compiled stack store, and the shadow trace now carries rsp per step.

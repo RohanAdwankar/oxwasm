@@ -1368,7 +1368,7 @@ export class LinuxEngine {
         st.diverged++; this._shadowDiverged = (this._shadowDiverged ?? 0) + 1;
         if (ENV.OXWASM_DUMPDIR) { const b = new Uint8Array(0x800); for (let i = 0; i < b.length; i++) { try { b[i] = Number(this.mem.read(entryRip + BigInt(i), 1n)); } catch { break; } } try { process.getBuiltinModule('node:fs').writeFileSync(ENV.OXWASM_DUMPDIR + '/div_' + entryRip.toString(16) + '.bin', b); } catch {} }
         __dbg(`<SHADOW-DIVERGE disp=${this.stats.disp} fn=0x${entryRip.toString(16)} exit=0x${exitRip.toString(16)} step=${best.k}/${trace.length} entry=[${regs0.map(v=>v.toString(16)).join(',')}]>`);
-        try { __dbg(`<SHADOW-CODE fn=0x${entryRip.toString(16)} ${Buffer.from(this.mem.view(entryRip, 512n)).toString('hex')}>`); __dbg(`<SHADOW-TRACE ${trace.slice(0, Math.min(trace.length, best.k + 1)).map((t) => t.rip.toString(16)).join(' ')}>`); } catch {}
+        try { __dbg(`<SHADOW-CODE fn=0x${entryRip.toString(16)} ${Buffer.from(this.mem.view(entryRip, 512n)).toString('hex')}>`); __dbg(`<SHADOW-TRACE ${trace.slice(0, Math.min(trace.length, best.k + 1)).map((t) => t.rip.toString(16) + '/' + t.rsp.toString(16)).join(' ')}>`); } catch {}
         for (const d of best.diffs.slice(0, 20)) __dbg('  ' + d);
       }
       this._shadowBusy = false;
