@@ -87,6 +87,8 @@ const CWTRACE = ENV.OXWASM_CWTRACE ? BigInt('0x' + ENV.OXWASM_CWTRACE) : null;  
 const EXACT_CW_OFF = ENV.OXWASM_CW_PAGE === '1';   // old behaviour: every store into a watched page drops the whole page
 const CW_QUIET = Number(ENV.OXWASM_CW_QUIET || 100_000);
 const BREAKS = typeof process !== 'undefined' && ENV.OXWASM_BREAK ? new Set(ENV.OXWASM_BREAK.split(',').map((h) => BigInt('0x' + h))) : null;   // interpreter breakpoints: print the thread, registers and [rdi+0x340..] (diagnosis)
+const XMM_EAGER = ENV.OXWASM_XMM_EAGER === '1';   // A/B lever: never leave cpu.xmm stale after a compiled syscall hop
+const CW_NOHEAL = ENV.OXWASM_CW_NOHEAL === '1';   // A/B lever: leave a marked line alone even when nothing covers it
 const ROTATE_MS = Number(ENV.OXWASM_ROTATE_MS || 10);   // wall-clock quantum: a thread that has run this long yields to a runnable sibling (see _rotateDue)
 // OXWASM_ANON_HEAT: calls required before GENERATED code is translated, as
 // against a program's own text. A JIT's output has a different life
@@ -688,6 +690,7 @@ export class LinuxEngine {
   }
   rebuildFtmap() {
     this._ftTomb = 0; this.stats.ftRebuild = (this.stats.ftRebuild | 0) + 1;
+    if (ENV.OXWASM_ABORTDIAG || ENV.OXWASM_TUTRACE) __dbg(`[ftmap rebuild] #${this.stats.ftRebuild} count=${this._ftCount} aotFns=${this.aotFns.size} disp=${this.stats.disp} t=${this.nowMs() | 0}ms`);
     new DataView(this.wmem.buffer).setUint32(FTMAP, 0, true);
     // open addressing has no in-place delete: clearing and reinserting is
     // the only way to drop an entry (a blacklisted unit, a restored image)
@@ -1180,7 +1183,7 @@ export class LinuxEngine {
               const fl = this.flagview[0];
               if (fl < 0n) { const f = this.cpu.f; f.cf = Number(fl & 1n); f.pf = Number((fl >> 2n) & 1n); f.af = Number((fl >> 4n) & 1n);
                 f.zf = Number((fl >> 6n) & 1n); f.sf = Number((fl >> 7n) & 1n); f.of = Number((fl >> 11n) & 1n); this.flagview[0] = 0n; }
-              this._xmmStale = true; }
+              if (XMM_EAGER) this.syncInXmm(); else this._xmmStale = true; }
   xmmFresh() { if (this._xmmStale) this.syncInXmm(); }
 
   // Run one compiled function; a deopt inside it (or its wasm callees)
@@ -1653,7 +1656,7 @@ export class LinuxEngine {
       // gone stays marked until something unmarks it. 170k-270k of these a round made a 60 ms objects round take 800.
       // A line no translation covers any more is cleared here, on the store that found it; a line still shared with
       // live code keeps paying. Units still being assembled are in _extents already (they register at creation).
-      if (!this._cwLineCovered(g & ~63n)) { this._cwBitsOne(g >> 6n, false); this.stats.cwHeal = (this.stats.cwHeal | 0) + 1; }
+      if (!CW_NOHEAL && !this._cwLineCovered(g & ~63n)) { this._cwBitsOne(g >> 6n, false); this.stats.cwHeal = (this.stats.cwHeal | 0) + 1; }
       return;
     }
     const changed = this._invalidateCode(lo, hi, EXACT_CW_OFF ? undefined : [g, end]);
@@ -3586,10 +3589,13 @@ export class LinuxEngine {
         if (ENV.OXWASM_ABORTDIAG && sig === 6) {          // who aborted: the guest return addresses on the stack at the call
           const rsp = this.cpu.regs[4], words = [];
           for (let i = 0n; i < 400n && words.length < 40; i++) { let w; try { w = this.mem.read(rsp + 8n * i, 8n); } catch { break; } if (w > 0x200000n && w < 0x6000000n) words.push(w.toString(16)); }
+          if (this.ripTrace !== undefined) { const n = 600, seq = []; for (let i = n; i >= 1; i--) { const v = this.ripTrace[(this.ripTraceI - i) & 65535]; seq.push(v < 0n ? 'A' + (-v).toString(16) : v.toString(16)); } __dbg('[abort-riptrace] ' + seq.join(' '));
+            const seen = new Set(); const dumps = []; for (let i = 1; i <= 4000 && dumps.length < 12; i++) { const v = this.ripTrace[(this.ripTraceI - i) & 65535]; if (v <= 0n) continue; const pg = v & ~63n; if (seen.has(pg) || !this.inExec?.(v)) continue; seen.add(pg); let hx = ''; try { hx = Buffer.from(this.mem.view(pg, 128n)).toString('hex'); } catch {} dumps.push(pg.toString(16) + ':' + hx); } __dbg('[abort-code] ' + dumps.join(' ')); }
+          if (this._dring !== undefined) { const r = this._dring, n = r.length, i0 = this._dringI | 0; const lines = []; for (let i = 0; i < n; i++) { const e = r[(i0 + i) % n]; if (e) lines.push(e); } __dbg('[abort-ring] ' + lines.slice(-400).join(' | ')); }
           __dbg(`[abort] tid=${this.threads[this.ti]?.id} rip=${this.cpu.rip.toString(16)} stack-code=${words.join(' ')}`);
           try { __dbg(`[abort-thunk2] base=5a224000 ${Buffer.from(this.mem.view(0x5a224000n, 2048n)).toString('hex')}`); } catch {}
           try { __dbg(`[abort-thunk] base=5a2315c0 ${Buffer.from(this.mem.view(0x5a2315c0n, 1024n)).toString('hex')}`); } catch {}
-          __dbg(`[abort-stats] aotFns=${this.aotFns.size} ftFull=${this._ftFull} ftCount=${this._ftCount} extents=${this._extents?.size} noExtPg=${this._noExtPg?.size} wide=${this._wideExt?.size | 0} volatile=${this._volatilePages?.size | 0} codeWrites=${this.stats.codeWrites | 0} invalSlow=${this.stats.invalSlow | 0} execRanges=${this.execRanges.map(([x, y]) => x.toString(16) + '-' + y.toString(16)).join(',')} interpreted=${this.stats.interpreted} disp=${this.stats.disp}`);
+          __dbg(`[abort-stats] ftRebuild=${this.stats.ftRebuild | 0} tomb=${this._ftTomb | 0} aotFns=${this.aotFns.size} ftFull=${this._ftFull} ftCount=${this._ftCount} extents=${this._extents?.size} noExtPg=${this._noExtPg?.size} wide=${this._wideExt?.size | 0} volatile=${this._volatilePages?.size | 0} codeWrites=${this.stats.codeWrites | 0} invalSlow=${this.stats.invalSlow | 0} execRanges=${this.execRanges.map(([x, y]) => x.toString(16) + '-' + y.toString(16)).join(',')} interpreted=${this.stats.interpreted} disp=${this.stats.disp}`);
           { const raw = []; for (let i = 0n; i < 70n; i++) { let w; try { w = this.mem.read(rsp + 8n * i, 8n); } catch { break; }
               let ty = ''; if ((w & 0xfffe000000000002n) === 0n && w > 0x1000000n) { try { ty = ':t' + this.mem.read(w + 5n, 1n).toString(16); } catch {} }
               raw.push(w.toString(16) + ty); }

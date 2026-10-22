@@ -1627,3 +1627,32 @@ changes nothing), not Liftoff (--no-liftoff and eager TurboFan change nothing), 
 JSC's own collections: count per run matches native (12 vs 8), cost per pause is 40x. The indirect-call protocol in the
 collector's visit loop (u_5109300, V8 machine code) is ~75 instructions plus the callee's entry against native's three, and
 the straight-line code is ~8-12 machine instructions per guest instruction, so the marking code pays both.
+
+### The jsAddSlowCase abort is a collector-thread interleaving bug, not stale code
+With stale translations gone (cold68, CWVERIFY stale=0) the full mix still aborted, now 3/3, always after round 4, with one
+signature: JSC's jsAddSlowCase (5637390) finds a `+` operand that is a cell of an impossible JSType - a freed cell still
+referenced from the JS frame, which is what a missed GC root looks like. Bisecting the phases: no single phase aborts, nor any
+pair; strings+json+math does, and adding fib to those three does not - heap-layout and timing dependent. Decisive:
+BUN_JSC_useConcurrentGC=0 removes it (3/3 complete, control aborts), and so do OXWASM_ROTATE_MS=1 and =1000 against the
+default 10 ms quantum (3/3 each). The bug is in how the collector thread and the mutator interleave under the engine's
+scheduler - the suspend signal's ucontext, the stack bounds the conservative scan reads, or a safepoint the mutator reaches
+with registers the collector cannot see. Then the full mix aborted
+or hung with BUN_JSC_useConcurrentGC=0 too (2 aborts, 1 hang in 3), so the collector thread is a contributor, not the cause;
+the three strings+json+math passes were luck at a lower rate.
+
+What the full mix shows, every time, at round 5 (36-45 s in): either the abort above or a hang in which the engine stops
+dispatching altogether (OXWASM_HEARTBEAT: the last line at ~50 s, nothing after; IDLEDIAG shows only the harness's sh and
+sleep idle). Ruled out one by one, each with 2-4 runs of the mix: the line heal (OXWASM_CW_NOHEAL=1), a dispatch-table
+rebuild (ftRebuild=0 at the abort), a stale xmm half of the register file after a compiled syscall hop (OXWASM_XMM_EAGER=1
+syncs it eagerly), volatile pages (OXWASM_CW_VOLATILE=1000), the preemption quantum (1 and 1000 ms pass 3/3 but the mix was
+not retried under them), Liftoff. Switching to the interpreter before round 5 (OXWASM_AOTSTOP) is too slow to reach it.
+The abort diagnostic now also dumps the dispatch ring (OXWASM_DISPRING), the last 600 interpreted rips (OXWASM_RIPTRACE=1)
+and 128 bytes of code at each of their lines: the ring shows the JS function's own baseline code at 5a265200-5a265d6a being
+INTERPRETED instruction by instruction (callout-interp into it every iteration, no translation), with the thunks around it
+compiled, and the crash entered from the slow-path thunk dispatched at 5a2345c0 after a different exit than the previous
+iterations took. So the value was already bad when the JIT code tested it. The operand slots around it hold cells with the
+header 500200a1/00020800 (one structure, JSType 2, the bench's strings); the bad one is a cell of JSType ≤ 0x20 outside
+{2,3,6}: a zapped, freed cell - a root the collector did not see, or a store the mutator lost.
+
+Next angle: the shadow comparator (OXWASM_SHADOW_RANGE over the JIT region) on rounds 4-5 only, now that its known false
+positives (clocks, r11, timespec writes, re-executed allocations) are handled; and why 5a265200 is never translated.
