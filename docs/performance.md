@@ -1487,3 +1487,12 @@ Runtime measurements of each build (cold61 byte-map guard, cold62 current emitte
   maps at 73 ms, the same as with the guard. Its 29% of the machine code is the deferred slow-path blocks, which are cold.
 - Suite runs for this round: suite 2 (byte-map guard) green; suite 3 one failure in an isolation test that asserts a sandbox timeout,
   during the disk-full outage; suite 4 (same code, after the outage) green. Committed as efe513b.
+
+### Run-time results of the emitter changes, and a reverted "heal" of stale guard marks
+- cold62 (byte-map guard, folded check, i32 conditions, peephole; 25% less machine code than the old emitter) runs exactly like the
+  old cache: sorting 48-50 ms, maps 78-82, json 42-43, fib 4, math 23-24, strings 28-56, objects 111 or abort, full mix 272 ms
+  (fib 4, math 25, objects 23, strings 17, sorting 53, maps 72, json 34). Machine-code size is not what the time is spent on.
+- Clearing a marked guard line when a store's host call finds no translation covering it (so a stale mark stops calling in on
+  every store) was tried as an engine-only change on the same cache: objects-only aborted 4 of 4 (with CWVERIFY, no stale
+  translation reported), and the two full-mix runs that finished were 346 and 456 ms with objects at 31 and 52 ms. Reverted.
+  The slow objects mode is therefore not only stale marks; the 9.2M-call storm seen once was one of its shapes, not its cause.
