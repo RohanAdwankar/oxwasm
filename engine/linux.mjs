@@ -88,6 +88,7 @@ const EXACT_CW_OFF = ENV.OXWASM_CW_PAGE === '1';   // old behaviour: every store
 const CW_QUIET = Number(ENV.OXWASM_CW_QUIET || 100_000);
 const BREAKS = typeof process !== 'undefined' && ENV.OXWASM_BREAK ? new Set(ENV.OXWASM_BREAK.split(',').map((h) => BigInt('0x' + h))) : null;   // interpreter breakpoints: print the thread, registers and [rdi+0x340..] (diagnosis)
 const XMM_EAGER = ENV.OXWASM_XMM_EAGER === '1';   // A/B lever: never leave cpu.xmm stale after a compiled syscall hop
+const TRACE_RANGE = ENV.OXWASM_TRACE_RANGE ? ENV.OXWASM_TRACE_RANGE.split('-').map((h) => BigInt('0x' + h)) : null;   // see _traceEntry
 const CW_NOHEAL = ENV.OXWASM_CW_NOHEAL === '1';   // A/B lever: leave a marked line alone even when nothing covers it
 const ROTATE_MS = Number(ENV.OXWASM_ROTATE_MS || 10);   // wall-clock quantum: a thread that has run this long yields to a runnable sibling (see _rotateDue)
 // OXWASM_ANON_HEAT: calls required before GENERATED code is translated, as
@@ -1462,6 +1463,7 @@ export class LinuxEngine {
       const before = cpu.rip;
       if (this._ripLog !== undefined && this._ripLog.has(before)) this._ripHit(before);
       if (ARM_FP !== null) this._armFp(before);
+      if (TRACE_RANGE !== null && cpu.rip >= TRACE_RANGE[0] && cpu.rip < TRACE_RANGE[1] && (cpu.rip & 0x3fn) === 0n) this._traceEntry(cpu.rip, 'I');
       const insn = cpu.step(); this.stats.interpreted++;
       if (this.exitCode !== null) throw EXIT;
       if (this.blocked) { cpu.rip = before; break; }           // the run loop parks; the syscall re-executes
@@ -1546,6 +1548,7 @@ export class LinuxEngine {
       if (ARM_FP !== null) this._armFp(before);
       this._cleanSync = false;
       if (BREAKS !== null && BREAKS.has(this.cpu.rip)) this._onBreak();
+      if (TRACE_RANGE !== null && this.cpu.rip >= TRACE_RANGE[0] && this.cpu.rip < TRACE_RANGE[1] && (this.cpu.rip & 0x3fn) === 0n) this._traceEntry(this.cpu.rip, 'I');
       const insn = this.cpu.step(); this.stats.interpreted++;
       if (globalThis.__ihist !== undefined && (this.stats.interpreted & 63) === 0) { const h = globalThis.__ihist, k = this.cpu.rip; h.set(k, (h.get(k) || 0) + 1); }   // IHIST: every 64th interpreted step, by rip
       branched = BRANCHY.has(insn.mnem) || this.cpu.rip !== this.cpu.ripNext && this.cpu.rip !== before + BigInt(insn.len);
@@ -1811,6 +1814,7 @@ export class LinuxEngine {
     return {
       codewrite: (a, next, size) => this._codeWrite(a, next, size),
       loophot: (a) => this._loopHot(BigInt.asUintN(64, a)),
+      trace: (rip) => this._traceEntry(BigInt.asUintN(64, rip), 'C'),
       // rip = guest address of the syscall instruction (an emit-time constant)
       // so a blocking syscall can suspend: state is spilled, frames unwind,
       // and resume re-executes the syscall at exactly this rip.
@@ -5587,6 +5591,14 @@ export class LinuxEngine {
     if (t.suspendOld != null) { this.cpu.regs[0] = BigInt.asUintN(64, -4n); this._sigDeliver(this.cpu, t, sig, this.cpu.rip + 2n); return true; }
     this._sigDeliver(this.cpu, t, sig, this.cpu.rip);
     return true;
+  }
+  // OXWASM_TRACE_RANGE: one line per entry into a function in the range - from compiled code (C, read from the regfile
+  // right after the entry reloads) and from the interpreter (I, at a 0x40-aligned rip in the range) - so a compiled run
+  // and an interpreted run (OXWASM_EXEC_ANON=0) of the same program can be diffed to the first divergent entry state.
+  _traceEntry(rip, how) {
+    const R = how === 'C' ? (i) => BigInt.asUintN(64, this.regview[i]) : (i) => this.cpu.regs[i];
+    let top = '?'; try { top = this.mem.read(R(4), 8n).toString(16); } catch {}
+    __dbg(`[tr] ${how} ${rip.toString(16)} rsp=${R(4).toString(16)} rbp=${R(5).toString(16)} rcx=${R(1).toString(16)} rsi=${R(6).toString(16)} rdi=${R(7).toString(16)} rax=${R(0).toString(16)} rdx=${R(2).toString(16)} r11=${R(11).toString(16)} top=${top} tid=${this.threads[this.ti]?.id}`);
   }
   // int3 (0xCC): the kernel's do_int3 raises SIGTRAP with si_code SI_KERNEL and the frame's rip at the byte after
   // the trap. JSC's VMTraps - signal-based by default on x86-64 Linux, not polling - plants int3 over the first byte

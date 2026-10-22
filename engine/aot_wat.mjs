@@ -82,6 +82,9 @@ const MAXWAT = Number(process.env.OXWASM_MAXWAT || 5_000_000);
 // A computed goto with a table this wide is an interpreter's dispatch: the one kind of
 // function worth compiling whole, however large (JavaScriptCore's LLInt has 272 per site).
 // OXWASM_ESC_RANGES=lo-hi[,lo-hi] (hex guest addresses): instructions there are never translated (they escape to the interpreter) - for bisecting a miscompile
+// OXWASM_TRACE_RANGE=lo-hi (hex): functions entered in the range call $x_trace at entry, after the regfile reloads, so the
+// engine can log their entry state and compare it with the interpreter's (OXWASM_EXEC_ANON=0) run of the same program.
+const TRACE_RANGE = typeof process !== 'undefined' && process.env?.OXWASM_TRACE_RANGE ? process.env.OXWASM_TRACE_RANGE.split('-').map((h) => BigInt('0x' + h)) : null;
 const ESC_RANGES = typeof process !== 'undefined' && process.env?.OXWASM_ESC_RANGES ? process.env.OXWASM_ESC_RANGES.split(',').map((r) => { const [a, b] = r.split('-'); return [BigInt('0x' + a), BigInt('0x' + b)]; }) : null;
 const MEGA_SITE = Number((typeof process !== 'undefined' && process.env?.OXWASM_MEGA_SITE) || 256);
 // ... and the root has to be one of its handlers: a small function whose tail jump
@@ -4164,6 +4167,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   for (let r=0;r<16;r++) if (touched(r) && (entryKeep === null || (entryKeep & (1<<r)))) wat += '    ' + reloadR(r) + '\n';
   for (const r of xUsed) if (entryKeep === null || (entryKeep & ((0x10000<<r)|0))) wat += '    ' + xReload(r) + '\n';
   wat += '    (local.set $rsp0 (local.get $r4))\n';
+  if (TRACE_RANGE && fnAddr >= TRACE_RANGE[0] && fnAddr < TRACE_RANGE[1]) wat += `    (call $x_trace (i64.const ${BigInt.asIntN(64, fnAddr).toString()}))\n`;   // OXWASM_TRACE_RANGE: entry-state trace
   wat += '    ' + ftInc + '\n';       // entry tax: this frame\'s stack weight
   if (typeof process !== 'undefined' && process.env?.OXWASM_COUNTCALLS === '1') wat += `    (i64.store (i32.const ${FTMAP + 32}) (i64.add (i64.load (i32.const ${FTMAP + 32})) (i64.const 1)))\n`;
   // OXWASM_FNPROF=1: a per-function entry counter (diagnosis only). aotCalls
@@ -4569,6 +4573,7 @@ export function compileUnitWat(mem, entry, opts = {}) {
   // Only when the guard is on, so a module built without it keeps exactly the
   // imports every existing consumer supplies.
   if (STOREGUARD) wat += '  (import "env" "codewrite" (func $x_cw (param i32 i64 i32)))\n';   // (address, guest rip after the storing instruction)
+  if (TRACE_RANGE) wat += '  (import "env" "trace" (func $x_trace (param i64)))\n';
   // the global dispatch table + its in-wasm resolver, iff some site chains
   // through it (indirect call, out-of-unit static call, indirect tail jump)
   const tf0 = PHASE ? performance.now() : 0;

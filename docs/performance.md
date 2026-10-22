@@ -1724,3 +1724,10 @@ as a return), and int3 raises SIGTRAP. A mitigation that recognised the shape by
 with 10 thunks so vetoed the mix aborted, hung, and once completed at 1.4 s a round (sorting 811 ms: the vetoed thunks
 are hot), so the two clean thunks-only veto runs were luck and the block-veto result rests on the whole block. Reverted.
 The root cause is open; what is established: interpreted JIT region = never aborts; the 13-entry block vetoed = clean 5/5.
+An entry-state trace (OXWASM_TRACE_RANGE=lo-hi: compiled functions in the range call the engine at entry after the regfile
+reloads; the interpreter logs 0x40-aligned rips in the range) was meant to diff a compiled run against an interpreted one
+(OXWASM_EXEC_ANON=0). It cannot be aligned across runs: JSC lays its stubs out in a different order when the JIT region is
+interpreted (the three stubs traced sit at different addresses in the two runs), and in-unit entries reached by a jump are
+not function entries on the compiled side. A same-run comparator for nested calls is what this needs; the trace stays as a
+tool. The tracing itself also changed the failure (a hang in round 1 instead of the round-5 abort), which is consistent with
+a bug that depends on when a unit is entered relative to JSC's patching rather than on the bytes alone.
