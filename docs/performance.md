@@ -1496,3 +1496,12 @@ Runtime measurements of each build (cold61 byte-map guard, cold62 current emitte
   every store) was tried as an engine-only change on the same cache: objects-only aborted 4 of 4 (with CWVERIFY, no stale
   translation reported), and the two full-mix runs that finished were 346 and 456 ms with objects at 31 and 52 ms. Reverted.
   The slow objects mode is therefore not only stale marks; the 9.2M-call storm seen once was one of its shapes, not its cause.
+
+### Function entries per round: 13 million (OXWASM_COUNTCALLS, printed at each write syscall)
+A full-mix round (fib, math, objects, strings, sorting, maps, json; 28-39 ms natively) enters 7.3-13.3 million translated wasm
+functions, with only 1.5-15 thousand interpreted steps and 110-650 host dispatches. At 5 ns an entry the entries alone are 65 ms,
+twice the whole native round, and the measured cost of a cross-unit call site (about 60 machine instructions plus the callee's 20) is
+more like 10-15 ns. So the gap is the number of guest calls times the translated call protocol, and the straight-line code quality,
+the guard, the counters and the interpreter are second order. The levers are the number of entries (inlining callees so the call
+disappears; cold64 tests OXWASM_UNPRUNE_TINY=64) and the protocol itself (registers in wasm locals across calls instead of the
+regfile round trip).
