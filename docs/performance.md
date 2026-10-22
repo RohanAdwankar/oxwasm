@@ -1505,3 +1505,9 @@ more like 10-15 ns. So the gap is the number of guest calls times the translated
 the guard, the counters and the interpreter are second order. The levers are the number of entries (inlining callees so the call
 disappears; cold64 tests OXWASM_UNPRUNE_TINY=64) and the protocol itself (registers in wasm locals across calls instead of the
 regfile round trip).
+
+### cold63: OXWASM_NOFUEL=1 OXWASM_LOOPYIELD=0 (node mode)
+Solo phases, 60 rounds, 2 runs each: sorting 45/46 ms (cold62: 48/50), maps 67/76 (78/82), json 41/37 (42/43), strings 12/12 (28/56),
+objects 21 (good mode; the other run aborted), fib 4, math 23. Full mix 268 ms (fib 5, math 23, objects 22, strings 11, sorting 45,
+maps 85, json 31) against 272. Each 60-round solo run completed in 52-62 s against 69-89 s: with no loop yield the warm-up
+re-dispatches far less. A 5-10% steady-state gain, and the configuration to use on node. Aborts: 3 of 17 runs, as before.
