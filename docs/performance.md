@@ -2088,3 +2088,70 @@ JIT code. Clean 6/6, suite30 green.
 OXWASM_ABIRELOAD=1 on top (no post-call reload of callee-saved GPRs and caller-saved xmm): 186.0, 200.5, 202.0.
 Within noise of the guard skip alone, and it cannot be the default (the suite's call-mem test returns a value
 in rbx), so it stays opt-in.
+
+### Where the steady round goes now (anchored profile, rounds 21-39, JIT-on mix, cold94)
+
+The earlier profile windows were placed with the wrong clock: V8's tick timestamps count from process start and
+the stats line's `hr=` from boot, and the offset was taken from the last tick, which belongs to the harness's
+post-run child commands (python3, tail, date, sh in their own engines), not to the benchmark. The window therefore
+leaked into those commands, which is where the "Liftoff compiles and tier-ups in the steady state" came from. The
+stats line now carries `pn=` (performance.now(), the V8 clock) and `winprof.py` anchors on it.
+
+Rounds 21-39, 4.4 s, 3,898 ticks: static units 58.4%, JIT units 23.8%, V8 builtins 6.4%, node C++ 5.5%,
+engine JS 2.5%, libc 1.4%. Of the non-unit ticks: the interpreter 5% (step/decode and the builtins they call;
+tens of steps a round in the stats, but each costs a few microseconds), tier-ups 3% (60 ms over 19 rounds, in
+`[tu<]`), dispatch 1.2%, syscalls 1.7% (mostly the madvise fast path's memset). 99% of the unit ticks are in
+TurboFan code, so tiering is not the gap. The static profile is flat: 206 functions, the top one at 3.3%, the top
+40 at 66%.
+
+So the translated code is the round: at ~82% of 200 ms it is 3.5x the whole native round by itself, and the
+other 18% would not reach the goal if it vanished. On the ten hottest static functions TurboFan emits 39 bytes of
+machine code per guest instruction (15-66 by function); the hottest C++ function (f_53818e0, 1,137 guest
+instructions) compiles to 9,229 machine instructions of which 28.8% are frame spills/reloads and 25.1%
+register-to-register moves: half the code is TurboFan's allocator shuffling 16 i64 locals plus the flag locals
+through a large CFG. No TurboFan flag changes it (instruction scheduling, splitting, move optimisation, loop
+rotation, turboshaft on/off: within 2%). Of the emitter's knobs, only removing the store guard entirely changes
+it much: 9,229 -> 7,084 instructions, and 2,661 -> 1,632 spills, because each guard's slow-path call is a call
+site, and a call site makes every live value spill.
+
+### Cold builds hung on a jump-table dispatcher's bogus extent (fixed)
+
+Every cold cache build since an unknown point hung at the tier-up of 25a9e92 (the control run without any new
+emitter change hung the same way; the warm cold94 cache had hidden it). The unit is a 6,959-way jump table of
+nine-byte handlers at 25a9c9f (9.7 MB of WAT, each handler its own tail-target function), and one branch in it
+has a rel32 that points 384 MB below the image: in the engine that address wraps to a valid wasm offset, the
+analyzer decoded whatever lay there, and every handler's extent hull ran from 25a9c9f to 0xffffffffea5a9d00.
+Marking those lines ran for longer than the guard; with that capped, 6,959 WIDE extents made `_extOverlap`'s
+linear scan the whole run (the worker profiled at 58% there, through the inspector's NodeWorker domain while it
+was stuck; `cdpprof.mjs` in the scratchpad does that in one command).
+
+Fixes: the analyzer treats a target outside the canonical range as an undecodable deopt point and never fetches
+it; extents skip such blocks; the engine drops any span past the canonical range at registration (stats.extBogus)
+and refuses to mark a span wider than 256 MB (stats.cwBitsAbsurd). A cold build now runs round 0 in 49 s and 40
+rounds in 155 s.
+
+A cache built from scratch today runs the mix 20-25% slower than cold94 (medians 242-273 vs 196-221): the unit
+composition differs (cold94 accumulated units over many runs and sessions). A/B comparisons must use caches built
+the same way, which is why the deferred-guard runs below compare two fresh keys.
+
+### Deferred code-write guard (OXWASM_CWDEFER): fewer spills, slower round - off by default
+
+The guard's slow path is a call, and a call site makes TurboFan spill every live value around it, so the hit path
+was changed to record the store in a ring in wasm memory (CWRING: nine straight-line ops, no call) and the ring
+is flushed at the next spill point (every call, tail jump and return carries `(if (i32.load CWRING) (then (call
+$x_cwflush)))` after its spill) and on every entry from compiled code (dispatch, callout, deopt, loop yield). The
+hottest C++ function went from 9,229 to 8,504 machine instructions and from 2,661 to 1,676 frame spills.
+
+Measured on fresh caches built the same way, JIT-on mix, 40 rounds, medians of rounds 21-40:
+
+| variant | medians (ms) |
+|---|---|
+| synchronous guard (CWDEFER=0, cold99s) | 253.0, 242.0, 250.5 |
+| ring recording only, no flush checks (CWDEFER=2, unsafe pricing, cold99r) | 240.0, 240.0 |
+| flush checks only, call kept (CWDEFER=3, pricing, cold99k) | 252.5, 261.5 |
+| both (CWDEFER=1, cold99d) | 268.0, 273.0, 261.5, 276.0 |
+
+The spill reduction is worth at most 4% of the round and the checks cost 5-8%: a load and a branch at every call
+and return, in the code that runs most, outweigh spills that sit mostly off the hot paths. Net 7% slower, so the
+knob stays off. The lesson is the same as the registers-in-memory one: TurboFan's spill count is not a proxy for
+time on this code; what runs is the call protocol, and anything added to it is paid at every call.

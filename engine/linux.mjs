@@ -10,7 +10,7 @@ import { CPU, Memory } from './interp.mjs';
 import { compileLoop } from './jit2.mjs';
 import { compileVectorLoop } from './jitsimd.mjs';
 import { fnprofSlot } from './aot_wat.mjs';
-import { compileUnitWat, pltStubWat, FTMAP, FTMAP_MAX, FTENTRY, FTDLIMIT, FTFUEL, FTLOOP, FTNEST, FTSTALE, LOOPYIELD_N,
+import { compileUnitWat, pltStubWat, FTMAP, FTMAP_MAX, FTENTRY, FTDLIMIT, FTFUEL, FTLOOP, FTNEST, FTSTALE, LOOPYIELD_N, CWRING, CWRING_N,
          FTHASH, FTHBITS, FTHMASK, FTHBYTES, CWLO_SLOT, CWLEN_SLOT, CWBM_SLOT, PGMAP } from './aot_wat.mjs';
 // OXWASM_DISPSTAT=1: count the rips that HAD a compiled unit and were not
 // dispatched anyway. Off by default - it costs a map lookup per instruction.
@@ -1148,7 +1148,12 @@ export class LinuxEngine {
       if (BYTECHECK && unit.ext && !_inStatic) { for (const [k, a, b, spans] of unit.ext) if (a !== null) { try { const cp = []; for (const [x, y] of (spans || [[a, b]])) cp.push([x, this.mem.view(x, y - x).slice()]); (this._byteCopy ??= new Map()).set(k, { cp, tag: this.stats.disp | 0 }); } catch {} } }
       // PATCHJMP sites (aot_wat.mjs): stores that stay inside one are JSC repatching a jump the unit reads at run time
       if (unit.patch && unit.patch.length) { const ps = this._patchSites ??= new Map(); for (const [x, y] of unit.patch) { const q = x >> 12n; let l = ps.get(q); if (!l) ps.set(q, l = []); l.push([x, y]); } this.stats.patchSites = (this.stats.patchSites | 0) + unit.patch.length; }
-      if (unit.ext) { const ex = this._extents ??= new Map(); for (const [k, a, b, spans] of unit.ext) if (a !== null) {
+      if (unit.ext) { const ex = this._extents ??= new Map(); for (let [k, a, b, spans] of unit.ext) if (a !== null) {
+        // A span past the canonical address range came from a displacement that pointed nowhere (see analyze): it is
+        // not bytes this translation depends on. Left in, it made every handler of a 6,959-way jump table a WIDE
+        // extent, and the linear wide-extent scan in _extOverlap then took a cold opencode build past its guard.
+        if (spans) { const ok = spans.filter(([x, y]) => x < y && y < 0x800000000000n); if (ok.length !== spans.length) { this.stats.extBogus = (this.stats.extBogus | 0) + 1; if (!ok.length) continue; spans = ok; a = ok[0][0]; b = ok[0][1]; for (const [x, y] of ok) { if (x < a) a = x; if (y > b) b = y; } } }
+        else if (!(a < b && b < 0x800000000000n)) { this.stats.extBogus = (this.stats.extBogus | 0) + 1; continue; }
         ex.set(k, [a, b]);
         if (CWVERIFY && !(this.execRangesStatic ?? []).some(([x, y]) => a >= x && a < y)) { try { for (const [sx, sy] of (spans || [[a, b]])) { if (sy - sx > 65536n) continue; const v = this.mem.view(sx, sy - sx); if (v) (this._extSnap ??= new Map()).set(k + ':' + sx, { k, a: sx, bytes: Uint8Array.from(v) }); } } catch {} }
         // An extent spanning more than WIDE_EXT_PAGES pages (a function whose blocks straddle distant regions) is NOT indexed page by
@@ -1310,6 +1315,7 @@ export class LinuxEngine {
     // interpreter), so a reset here would wipe the taxes of everything above
     // us and unbound the stack. run() resets the word at true top level.
     const fdv = (this._ftdv ??= new DataView(this.wmem.buffer));
+    if (fdv.getUint32(CWRING, true) !== 0) this._cwFlush();
     const fd0 = fdv.getUint32(FTMAP + 8, true);
     if (ENV.OXWASM_DEPTHLOG && fd0 > 200 && ((this.stats.dd = (this.stats.dd | 0) + 1) % 3000) === 1) console.error(`[ddisp] rip=${this.cpu.rip.toString(16)} fd0=${fd0} rsp=${this.cpu.regs[4].toString(16)}`);
     // fill the chain-fuel tank for this dispatch (see FTFUEL in aot_wat.mjs);
@@ -1322,6 +1328,7 @@ export class LinuxEngine {
     const entry = this.cpu.rip; this._lastEntry = entry;
     if (DISPRING) this._dr('disp', entry, this.cpu.regs[4]);
     try { let exit = f();
+      if (fdv.getUint32(CWRING, true) !== 0) this._cwFlush();   // the unit may have left recorded code writes at its exit
       if (DISPRING) this._dr('exit', entry, BigInt.asUintN(64, exit), this.aotDrive ? 1 : 0);
       if (fdv.getUint32(FTLOOP, true) === 0) this.stats.loopYieldTop = (this.stats.loopYieldTop || 0) + 1;   // the frame returned on a spent loop budget: a top-level yield
       // In-wasm driver: a top frame's guest ret exits its wasm function, but
@@ -1770,6 +1777,23 @@ export class LinuxEngine {
       }
     }
   }
+  // Deferred guard (CWRING in aot_wat.mjs): units record the stores that hit a marked line and call this at their
+  // next spill point; the engine also drains it on every entry from compiled code (dispatch, callout, deopt,
+  // syscall, loop yield) so nothing is dispatched or interpreted with a stale translation.
+  _cwFlush() {
+    if (!this.wmem) return;
+    const dv = (this._ftdv ??= new DataView(this.wmem.buffer));
+    const n = dv.getUint32(CWRING, true);
+    if (n === 0) return;
+    dv.setUint32(CWRING, 0, true);
+    this.stats.cwFlush = (this.stats.cwFlush | 0) + 1;
+    const m = Math.min(n, CWRING_N);
+    for (let i = 0; i < m; i++) { const e = CWRING + 16 + i * 16; this._codeWrite(dv.getUint32(e, true), dv.getBigUint64(e + 8, true), dv.getUint32(e + 4, true)); }
+    if (n > CWRING_N) {   // entries were lost: drop every translation of anonymous executable memory
+      this.stats.cwOverflow = (this.stats.cwOverflow | 0) + 1;
+      for (const [a, b] of this.execRanges ?? []) if (!(this.execRangesStatic ?? []).some(([x, y]) => a >= x && b <= y)) this._invalidateCode(a & ~4095n, (b + 4095n) & ~4095n);
+    }
+  }
   _codeWrite(waddr, next, size) {
     const g = this.base + BigInt((waddr >>> 0) - this.RAMOFF);
     if (WATCHADDR !== null) { const e = g + BigInt(size >>> 0 || 1); for (let a = g & ~7n; a < e; a += 8n) if (WATCHADDR.has(a)) { const hk = this._extOverlap(g, e); this._waLog(a, g, size, 'C rip=' + (next === undefined ? '?' : BigInt.asUintN(64, next).toString(16)) + ' disjoint=' + this._cwDisjoint(g, e) + ' hit=' + (hk ? hk.map((k) => k.toString(16) + (this.aotFns.has(k) ? '+' : '-')).join(',') : 'none') + ' vol=' + !!this._volatilePages?.has(g & ~4095n)); break; } }
@@ -1849,6 +1873,7 @@ export class LinuxEngine {
     if (!STOREGUARD || !this.wmem) return;
     if (CWTRACE !== null && x - 15n <= CWTRACE && y > CWTRACE) __dbg(`[cwtrace] lines ${on ? 'SET' : 'CLEAR'} [${x.toString(16)},${y.toString(16)}) by=${why || '?'} skipVolatile=${!!skipVolatile} vol=${!!this._volatilePages?.has(CWTRACE & ~4095n)} disp=${this.stats.disp}`);
     const clip = this._cwClip(x >= 15n && on ? x - 15n : x, y); if (!clip) return; x = clip[0]; y = clip[1];
+    if (y - x > 0x10000000n) { this.stats.cwBitsAbsurd = (this.stats.cwBitsAbsurd | 0) + 1; if (ENV.OXWASM_TUTRACE) __dbg(`[cwbits-absurd] ${x.toString(16)}-${y.toString(16)} by=${why || '?'}`); return; }   // no translation spans 256 MB: a bogus extent, not a mark job (one ran past a build's guard)
     const u8 = new Uint8Array(this.wmem.buffer), bm = this.CWBM;
     for (let g = x >> 6n; g <= (y - 1n) >> 6n; g++) {
       if (skipVolatile && this._volatilePages?.has((g << 6n) & ~4095n)) continue;
@@ -1967,7 +1992,8 @@ export class LinuxEngine {
   aotEnv() {
     return {
       codewrite: (a, next, size) => this._codeWrite(a, next, size),
-      loophot: (a) => this._loopHot(BigInt.asUintN(64, a)),
+      cwflush: () => this._cwFlush(),
+      loophot: (a) => { if (this._ftdv !== undefined && this._ftdv.getUint32(CWRING, true) !== 0) this._cwFlush(); return this._loopHot(BigInt.asUintN(64, a)); },
       trace: (rip) => this._traceEntry(BigInt.asUintN(64, rip), 'C'),
       // rip = guest address of the syscall instruction (an emit-time constant)
       // so a blocking syscall can suspend: state is spilled, frames unwind,
@@ -2053,6 +2079,7 @@ export class LinuxEngine {
       },
       callout: (target) => {
         target = BigInt.asUintN(64, target);
+        if (this._ftdv !== undefined && this._ftdv.getUint32(CWRING, true) !== 0) this._cwFlush();
         // Chain preemption: a wasm-to-wasm chain never returns to run(), and
         // each hop's interpUntil restarts its own step counter, so thousands
         // of short hops dodge every other deadline check (measured: 175ms
@@ -2169,6 +2196,7 @@ export class LinuxEngine {
       // Profile the landing so an indirect jump that only runs inside AOT code
       // (a compiled trampoline, a jump table) still tiers up its target.
       deopt: (rip, _rsp0) => {
+        if (this._ftdv !== undefined && this._ftdv.getUint32(CWRING, true) !== 0) this._cwFlush();
         if (ENV.OXWASM_HEAPPROF) __heapProfCheck();
         if (DISPRING) this._dr('deopt', BigInt.asUintN(64, rip), _rsp0 === undefined ? 0n : BigInt.asUintN(64, _rsp0));
         if (this._loopHotSeen?.has(BigInt.asUintN(64, rip))) this.stats.loopYieldNested = (this.stats.loopYieldNested || 0) + 1;   // a nested frame's yield arrives as a deopt to a loop head
@@ -2911,7 +2939,7 @@ export class LinuxEngine {
     if (ENV.OXWASM_COUNTCALLS === '1' && nr === 1 && this._ctor?.argv?.[0]?.includes('opencode')) { const c = new DataView(this.wmem.buffer).getBigUint64(FTMAP + 32, true); const st = this.stats, pv = this._lastStW ?? {}, d = (k) => (st[k] | 0) - (pv[k] | 0), sysSum = Object.values(st.sysMs ?? {}).reduce((x, y) => x + y, 0), sysN = Object.values(st.syscalls ?? {}).reduce((x, y) => x + y, 0), now = performance.now();
       if (ENV.OXWASM_IHIST_RESET && globalThis.__ihist && !this._ihReset && (now - (pv.now ?? now)) > +ENV.OXWASM_IHIST_RESET) { this._ihReset = true; globalThis.__ihist.clear(); if (this.deoptLog) this.deoptLog.clear(); if (this.calloutLog) this.calloutLog.clear(); if (this._episodes) this._episodes.clear(); }   // OXWASM_IHIST_RESET=<ms>: histograms count from the first round longer than this
       let txt = ''; try { const n = Number(cpu.regs[2]); txt = Buffer.from(this.mem.view(BigInt.asUintN(64, cpu.regs[6]), BigInt(Math.min(n, 16)))).toString('latin1').replace(/[^ -~]/g, '.'); } catch {}
-      __dbg(`[calls-w] hr=${process.hrtime.bigint() / 1000n} txt=${JSON.stringify(txt)} n=${c} d=${c - (this._lastCallsW ?? 0n)} interp=${d('interpreted')} disp=${d('disp')} ms=${(now - (pv.now ?? now)) | 0} tu=${(st.tuTotalMs - (pv.tuTotalMs || 0)) | 0}ms/${d('tiers_aot')} inval=${d('invalSlow')} cw=${d('codeWrites')} deopt=${d('deopts')} comp=${d('compiles')}/${d('unitHits')}/${d('tierCalls')} callout=${d('coNoF')} vol=${d('volatilePages')} sys=${sysN - (pv.sysN || 0)}/${(sysSum - (pv.sysSum || 0)) | 0}ms sig=${Object.entries(this._sigN ?? {}).map(([k, v]) => k + ':' + (v - ((pv._sigN ?? {})[k] | 0))).join(',')} heap=${(process.memoryUsage().heapUsed / 1048576) | 0}MB v8gc=${(() => { try { const h = process.getBuiltinModule('node:v8').getHeapStatistics(); return ((h.total_heap_size / 1048576) | 0) + 'MB/' + ((h.malloced_memory / 1048576) | 0) + 'MBm'; } catch { return '?'; } })()} ext=${(process.memoryUsage().external / 1048576) | 0}MB`);
+      __dbg(`[calls-w] hr=${process.hrtime.bigint() / 1000n} pn=${now | 0} txt=${JSON.stringify(txt)} n=${c} d=${c - (this._lastCallsW ?? 0n)} interp=${d('interpreted')} disp=${d('disp')} ms=${(now - (pv.now ?? now)) | 0} tu=${(st.tuTotalMs - (pv.tuTotalMs || 0)) | 0}ms/${d('tiers_aot')} inval=${d('invalSlow')} cw=${d('codeWrites')} deopt=${d('deopts')} comp=${d('compiles')}/${d('unitHits')}/${d('tierCalls')} callout=${d('coNoF')} vol=${d('volatilePages')} sys=${sysN - (pv.sysN || 0)}/${(sysSum - (pv.sysSum || 0)) | 0}ms sig=${Object.entries(this._sigN ?? {}).map(([k, v]) => k + ':' + (v - ((pv._sigN ?? {})[k] | 0))).join(',')} heap=${(process.memoryUsage().heapUsed / 1048576) | 0}MB v8gc=${(() => { try { const h = process.getBuiltinModule('node:v8').getHeapStatistics(); return ((h.total_heap_size / 1048576) | 0) + 'MB/' + ((h.malloced_memory / 1048576) | 0) + 'MBm'; } catch { return '?'; } })()} ext=${(process.memoryUsage().external / 1048576) | 0}MB`);
       this._lastCallsW = c; this._lastStW = { ...st, tiers_aot: st.tiers?.aot | 0, now, sysSum, sysN, _sigN: { ...(this._sigN ?? {}) } }; st.tiers_aot = st.tiers?.aot | 0; }
     if (ENV.OXWASM_JITSYS && (nr === 9 || nr === 10 || nr === 11 || nr === 25 || nr === 28) && this._ctor?.argv?.[0]?.includes('opencode')) {
       const lo = BigInt('0x' + (ENV.OXWASM_JITSYS === '1' ? '5a000000' : ENV.OXWASM_JITSYS.split('-')[0])), hi = BigInt('0x' + (ENV.OXWASM_JITSYS === '1' ? '5b000000' : ENV.OXWASM_JITSYS.split('-')[1]));

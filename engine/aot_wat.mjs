@@ -68,6 +68,19 @@ export const FCW_SLOT = 164;      // regfile slot: the x87 control word, so fnst
 export const CWLO_SLOT = 168, CWLEN_SLOT = 172;
 // Where the line bitmap lives (a wasm offset, past the end of guest RAM): one bit per 64-byte line of the window.
 export const CWBM_SLOT = 176;
+// Deferred code-write guard (OXWASM_CWDEFER=1, off by default): a store that hits a marked line is RECORDED in
+// a ring in wasm memory instead of calling the engine, and the ring is flushed at the next spill point (a call, a
+// tail jump, a return, any JS exit). The hit path then has no call in it, and TurboFan no longer spills every
+// live register around each guarded store: a call site makes every live value spill-and-reload, and a C++ function
+// with 68 guarded stores had 2,661 frame spills in 9,229 instructions; without the guard's calls, 1,632 in 7,084.
+// Layout at CWRING: u32 count, pad; then CWRING_N entries of {u32 addr, u32 size, u64 next} written at count mod CWRING_N,
+// so the hit path is nine straight-line ops. A count past CWRING_N (one function making that many hitting stores
+// between two spill points) makes the flush invalidate every anonymous executable range instead.
+export const CWRING = 0x280000, CWRING_N = 4096;   // 64 KB of entries, below PGMAP at 0x300000
+const CWDEFER_MODE = (typeof process !== 'undefined' && process.env?.OXWASM_STOREGUARD === '1') ? (process.env?.OXWASM_CWDEFER ?? '0') : '0';   // off by default: measured a net loss (docs/performance.md)
+export const CWDEFER = CWDEFER_MODE !== '0';
+// pricing modes (unsafe, measurement only): 2 = record inline but emit no flush checks; 3 = flush checks with the synchronous call kept
+const CWDEFER_RING = CWDEFER_MODE === '1' || CWDEFER_MODE === '2', CWDEFER_CHECKS = CWDEFER_MODE === '1' || CWDEFER_MODE === '3';
 // One byte per 4K page of the guarded window, in the dead space between the
 // dispatch hash and guest RAM. A single interval could not say "this page is
 // volatile, stop watching it" without dropping its neighbours too, and a page
@@ -343,7 +356,7 @@ export function pltStubWat(entry, gotOff) {
     (local.set $fti (call $ftr (local.get $v)))
     (if (i32.and (i32.ge_s (local.get $fti) (i32.const 0))
           (i32.and (i32.lt_u (i32.load (i32.const ${FTDEPTH})) (i32.const ${FTDLIMIT}))
-                   (i32.ne (i32.load (i32.const ${FTFUEL})) (i32.const 0))))
+                   (i32.and (i32.ne (i32.load (i32.const ${FTFUEL})) (i32.const 0)) (i32.eqz (i32.load (i32.const ${CWRING}))))))
       (then (i32.store (i32.const ${FTFUEL}) (i32.sub (i32.load (i32.const ${FTFUEL})) (i32.const 1)))
             (return_call_indirect $ft (type $uft) (local.get $fti))))
     (return (call $x_callout (local.get $v))))\n)\n`;
@@ -632,6 +645,10 @@ export function analyze(mem, entry, { maxInsns = 20000, noJtab = false, entries 
     if (seen.has(kn)) continue; seen.add(kn);
     if (count++ > maxInsns) throw new Error('function too large');
     let insn;
+    // A target outside the canonical user address range is a displacement that pointed nowhere (a `call` rel32 of
+    // -0x18000000 in opencode's image): wasm offsets wrap at 4 GB, so the fetch would read whatever lies there and
+    // decode it as this function's code. It is a deopt point like undecodable bytes, and no extent is built from it.
+    if (rip >= 0x800000000000n) { insnAt.set(key, { mnem: 'udec', rip, next: rip + 1n, len: 1, bogus: true }); continue; }
     try { insn = decode(fetcher(rip), rip); }
     catch (e) {
       // Undecodable bytes (padding, data, an unsupported encoding) become a
@@ -2114,6 +2131,12 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   const nmask = (e, bits) => cleanBits(e) <= bits
     ? e : `(i64.and ${e} (i64.const 0x${((1n << BigInt(bits)) - 1n).toString(16).toUpperCase()}))`;
   let usesGa = false;                 // a guarded store needs an i32 local for the address
+  // the recording hit path of a deferred guard (see CWRING): no call, so no spill point
+  const cwHit = (size, next) => { if (!CWDEFER_RING) return `(call $x_cw (local.get $ga) (i64.const ${next === undefined ? 0 : next}) (i32.const ${size}))`;
+    return `(local.set $cwn (i32.load (i32.const ${CWRING}))) (i32.store (i32.const ${CWRING}) (i32.add (local.get $cwn) (i32.const 1))) ` +
+      `(local.set $cwn (i32.add (i32.const ${CWRING + 16}) (i32.shl (i32.and (local.get $cwn) (i32.const ${CWRING_N - 1})) (i32.const 4)))) ` +
+      `(i32.store (local.get $cwn) (local.get $ga)) (i32.store offset=4 (local.get $cwn) (i32.const ${size})) (i64.store offset=8 (local.get $cwn) (i64.const ${next === undefined ? 0 : next}))`; };
+  const cwCheck = CWDEFER_CHECKS ? `(if (i32.load (i32.const ${CWRING})) (then (call $x_cwflush)))` : '';
   // A store into guest memory that may be generated code: one unsigned subtract and compare against a window the engine
   // owns. The address is computed once into a local so the guard and the store share it, which keeps the evaluation
   // order the unguarded form already has: address first, then the value. `size` is the byte count written, so the engine
@@ -2137,11 +2160,11 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     // store that starts just before a span is seen too.
     if (GUARDPG) return `(local.set $ga ${addr}) ` +
            `(if (i32.load8_u offset=${PGMAP} (i32.shr_u (local.get $ga) (i32.const 12))) ` +
-           `(then (call $x_cw (local.get $ga) (i64.const ${next === undefined ? 0 : next}) (i32.const ${size})))) ` +
+           `(then ${cwHit(size, next)})) ` +
            mk('(local.get $ga)');
     return `(local.set $ga ${addr}) ` +
            `(if (i32.load8_u (i32.add (i32.load (i32.const ${CWBM_SLOT})) (i32.shr_u (local.get $ga) (i32.const 6)))) ` +
-           `(then (call $x_cw (local.get $ga) (i64.const ${next === undefined ? 0 : next}) (i32.const ${size})))) ` +
+           `(then ${cwHit(size, next)})) ` +
            mk('(local.get $ga)');
   };
   // The same for a run of `len` bytes (rep movs/stos, bulk copy): any overlap with the window reports the whole range.
@@ -4198,7 +4221,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       // off: every marker becomes the full list; no scan, no dataflow
       const sa = expandFull(false), sX = expandFull(true);
       for (let b = 0; b < N; b++) if (bodies[b].indexOf('\x00') !== -1)
-        bodies[b] = bodies[b].replaceAll(SA_MARK, sa).replaceAll(SX_MARK, sX).replaceAll(RL_MARK, rlFull).replaceAll('\x00RC\x00', rlCall);
+        bodies[b] = bodies[b].replaceAll(SA_MARK, sa + cwCheck).replaceAll(SX_MARK, sX + cwCheck).replaceAll(RL_MARK, rlFull).replaceAll('\x00RC\x00', rlCall);
     } else {
     const bit = new Map();                      // '$rN'/'$xN' -> dataflow bit
     for (let r = 0; r < 16; r++) if (touched(r)) bit.set('$r'+r, 1 << r);
@@ -4250,7 +4273,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
         let out = '', last = 0;
         for (const mk of marks[b]) {
           const mask = (IN[b] & ~mk.kill) | mk.gen;
-          const txt = expand(mk.sx, mask);
+          const txt = expand(mk.sx, mask) + cwCheck;
           stats.sites++; const k = nOps(txt, '.store');
           stats.spills += k; stats.skipped += fullStores[mk.sx ? 1 : 0] - k;
           out += bodies[b].slice(last, mk.at) + txt;
@@ -4388,7 +4411,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   if ((DISP || hasJtab || ctx.tailTargets != null) && !MULTI) wat += '    (local $pc i32)\n';
   if (usesFtr) wat += '    (local $fti i32)\n';
   if (usesFts) wat += '    (local $fts i32)\n';
-  if (usesGa) wat += '    (local $ga i32) (local $gp i32)\n';
+  if (usesGa) wat += '    (local $ga i32) (local $gp i32)' + (CWDEFER ? ' (local $cwn i32)' : '') + '\n';
   if (usesIcp) wat += '    (local $icp i32)\n';
   for (const r of xUsed) wat += `    (local ${xreg(r)} v128)\n`;
   for (const t of tmps) wat += `    (local ${t} i64)\n`;
@@ -4812,6 +4835,7 @@ export function compileUnitWat(mem, entry, opts = {}) {
   // Only when the guard is on, so a module built without it keeps exactly the
   // imports every existing consumer supplies.
   if (STOREGUARD) wat += '  (import "env" "codewrite" (func $x_cw (param i32 i64 i32)))\n';   // (address, guest rip after the storing instruction)
+  if (CWDEFER) wat += '  (import "env" "cwflush" (func $x_cwflush))\n';   // flush the recorded code writes (see CWRING)
   if (TRACE_RANGE) wat += '  (import "env" "trace" (func $x_trace (param i64)))\n';
   // the global dispatch table + its in-wasm resolver, iff some site chains
   // through it (indirect call, out-of-unit static call, indirect tail jump)
@@ -4843,6 +4867,7 @@ export function compileUnitWat(mem, entry, opts = {}) {
         (local.set $fti (call $ftr (local.get $rip)))
         (br_if $out (i32.lt_s (local.get $fti) (i32.const 0)))
         (br_if $out (i32.eqz (i32.and (i32.lt_u (i32.load (i32.const ${FTDEPTH})) (i32.const ${FTDLIMIT})) (i32.ne (i32.load (i32.const ${FTFUEL})) (i32.const 0)))))
+        ${CWDEFER ? `(br_if $out (i32.load (i32.const ${CWRING})))` : ''}
         (i32.store (i32.const ${FTFUEL}) (i32.sub (i32.load (i32.const ${FTFUEL})) (i32.const 1)))
         (local.set $rip (call_indirect $ft (type $uft) (local.get $fti)))
         (br $l)))
@@ -4865,8 +4890,14 @@ export function compileUnitWat(mem, entry, opts = {}) {
            // the guest bytes each function was translated from: a patch anywhere in them stales the translation
            ext: [...texts.keys()].map(k => { let lo = null, hi = null;
              const spans = [];
-             for (const b of funcs.get(k).blocks) { const e = b.insns.length ? b.insns[b.insns.length - 1].next : b.start;
+             // An empty block is a branch target that did not decode (a cold deopt edge, see deoptTo): no bytes were
+             // translated from it, and its address can be anything the displacement said. One at 0xffffffffea5a9d00
+             // (a `call` whose rel32 pointed 384 MB below the image) put the hull of 166 functions across the whole
+             // address space, and marking those lines ran for longer than the build's guard (a cold opencode build).
+             for (const b of funcs.get(k).blocks) { if (!b.insns.length || b.start >= 0x800000000000n) continue; const e = b.insns[b.insns.length - 1].next;
                if (lo === null || b.start < lo) lo = b.start; if (hi === null || e > hi) hi = e; spans.push([b.start, e]); }
+             if (lo === null) { lo = BigInt(k); hi = lo + 1n; spans.push([lo, hi]); }
+             if (hi >= 0x800000000000n && typeof process !== 'undefined' && process.env?.OXWASM_TUTRACE) { const bb = funcs.get(k).blocks.filter((b) => b.insns.length && b.insns[b.insns.length - 1].next >= 0x800000000000n); console.error(`[ext-bogus] fn=${BigInt(k).toString(16)} ` + bb.slice(0, 3).map((b) => `start=${b.start.toString(16)} n=${b.insns.length} first=${b.insns[0].mnem}@${b.insns[0].rip.toString(16)} last=${b.insns[b.insns.length - 1].mnem}@${b.insns[b.insns.length - 1].rip.toString(16)} next=${b.insns[b.insns.length - 1].next.toString(16)}`).join(' | ')); }
              // the bytes actually decoded (blocks, merged), as opposed to the hull lo..hi that also spans whatever lies between them
              spans.sort((x, y) => (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0));
              const merged = [];
