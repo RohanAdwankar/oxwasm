@@ -1947,6 +1947,11 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   // Measured: call kernel 4.94x -> 4.17x, m4 steady state 8.93x -> 8.65x.
   const RC_MARK = (typeof process !== 'undefined' && process.env?.OXWASM_ABIRELOAD === '1') ? '\x00RC\x00' : RL_MARK;
   const CS_MASK = (1 << 3) | (1 << 5) | (1 << 12) | (1 << 13) | (1 << 14) | (1 << 15);
+  // Under the same lever, xmm2-xmm15 are not reloaded after a call either: every xmm register is caller-saved, so
+  // ABI-compliant code never reads one after a call before writing it, and only xmm0/xmm1 carry return values.
+  // The post-call reload of all 8 xmm locals (and their re-spill to the frame) was the hottest region of JSC's
+  // interpreter. The same caveat as the GPR rule: hand-written asm may return values in other xmm registers.
+  const XMM_CALLER = RC_MARK === RL_MARK ? 0 : (0xFFFC0000 | 0);   // bits (0x10000 << r) for r = 2..15
 
   // ---- operand / instruction emit (identical semantics to the dispatch version) ----
   const hexs = (v) => BigInt.asIntN(64, v).toString();
@@ -4051,7 +4056,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       ...xS.map(xSpill),
     ].join('\n');
     const rlFull = [...regs16.filter(touched).map(reloadR), ...xS.map(xReload)].join('\n');
-    const rlCall = [...regs16.filter(r => touched(r) && !(CS_MASK & (1 << r))).map(reloadR), ...xS.map(xReload)].join('\n');
+    const rlCall = [...regs16.filter(r => touched(r) && !(CS_MASK & (1 << r))).map(reloadR), ...xS.filter(r => !(XMM_CALLER & ((0x10000 << r) | 0))).map(xReload)].join('\n');
     if (!narrowOn) {
       // off: every marker becomes the full list; no scan, no dataflow
       const sa = expandFull(false), sX = expandFull(true);
@@ -4162,7 +4167,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           if (e.k === 0) live |= e.bit;
           else if (e.k === 1) { if (e.d === 0) live &= ~e.bit; }     // conditional defs don't kill
           else { if (rec) rec.push({ at: e.at, live, cs: e.cs });
-                 live = e.cs ? (live & CS_MASK) : 0; }               // reload defines all it keeps; callee-saved live through a call
+                 live = e.cs ? (live & (CS_MASK | XMM_CALLER)) : 0; }   // reload defines all it keeps; callee-saved (and, under the lever, caller-saved xmm) live through a call
         }
         return live;
       };
@@ -4187,7 +4192,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
         rec.sort((a, c) => a.at - c.at);        // reverse walk recorded back-to-front
         let out = '', last = 0;
         for (const mk of rec) {
-          const txt = rlExpand(mk.cs ? (mk.live & ~CS_MASK) : mk.live);
+          const txt = rlExpand(mk.cs ? (mk.live & ~(CS_MASK | XMM_CALLER)) : mk.live);
           stats.rlSites++; const k = nOps(txt, '.load');
           stats.rlLoads += k; stats.rlSkipped += rlFullLoads - k;
           out += bodies[b].slice(last, mk.at) + txt;

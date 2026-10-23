@@ -1021,7 +1021,7 @@ export class LinuxEngine {
     const _tc0 = performance.now();
     const _unitEx = this.unitStore ? this._unitExeId() : null, _unitRs = this._exeRanges;
     if (HEAPPROF) globalThis.__hpExtra = () => { const sz = (m) => (m && (m.size ?? m._size ?? m.count)) ?? -1; const tot = (m) => { let n = 0; if (m) for (const v of m.values()) n += v.size ?? 0; return n; }; return `engine=${this._ctor?.argv?.[0]?.slice(-24)} extPages=${sz(this._extPages)} entries=${tot(this._extPages)} noExtPg=${sz(this._noExtPg)} entries=${tot(this._noExtPg)} extents=${sz(this._extents)} aotFns=${sz(this.aotFns)} ftSeen=${sz(this._ftSeen)} failed=${sz(this.aotFailed)} tiny=${sz(this._tinyMemo)} failMemo=${sz(this._failMemo)} sizeMemo=${sz(this._sizeMemo)} profile=${sz(this.profile)} calls=${sz(this.aotCalls)} callT=${sz(this._callTargets)} pend=${sz(this._pendingFns)} inflight=${sz(this._inflight)} codePages=${sz(this.codePages)}`; };
-    if (ENV.OXWASM_TUTRACE) { const sz = (m) => (m && (m.size ?? m._size ?? m.count)) ?? -1; __dbg(`[tu>] ${entry.toString(16)} t=${(_tc0 | 0)} heap=${(process.memoryUsage().heapUsed / 1048576) | 0}MB aot=${this.aotFns.size} failed=${this.aotFailed.size} tiny=${sz(this._tinyMemo)} failMemo=${sz(this._failMemo)} sizeMemo=${sz(this._sizeMemo)} ftSeen=${sz(this._ftSeen)} ext=${sz(this._extents)} extPg=${sz(this._extPages)} prof=${sz(this.profile)} calls=${sz(this.aotCalls)} callT=${sz(this._callTargets)} inflight=${sz(this._inflight)} pend=${sz(this._pendingFns)}`); }
+    if (ENV.OXWASM_TUTRACE) { const sz = (m) => (m && (m.size ?? m._size ?? m.count)) ?? -1; __dbg(`[tu>] ${entry.toString(16)} prog=${this._ctor?.argv?.[0]?.split('/').pop() ?? '?'} t=${(_tc0 | 0)} heap=${(process.memoryUsage().heapUsed / 1048576) | 0}MB aot=${this.aotFns.size} failed=${this.aotFailed.size} tiny=${sz(this._tinyMemo)} failMemo=${sz(this._failMemo)} sizeMemo=${sz(this._sizeMemo)} ftSeen=${sz(this._ftSeen)} ext=${sz(this._extents)} extPg=${sz(this._extPages)} prof=${sz(this.profile)} calls=${sz(this.aotCalls)} callT=${sz(this._callTargets)} inflight=${sz(this._inflight)} pend=${sz(this._pendingFns)}`); }
     // a giant root deferred by the size gate in an earlier run: its size was kept beside the cached units, so the
     // gate can answer without analysing the whole function again
     if (SIZEGATE && this._gateCalls && _unitEx && this.unitStore.getSize) {
@@ -2742,7 +2742,7 @@ export class LinuxEngine {
     if (IDLEDIAG) {   // every thread is blocked: say on what, at most every 5 s, so a livelock/deadlock can be read from the log
       const now = performance.now();
       if (now - (this._idleDiagT ?? 0) > 5000) { this._idleDiagT = now;
-        __dbg(`[idle t=${now | 0}] deadline=${dl == null ? 'none' : (dl - this.nowMs()) | 0}ms ` + this.threads.map((x) => `${x.id}:${x.state}${x.futex != null ? ' futex=' + x.futex.toString(16) : ''}${x.dl != null ? ' dl=' + ((x.dl - this.nowMs()) | 0) : ''} sys=${x.lastSys ?? '?'}${x.lastSysRip != null ? '@' + x.lastSysRip.toString(16) : ''} rip=${x.cpu?.rip?.toString(16) ?? '?'}`).join(' | ') + ' | strace: ' + (this.strace ? this.strace.slice(-6).join(' ; ') : '-')); }
+        __dbg(`[idle t=${now | 0}] prog=${this._ctor?.argv?.[0]?.split('/').pop() ?? '?'} deadline=${dl == null ? 'none' : (dl - this.nowMs()) | 0}ms ` + this.threads.map((x) => `${x.id}:${x.state}${x.futex != null ? ' futex=' + x.futex.toString(16) : ''}${x.dl != null ? ' dl=' + ((x.dl - this.nowMs()) | 0) : ''} sys=${x.lastSys ?? '?'}${x.lastSysRip != null ? '@' + x.lastSysRip.toString(16) : ''}${x.lastSysArg != null ? '(' + BigInt.asIntN(32, x.lastSysArg) + ')' : ''} pid=${x.proc?.pid ?? this.pid ?? '?'} rip=${x.cpu?.rip?.toString(16) ?? '?'}`).join(' | ') + ' | strace: ' + (this.strace ? this.strace.slice(-6).join(' ; ') : '-')); }
     }
     return false;
   }
@@ -2780,7 +2780,7 @@ export class LinuxEngine {
     const nr = Number(cpu.regs[0]);
     const [a1, a2, a3] = [cpu.regs[7], cpu.regs[6], cpu.regs[2]];   // rdi rsi rdx
     this.stats.syscalls[nr] = (this.stats.syscalls[nr] || 0) + 1;
-    if (IDLEDIAG) { const t = this.threads[this.ti]; if (t) { t.lastSys = nr; t.lastSysRip = cpu.rip; } }
+    if (IDLEDIAG) { const t = this.threads[this.ti]; if (t) { t.lastSys = nr; t.lastSysRip = cpu.rip; t.lastSysArg = a1; } }
     if (ENV.OXWASM_COUNTCALLS === '1' && nr === 1 && this._ctor?.argv?.[0]?.includes('opencode')) { const c = new DataView(this.wmem.buffer).getBigUint64(FTMAP + 32, true); const st = this.stats, pv = this._lastStW ?? {}, d = (k) => (st[k] | 0) - (pv[k] | 0), sysSum = Object.values(st.sysMs ?? {}).reduce((x, y) => x + y, 0), sysN = Object.values(st.syscalls ?? {}).reduce((x, y) => x + y, 0), now = performance.now();
       if (ENV.OXWASM_IHIST_RESET && globalThis.__ihist && !this._ihReset && (now - (pv.now ?? now)) > +ENV.OXWASM_IHIST_RESET) { this._ihReset = true; globalThis.__ihist.clear(); if (this.deoptLog) this.deoptLog.clear(); if (this.calloutLog) this.calloutLog.clear(); if (this._episodes) this._episodes.clear(); }   // OXWASM_IHIST_RESET=<ms>: histograms count from the first round longer than this
       __dbg(`[calls-w] hr=${process.hrtime.bigint() / 1000n} n=${c} d=${c - (this._lastCallsW ?? 0n)} interp=${d('interpreted')} disp=${d('disp')} ms=${(now - (pv.now ?? now)) | 0} tu=${(st.tuTotalMs - (pv.tuTotalMs || 0)) | 0}ms/${d('tiers_aot')} inval=${d('invalSlow')} cw=${d('codeWrites')} deopt=${d('deopts')} comp=${d('compiles')}/${d('unitHits')}/${d('tierCalls')} callout=${d('coNoF')} vol=${d('volatilePages')} sys=${sysN - (pv.sysN || 0)}/${(sysSum - (pv.sysSum || 0)) | 0}ms sig=${Object.entries(this._sigN ?? {}).map(([k, v]) => k + ':' + (v - ((pv._sigN ?? {})[k] | 0))).join(',')} heap=${(process.memoryUsage().heapUsed / 1048576) | 0}MB v8gc=${(() => { try { const h = process.getBuiltinModule('node:v8').getHeapStatistics(); return ((h.total_heap_size / 1048576) | 0) + 'MB/' + ((h.malloced_memory / 1048576) | 0) + 'MBm'; } catch { return '?'; } })()} ext=${(process.memoryUsage().external / 1048576) | 0}MB`);
@@ -5423,7 +5423,7 @@ export class LinuxEngine {
     // ignored"): script(1) takes SIGCHLD through a signalfd with the signal
     // blocked and SIG_DFL, and a discarded SIGCHLD left it polling forever
     if (!act && this._sigDefaultIgnored(sig) && !(t.sigmask & bit)) return;
-    if (globalThis.__sigtrace) console.error(`<raise sig=${sig} -> tid=${t.id} st=${t.state} cur=${this.threads[this.ti].id} mask=${t.sigmask.toString(16)}>`);
+    if (globalThis.__sigtrace) console.error(`<raise sig=${sig} -> tid=${t.id} st=${t.state} cur=${this.threads[this.ti].id} mask=${t.sigmask.toString(16)} t=${this.nowMs() | 0} prog=${this._ctor?.argv?.[0]?.split('/').pop() ?? '?'} pid=${this.pid ?? '?'} info=${JSON.stringify(info)}>`);
     // no handler and deliverable now: the default action (terminate) applies
     // at once. Blocked, it stays pending — for sigprocmask to unblock later,
     // or for sigtimedwait / signalfd to consume.
@@ -5830,7 +5830,11 @@ export class LinuxEngine {
     // the timer thread's exit woke nobody and the main thread joined forever.
     const m0 = ceng.threads[0];
     m0.id = t.id; m0.ctid = t.ctid ?? 0n; m0.sigmask = t.sigmask ?? 0n; m0.pending = t.pending ?? 0n;
-    m0.altstack = t.altstack ?? null; m0.eintr = false; m0.suspendOld = null;
+    // A child that blocks in sigsuspend inside its window is parked with its syscall rewound and suspendOld
+    // holding the mask to restore; dropping the marker here delivered the next SIGCHLD at the syscall insn
+    // itself (not EINTR past it), the sigsuspend re-ran and slept on - dash's `wait` returned only at the
+    // next SIGCHLD, 200 s later (the guard's sleep) in every short run of the steady-state harness.
+    m0.altstack = t.altstack ?? null; m0.eintr = false; m0.suspendOld = t.suspendOld ?? null;
     ceng.nextTid = Math.max(ceng.nextTid ?? 2, t.id + 1);
     ceng.blocked = null;
     // threads the child created inside the window move with it
@@ -6411,6 +6415,7 @@ export class LinuxEngine {
         if (DISPSTAT) { if (!branched && this.aotFns.get(key)) this.stats.noLook = (this.stats.noLook || 0) + 1; }
         if (f && this.aotBudget !== undefined && --this.aotBudget < 0) { f = null; this.stats.dispBudget = (this.stats.dispBudget || 0) + 1; }
         if (f) { if (this.ripTrace !== undefined) { this.ripTrace[this.ripTraceI++ & 65535] = -key; }   // negative = AOT entry
+                 if (IDLEDIAG) { const nw = performance.now(); if (nw - (this._busyT ?? 0) > 5000) { this._busyT = nw; __dbg(`[busy t=${nw | 0}] tid=${this.threads[this.ti]?.id} disp rip=${key.toString(16)} disp=${this.stats.disp} interp=${this.stats.interpreted} threads=${this.threads.map((x) => x.id + ':' + x.state).join(',')}`); } }   // a thread that never parks: where it is
                  if (EPISODES && this._epStart !== undefined) { const e = this._episodes, k = this._epStart; let r = e.get(k); if (!r) e.set(k, r = [0, 0, this._epHow]); r[0]++; r[1] += this.stats.interpreted - this._epN; this._epStart = undefined; }
                  this.cpu.rip = this.dispatchMaybeShadow(f);
                  if (EPISODES) { this._epStart = this.cpu.rip; this._epN = this.stats.interpreted; this._epHow = 'exit'; }
@@ -6438,6 +6443,7 @@ export class LinuxEngine {
         if (this.ripTrace !== undefined && before >= this._rtLo && before < this._rtHi) this.ripTrace[this.ripTraceI++ & 65535] = before;
       if (this._ripLog !== undefined && this._ripLog.has(before)) this._ripHit(before);
       if (ARM_FP !== null) this._armFp(before);
+        if (IDLEDIAG && (steps & 0xFFFF) === 0) { const nw = performance.now(); if (nw - (this._busyT ?? 0) > 5000) { this._busyT = nw; __dbg(`[busy t=${nw | 0}] tid=${this.threads[this.ti]?.id} interp rip=${before.toString(16)} disp=${this.stats.disp} interp=${this.stats.interpreted} threads=${this.threads.map((x) => x.id + ':' + x.state).join(',')}`); } }
 
         let insn;
         this._cleanSync = false;

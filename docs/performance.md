@@ -1849,3 +1849,13 @@ hottest is therefore real work on this layout, and the next lever is narrowing i
 and never read back by ABI-compliant code; OXWASM_ABIRELOAD already skips the six callee-saved GPRs).
 
 The late `wait` with roots on recurred in two of seven runs (secs=641, 643, rounds and medians unaffected).
+
+**The late `wait` was never the roots.** A short job (fib,objects x4, guard 200) returned at the guard's expiry in
+every run, roots on or off (secs=213-235), and the timestamped signal trace showed why: opencode's exit raised
+SIGCHLD to the subshell doing `wait $P`, the handler ran, and the sigreturn went back to the sigsuspend
+INSTRUCTION rather than past it with EINTR, so the shell slept until the next SIGCHLD - the guard's sleep. The
+subshell is a fork child that blocked in sigsuspend inside its vfork window; materialising it into its own engine
+copied the thread without its sigsuspend marker (suspendOld), and every delivery path keys the EINTR-after-handler
+rule on that marker. Carrying it through materialisation fixes it: the short job returns in 28 s. The two long
+runs that returned at 641/643 s were the same race landing on a different timing; the roots only changed when
+the shell's child exited relative to its sigsuspend.
