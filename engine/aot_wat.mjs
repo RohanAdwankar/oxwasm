@@ -500,6 +500,20 @@ export function analyze(mem, entry, { maxInsns = 20000, noJtab = false, entries 
     const off = Number(rip - fr.base), b = fr.bytes, end = b.length;
     return (i) => { const o = off + i; return o < end ? b[o] : Number(mem.read(rip + BigInt(i), 1n)); };
   };
+  // Does the code at `t` run straight into a trap (int3/ud2/hlt) within a few instructions, with no branch or return?
+  const isTrapStub = (t) => {
+    try {
+      let rip = t;
+      for (let i = 0; i < 6; i++) {
+        const x = decode(fetcher(rip), rip);
+        if (typeof process !== 'undefined' && process.env?.OXWASM_TRAPSTUB_LOG) console.error(`[trapstub] ${t.toString(16)} +${i} ${rip.toString(16)} ${x.mnem}`);
+        if (x.mnem === 'int3' || x.mnem === 'ud2' || x.mnem === 'hlt') return true;
+        if (x.mnem === 'push' || x.mnem === 'mov' || x.mnem === 'lea' || x.mnem === 'sub' || x.mnem === 'nop') { rip = rip + BigInt(x.len); continue; }
+        return false;
+      }
+    } catch (e) { if (typeof process !== 'undefined' && process.env?.OXWASM_TRAPSTUB_LOG) console.error(`[trapstub] ${t.toString(16)} threw ${e.message.slice(0, 80)}`); }
+    return false;
+  };
   const drain = () => { while (work.length) {
     const rip = work.pop(); const key = rip.toString();
     // the visited set is keyed by Number: a guest address fits 2^53, and a
@@ -594,6 +608,11 @@ export function analyze(mem, entry, { maxInsns = 20000, noJtab = false, entries 
       // to the real address, so a wrong guess costs a frame's interpretation,
       // never correctness.
       if (insn.next !== entry && entries && entries.has(insn.next.toString())) { insn.noretCut = true; continue; }
+      // A call to a TRAP STUB - a few straight-line instructions ending in int3/ud2/hlt (bun's placeholder bodies:
+      // `push rbp; mov rbp,rsp; mov r11,rdi; int3...`) - never returns natively, so its fall-through is cut the same way.
+      // Left uncut, a `jne` that follows such a call reads the callee's flags and refused the whole function
+      // (5b9a4e0: 158 interpreted calls a run, ~21k interpreted instructions a round in the JIT-off mix).
+      if (insn.next !== entry && isTrapStub((insn.next + insn.rel) & M)) { insn.noretCut = true; continue; }
     }
     work.push(insn.next);
   } };
@@ -1309,6 +1328,10 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       if (hasJtab && a0.jtabs.has(last.rip.toString())) { term.push({kind:'jtab', src:last.src}); succs.push([...jtabUnion]); }
       else { term.push({kind:'deopt', src:last.src}); succs.push([]); } }
     else if (last.mnem === 'udec')   { hasDeopt = true; term.push({kind:'deopt', src:null, at:last.rip}); succs.push([]); }
+    // a call whose fall-through was cut (noreturn callee, trap stub): the continuation is a deopt to the real next
+    // address and NOT an edge, even when that address is a block of this function - as an edge it handed the block
+    // the call's flag kill, and a `jne` there (reached properly from a `cmp` elsewhere) refused the whole function
+    else if (last.mnem === 'call' && last.noretCut) { hasDeopt = true; term.push({kind:'deopt', src:null, at:next}); succs.push([]); }
     else { const t = idxOf(next); if (t < 0) hasDeopt = true;
       term.push({kind:'fall', t, ta: next}); succs.push([t]); }
   }
@@ -2661,7 +2684,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       if (p >= 0) matProducers.add(b+':'+p);
       else if (p === -2) throw new Error('AOT: unmodeled flag producer '+clob.mnem+' @ '+clob.rip.toString(16));
       else {                                        // producer is cross-block
-        if (!blkFlagIn[b]) throw new Error('AOT: cross-block flags for '+(insns[j].mnem==='jcc'?'jcc':insns[j].mnem)+' @ '+insns[j].rip.toString(16));
+        if (!blkFlagIn[b]) { if (typeof process !== 'undefined' && process.env?.OXWASM_TRAPSTUB_LOG) console.error(`[xflags] block ${b} start=${blocks[b].start.toString(16)} inDefs=${[...inDefs[b]].join(',')}`); throw new Error('AOT: cross-block flags for '+(insns[j].mnem==='jcc'?'jcc':insns[j].mnem)+' @ '+insns[j].rip.toString(16)); }
         for (const key of inDefs[b]) if (key !== 'EXT' && key !== 'KILL') matProducers.add(key);
       }
     }
