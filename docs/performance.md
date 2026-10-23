@@ -1731,3 +1731,11 @@ interpreted (the three stubs traced sit at different addresses in the two runs),
 not function entries on the compiled side. A same-run comparator for nested calls is what this needs; the trace stays as a
 tool. The tracing itself also changed the failure (a hang in round 1 instead of the round-5 abort), which is consistent with
 a bug that depends on when a unit is entered relative to JSC's patching rather than on the bytes alone.
+
+### A stable configuration: JSC with its JIT off runs the whole mix, 6.5-7.5x native
+BUN_JSC_useJIT=0 (LLInt only: every instruction executed is static code, so every unit comes from the cache and nothing
+lives in the JIT region) completes the 24-round mix 3/3 with a tight distribution: medians 778/677/731 ms, p25 within 6%,
+phases fib 30 math 75 objects 99-121 strings 95 sorting 83 maps 130 json 90. Native with the same setting: 104 ms (fib 5
+math 13 objects 16 strings 14 sorting 14 maps 28 json 9); native with the baseline JIT: 45 ms. So 6.5-7.5x against the
+like-for-like native, 15x against the native default - but measurable to a few percent, with no abort and no GC-timing
+noise. This is the configuration to optimise the translation against; the JIT-region miscompile stays open in parallel.
