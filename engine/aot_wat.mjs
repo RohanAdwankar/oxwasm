@@ -88,6 +88,47 @@ const GUARDPG = typeof process !== 'undefined' && process.env?.OXWASM_GUARDPG ==
 // registers in memory a handler loads what it reads and stores what it writes, the loop carries no live ranges,
 // and a call needs no spill or reload at all. OXWASM_MEMREG=all applies it to every function (a measurement lever).
 const MEMREG = (typeof process !== 'undefined' && process.env?.OXWASM_MEMREG) || '';
+// OXWASM_THREADED=1: a dispatch root (an interpreter) is emitted as one wasm function PER HANDLER REGION instead of
+// one giant function. A region is the set of blocks reachable from a handler entry (a jump-table target) without
+// passing another entry, closed so that no block has predecessors in two regions. Each handler's own computed
+// goto becomes an indirect tail call through the dispatch hash ($ftr, as a tail jump to a known entry already
+// does), and the few direct edges between regions become tail calls too. What that buys: every handler has its
+// own indirect-jump site (the single br_table of the giant function mispredicts like a switch interpreter), V8
+// compiles 800 small functions instead of one 1.2 MB one, and no register state is live across a dispatch loop.
+// JSC's LLInt: 29,914 instructions, 792 regions of median 17 instructions, 1,268 dispatch sites, 165 direct edges.
+const THREADED = typeof process !== 'undefined' && process.env?.OXWASM_THREADED === '1';
+export function splitDispatchRoot(an, entry) {
+  const N = an.blocks.length, M = an.M, idx = an.bidx;
+  const targets = new Set();
+  for (const ts of an.jtabs.values()) for (const t of ts) { const i = idx.get(t.toString()); if (i !== undefined) targets.add(i); }
+  const succ = an.blocks.map((b) => { const last = b.insns[b.insns.length - 1], next = last.rip + BigInt(last.len), out = [];
+    const add = (a) => { const i = idx.get((a & M).toString()); if (i !== undefined) out.push(i); };
+    if (last.mnem === 'jcc') { add(next + last.rel); add(next); } else if (last.mnem === 'jmp') add(next + last.rel);
+    else if (last.mnem === 'ret' || last.mnem === 'retn' || last.mnem === 'jmpind' || last.mnem === 'udec') {} else if (last.mnem === 'call' && last.noretCut) {} else add(next);
+    return out; });
+  const preds = an.blocks.map(() => []); succ.forEach((ss, i) => ss.forEach((j) => preds[j].push(i)));
+  const entryIdx = idx.get(entry.toString());
+  const entries = new Set([entryIdx, ...targets]);
+  let region;
+  for (;;) {
+    region = new Int32Array(N).fill(-1); const stack = [];
+    for (const en of entries) { region[en] = en; stack.push(en); }
+    while (stack.length) { const b = stack.pop(); for (const s of succ[b]) { if (entries.has(s)) continue; if (region[s] === -1) { region[s] = region[b]; stack.push(s); } } }
+    const conflict = [];
+    for (let b = 0; b < N; b++) if (!entries.has(b)) { const rs = new Set(preds[b].map((p) => region[p]).filter((r) => r >= 0)); if (rs.size > 1) conflict.push(b); }
+    if (!conflict.length) break;
+    for (const c of conflict) entries.add(c);
+  }
+  const out = new Map();
+  for (const en of entries) {
+    const blocks = []; for (let b = 0; b < N; b++) if (region[b] === en) blocks.push(an.blocks[b]);
+    blocks.sort((x, y) => x.start < y.start ? -1 : x.start > y.start ? 1 : 0);
+    const bidx = new Map(); blocks.forEach((b, i) => bidx.set(b.start.toString(), i));
+    const calls = new Set(); for (const b of blocks) for (const insn of b.insns) if (insn.mnem === 'call' && insn.rel !== undefined) calls.add(((insn.rip + BigInt(insn.len) + insn.rel) & M).toString());
+    out.set(an.blocks[en].start.toString(), { blocks, bidx, M, calls, jtabs: new Map(), region: true });
+  }
+  return out;
+}
 // Rewrites a finished function's text: `(local.get $rN)` and `(local.set $rN E)` become loads and stores of slot 8N,
 // an i32 local's store zero-extends (the register is 32-bit), `$xN` maps to its xmm slot, and the spill/reload sites
 // of the register protocol - now copies of a slot onto itself - are deleted.
@@ -1201,6 +1242,7 @@ function structure(N, succs) {
 //                              the frame exits (rsp rises above rsp0) — jmpind
 function emitUnitFunction(a0, fnAddr, ctx) {
   const { guestBase, ramBase, canDirect } = ctx;
+  const isTailTarget = (a) => ctx.tailTargets != null && ctx.tailTargets.has(a.toString());   // THREADED: a sibling region's entry
   // Fast dispatch: inline the $ftr hash's FIRST probe at each resolution
   // site. idealdisp priced the out-of-line $ftr call at 7.6x native per call
   // against 4.9x for the same probe inlined - the wasm call boundary itself
@@ -1367,7 +1409,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     else if (last.edgeT !== undefined) {
       const ta = (next+last.rel)&MM, t = idxOfEdge(last.edgeT);
       if (t < 0) hasDeopt = true;
-      term.push({kind:'jmp', t, ta, tail: !!last.tailCut}); succs.push([t]); }
+      term.push({kind:'jmp', t, ta, tail: !!last.tailCut || (t < 0 && isTailTarget(ta))}); succs.push([t]); }
     else if (last.edgeN !== undefined) {
       const t = idxOfEdge(last.edgeN);
       if (t < 0) hasDeopt = true;
@@ -1377,7 +1419,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       term.push({kind:'jcc', t, f, ta, fa}); succs.push([t, f]); }
     else if (last.mnem === 'jmp') { const ta = (next+last.rel)&MM, t = idxOf(ta);
       if (t < 0) hasDeopt = true;
-      term.push({kind:'jmp', t, ta, tail: !!last.tailCut}); succs.push([t]); }
+      term.push({kind:'jmp', t, ta, tail: !!last.tailCut || (t < 0 && isTailTarget(ta))}); succs.push([t]); }
     else if (last.mnem === 'ret' || last.mnem === 'retn') { term.push({kind:'ret', pad: last.mnem==='retn' ? Number(last.n) : 0}); succs.push([]); }
     else if (last.mnem === 'jmpind') { hasDeopt = true;
       if (hasJtab && a0.jtabs.has(last.rip.toString())) { term.push({kind:'jtab', src:last.src}); succs.push([...jtabUnion]); }
@@ -2827,9 +2869,14 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   // call as if the callee had returned, the throw was swallowed, and the JS state it left behind crashed JSC at a later
   // slow path (jsAddSlowCase on a freed cell, round 5 of the mix / round ~37 of objects, bisected to those thunks).
   const retCheck = (rb, next) => `(if (i32.or (i64.ne (local.get $r4) (local.get ${rb})) (i64.ne (local.get $rex) (i64.const ${hexs(next)}))) (then (return (local.get $rex))))`;
+  // THREADED: a handler region's entry rsp is not a frame base (JSC's LLInt resets rsp from the JS frame after
+  // every call), so the frame-exit clause below is wrong there and sent every dispatch after a JS call through
+  // the deopt import's abandoned-frame unwind (~100 us; fib 10x). A region tail-calls on a hash hit alone, which
+  // is what the giant function's internal branches were.
   const tailJmp = () => { usesFtr = true; return [
     icResolve('(local.get $rex)'),
-    `(if (i32.and ${ftHit} (i32.or (i64.le_u (local.get $r4) (local.get $rsp0)) (i32.or (i32.eqz (i32.load (i32.const ${FTNEST}))) (i32.load8_u (i32.add (i32.const ${FTENTRY}) (local.get $fti))))))`,
+    ctx.tailTargets != null ? `(if ${ftHit}`
+    : `(if (i32.and ${ftHit} (i32.or (i64.le_u (local.get $r4) (local.get $rsp0)) (i32.or (i32.eqz (i32.load (i32.const ${FTNEST}))) (i32.load8_u (i32.add (i32.const ${FTENTRY}) (local.get $fti))))))`,
     `  (then ${ftBurn} ${ftDec} (return_call_indirect $ft (type $uft) (local.get $fti))))`,
   ]; };
 
@@ -3875,7 +3922,9 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     // poisoning the function: if control actually goes there, the engine
     // resumes in the interpreter at that address, which faults exactly as
     // native would if the bytes are truly garbage.
-    const deoptTo = (addr) => [`(local.set $rex (i64.const ${hexs(addr)}))`,
+    const deoptTo = (addr) => isTailTarget(addr)
+      ? [`(local.set $rex (i64.const ${hexs(addr)}))`, SA_MARK, ...tailJmp(), `(return (call $x_deopt (local.get $rex) (local.get $rsp0)))`]   // THREADED: a sibling region, chained in wasm
+      : [`(local.set $rex (i64.const ${hexs(addr)}))`,
       SA_MARK, `(return (call $x_deopt (local.get $rex) (local.get $rsp0)))`];
     if (t.kind === 'jcc') {
       const c = cond(last.cond);
@@ -4474,6 +4523,7 @@ export function compileUnitWat(mem, entry, opts = {}) {
   };
   const UNIT_TOTAL = Number((typeof process !== 'undefined' && process.env?.OXWASM_UNIT_TOTAL) || 60000);
   let unitInsns = 0;
+  let tailTargets = null;   // THREADED: the region entries of a split dispatch root (edges to them are tail calls)
   const funcs = new Map();                       // addrStr -> analysis
   const poisoned = new Set();                    // addrStr -> engine-only (callout)
   const pending = [entry];
@@ -4582,6 +4632,13 @@ export function compileUnitWat(mem, entry, opts = {}) {
         // 3 MB of wasm, which V8's baseline compiler alone spends gigabytes on.
         if (k !== entry.toString() && unitInsns + n > UNIT_TOTAL) continue;
         unitInsns += n; }
+      if (THREADED && k === entry.toString() && an.jtabs?.size && isDispatchRoot(an, BigInt(k))) {
+        const regions = splitDispatchRoot(an, BigInt(k));
+        tailTargets = new Set(regions.keys());
+        for (const [rk, ra] of regions) if (rk !== k) funcs.set(rk, ra);
+        an = regions.get(k);
+        if (PHASE) PH.regions = regions.size;
+      }
       funcs.set(k, an);
       // the ROOT's cycles only: noting every member's cycles cascaded (m4:
       // 862 callees, 116k instructions kept over one run, +2 s of startup)
@@ -4598,7 +4655,7 @@ export function compileUnitWat(mem, entry, opts = {}) {
   // 20,464 the run needed, a third of the emit phase.
   let emitting = null; const uses = new Map();
   const canDirect = (k) => { const ok = funcs.has(k) && !poisoned.has(k); if (ok && emitting !== null) uses.get(emitting).add(k); return ok; };
-  const ctx = { guestBase, ramBase, canDirect };
+  const ctx = { guestBase, ramBase, canDirect, tailTargets };
   // emit; a failure poisons that function and re-emits its direct callers -
   // they switch from direct wasm calls to callout escapes
   const texts = new Map();
