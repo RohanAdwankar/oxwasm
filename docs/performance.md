@@ -2208,3 +2208,17 @@ tail that per-site rooting does not reach. What would reach it is not leaving th
 deopts inside callees (2k deopts and 4k callouts to targets without a unit per run), and each one costs its whole
 caller chain. The deopt sources: an undecodable instruction at c5851d5 (106 a run, in a mapping outside the
 image), frame-gone exits at 4643330 (47), cpuid (13), and a long tail of cold-edge deopts.
+
+### In-place deopts: a landing-less deopt finishes its own frame instead of unwinding the chain
+
+A deopt with no landing unit threw DeoptUnwind through every wasm frame above it, and each caller's
+continuation then ran interpreted to the next translated entry. The deopt import now interprets the rest of the
+deopting frame in place (syncIn, interpret until rsp passes the frame's entry rsp, syncOut: the callout import's
+finish) and returns the frame's exit to the wasm caller, whose retCheck sees its own return address and goes on.
+Loop-head deopts (a nested frame's yield) still unwind. OXWASM_DEOPT_INPLACE=0 restores the unwind.
+
+Same key, JIT-on mix, 40 rounds, medians of rounds 21-40: in place 254.0, 232.5, 229.0, 239.5 (1,570-1,590
+deopts a run handled in place, 686k-704k interpreted steps); unwinding 245.5, 243.0 (985k-1.0M steps). A 30%
+cut in interpreted steps for 0-5% of the round. The exits that remain are blocking syscalls and syscall
+preemption (BlockUnwind must drop the frames: the thread parks), whose continuations after resume are the
+return addresses in the episode log (4fd1aa0, pthread_cond_wait+221 ...). suite34 green.

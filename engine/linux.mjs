@@ -133,6 +133,7 @@ const EPISODES = ENV.OXWASM_EPISODES === '1';
 // starting at a return address (pthread_cond_wait's continuation alone 57k). A unit rooted at the return address runs
 // the continuation compiled; it exits at the function's ret like a loop-head root does.
 const RETROOT = ENV.OXWASM_RETROOT === undefined ? 8 : +ENV.OXWASM_RETROOT;
+const DEOPT_INPLACE = ENV.OXWASM_DEOPT_INPLACE !== '0';   // a deopt with no landing unit interprets its frame in place (see the deopt import)
 const RETROOT_LIBEXIT = ENV.OXWASM_RETROOT_LIBEXIT === '1';
 const ROOTTRACE = ENV.OXWASM_ROOTTRACE ? BigInt('0x' + ENV.OXWASM_ROOTTRACE) : null;   // trace _retRoot decisions for one rip
 const RETROOT_MAX = +ENV.OXWASM_RETROOT_MAX || 3000;   // instruction budget of a continuation root's own function
@@ -2255,6 +2256,23 @@ export class LinuxEngine {
           try { this.stats.aotRuns++; return BigInt.asIntN(64, BigInt.asUintN(64, f())); }
           finally { this._deoD--; this._deoChainT = prevT;     // restores through unwinds too
                     fdv.setUint32(FTMAP + 8, fd, true); }
+        }
+        // No landing unit: interpret the rest of THIS frame here and hand its exit back to the wasm caller, the way
+        // a callout finishes an interpreted callee. Unwinding instead dropped every wasm frame above the deopt, and
+        // each caller's continuation then ran interpreted to the next translated entry: 31k such episodes a run,
+        // 30 steps each, at thousands of return addresses (the long tail no root reaches). A deopt at a loop head
+        // (a nested frame's yield) still unwinds: interpreting the loop in place would be the old interpreter.
+        if (DEOPT_INPLACE && _rsp0 !== undefined && !this.chainSlow && (this._deoD | 0) < 200 && fd < FTDLIMIT &&
+            !this._loopHotSeen?.has(t) &&
+            (this.sliceDeadline == null || performance.now() <= this.sliceDeadline)) {
+          const rsp0 = BigInt.asUintN(64, _rsp0); let retAddr = 0n; try { retAddr = this.mem.read(rsp0, 8n); } catch {}
+          const rspExit = BigInt.asUintN(64, rsp0 + 8n);
+          this.stats.deoptInPlace = (this.stats.deoptInPlace | 0) + 1;
+          this.syncIn(); this.cpu.rip = t;
+          this._deoD = (this._deoD | 0) + 1;
+          if (STALE_DEPTH) fdv.setUint32(FTMAP + 8, fd + 1, true);
+          try { this._finishFrame(retAddr, rspExit); } finally { this._deoD--; fdv.setUint32(FTMAP + 8, fd, true); }
+          return BigInt.asIntN(64, this.cpu.rip);
         }
         throw new DeoptUnwind(t); },
     };
