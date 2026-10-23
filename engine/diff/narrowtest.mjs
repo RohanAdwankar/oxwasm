@@ -45,9 +45,12 @@ for (const [name, asm, cmpRegs, struct] of CASES) {
   let r;
   try { r = compileFunctionWat(new Memory([{ base: CODE, bytes: code }]), CODE, { guestBase: CODE, ramBase: 0 }); }
   finally { delete globalThis.__narrow; }
-  for (const s of struct.mustHave ?? []) if (!r.wat.includes(s)) {
+  // OXWASM_MEMREG keeps the registers in the regfile: there are no entry reloads to find in the text, so only the
+  // bit-exact comparison below applies
+  const memreg = !!process.env.OXWASM_MEMREG;
+  for (const s of memreg ? [] : struct.mustHave ?? []) if (!r.wat.includes(s)) {
     fail++; console.log(`STRUCT ${name}: narrowed WAT lost required "${s}"`); }
-  for (const s of struct.mustNotHave ?? []) if (r.wat.includes(s)) {
+  for (const s of memreg ? [] : struct.mustNotHave ?? []) if (r.wat.includes(s)) {
     fail++; console.log(`STRUCT ${name}: narrowed WAT kept "${s}"`); }
 
   writeFileSync('/tmp/nrw.wat', r.wat);

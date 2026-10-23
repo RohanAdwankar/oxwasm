@@ -80,6 +80,53 @@ const STOREGUARD = typeof process !== 'undefined' && process.env?.OXWASM_STOREGU
 // line map's slot load, shift, add, load and branch. Coarser: a store to data on a page that also holds translated code
 // calls the engine, which answers from the line map as before. Measured on JIT-off opencode: see docs/performance.md.
 const GUARDPG = typeof process !== 'undefined' && process.env?.OXWASM_GUARDPG === '1';
+// OXWASM_MEMREG=1: a dispatch-root function (an interpreter: one computed-goto loop over thousands of handler blocks)
+// keeps the guest registers in the regfile memory instead of wasm locals. In the one-function layout every register
+// local is live at the dispatch loop, so V8 spills most of them to the frame and each handler reloads what it
+// touches (29% of the LLInt's 466k instructions are frame spills), and every slow-path call reloads all 16 GPRs
+// and 8 xmm from the regfile only to spill them again - the hottest 0x100 bytes of JSC's interpreter. With the
+// registers in memory a handler loads what it reads and stores what it writes, the loop carries no live ranges,
+// and a call needs no spill or reload at all. OXWASM_MEMREG=all applies it to every function (a measurement lever).
+const MEMREG = (typeof process !== 'undefined' && process.env?.OXWASM_MEMREG) || '';
+// Rewrites a finished function's text: `(local.get $rN)` and `(local.set $rN E)` become loads and stores of slot 8N,
+// an i32 local's store zero-extends (the register is 32-bit), `$xN` maps to its xmm slot, and the spill/reload sites
+// of the register protocol - now copies of a slot onto itself - are deleted.
+export function regsToMemory(s, isI32, xmmOff) {
+  const closeOf = (t, i) => { let d = 0; for (let k = i; k < t.length; k++) { const c = t[k]; if (c === '(') d++; else if (c === ')') { d--; if (d === 0) return k + 1; } } return -1; };
+  let out = '', i = 0;
+  const re = /\(local\.(get|set) \$([rx])(\d+)([ )])/g;
+  const pend = [];   // positions (in out) where an extra ')' closes an i64.extend_i32_u: handled by rewriting the set's full extent
+  for (;;) {
+    re.lastIndex = i;
+    const m = re.exec(s);
+    if (!m) break;
+    const j = m.index, kind = m[1], cls = m[2], n = +m[3];
+    const off = cls === 'r' ? n * 8 : xmmOff + n * 16;
+    if (kind === 'get') {
+      const op = cls === 'x' ? 'v128.load' : isI32(n) ? 'i32.load' : 'i64.load';
+      out += s.slice(i, j) + `(${op} offset=${off} (i32.const 0))`;
+      i = j + m[0].length;
+      continue;
+    }
+    // set: rewrite the whole (local.set ...) extent so the i32 case can wrap its value
+    const end = closeOf(s, j);
+    const body = s.slice(j + m[0].length, end - 1);          // the value expression
+    const inner = regsToMemory(body, isI32, xmmOff);
+    if (cls === 'x') out += s.slice(i, j) + `(v128.store offset=${off} (i32.const 0) ${inner})`;
+    else if (isI32(n)) out += s.slice(i, j) + `(i64.store offset=${off} (i32.const 0) (i64.extend_i32_u ${inner}))`;
+    else out += s.slice(i, j) + `(i64.store offset=${off} (i32.const 0) ${inner})`;
+    i = end;
+  }
+  out += s.slice(i);
+  // the protocol's spills and reloads are now slot-to-same-slot copies
+  out = out.replace(/\(i64\.store \(i32\.const (\d+)\) \(i64\.load offset=\1 \(i32\.const 0\)\)\)/g, '')
+           .replace(/\(i64\.store \(i32\.const (\d+)\) \(i64\.extend_i32_u \(i32\.load offset=\1 \(i32\.const 0\)\)\)\)/g, '')
+           .replace(/\(i64\.store offset=(\d+) \(i32\.const 0\) \(i64\.load \(i32\.const \1\)\)\)/g, '')
+           .replace(/\(i64\.store offset=(\d+) \(i32\.const 0\) \(i64\.extend_i32_u \(i32\.load \(i32\.const \1\)\)\)\)/g, '')
+           .replace(/\(v128\.store \(i32\.const (\d+)\) \(v128\.load offset=\1 \(i32\.const 0\)\)\)/g, '')
+           .replace(/\(v128\.store offset=(\d+) \(i32\.const 0\) \(v128\.load \(i32\.const \1\)\)\)/g, '');
+  return out;
+}
 export const PGMAP = 0x300000, PGMAP_BYTES = 0x100000;
 // Largest wat text this emitter will hand the runtime for ONE function; see
 // the refusal at the end of the function emitter for the two measurements
@@ -2904,7 +2951,12 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       const N = S < 8, w = (e) => `(i32.wrap_i64 ${e})`;
       const sxN = (e) => S === 4 ? e : S === 2 ? `(i32.extend16_s ${e})` : `(i32.extend8_s ${e})`;
       const sgnN = Number(sgn), signN = (e) => S === 4 ? `(i32.lt_s ${e} (i32.const 0))` : `(i32.ne (i32.and ${e} (i32.const ${sgnN})) (i32.const 0))`;
-      const zf = N ? `(i32.eqz ${w(r)})` : `(i64.eqz ${r})`, nz = N ? `(i32.ne ${w(r)} (i32.const 0))` : `(i64.ne ${r} (i64.const 0))`;
+      // ZF of a subtraction is the operands' equality: comparing them directly lets V8 emit `cmp a,b; je` and drop
+      // the difference when nothing else reads it, where testing the result cost the subtraction, a zero-extending
+      // move and a test (`cmp $0x80,%ecx; je` came out as lea, movl, testl, jnz).
+      const eqAB = N ? `(i32.eq ${w(a)} ${w(b)})` : `(i64.eq ${a} ${b})`, neAB = N ? `(i32.ne ${w(a)} ${w(b)})` : `(i64.ne ${a} ${b})`;
+      const zf = fs.kind === 'sub' ? eqAB : N ? `(i32.eqz ${w(r)})` : `(i64.eqz ${r})`;
+      const nz = fs.kind === 'sub' ? neAB : N ? `(i32.ne ${w(r)} (i32.const 0))` : `(i64.ne ${r} (i64.const 0))`;
       const sf = N ? signN(w(r)) : `(i64.ne (i64.and ${r} (i64.const ${sgn})) (i64.const 0))`;
       const nsf = N ? `(i32.eqz ${sf})` : `(i64.eq (i64.and ${r} (i64.const ${sgn})) (i64.const 0))`;
       // OF for sub (a-b=r) and add (a+b=r), matching the interpreter's flag rules
@@ -4177,6 +4229,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   // gets the dispatch layout.
   const MEGA_BIG = DISP && hasJtab && isDispatchRoot(a0, fnAddr);
   const finish = (w) => {
+    if (MEMREG && (MEMREG === 'all' || MEGA)) w = regsToMemory(w, isI32, XMMOFF);   // registers in the regfile, not locals (see MEMREG)
     if (w.length > (MEGA_BIG ? MAXWAT_MEGA : MAXWAT)) throw new Error('emitted function exceeds the runtime limit: ' + w.length + ' bytes of wat');
     return w;
   };
