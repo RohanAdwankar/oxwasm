@@ -10,7 +10,7 @@ import { CPU, Memory } from './interp.mjs';
 import { compileLoop } from './jit2.mjs';
 import { compileVectorLoop } from './jitsimd.mjs';
 import { fnprofSlot } from './aot_wat.mjs';
-import { compileUnitWat, pltStubWat, FTMAP, FTMAP_MAX, FTENTRY, FTDLIMIT, FTFUEL, FTLOOP, FTNEST, LOOPYIELD_N,
+import { compileUnitWat, pltStubWat, FTMAP, FTMAP_MAX, FTENTRY, FTDLIMIT, FTFUEL, FTLOOP, FTNEST, FTSTALE, LOOPYIELD_N,
          FTHASH, FTHBITS, FTHMASK, FTHBYTES, CWLO_SLOT, CWLEN_SLOT, CWBM_SLOT, PGMAP } from './aot_wat.mjs';
 // OXWASM_DISPSTAT=1: count the rips that HAD a compiled unit and were not
 // dispatched anyway. Off by default - it costs a map lookup per instruction.
@@ -81,6 +81,8 @@ const CW_VOLATILE = Number(ENV.OXWASM_CW_VOLATILE || 8);
 // a 100x tax on exactly the loops that matter.
 const CW_ALLPAGES = ENV.OXWASM_CW_ALLPAGES === '1';
 const IDLEDIAG = ENV.OXWASM_IDLEDIAG === '1';
+const STALE_RT = ENV.OXWASM_STALEUNWIND !== '0';          // the engine side of FTSTALE (aot_wat.mjs): raise on invalidation, lower per dispatch
+const STALE_DEPTH = STALE_RT && ENV.OXWASM_STALEDEPTH !== '0';   // the interpreted callee of a callout counts its caller's frame
 const CWHIST = ENV.OXWASM_CWHIST === '1';
 const CWVERIFY = ENV.OXWASM_CWVERIFY === '1';
 const CWTRACE = ENV.OXWASM_CWTRACE ? BigInt('0x' + ENV.OXWASM_CWTRACE) : null;   // one guest address: log every write covering it, the overlap decision, the drop, and re-registrations of translations covering it
@@ -441,6 +443,7 @@ export class LinuxEngine {
   // hook by hand, and the reason is what turns "some function is slow" into a
   // one-instruction fix.
   noteAotFail(entry, why) {
+    if (ENV.OXWASM_TUTRACE) __dbg(`[aotfail] ${entry.toString(16)} ${String(why).slice(0, 200)}`);
     (this._aotWhy ??= new Map()).set(entry, why);
     if (this.onAotFail) this.onAotFail(entry, why);
   }
@@ -509,11 +512,31 @@ export class LinuxEngine {
   }
   // Pre-linked bundles of this program's cached units (tools/bundle-units.mjs): a handful of instances instead
   // of thousands. Every instance that imports the shared funcref table makes each table set cost O(instances).
+  // OXWASM_WASMNAMES=1: every module instantiated (cached units, bundles, tier-ups) gets a "name" custom section
+  // built from its exports, so a V8 tick log reads f_<entry> instead of wasm-function[i]. OXWASM_WASMDIR=<dir>
+  // writes the bytes there as <name>.wasm. Both are profiling aids; off, this returns the bytes untouched.
+  _modBytes(name, b) {
+    if (ENV.OXWASM_WASMDIR) { try { process.getBuiltinModule('node:fs').writeFileSync(ENV.OXWASM_WASMDIR + '/' + name + '.wasm', b); } catch {} }
+    if (!ENV.OXWASM_WASMNAMES) return b;
+    let o = 8; const u32 = () => { let r = 0, s = 0; for (;;) { const x = b[o++]; r |= (x & 127) << s; if (!(x & 128)) break; s += 7; } return r >>> 0; };
+    const exps = new Map();
+    while (o < b.length) { const id = b[o++]; const len = u32(); const end = o + len;
+      if (id === 7) { const n = u32(); for (let i = 0; i < n; i++) { const nl = u32(); const nm = b.subarray(o, o + nl); o += nl; const k = b[o++]; const ix = u32(); if (k === 0 && !exps.has(ix)) exps.set(ix, nm); } }
+      o = end; }
+    if (!exps.size) return b;
+    const leb = (n) => { const r = []; do { let x = n & 127; n >>>= 7; if (n) x |= 128; r.push(x); } while (n); return r; };
+    const ent = [...exps.entries()].sort((x, y) => x[0] - y[0]);
+    const sub = [...leb(ent.length)]; for (const [ix, nm] of ent) sub.push(...leb(ix), ...leb(nm.length), ...nm);
+    const body = [...leb(4), 110, 97, 109, 101, 1, ...leb(sub.length), ...sub];
+    const lb = leb(body.length); const out = new Uint8Array(b.length + 1 + lb.length + body.length);
+    out.set(b, 0); out[b.length] = 0; out.set(lb, b.length + 1); out.set(body, b.length + 1 + lb.length);
+    return out;
+  }
   _loadBundles(ex) {
     let n = 0;
     for (const bytes of this.unitStore.bundles(ex)) {
       try {
-        const inst = new WebAssembly.Instance(new WebAssembly.Module(bytes), this.aotImports());
+        const inst = new WebAssembly.Instance(new WebAssembly.Module(this._modBytes('b_' + (this._bundleN = (this._bundleN | 0) + 1), bytes)), this.aotImports());
         for (const name of Object.keys(inst.exports)) if (name.startsWith('f_')) {
           const a = BigInt('0x' + name.slice(2));
           if (!this.aotFns.get(a) && !this.aotFailed.has(a)) { this.registerAotFn(a, inst.exports[name]); n++; }
@@ -828,6 +851,8 @@ export class LinuxEngine {
     }
     if (this.codePages && !exact) for (let q = p0; q <= p1 && p1 - p0 < 4096n; q++) this.codePages.delete(q);
     if (hit || dropped.length) this._ftDrop(dropped);
+    // a dropped function may be live on the wasm stack: every JIT-region frame leaves at its next call return (FTSTALE)
+    if (STALE_RT && hit && this.wmem) { const dv = (this._ftdv ??= new DataView(this.wmem.buffer)), d = dv.getUint32(FTMAP + 8, true); if (d > dv.getUint32(FTSTALE, true)) dv.setUint32(FTSTALE, d, true); this.stats.staleUnwinds = (this.stats.staleUnwinds | 0) + 1; }
     return changed;
   }
   finishAotUnit(unit, instance) {
@@ -923,7 +948,7 @@ export class LinuxEngine {
           this.stats.tiers.aot = (this.stats.tiers.aot || 0) + 1;
         };
         if (!this.asyncCompile && typeof process !== 'undefined') {
-          try { const _m0 = performance.now(); if (ENV.OXWASM_TUTRACE) console.error(`[wm>] ${entry.toString(16)} ${bytes.length}B`); const _mod = new WebAssembly.Module(bytes); if (ENV.OXWASM_TUTRACE) console.error(`[wm:mod] ${entry.toString(16)} ${(performance.now() - _m0) | 0}ms`); registerAll(new WebAssembly.Instance(_mod, this.aotImports())); if (ENV.OXWASM_TUTRACE) console.error(`[wm<] ${entry.toString(16)} ${(performance.now() - _m0) | 0}ms`); }
+          try { const _m0 = performance.now(); if (ENV.OXWASM_TUTRACE) console.error(`[wm>] ${entry.toString(16)} ${bytes.length}B`); const _mod = new WebAssembly.Module(this._modBytes('u_' + entry.toString(16), bytes)); if (ENV.OXWASM_TUTRACE) console.error(`[wm:mod] ${entry.toString(16)} ${(performance.now() - _m0) | 0}ms`); registerAll(new WebAssembly.Instance(_mod, this.aotImports())); if (ENV.OXWASM_TUTRACE) console.error(`[wm<] ${entry.toString(16)} ${(performance.now() - _m0) | 0}ms`); }
           catch (e) { this.aotFailed.add(k); this.noteAotFail(entry, e.message); }
           return;
         }
@@ -1041,7 +1066,7 @@ export class LinuxEngine {
     const _inStatic = (this.execRangesStatic ?? []).some(([a, b]) => k >= a && k < b);   // JIT/anonymous code is reused at the same addresses with different bytes: never remember anything about it by address
     if (_unitEx && _inStatic && this.unitStore.hasFail && this.unitStore.hasFail(_unitEx, k.toString(16))) { this.aotFailed.add(k); this.stats.failKnown = (this.stats.failKnown | 0) + 1; return; }   // failed after a long analysis in an earlier run
     try {
-      const unit = compileUnitWat(this.mem, entry, { guestBase: this.base, ramBase: this.RAMOFF,
+      const unit = compileUnitWat(this.mem, entry, { guestBase: this.base, ramBase: this.RAMOFF, staleCheck: !_inStatic,
         // prune the closure at functions already in the dispatch map: calls
         // reach them via $ftr chaining, so re-including their bodies only
         // duplicates translation work and module bytes
@@ -1166,7 +1191,7 @@ export class LinuxEngine {
                           this.noteAotFail(entry, e.message); });
         return;
       }
-      const inst = new WebAssembly.Instance(new WebAssembly.Module(bytes), this.aotImports());
+      const inst = new WebAssembly.Instance(new WebAssembly.Module(this._modBytes('t_' + entry.toString(16), bytes)), this.aotImports());
       for (const a of unit.funcs) {
         const ak = a;
         if (!this.aotFns.has(ak)) this.registerAotFn(ak, inst.exports['f_' + a.toString(16)]);
@@ -1177,11 +1202,12 @@ export class LinuxEngine {
           if (!this.aotFns.get(a) && !this.aotFailed.has(a)) this.registerAotFn(a, inst.exports[name]);
         }
       if (inst.exports.drive) this.aotDrive = inst.exports.drive;
-      if (!this.aotFns.has(k)) throw new Error('entry missing from unit');
+      if (!this.aotFns.has(k)) { if (ENV.OXWASM_TUTRACE) __dbg(`[tu:missing] ${entry.toString(16)} inFuncs=${unit.funcs.some((a) => a === k)} export=${typeof inst.exports['f_' + entry.toString(16)]} failed=${this.aotFailed.has(k)} why=${this._aotWhy?.get(entry) ?? '-'} funcs=${unit.funcs.length} entryName=${unit.entryName} exports=${Object.keys(inst.exports).slice(0, 6).join(',')}`); throw new Error('entry missing from unit'); }
       this.stats.tiers.aot = (this.stats.tiers.aot || 0) + 1;
     } catch (e) { const _dt = performance.now() - _tc0; this.stats[e.deferred ? 'tuDeferMs' : 'tuFailMs'] = (this.stats[e.deferred ? 'tuDeferMs' : 'tuFailMs'] || 0) + _dt; this.stats[e.deferred ? 'tuDefers' : 'tuFails'] = (this.stats[e.deferred ? 'tuDefers' : 'tuFails'] || 0) + 1;
       if (e.deferred) { this.stats.sizeDeferred = (this.stats.sizeDeferred || 0) + 1; return; }   // size gate: not a failure, re-tiers at the count it named
       if (globalThis.__asmTrace) console.error(e.stack);
+      if (ENV.OXWASM_TUTRACE) __dbg(`[tu:fail] ${entry.toString(16)} ${String(e.message).slice(0, 300)}`);
       this.aotFailed.add(k);
       this.noteAotFail(entry, e.message);
       if (_dt > 1000 && _unitEx && _inStatic && this.unitStore.putFail) this.unitStore.putFail(_unitEx, k.toString(16), e.message);   // long, deterministic-looking failure: do not repeat it next run
@@ -1251,6 +1277,7 @@ export class LinuxEngine {
     fdv.setUint32(FTFUEL, this.chainFuel ?? 0x0FFFFFFF, true);
     fdv.setUint32(FTLOOP, this.loopYield ?? LOOPYIELD_N, true);      // backward edges before a frame yields its loop head (see FTLOOP)
     const fn0 = fdv.getUint32(FTNEST, true); fdv.setUint32(FTNEST, 0, true);   // this dispatch's frame is top-level: its exit rip is honoured
+    if (STALE_RT && fdv.getUint32(FTSTALE, true) > fd0) fdv.setUint32(FTSTALE, fd0, true);   // frames above this depth are gone (see FTSTALE)
     this.syncOut();
     const entry = this.cpu.rip; this._lastEntry = entry;
     if (DISPRING) this._dr('disp', entry, this.cpu.regs[4]);
@@ -1593,6 +1620,7 @@ export class LinuxEngine {
       if (BREAKS !== null && BREAKS.has(this.cpu.rip)) this._onBreak();
       if (TRACE_RANGE !== null && this.cpu.rip >= TRACE_RANGE[0] && this.cpu.rip < TRACE_RANGE[1] && (this.cpu.rip & 0x3fn) === 0n) this._traceEntry(this.cpu.rip, 'I');
       const insn = this.cpu.step(); this.stats.interpreted++;
+      if (IDLEDIAG && (this.stats.interpreted & 0xFFFF) === 0) { const nw = performance.now(); if (nw - (this._busyT ?? 0) > 5000) { this._busyT = nw; __dbg(`[busy t=${nw | 0}] tid=${this.threads[this.ti]?.id} iu=${this._iuDepth} rip=${before.toString(16)} disp=${this.stats.disp} interp=${this.stats.interpreted} aotFns=${this.aotFns.size} failed=${this.aotFailed.size} ftd=${(this._ftdv ??= new DataView(this.wmem.buffer)).getUint32(FTMAP + 8, true)} stale=${this._ftdv.getUint32(FTSTALE, true)} deep=${this.stats.dispDeep | 0} tuFails=${this.stats.tuFails | 0} su=${this.stats.staleUnwinds | 0} prog=${this._ctor?.argv?.[0]}`); } }
       if (globalThis.__ihist !== undefined && (this.stats.interpreted & 63) === 0) { const h = globalThis.__ihist, k = this.cpu.rip; h.set(k, (h.get(k) || 0) + 1); }   // IHIST: every 64th interpreted step, by rip
       branched = BRANCHY.has(insn.mnem) || this.cpu.rip !== this.cpu.ripNext && this.cpu.rip !== before + BigInt(insn.len);
       if (this.onProgress && this.stats.interpreted % 2e7 === 0) this.onProgress('callout');
@@ -2009,7 +2037,8 @@ export class LinuxEngine {
               return BigInt.asIntN(64, exit);
             this.stats.coExitMismatch = (this.stats.coExitMismatch | 0) + 1;
             this.syncIn(); this.cpu.rip = exit;
-            this._finishFrame(retAddr, rspExit);
+            if (STALE_DEPTH) ftdv.setUint32(FTMAP + 8, ftd + 1, true);   // the caller's frame stays live (see the interpreted path below)
+            try { this._finishFrame(retAddr, rspExit); } finally { ftdv.setUint32(FTMAP + 8, ftd, true); }
             return BigInt.asIntN(64, retAddr);
           }
           catch (e) {
@@ -2022,7 +2051,8 @@ export class LinuxEngine {
             this.syncIn(); this.cpu.rip = e.rip;
             if (DISPRING) this._dr('callout-catch', target, e.rip, retAddr);
             if (globalThis.__frameTrace) console.error(`<callout-catch target=${target.toString(16)} erip=${e.rip.toString(16)} retAddr=${retAddr.toString(16)} rspExit=${rspExit.toString(16)} rsp=${this.cpu.regs[4].toString(16)}>`);
-            this._finishFrame(retAddr, rspExit);
+            if (STALE_DEPTH) ftdv.setUint32(FTMAP + 8, ftd + 1, true);
+            try { this._finishFrame(retAddr, rspExit); } finally { ftdv.setUint32(FTMAP + 8, ftd, true); }
             if (globalThis.__frameTrace) console.error(`<callout-ret(catch) target=${target.toString(16)} retAddr=${retAddr.toString(16)}>`);
             return BigInt.asIntN(64, retAddr);
           }
@@ -2036,7 +2066,10 @@ export class LinuxEngine {
         if (this.assembleWat) this.profileTarget(target);
         this.syncIn(); this.cpu.rip = target;
         if (DISPRING) this._dr('callout-interp', target, retAddr, rspExit);
-        this._finishFrame(retAddr, rspExit);
+        // the caller's wasm frame stays live under the interpreter: count it, so a dispatch nested here sits
+        // above the caller's depth and FTSTALE can tell the caller (stale, must leave) from the fresh chain
+        if (STALE_DEPTH) ftdv.setUint32(FTMAP + 8, ftd + 1, true);
+        try { this._finishFrame(retAddr, rspExit); } finally { ftdv.setUint32(FTMAP + 8, ftd, true); }
         if (globalThis.__frameTrace) console.error(`<callout-ret(interp) target=${target.toString(16)} retAddr=${retAddr.toString(16)} rsp=${this.cpu.regs[4].toString(16)}>`);
         return BigInt.asIntN(64, retAddr);
       },
@@ -6428,7 +6461,7 @@ export class LinuxEngine {
         if (DISPSTAT) { if (!branched && this.aotFns.get(key)) this.stats.noLook = (this.stats.noLook || 0) + 1; }
         if (f && this.aotBudget !== undefined && --this.aotBudget < 0) { f = null; this.stats.dispBudget = (this.stats.dispBudget || 0) + 1; }
         if (f) { if (this.ripTrace !== undefined) { this.ripTrace[this.ripTraceI++ & 65535] = -key; }   // negative = AOT entry
-                 if (IDLEDIAG) { const nw = performance.now(); if (nw - (this._busyT ?? 0) > 5000) { this._busyT = nw; __dbg(`[busy t=${nw | 0}] tid=${this.threads[this.ti]?.id} disp rip=${key.toString(16)} disp=${this.stats.disp} interp=${this.stats.interpreted} threads=${this.threads.map((x) => x.id + ':' + x.state).join(',')}`); } }   // a thread that never parks: where it is
+                 if (IDLEDIAG) { const nw = performance.now(); if (nw - (this._busyT ?? 0) > 5000) { this._busyT = nw; __dbg(`[busy t=${nw | 0}] tid=${this.threads[this.ti]?.id} disp rip=${key.toString(16)} disp=${this.stats.disp} interp=${this.stats.interpreted} ftd=${new DataView(this.wmem.buffer).getUint32(FTMAP + 8, true)} stale=${new DataView(this.wmem.buffer).getUint32(FTSTALE, true)} su=${this.stats.staleUnwinds | 0} co=${this.stats.coNoF | 0} prog=${this._ctor?.argv?.[0]} pid=${this.pid} threads=${this.threads.map((x) => x.id + ':' + x.state).join(',')}`); } }   // a thread that never parks: where it is
                  if (EPISODES && this._epStart !== undefined) { const e = this._episodes, k = this._epStart; let r = e.get(k); if (!r) e.set(k, r = [0, 0, this._epHow]); r[0]++; r[1] += this.stats.interpreted - this._epN; this._epStart = undefined; }
                  this.cpu.rip = this.dispatchMaybeShadow(f);
                  if (EPISODES) { this._epStart = this.cpu.rip; this._epN = this.stats.interpreted; this._epHow = 'exit'; }
@@ -6456,7 +6489,7 @@ export class LinuxEngine {
         if (this.ripTrace !== undefined && before >= this._rtLo && before < this._rtHi) this.ripTrace[this.ripTraceI++ & 65535] = before;
       if (this._ripLog !== undefined && this._ripLog.has(before)) this._ripHit(before);
       if (ARM_FP !== null) this._armFp(before);
-        if (IDLEDIAG && (steps & 0xFFFF) === 0) { const nw = performance.now(); if (nw - (this._busyT ?? 0) > 5000) { this._busyT = nw; __dbg(`[busy t=${nw | 0}] tid=${this.threads[this.ti]?.id} interp rip=${before.toString(16)} disp=${this.stats.disp} interp=${this.stats.interpreted} threads=${this.threads.map((x) => x.id + ':' + x.state).join(',')}`); } }
+        if (IDLEDIAG && (steps & 0xFFFF) === 0) { const nw = performance.now(); if (nw - (this._busyT ?? 0) > 5000) { this._busyT = nw; __dbg(`[busy t=${nw | 0}] tid=${this.threads[this.ti]?.id} interp rip=${before.toString(16)} disp=${this.stats.disp} interp=${this.stats.interpreted} ftd=${new DataView(this.wmem.buffer).getUint32(FTMAP + 8, true)} stale=${new DataView(this.wmem.buffer).getUint32(FTSTALE, true)} su=${this.stats.staleUnwinds | 0} co=${this.stats.coNoF | 0} threads=${this.threads.map((x) => x.id + ':' + x.state).join(',')}`); } }
 
         let insn;
         this._cleanSync = false;

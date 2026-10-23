@@ -1926,3 +1926,50 @@ OXWASM_SHADOW_NESTED=1, OXWASM_SHADOW_EXIT=1, cap lifted) reports only SHADOW-NO
 interpreter never reaches, so the comparator cannot align there. That is the same blind spot the earlier trace
 attempt hit. A comparator that treats a blocking unwind as a match point - compare the register file at the
 unwind rather than at the exit rip - is what the next attempt needs; the reproduction itself is now 32 s.
+
+### The JIT-on numbers so far were measured with the inline-cache page interpreted
+Every "clean" JIT-on run until now vetoed the 64-byte stub block at 5a234000 (OXWASM_ROOTVETO) to dodge the round-5
+abort. That block is where JavaScriptCore puts its inline-cache stubs - the `length` getter, the ArithAdd fast paths,
+the slow-path call thunks - and a vetoed function is interpreted on every call: 1.38M callouts a run into one stub
+(5a234540, `push rbp; cmp byte [rdi+5],2; test byte [rdi+8],1; load length; or rax,r14; pop rbp; ret`), 16.5M
+interpreted instructions, strings at 1,117 ms a round. The same strings phase with the block translated runs at
+8-14 ms a round (24 rounds, no abort: strings alone does not trigger it), which is the native class. So the
+249-458 ms JIT-on rounds in the notes above are not a translation-quality number; they are the cost of interpreting
+the stub page, and the gap to native on the JIT-on mix is unmeasured until the abort is gone.
+
+Two aids for this: OXWASM_WASMNAMES=1 appends a name section to every module the engine instantiates (cached units,
+bundles, tier-ups), so a V8 tick log reads `f_<entry>` instead of `wasm-function[7]` and a profile attributes to guest
+entries without any module-address matching (/tmp/v8name_tool.py); OXWASM_WASMDIR=<dir> dumps the bytes.
+
+### Volatile pages turn the stub page into interpreted code after four writes
+With the block translated, the mix's strings phase is bimodal within one run: 14-65 ms in rounds 11-14, 211-285 ms
+from round 15 on, with 25k interpreted instructions a round once it is slow. The stats say volatilePages=3: a page
+written OXWASM_CW_VOLATILE (4 in the bench scripts) times stops being watched and translated, and JSC regenerates
+its ICs in that page a few times per run. The threshold was chosen for HotSpot's scratch pages; for JSC it retires
+the hottest code in the process. CWV=1000 is being measured.
+
+### Translations that are live on the wasm stack when their bytes change (FTSTALE)
+A code write drops the translations built from the bytes (and their unit siblings) from the dispatch map, and
+nothing more. The frame that is executing a dropped translation at that moment carries on: the JIT body whose
+inline cache the slow-path thunk it is inside just regenerated returns from the thunk into the body's old
+translation, which jumps where the old bytes jumped. That is exactly the shape of the abort's dependence on timing
+("when a unit is entered relative to JSC's patching") and of the block veto working while any subset of it fails.
+
+Now every unit built from anonymous memory tests, at each call's return, whether the wasm depth it called at
+(`$fts`) is below FTSTALE, a word the invalidation raises to the depth of the moment, and leaves with its
+continuation rip if so; the dispatcher resumes from the register file through fresh translations, and lowers the
+word to its own depth on every dispatch (frames above it are gone), so fresh chains never unwind. The interpreted
+callee of a callout now counts its caller's frame in the depth word, so a dispatch nested under it sits above the
+caller (a stale caller at the same depth as a fresh nested chain was the hole in the first version, which also
+hung the second run of each chain). Static-image units carry no check. OXWASM_STALEUNWIND=0 turns it off.
+
+The first measurements of it were worthless, and the reason is worth keeping: the first cut of the return check
+emitted `(i32.or (i64.ne ..))` with ONE operand whenever the stale check was off - which is every static-image
+unit - so every unit compiled after the edit failed to assemble ("type mismatch in i32.or"), the engine ran on
+the cached units alone and interpreted everything new, the sandbox agent's cold boot went from 47 s to never, and
+the mix "hung" on every run that was not the first after an edit (the first restores nothing and happened to get
+by on the cache). The runs that did complete (24 rounds clean, 45 s; abort at round 5) were on that broken
+emitter and say nothing. The tell was in the tier-up trace once it printed the refusal reason (OXWASM_TUTRACE
+now logs every noteAotFail): 315 of 416 refusals in a 15 s boot were the assembler's. Lesson: a change to the
+emitter is validated by the sandbox agent's cold boot (scratchpad boottest.mjs, 41-47 s) before anything else.
+With the check emitted correctly the suite and a six-and-six A/B (OXWASM_STALEUNWIND=0 vs 1, CWV=1000) run next.

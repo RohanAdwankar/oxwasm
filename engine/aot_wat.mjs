@@ -174,6 +174,7 @@ export const PGMAP = 0x300000, PGMAP_BYTES = 0x100000;
 // Largest wat text this emitter will hand the runtime for ONE function; see
 // the refusal at the end of the function emitter for the two measurements
 // that bracket it.
+const STALE_UNWIND = !(typeof process !== 'undefined' && process.env?.OXWASM_STALEUNWIND === '0');   // see FTSTALE
 const WATCOMMENTS = typeof process !== 'undefined' && process.env?.OXWASM_WATCOMMENTS === '1';
 const MAXWAT = Number(process.env.OXWASM_MAXWAT || 5_000_000);
 // A computed goto with a table this wide is an interpreter's dispatch: the one kind of
@@ -254,6 +255,15 @@ export const FTLOOP = FTMAP + 16;
 export const FTNEST = FTMAP + 20;
 // yield counters, bumped in the $yield tail: top-level returns at +24, nested deopts at +28
 export const FTYTOP = FTMAP + 24, FTYNEST = FTMAP + 28;
+// FTSTALE: a wasm-frame depth (FTDEPTH units) below which every live frame built from anonymous memory must leave.
+// A code write that drops translations (see _invalidateCode) raises it to the depth of the moment: a dropped function
+// may be ON THE WASM STACK right then - the JIT body whose inline cache the callout it is inside just regenerated -
+// and would otherwise carry on running the bytes it was built from once the callout returns. A frame's call site
+// saved the depth it called at in $fts; a frame with $fts below the word leaves at the call's return with its
+// continuation rip, and the dispatcher resumes from the regfile through fresh translations. Every dispatch lowers
+// the word to its own depth (frames above it are gone), so fresh chains never unwind; 0 means nothing is stale.
+// Static-image units never go stale and carry no check.
+export const FTSTALE = FTMAP + 40;
 
 // The in-wasm resolver over the sorted (addr, table-slot) map at FTMAP —
 // shared by every unit module and by generated PLT stubs.
@@ -2876,7 +2886,9 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   // discards the return address when an exception is pending. With the rsp test alone the caller carried on after the
   // call as if the callee had returned, the throw was swallowed, and the JS state it left behind crashed JSC at a later
   // slow path (jsAddSlowCase on a freed cell, round 5 of the mix / round ~37 of objects, bisected to those thunks).
-  const retCheck = (rb, next) => `(if (i32.or (i64.ne (local.get $r4) (local.get ${rb})) (i64.ne (local.get $rex) (i64.const ${hexs(next)}))) (then (return (local.get $rex))))`;
+  const retCheck = (rb, next) => ctx.staleCheck
+    ? `(if (i32.or (i64.ne (local.get $r4) (local.get ${rb})) (i32.or (i64.ne (local.get $rex) (i64.const ${hexs(next)})) (i32.lt_u (local.get $fts) (i32.load (i32.const ${FTSTALE}))))) (then (return (local.get $rex))))`
+    : `(if (i32.or (i64.ne (local.get $r4) (local.get ${rb})) (i64.ne (local.get $rex) (i64.const ${hexs(next)}))) (then (return (local.get $rex))))`;
   // THREADED: a handler region's entry rsp is not a frame base (JSC's LLInt resets rsp from the JS frame after
   // every call), so the frame-exit clause below is wrong there and sent every dispatch after a JS call through
   // the deopt import's abandoned-frame unwind (~100 us; fib 10x). A region tail-calls on a hash hit alone, which
@@ -4682,7 +4694,7 @@ export function compileUnitWat(mem, entry, opts = {}) {
   // 20,464 the run needed, a third of the emit phase.
   let emitting = null; const uses = new Map();
   const canDirect = (k) => { const ok = funcs.has(k) && !poisoned.has(k); if (ok && emitting !== null) uses.get(emitting).add(k); return ok; };
-  const ctx = { guestBase, ramBase, canDirect, tailTargets, jtTables: new Map() };
+  const ctx = { guestBase, ramBase, canDirect, tailTargets, jtTables: new Map(), staleCheck: !!opts.staleCheck && STALE_UNWIND };
   // emit; a failure poisons that function and re-emits its direct callers -
   // they switch from direct wasm calls to callout escapes
   const texts = new Map();
