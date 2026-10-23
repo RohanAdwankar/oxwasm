@@ -1832,3 +1832,20 @@ it is being hunted with the idle diagnostic.
 
 One more flag-materialization peephole landed on the way: ZF of a subtraction is now the operands' equality
 (`cmp a,b; je` instead of lea, movl, testl, jnz), 0.6% off the unit's machine code.
+
+### Registers in memory lose, for the LLInt too (cold87/cold88, warmed caches, roots on)
+| configuration | medians | fib | math | objects | strings | sorting |
+|---|---|---|---|---|---|---|
+| locals (cold83) | 683, 645 | 30 | 74-76 | 95-97 | 82-84 | 82 |
+| OXWASM_MEMREG=1: the LLInt's registers in the regfile (cold87) | 707 | 36 | 86 | 96 | 83 | 87 |
+| OXWASM_MEMREG=all: every function (cold88) | 886 | 40 | 96 | 134 | 117 | 118 |
+
+Every phase runs in the LLInt (the JIT is off), and the tight-loop phases are 15-20% slower with its registers in
+memory: a load at every register read and a store at every write cost more than the frame spills they replace,
+because V8 keeps a handler's hot registers in machine registers between its spill points, and a guest store kills
+whatever regfile loads it had hoisted. The 18% smaller machine code was instruction count, not time. Everywhere,
+it is 30-40% slower. Both stay as opt-in levers; the default is locals. The reload-after-call block that profiled
+hottest is therefore real work on this layout, and the next lever is narrowing it (the xmm half is caller-saved
+and never read back by ABI-compliant code; OXWASM_ABIRELOAD already skips the six callee-saved GPRs).
+
+The late `wait` with roots on recurred in two of seven runs (secs=641, 643, rounds and medians unaffected).
