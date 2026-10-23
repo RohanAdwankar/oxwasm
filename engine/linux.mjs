@@ -393,7 +393,7 @@ export class LinuxEngine {
     if (assembleWat) {
       this.cpu.onCall = (t) => {
         const ce = (this._callEntries ??= new Set());
-        if (!ce.has(t)) { ce.add(t); const ix = this._ftIdxOf?.get(t); if (ix !== undefined) new DataView(this.wmem.buffer).setUint8(FTENTRY + ix, 1); }   // called after it was mapped: flag it now
+        if (!ce.has(t)) { ce.add(t); this._entries?.add(t.toString()); const ix = this._ftIdxOf?.get(t); if (ix !== undefined) new DataView(this.wmem.buffer).setUint8(FTENTRY + ix, 1); }   // called after it was mapped: flag it now
         this.profileTarget(t);
       };   // _callEntries: real function entries (a longjmp landing is never called)
       // a PLT stub reaches the real function via `jmp *GOT` — profile the
@@ -880,7 +880,10 @@ export class LinuxEngine {
     // A continuation inside a giant function (an LLInt opcode's slow-path return) would re-translate everything
     // reachable from it: 9.9 s for one root inside JSC's interpreter. The budget refuses those ('function too
     // large' -> aotFailed, never retried); the small continuations are the ones that matter.
-    if (n >= RETROOT) { this.stats.retRoots = (this.stats.retRoots | 0) + 1; this._rootMaxInsns = RETROOT_MAX; try { this.tierUpAot(hk); } finally { this._rootMaxInsns = undefined; } }
+    // A continuation root is a return address. The analyzer cuts a call whose fall-through is a known ENTRY as
+    // noreturn (the next function starts there), so a root must never reach the entries set: with it there, every
+    // later translation of the caller deopted to the root after each call - 198k deopts a run on one site.
+    if (n >= RETROOT) { this.stats.retRoots = (this.stats.retRoots | 0) + 1; (this._retRoots ??= new Set()).add(hk.toString()); this._entries?.delete(hk.toString()); this._rootMaxInsns = RETROOT_MAX; try { this.tierUpAot(hk); } finally { this._rootMaxInsns = undefined; } }
   }
   tierUpAot(entry) {
     const k = entry;
@@ -2049,6 +2052,7 @@ export class LinuxEngine {
         const t = BigInt.asUintN(64, rip);
         this.stats.deopts = (this.stats.deopts || 0) + 1;
         if (this.deoptLog) this.deoptLog.set(t, (this.deoptLog.get(t) || 0) + 1);
+        if (this.deoptLog && ENV.OXWASM_DEOPTSRC) { const k = t.toString(16) + '<' + (this._lastEntry?.toString(16) ?? '?') + ' rsp=' + (BigInt.asUintN(64, this.regview[4]) > BigInt.asUintN(64, _rsp0 ?? 0n) ? 'above' : 'in'); const m = (this.deoptSrc ??= new Map()); m.set(k, (m.get(k) || 0) + 1); }   // OXWASM_DEOPTSRC=1: deopt target by the entry dispatched from the run loop
         if (this.inExec(t)) this.profileTarget(t);
         const f = this._aotOff ? undefined : this.aotFns.get(t);
         // t !== _deoChainT: an instruction-escape deopt (rdtsc/cpuid/div
@@ -3527,6 +3531,7 @@ export class LinuxEngine {
         if (ENV.OXWASM_IHIST && globalThis.__ihist && this._ctor?.argv?.[0]?.includes(ENV.OXWASM_IHIST)) { const b = new Map(); for (const [k, v] of globalThis.__ihist) { const kk = (BigInt(k) >> 6n << 6n).toString(16); b.set(kk, (b.get(kk) || 0) + v); } __dbg('[ihist] ' + [...b].sort((x, y) => y[1] - x[1]).slice(0, 60).map(([k, v]) => k + '=' + v).join(' ')); __dbg('[ihist-maps] ' + (this.maps ?? []).filter((m) => m.path).map((m) => m.at.toString(16) + '+' + m.len.toString(16) + '@' + (m.fileOff ?? 0).toString(16) + ':' + m.path).join(' ')); }
         if (this.calloutLog && ENV.OXWASM_STATS && this._ctor?.argv?.[0]?.includes(ENV.OXWASM_STATS)) console.error('[callouts] ' + [...this.calloutLog].sort((x, y) => y[1] - x[1]).slice(0, 30).map(([k, v]) => k + ' x' + v).join(' | '));
         if (this._episodes && ENV.OXWASM_STATS && this._ctor?.argv?.[0]?.includes(ENV.OXWASM_STATS)) { const E = [...this._episodes]; const tot = E.reduce((a, [, v]) => a + v[1], 0), n = E.reduce((a, [, v]) => a + v[0], 0); console.error(`[episodes] n=${n} steps=${tot} ` + E.sort((x, y) => y[1][1] - x[1][1]).slice(0, 40).map(([k, v]) => k.toString(16) + ':' + v[2] + ':' + v[0] + 'x' + v[1] + (this.aotFns.has(k) ? '[unit]' : this.aotFailed.has(k) ? '[failed:' + (this._aotWhy?.get(k) || '?').slice(0, 60) + ']' : '[prof=' + (this.profile.get(k) | 0) + ']')).join(' ')); }
+        if (this.deoptSrc && ENV.OXWASM_STATS && this._ctor?.argv?.[0]?.includes(ENV.OXWASM_STATS)) console.error('[deoptsrc] ' + [...this.deoptSrc].sort((x, y) => y[1] - x[1]).slice(0, 12).map(([k, v]) => k + ' x' + v).join(' | '));
         if (this.deoptLog && ENV.OXWASM_STATS && this._ctor?.argv?.[0]?.includes(ENV.OXWASM_STATS)) console.error('[deopts] ' + [...this.deoptLog].sort((x, y) => y[1] - x[1]).slice(0, 40).map(([k, v]) => k.toString(16) + ' x' + v).join(' '));
         if (ENV.OXWASM_DUMPTAB && ENV.OXWASM_STATS && this._ctor?.argv?.[0]?.includes(ENV.OXWASM_STATS)) { try { const [ah, cnt, file] = ENV.OXWASM_DUMPTAB.split(':'); const a = BigInt('0x' + ah), n = +cnt; const out = []; for (let i = 0; i < n; i++) out.push(this.mem.read(a + BigInt(i * 8), 8n).toString(16)); process.getBuiltinModule('node:fs').writeFileSync(file, out.join('\n') + '\n'); } catch (e) { console.error('[dumptab] ' + e.message); } }   // OXWASM_DUMPTAB=hexaddr:count:file: u64 words of guest memory at exit (a runtime-filled jump table)
         if (ENV.OXWASM_STATS && this._ctor?.argv?.[0]?.includes(ENV.OXWASM_STATS)) console.error('[aotfail] ' + this.hotFailures(30).slice(0, 40).map((f) => f.addr.toString(16) + ' x' + f.calls + ' ' + f.why).join(' | '));
@@ -5948,14 +5953,16 @@ export class LinuxEngine {
   // (41k entries x 1,800 units). Unmapped code leaves stale entries behind,
   // which only means a call's fall-through may be cut at an address that
   // was an entry; a snapshot restore or a funcref-table reset starts over.
+  // Only addresses the guest has CALLED. The set used to hold every registered export and profiled target as
+  // well, which includes loop-head and continuation roots - return addresses - and a cached continuation unit
+  // re-registered in the next run cut its caller's call as noreturn: 1.67M deopts a run with the threaded LLInt,
+  // whose final ret lands in the run loop and roots the C++ return address.
   _knownEntries() {
     if (!this._entries) { const e = this._entries = new Set();
-      for (const k of this.aotCalls.keys()) e.add(k.toString());
-      for (const k of this.aotFns.keys()) e.add(k.toString());
-      for (const k of this._ftSeen) e.add(k.toString()); }
+      for (const t of this._callEntries ?? []) e.add(t.toString()); }
     return this._entries;
   }
-  _entryAdd(k) { if (this._entries) this._entries.add(k.toString()); }
+  _entryAdd(k) { }   // registration no longer makes an entry (see _knownEntries)
   _killProcSiblings(t) {
     for (const x of this.threads) if (x !== t && x.proc === t.proc && x.state !== 'dead') {
       x.state = 'dead'; if (x.ctid) { try { this.mem.write(x.ctid, 4n, 0n); } catch {} }

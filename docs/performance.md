@@ -1879,3 +1879,34 @@ noise (strings -10%, nothing else), so it stays opt-in; one GC marker instead of
 **OXWASM_MEMREG=xmm** (only the xmm locals of a dispatch root in the regfile, GPRs stay locals) measured 441 and
 509 against the locals' 489 and 472 in alternating pairs: the machine's run-to-run noise (fib 20-26 for the same
 cache) is larger than any effect. Not adopted; opt-in like the other two modes.
+
+### The LLInt as one function per handler (OXWASM_THREADED=1): built, measured, slower
+The per-handler layout exists now: a dispatch root is split into regions (blocks reachable from a jump-table
+target without passing another target, closed over shared predecessors), each region is a wasm function
+exporting its entry, every handler's computed goto tail-calls through a module-local funcref table built from
+the runtime-filled opcode table (6 tables cover all 1,268 sites of JSC's LLInt), direct edges between regions
+tail-call through the dispatch hash, and an unreachable target is returned to the caller rather than handed to
+the deopt import, because a region's entry rsp is not a frame base (the LLInt resets rsp from the JS frame after
+every call: through the import, every dispatch after a JS call was an abandoned-frame unwind, fib 10x). 792
+functions and 1.33 MB of machine code replace one 3.1 MB function; the suite is bit-exact with it on.
+
+Measured on fresh caches, same engine, alternating (cold94 giant, cold95 threaded):
+
+| layout | medians | fib | math | objects | strings | maps |
+|---|---|---|---|---|---|---|
+| one function (default) | 503, 490 | 20-21 | 38-40 | 59-65 | 51-54 | 79 |
+| per handler | 568, 513 | 18 | 53-55 | 66-84 | 58-68 | 96-97 |
+
+Per-site indirect jumps do help the call-heavy phase (fib -10%), but every bytecode now pays a regfile spill
+of the dirty registers, the fuel and depth bookkeeping, a bounds-checked indirect tail call and the callee's
+reload, where the giant function paid a br_table and whatever V8 spilled to the frame - and the arithmetic
+phases pay it most (math +40%). Overall 3-13% slower; it stays opt-in. V8's lazy compilation and Liftoff are not
+a factor (--no-wasm-lazy-compilation, --no-liftoff: within noise).
+
+Two engine bugs surfaced on the way, both fixed and both in the default layout too:
+- A call whose fall-through address was any registered export or profiled target was cut as noreturn by the
+  analyzer. Continuation roots and loop heads are return addresses and jump targets, so once one existed at a
+  C++ return address every later translation of that caller deopted after the call: 198k-1.67M deopts a run
+  with the threaded LLInt (whose final ret lands in the run loop and roots the return address), 6k a run in the
+  default layout. The entries set is now the addresses the guest has actually called: deopts per run 677.
+- OXWASM_DEOPTSRC=1 attributes deopt targets to the entry dispatched from the run loop, which is what found it.

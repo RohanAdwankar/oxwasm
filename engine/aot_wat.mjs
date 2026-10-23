@@ -125,7 +125,8 @@ export function splitDispatchRoot(an, entry) {
     blocks.sort((x, y) => x.start < y.start ? -1 : x.start > y.start ? 1 : 0);
     const bidx = new Map(); blocks.forEach((b, i) => bidx.set(b.start.toString(), i));
     const calls = new Set(); for (const b of blocks) for (const insn of b.insns) if (insn.mnem === 'call' && insn.rel !== undefined) calls.add(((insn.rip + BigInt(insn.len) + insn.rel) & M).toString());
-    out.set(an.blocks[en].start.toString(), { blocks, bidx, M, calls, jtabs: new Map(), region: true });
+    const jtabs = new Map(); for (const b of blocks) { const l = b.insns[b.insns.length - 1]; if (l.mnem === 'jmpind' && an.jtabs.has(l.rip.toString())) jtabs.set(l.rip.toString(), an.jtabs.get(l.rip.toString())); }
+    out.set(an.blocks[en].start.toString(), { blocks, bidx, M, calls, jtabs, region: true });
   }
   return out;
 }
@@ -1243,6 +1244,12 @@ function structure(N, succs) {
 function emitUnitFunction(a0, fnAddr, ctx) {
   const { guestBase, ramBase, canDirect } = ctx;
   const isTailTarget = (a) => ctx.tailTargets != null && ctx.tailTargets.has(a.toString());   // THREADED: a sibling region's entry
+  // How a unit hands control to a rip it cannot reach in wasm. Normally the deopt import interprets inside this
+  // frame until the frame exits. A handler region has no frame of its own (its entry rsp is wherever the
+  // interpreter's rsp happened to be), so it RETURNS the rip instead: a caller unit's return check accepts a real
+  // return and passes anything else up to the run loop, which dispatches or interprets it - and can root a
+  // continuation there. Through the import, every such jump was an abandoned-frame unwind by exception.
+  const DEOPT_REX = ctx.tailTargets != null ? '(return (local.get $rex))' : '(return (call $x_deopt (local.get $rex) (local.get $rsp0)))';
   // Fast dispatch: inline the $ftr hash's FIRST probe at each resolution
   // site. idealdisp priced the out-of-line $ftr call at 7.6x native per call
   // against 4.9x for the same probe inlined - the wasm call boundary itself
@@ -1422,7 +1429,8 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       term.push({kind:'jmp', t, ta, tail: !!last.tailCut || (t < 0 && isTailTarget(ta))}); succs.push([t]); }
     else if (last.mnem === 'ret' || last.mnem === 'retn') { term.push({kind:'ret', pad: last.mnem==='retn' ? Number(last.n) : 0}); succs.push([]); }
     else if (last.mnem === 'jmpind') { hasDeopt = true;
-      if (hasJtab && a0.jtabs.has(last.rip.toString())) { term.push({kind:'jtab', src:last.src}); succs.push([...jtabUnion]); }
+      if (ctx.tailTargets != null && a0.jtabs?.has(last.rip.toString())) { term.push({kind:'tjtab', src:last.src}); succs.push([]); }   // THREADED: the table's rows are sibling functions
+      else if (hasJtab && a0.jtabs.has(last.rip.toString())) { term.push({kind:'jtab', src:last.src}); succs.push([...jtabUnion]); }
       else { term.push({kind:'deopt', src:last.src}); succs.push([]); } }
     else if (last.mnem === 'udec')   { hasDeopt = true; term.push({kind:'deopt', src:null, at:last.rip}); succs.push([]); }
     // a call whose fall-through was cut (noreturn callee, trap stub): the continuation is a deopt to the real next
@@ -3769,7 +3777,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
             // otherwise escape to the interpreter with them handed over.
             const inF = softFlags.get(i+':'+ii);
             if (!(inF && inF.kind === 'sub' && inF.size === S))
-              L.push(`(if (i64.eqz (local.get $r1)) (then ${eflagsStore(inF)} (local.set $rex (i64.const ${hexs(insn.rip)})) ${SA_MARK} (return (call $x_deopt (local.get $rex) (local.get $rsp0)))))`);
+              L.push(`(if (i64.eqz (local.get $r1)) (then ${eflagsStore(inF)} (local.set $rex (i64.const ${hexs(insn.rip)})) ${SA_MARK} ${DEOPT_REX}))`);
             const e = '$ce_'+insn.rip.toString(16), lp = '$cl_'+insn.rip.toString(16);
             // repe (rep): stop when fr != 0; repne (rep2): stop when fr == 0
             const stop = insn.rep2 ? `(i64.eqz (local.get $fr))` : `(i64.ne (local.get $fr) (i64.const 0))`;
@@ -3794,7 +3802,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           const inF = softFlags.get(i+':'+ii);
           const v = eflagsStore(inF, 'value');
           if (!v) { hasDeopt = true; L.push(`${eflagsStore(inF)} (local.set $rex (i64.const ${hexs(insn.rip)}))`, SA_MARK,
-                                            `(return (call $x_deopt (local.get $rex) (local.get $rsp0)))`); break; }
+                                            DEOPT_REX); break; }
           const t = T();
           L.push(`(local.set ${t} (i64.or ${v} (i64.or (i64.shl (i64.load32_u (i32.const ${DF_SLOT})) (i64.const 10)) (i64.load32_u (i32.const ${ESTICKY_SLOT})))))`,
                  `(local.set $r4 (i64.sub (local.get $r4) (i64.const 8)))`,
@@ -3923,9 +3931,9 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     // resumes in the interpreter at that address, which faults exactly as
     // native would if the bytes are truly garbage.
     const deoptTo = (addr) => isTailTarget(addr)
-      ? [`(local.set $rex (i64.const ${hexs(addr)}))`, SA_MARK, ...tailJmp(), `(return (call $x_deopt (local.get $rex) (local.get $rsp0)))`]   // THREADED: a sibling region, chained in wasm
+      ? [`(local.set $rex (i64.const ${hexs(addr)}))`, SA_MARK, ...tailJmp(), DEOPT_REX]   // THREADED: a sibling region, chained in wasm
       : [`(local.set $rex (i64.const ${hexs(addr)}))`,
-      SA_MARK, `(return (call $x_deopt (local.get $rex) (local.get $rsp0)))`];
+      SA_MARK, DEOPT_REX];
     if (t.kind === 'jcc') {
       const c = cond(last.cond);
       const T = t.t, F = t.f;
@@ -3954,7 +3962,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     } else if (t.kind === 'jmp' || t.kind === 'inlinecall') {
       if (t.t < 0 && t.tail) {                            // tail call to a known entry: chain in wasm, else deopt
         L.push(`(local.set $rex (i64.const ${hexs(t.ta)}))`, SA_MARK, ...tailJmp(),
-               `(return (call $x_deopt (local.get $rex) (local.get $rsp0)))`); }
+               DEOPT_REX); }
       else if (t.t < 0) L.push(...deoptTo(t.ta));
       else { const b = brTo(t.t); if (b) L.push(b); }
     } else if (t.kind === 'inlinetail') {
@@ -3991,6 +3999,25 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       L.push(`(local.set $r4 (i64.add (local.get $r4) (i64.const ${8 + t.pad})))`);
       L.push(SX_MARK);
       L.push(`(return (local.get $rex))`);
+    } else if (t.kind === 'tjtab') {
+      // THREADED: `jmp *(%base,%idx,8)` over a table whose rows are sibling region functions. The row index
+      // selects a module-local funcref table (one per distinct row vector, shared by every site that reads
+      // the same table) and the handler tail-calls through it: a bounds check and one indirect call, no hash
+      // probe. Out of range, or a row with no function in this unit, takes the generic path (hash, else the
+      // rip is returned). The fuel and depth words are kept exactly as the hash path keeps them.
+      const lastI = blk.insns[blk.insns.length - 1];
+      const ts = a0.jtabs.get(lastI.rip.toString());
+      L.push(`(local.set $rex ${rd(t.src,8,lnext)})`);
+      if (t.src.kind === 'mem' && t.src.index >= 0 && t.src.scale === 8 && !t.src.fs && ts && ts.length >= 2) {
+        const key = ts.map(String).join(',');
+        let tb = ctx.jtTables.get(key); if (!tb) { tb = { id: ctx.jtTables.size, ts }; ctx.jtTables.set(key, tb); }
+        const ix = rd({ kind: 'reg', r: t.src.index }, 8, lnext);
+        L.push(`(local.set $pc (select (i32.wrap_i64 ${ix}) (i32.const -1) (i64.lt_u ${ix} (i64.const ${ts.length}))))`);
+        L.push(SA_MARK);
+        L.push(`(if (i32.and (i32.ge_s (local.get $pc) (i32.const 0)) ${ftOk}) (then ${ftBurn} ${ftDec} (return_call_indirect $jt${tb.id} (type $uft) (local.get $pc))))`);
+      } else L.push(SA_MARK);
+      L.push(...tailJmp());
+      L.push(DEOPT_REX);
     } else if (t.kind === 'jtab') {
       // indirect jump through a discovered jump table: resolve the COMPUTED
       // address against this function's block map and re-enter the dispatch
@@ -4020,7 +4047,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
         L.push(`(br_if $L_disp (i32.ge_s (local.get $pc) (i32.const 0)))`);
         L.push(SA_MARK);
         L.push(...tailJmp());
-        L.push(`(return (call $x_deopt (local.get $rex) (local.get $rsp0)))`);
+        L.push(DEOPT_REX);
       } else {
         // structured: br_table over RPO index -> the target block's label.
         // A target that is the next block has no label of its own (it is
@@ -4032,7 +4059,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
         L.push(`(block $jt_next_${i} (block $jt_dflt_${i} (br_table ${vec.join(' ')} $jt_dflt_${i} (local.get $pc)))`);
         L.push(SA_MARK);
         L.push(...tailJmp());
-        L.push(`(return (call $x_deopt (local.get $rex) (local.get $rsp0))))`);
+        L.push(`${DEOPT_REX})`);
         if (globalThis.__jtabStats) globalThis.__jtabStats.structured++;
       }
     } else if (t.kind === 'deopt') {
@@ -4042,7 +4069,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       if (!t.src) { const st = eflagsStore(softFlags.get(i+':'+(blk.insns.length-1))); if (st) L.push(st); }   // escape: the interpreter continues with these flags
       L.push(SA_MARK);
       if (t.src) L.push(...tailJmp());
-      L.push(`(return (call $x_deopt (local.get $rex) (local.get $rsp0)))`);
+      L.push(DEOPT_REX);
     } else {                                              // fall-through
       if (t.t < 0) L.push(...deoptTo(t.ta));
       else { const b = brTo(t.t); if (b) L.push(b); }
@@ -4298,7 +4325,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   let wat = MULTI ? `  (func $${name}_m (param $pc i32) (result i64)\n` : `  (func $${name} (export "${name}") (result i64)\n`;
   for (let r=0;r<16;r++) wat += `    (local $r${r} ${isI32(r)?'i32':'i64'})\n`;
   wat += '    (local $fa i64) (local $fb i64) (local $fr i64) (local $cf i64) (local $fbits i64) (local $rsp0 i64) (local $rex i64)\n';
-  if ((DISP || hasJtab) && !MULTI) wat += '    (local $pc i32)\n';
+  if ((DISP || hasJtab || ctx.tailTargets != null) && !MULTI) wat += '    (local $pc i32)\n';
   if (usesFtr) wat += '    (local $fti i32)\n';
   if (usesFts) wat += '    (local $fts i32)\n';
   if (usesGa) wat += '    (local $ga i32) (local $gp i32)\n';
@@ -4328,7 +4355,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     `    ${yieldSpill()}\n    (i32.store (i32.const ${FTLOOP}) (i32.const ${LOOPYIELD_N}))\n` +
     `    (if (i32.eqz (i32.load (i32.const ${FTNEST}))) (then (i32.store (i32.const ${FTYTOP}) (i32.add (i32.load (i32.const ${FTYTOP})) (i32.const 1))) (return (local.get $rex))))\n` +
     `    (i32.store (i32.const ${FTYNEST}) (i32.add (i32.load (i32.const ${FTYNEST})) (i32.const 1)))\n` +
-    `    (return (call $x_deopt (local.get $rex) (local.get $rsp0)))\n`;
+    `    ${DEOPT_REX}\n`;
   if (usesYield) wat += '    (block $yield\n';
   // The jump-table resolver: address -> RPO index for every table target, a
   // balanced binary-search tree of ifs (log2(n) compares per computed
@@ -4655,7 +4682,7 @@ export function compileUnitWat(mem, entry, opts = {}) {
   // 20,464 the run needed, a third of the emit phase.
   let emitting = null; const uses = new Map();
   const canDirect = (k) => { const ok = funcs.has(k) && !poisoned.has(k); if (ok && emitting !== null) uses.get(emitting).add(k); return ok; };
-  const ctx = { guestBase, ramBase, canDirect, tailTargets };
+  const ctx = { guestBase, ramBase, canDirect, tailTargets, jtTables: new Map() };
   // emit; a failure poisons that function and re-emits its direct callers -
   // they switch from direct wasm calls to callout escapes
   const texts = new Map();
@@ -4733,6 +4760,13 @@ export function compileUnitWat(mem, entry, opts = {}) {
     wat += '  (import "js" "ftab" (table $ft 0 funcref))\n';
     wat += '  (type $uft (func (result i64)))\n';
     wat += FTR_WAT;
+    // THREADED: one funcref table per distinct jump-table row vector; a row whose function is not in this unit
+    // gets a stub that returns the rip, which is what a hash miss would have done
+    if (ctx.jtTables.size) { const stubs = new Set();
+      for (const tb of ctx.jtTables.values()) {
+        const names = tb.ts.map((a) => { const k = a.toString(); const nm = 'f_' + a.toString(16); if (texts.has(k)) return '$' + nm; stubs.add(nm); return '$jtmiss_' + nm; });
+        wat += `  (table $jt${tb.id} ${names.length} funcref)\n  (elem (table $jt${tb.id}) (i32.const 0) func ${names.join(' ')})\n`; }
+      for (const nm of stubs) wat += `  (func $jtmiss_${nm} (result i64) (i64.const ${BigInt('0x' + nm.slice(2))}))\n`; }
     // In-wasm dispatch driver: after a top frame's guest ret exits its wasm
     // function, resolve the exit rip and chain to the next compiled function
     // without returning to JS — the JS dispatch loop paid a full regfile
