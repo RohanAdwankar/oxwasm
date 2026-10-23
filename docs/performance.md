@@ -1859,3 +1859,19 @@ copied the thread without its sigsuspend marker (suspendOld), and every delivery
 rule on that marker. Carrying it through materialisation fixes it: the short job returns in 28 s. The two long
 runs that returned at 641/643 s were the same race landing on a different timing; the roots only changed when
 the shell's child exited relative to its sigsuspend.
+
+### Re-baselined on a fresh VM: 4.1-4.8x native with the JIT off (24-round mix, medians of rounds 9-24)
+The worker VM restarted mid-session and every number after it is ~30% lower than the same configuration measured
+before (fib 20 vs 30, math 40 vs 75): the earlier box was loaded or throttled, so the pre-restart tables above are
+only comparable among themselves. Clean numbers, all with the madvise fast path and the sigsuspend fix:
+
+| configuration | medians (ms) | interpreted/round |
+|---|---|---|
+| continuation roots off (cold77) | 493, 500 | 14-17k |
+| continuation roots on (cold83) | 450, 454, 445, 464, 419, 504 | 0.1-1.6k |
+| roots + OXWASM_ABIRELOAD=1 (cold89: callee-saved GPRs and xmm2-15 not reloaded after calls) | 443, 452 | 0.7-1.5k |
+| roots + BUN_JSC_numberOfGCMarkers=1 | 429, 421 | |
+
+Native, same binary, JIT off: 104 ms; native default: 45 ms. So the stable configuration stands at 4.1-4.8x the
+like-for-like native and ~10x the native default. The roots are worth 5-10% here; the ABI reload lever is within
+noise (strings -10%, nothing else), so it stays opt-in; one GC marker instead of four is within noise too.
