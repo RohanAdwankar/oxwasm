@@ -134,6 +134,7 @@ const EPISODES = ENV.OXWASM_EPISODES === '1';
 // the continuation compiled; it exits at the function's ret like a loop-head root does.
 const RETROOT = ENV.OXWASM_RETROOT === undefined ? 8 : +ENV.OXWASM_RETROOT;
 const DEOPT_INPLACE = ENV.OXWASM_DEOPT_INPLACE !== '0';   // a deopt with no landing unit interprets its frame in place (see the deopt import)
+const RETROOT_CHAIN = ENV.OXWASM_RETROOT_CHAIN !== '0';
 const RETROOT_LIBEXIT = ENV.OXWASM_RETROOT_LIBEXIT === '1';
 const ROOTTRACE = ENV.OXWASM_ROOTTRACE ? BigInt('0x' + ENV.OXWASM_ROOTTRACE) : null;   // trace _retRoot decisions for one rip
 const RETROOT_MAX = +ENV.OXWASM_RETROOT_MAX || 3000;   // instruction budget of a continuation root's own function
@@ -6621,7 +6622,10 @@ export class LinuxEngine {
                  // continuation root, like a ret the interpreter runs. An unwound exit is not: a signal's sigreturn lands
                  // on whatever instruction was interrupted, and a root there (dash's SIGCHLD inside its wait loop)
                  // broke the shell - `wait` returned only when the guard expired, then commands came back 127
-                 if (RETROOT && !this._exitUnwound && !this.aotFns.has(this.cpu.rip)) this._retRoot(this.cpu.rip, 'exit');
+                 // A park root is a continuation inside a frame; when its unit returns normally, the rip it lands on is the
+                 // caller's continuation, which nothing else reaches: root it as the park kind too, so the chain of
+                 // frames above a parked syscall fills in one level per resume (OXWASM_RETROOT_CHAIN=0 turns it off).
+                 if (RETROOT && !this._exitUnwound && !this.aotFns.has(this.cpu.rip)) this._retRoot(this.cpu.rip, (RETROOT_CHAIN && this._retRoots !== undefined && this._retRoots.has(this._lastEntry?.toString())) ? 'park' : 'exit');
                  if (this.ripTrace !== undefined) { this.ripTrace[this.ripTraceI++ & 65535] = -this.cpu.rip; }  // AOT exit
                  branched = true;
                  if (this.blocked) { if (this.park()) { if (EPISODES) { this._epStart = this.cpu.rip; this._epN = this.stats.interpreted; this._epHow = 'dpark'; } if (RETROOT && !this.aotFns.has(this.cpu.rip)) this._retRoot(this.cpu.rip, 'park'); continue; } break; }

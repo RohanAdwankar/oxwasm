@@ -2222,3 +2222,8 @@ deopts a run handled in place, 686k-704k interpreted steps); unwinding 245.5, 24
 cut in interpreted steps for 0-5% of the round. The exits that remain are blocking syscalls and syscall
 preemption (BlockUnwind must drop the frames: the thread parks), whose continuations after resume are the
 return addresses in the episode log (4fd1aa0, pthread_cond_wait+221 ...). suite34 green.
+
+Park roots chaining upward (a park-root unit's plain return roots the rip it lands on, OXWASM_RETROOT_CHAIN):
+250.5, 210.0, 247.0 with 68-76 roots and 584k-632k interpreted steps, against 242.5, 232.5 with 8-10 roots and
+700k steps. Another 15% of the steps for nothing measurable. On by default (it is cheap and bounded by the
+stack depth at the park); the interpreter is no longer where the round is.
