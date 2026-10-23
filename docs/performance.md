@@ -1739,3 +1739,14 @@ phases fib 30 math 75 objects 99-121 strings 95 sorting 83 maps 130 json 90. Nat
 math 13 objects 16 strings 14 sorting 14 maps 28 json 9); native with the baseline JIT: 45 ms. So 6.5-7.5x against the
 like-for-like native, 15x against the native default - but measurable to a few percent, with no abort and no GC-timing
 noise. This is the configuration to optimise the translation against; the JIT-region miscompile stays open in parallel.
+
+### Where the JIT-off mix goes (cold75, V8 ticks over rounds 8-15, 7.7 s)
+One wasm function takes 14% of all ticks by itself: bundle_0's function 130, `(i32) -> (i64)` with a 1,257,483-byte body -
+JavaScriptCore's LLInt, every bytecode handler in a single multi-entry function because the handlers chain through one
+computed-goto table (`jmp *table(%rsi,%rax,8)`), which the analyzer keeps in one function. V8's optimizer compiles a
+function that size with spills around the giant br_table, which fits a uniform 6-7x across phases. The per-function
+instruction cap (OXWASM_UNIT_MAXINSNS, 30,000 for the opencode child) is a refusal, not a split, so no knob chops it; a
+per-handler split would pay the call protocol per bytecode (~75 instructions) and is not obviously a win. Next after it:
+the engine's own JS at ~15% (LoadIC/FindOrderedHashMapEntry/StrictEqual under `step`: ~21k interpreted instructions a
+round at ~7 us each, driven by 3-9 callouts a round into refused functions - 5b9a4e0 x158, refused for a `jne` that
+consumes the flags of a `call`), V8 internals ~15% (Liftoff compiles and instantiation of late units, the host GC).
