@@ -524,9 +524,18 @@ export class LinuxEngine {
   // OXWASM_WASMNAMES=1: every module instantiated (cached units, bundles, tier-ups) gets a "name" custom section
   // built from its exports, so a V8 tick log reads f_<entry> instead of wasm-function[i]. OXWASM_WASMDIR=<dir>
   // writes the bytes there as <name>.wasm. Both are profiling aids; off, this returns the bytes untouched.
-  _modBytes(name, b) {
+  _modBytes(name, b, wat) {
     if (ENV.OXWASM_WASMDIR) { try { process.getBuiltinModule('node:fs').writeFileSync(ENV.OXWASM_WASMDIR + '/' + name + '.wasm', b); } catch {} }
     if (!ENV.OXWASM_WASMNAMES) return b;
+    // with the WAT at hand every defined function is named, exported or not (a multi-entry unit's body `$f_X_m` is
+    // not exported and showed up as wasm-function[7] - 10% of a JIT-on profile with no owner)
+    if (wat) { try { const names = []; let nImp = 0; const re = /^  \((?:import "[^"]*" "[^"]*" \(func|func)(?: \$([^\s()]+))?/gm; let m;
+        while ((m = re.exec(wat)) !== null) { if (m[0].startsWith('  (import')) nImp++; else names.push(m[1] || null); }
+        const leb = (n) => { const r = []; do { let x = n & 127; n >>>= 7; if (n) x |= 128; r.push(x); } while (n); return r; };
+        const enc = new TextEncoder(); const ent = []; names.forEach((nm, i) => { if (nm) ent.push([nImp + i, enc.encode(nm)]); });
+        if (ent.length) { const sub = [...leb(ent.length)]; for (const [ix, nm] of ent) sub.push(...leb(ix), ...leb(nm.length), ...nm);
+          const body = [...leb(4), 110, 97, 109, 101, 1, ...leb(sub.length), ...sub]; const lb = leb(body.length); const out = new Uint8Array(b.length + 1 + lb.length + body.length);
+          out.set(b, 0); out[b.length] = 0; out.set(lb, b.length + 1); out.set(body, b.length + 1 + lb.length); return out; } } catch {} }
     let o = 8; const u32 = () => { let r = 0, s = 0; for (;;) { const x = b[o++]; r |= (x & 127) << s; if (!(x & 128)) break; s += 7; } return r >>> 0; };
     const exps = new Map();
     while (o < b.length) { const id = b[o++]; const len = u32(); const end = o + len;
@@ -1137,6 +1146,8 @@ export class LinuxEngine {
       // OXWASM_BYTECHECK=1: keep a copy of the bytes each JIT-region function was translated from; dispatchAot compares
       // them before running the function and reports a translation whose source changed without an invalidation
       if (BYTECHECK && unit.ext && !_inStatic) { for (const [k, a, b, spans] of unit.ext) if (a !== null) { try { const cp = []; for (const [x, y] of (spans || [[a, b]])) cp.push([x, this.mem.view(x, y - x).slice()]); (this._byteCopy ??= new Map()).set(k, { cp, tag: this.stats.disp | 0 }); } catch {} } }
+      // PATCHJMP sites (aot_wat.mjs): stores that stay inside one are JSC repatching a jump the unit reads at run time
+      if (unit.patch && unit.patch.length) { const ps = this._patchSites ??= new Map(); for (const [x, y] of unit.patch) { const q = x >> 12n; let l = ps.get(q); if (!l) ps.set(q, l = []); l.push([x, y]); } this.stats.patchSites = (this.stats.patchSites | 0) + unit.patch.length; }
       if (unit.ext) { const ex = this._extents ??= new Map(); for (const [k, a, b, spans] of unit.ext) if (a !== null) {
         ex.set(k, [a, b]);
         if (CWVERIFY && !(this.execRangesStatic ?? []).some(([x, y]) => a >= x && a < y)) { try { for (const [sx, sy] of (spans || [[a, b]])) { if (sy - sx > 65536n) continue; const v = this.mem.view(sx, sy - sx); if (v) (this._extSnap ??= new Map()).set(k + ':' + sx, { k, a: sx, bytes: Uint8Array.from(v) }); } } catch {} }
@@ -1216,7 +1227,7 @@ export class LinuxEngine {
                           this.noteAotFail(entry, e.message); });
         return;
       }
-      const inst = new WebAssembly.Instance(new WebAssembly.Module(this._modBytes('t_' + entry.toString(16), bytes)), this.aotImports());
+      const inst = new WebAssembly.Instance(new WebAssembly.Module(this._modBytes('t_' + entry.toString(16), bytes, unit.wat)), this.aotImports());
       for (const a of unit.funcs) {
         const ak = a;
         if (!this.aotFns.has(ak)) this.registerAotFn(ak, inst.exports['f_' + a.toString(16)]);
@@ -1782,6 +1793,7 @@ export class LinuxEngine {
       if (this.stats.codeWrites % +ENV.OXWASM_CWSTAT === 0) { __dbg(`[cwwhy] ${[...t].map(([a, b]) => a + '=' + b).join(' ')} top=${[...pg].sort((x, y) => y[1] - x[1]).slice(0, 4).map(([a, b]) => a.toString(16) + 'x' + b).join(' ')}`); }
     }
     if (ENV.OXWASM_CWSTAT && this.stats.codeWrites % +ENV.OXWASM_CWSTAT === 0) __dbg(`[cwstat] t=${(this.nowMs() / 1000) | 0}s writes=${this.stats.codeWrites} disjoint=${this.stats.cwDisjoint | 0} invalSlow=${this.stats.invalSlow | 0} volatile=${this.stats.volatilePages | 0} aotFns=${this.aotFns.size} ext=${this._extents?.size} wide=${this._wideExt?.size | 0}`);
+    if (this._patchSites !== undefined) { const l = this._patchSites.get(g >> 12n); if (l !== undefined) for (const [x, y] of l) if (g >= x && end <= y) { this.stats.cwPatch = (this.stats.cwPatch | 0) + 1; return; } }
     // Translations record the bytes they were built from, so a store that touches none of them (the JIT emitting its
     // next function beside a thunk it already translated) changes nothing and does not make the page volatile.
     if (!EXACT_CW_OFF && this._cwDisjoint(g, end)) {

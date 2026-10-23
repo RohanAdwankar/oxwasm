@@ -174,6 +174,7 @@ export const PGMAP = 0x300000, PGMAP_BYTES = 0x100000;
 // Largest wat text this emitter will hand the runtime for ONE function; see
 // the refusal at the end of the function emitter for the two measurements
 // that bracket it.
+const PATCHJMP = !(typeof process !== 'undefined' && process.env?.OXWASM_PATCHJMP === '0');   // see patchSite
 const STALE_UNWIND = !(typeof process !== 'undefined' && process.env?.OXWASM_STALEUNWIND === '0');   // see FTSTALE
 const WATCOMMENTS = typeof process !== 'undefined' && process.env?.OXWASM_WATCOMMENTS === '1';
 const MAXWAT = Number(process.env.OXWASM_MAXWAT || 5_000_000);
@@ -2886,6 +2887,28 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   // discards the return address when an exception is pending. With the rsp test alone the caller carried on after the
   // call as if the callee had returned, the throw was swallowed, and the JS state it left behind crashed JSC at a later
   // slow path (jsAddSlowCase on a freed cell, round 5 of the mix / round ~37 of objects, bisected to those thunks).
+  // PATCHJMP. JavaScriptCore repatches the rel32 of a `jmp`, `jcc` or `call` in a JIT body when an inline cache
+  // changes (a new stub), and it does so constantly. Dropping and re-translating the body on every such store left
+  // the body interpreted most of the time (IHIST: one 640-byte body was 90% of all interpreted rips in a steady
+  // round) and re-compiled eight units a round. A unit of anonymous memory instead reads the instruction back at
+  // run time: if the opcode is not what was translated it deopts to the instruction (the interpreter runs whatever
+  // is there now); if only the displacement moved, a jump chains to the new target through the dispatch table and
+  // a call dispatches to it. The site is reported to the engine (unit.patch), which lets stores inside it pass
+  // without an invalidation. Static code never changes and pays nothing.
+  const wa32 = (g) => Number(BigInt.asUintN(32, g + woff));
+  const patchSite = (insn) => { ctx.patch.push([insn.rip, insn.rip + BigInt(insn.len)]); };
+  const opcodeOk = (insn) => {   // true iff the opcode byte(s) at rip still read as translated
+    if (insn.len === 5) { const b0 = ctx.readByte(insn.rip); return `(i32.eq (i32.load8_u (i32.const ${wa32(insn.rip)})) (i32.const ${b0}))`; }
+    const b0 = ctx.readByte(insn.rip), b1 = ctx.readByte(insn.rip + 1n);
+    return `(i32.eq (i32.load16_u (i32.const ${wa32(insn.rip)})) (i32.const ${b0 | (b1 << 8)}))`;
+  };
+  const relLoad = (insn) => `(i32.load (i32.const ${wa32(insn.rip + BigInt(insn.len) - 4n)}))`;
+  const relNow = (insn) => Number(BigInt.asIntN(32, BigInt(insn.rel)));
+  const patchable = (insn) => ctx.anon && insn.rel !== undefined && ((insn.mnem === 'jmp' && insn.len === 5) || (insn.mnem === 'call' && insn.len === 5) || (insn.mnem === 'jcc' && insn.len === 6)) && ctx.readByte(insn.rip) >= 0;
+  // lines to run BEFORE a jump is taken: opcode changed -> deopt to the instruction; displacement changed -> chain to the new target
+  const patchJump = (insn) => { patchSite(insn); usesFtr = true; const next = insn.rip + BigInt(insn.len);
+    return [`(if (i32.eqz ${opcodeOk(insn)}) (then (local.set $rex (i64.const ${hexs(insn.rip)})) ${SA_MARK} ${DEOPT_REX}))`,
+            `(if (i32.ne ${relLoad(insn)} (i32.const ${relNow(insn)})) (then (local.set $rex (i64.add (i64.const ${hexs(next)}) (i64.extend_i32_s ${relLoad(insn)}))) ${SA_MARK} ${tailJmp().join(' ')} ${DEOPT_REX}))`]; };
   const retCheck = (rb, next) => ctx.staleCheck
     ? `(if (i32.or (i64.ne (local.get $r4) (local.get ${rb})) (i32.or (i64.ne (local.get $rex) (i64.const ${hexs(next)})) (i32.lt_u (local.get $fts) (i32.load (i32.const ${FTSTALE}))))) (then (return (local.get $rex))))`
     : `(if (i32.or (i64.ne (local.get $r4) (local.get ${rb})) (i64.ne (local.get $rex) (i64.const ${hexs(next)}))) (then (return (local.get $rex))))`;
@@ -3183,7 +3206,11 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       if ((insn.mnem === 'cmp' || insn.mnem === 'test') && !producers.has(ii)) continue;
       switch (insn.mnem) {
         case 'nop': break;
-        case 'mov': L.push(wr(insn.dst,S,rd(insn.src,S,next),next)); break;
+        case 'mov':
+          // PATCHJMP: `movabs reg, imm64` in a JIT body is JSC's operation pointer before `call reg`, and it is
+          // repatched when the operation changes (a profiled variant): read the immediate back at run time
+          if (ctx.anon && insn.src.kind === 'imm' && insn.dst.kind === 'reg' && S === 8 && insn.len === 10 && ctx.readByte(insn.rip) >= 0) { patchSite(insn); L.push(wr(insn.dst,8,`(i64.load (i32.const ${wa32(insn.rip + 2n)}))`,next)); break; }
+          L.push(wr(insn.dst,S,rd(insn.src,S,next),next)); break;
         case 'movzx': L.push(wr(insn.dst,insn.size,rd(insn.src,insn.src.size,next),next)); break;
         case 'movsx': {   // sign-extend; for a memory source use a single sign-extending load
           const e = insn.src.kind === 'mem' ? `(${LD_S[insn.src.size]} ${wasmAddr(insn.src,next)})`
@@ -3663,7 +3690,17 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           // The callee's exit rip is kept (not dropped) and the guest rsp is checked against its
           // pre-push value once the regfile is reloaded: see retCheck below.
           const rb = T(); L.push(`(local.set ${rb} (i64.add (local.get $r4) (i64.const 8)))`);
-          if (canDirect(target.toString()))
+          if (patchable(insn)) {
+            // PATCHJMP: the callee is whatever the rel32 says now; a changed opcode deopts to the call itself
+            patchSite(insn); usesFtr = true; const td = T();
+            L.push(`(if (i32.eqz ${opcodeOk(insn)}) (then (local.set $r4 (i64.add (local.get $r4) (i64.const 8))) (i64.store (i32.const 32) (local.get $r4)) (local.set $rex (i64.const ${hexs(insn.rip)})) ${DEOPT_REX}))`,
+                   `(local.set ${td} (i64.add (i64.const ${hexs(next)}) (i64.extend_i32_s ${relLoad(insn)})))`,
+                   icResolve(`(local.get ${td})`),
+                   ftSave(),
+                   `(if ${ftHit}`,
+                   `  (then ${ftBurn} ${nestUp}(local.set $rex (call_indirect $ft (type $uft) (local.get $fti)))${nestDn} ${ftRestore})`,
+                   `  (else (local.set $rex (call $x_callout (local.get ${td})))))`);
+          } else if (canDirect(target.toString()))
             // stack-budget check even on direct calls: past it, x_callout
             // interprets the callee instead of nesting another wasm frame
             L.push(ftSave(),
@@ -3949,6 +3986,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     if (t.kind === 'jcc') {
       const c = cond(last.cond);
       const T = t.t, F = t.f;
+      if (last.mnem === 'jcc' && T < 0 && patchable(last)) L.push(`(if ${c} (then ${patchJump(last).join(' ')}))`);
       if (T < 0 || F < 0) {
         if (T < 0 && F < 0) { L.push(`(if ${c} (then ${deoptTo(t.ta).join('\n')}))`); L.push(...deoptTo(t.fa)); }
         else if (T < 0) { L.push(`(if ${c} (then ${deoptTo(t.ta).join('\n')}))`); const b = brTo(F); if (b) L.push(b); }
@@ -3972,6 +4010,9 @@ function emitUnitFunction(a0, fnAddr, ctx) {
         else { L.push(bj(T, c)); L.push(goto(F)); }
       }
     } else if (t.kind === 'jmp' || t.kind === 'inlinecall') {
+      // only a jump that leaves the function (an inline cache's jump to its stub): the loop and branch jumps inside
+      // a body are never repatched and paid a load and a compare each (+10-40% on the JIT-on mix)
+      if (t.kind === 'jmp' && last.mnem === 'jmp' && t.t < 0 && patchable(last)) L.push(...patchJump(last));
       if (t.t < 0 && t.tail) {                            // tail call to a known entry: chain in wasm, else deopt
         L.push(`(local.set $rex (i64.const ${hexs(t.ta)}))`, SA_MARK, ...tailJmp(),
                DEOPT_REX); }
@@ -4696,7 +4737,9 @@ export function compileUnitWat(mem, entry, opts = {}) {
   // 20,464 the run needed, a third of the emit phase.
   let emitting = null; const uses = new Map();
   const canDirect = (k) => { const ok = funcs.has(k) && !poisoned.has(k); if (ok && emitting !== null) uses.get(emitting).add(k); return ok; };
-  const ctx = { guestBase, ramBase, canDirect, tailTargets, jtTables: new Map(), staleCheck: !!opts.staleCheck && STALE_UNWIND };
+  const ctx = { guestBase, ramBase, canDirect, tailTargets, jtTables: new Map(), staleCheck: !!opts.staleCheck && STALE_UNWIND,
+    // PATCHJMP: a unit of anonymous memory keeps JavaScriptCore's patchable rel32 jumps and calls live (see patchSite)
+    anon: !!opts.staleCheck && PATCHJMP, patch: [], readByte: (g) => { try { return Number(mem.read(g, 1n)); } catch { return -1; } } };
   // emit; a failure poisons that function and re-emits its direct callers -
   // they switch from direct wasm calls to callout escapes
   const texts = new Map();
@@ -4811,7 +4854,7 @@ export function compileUnitWat(mem, entry, opts = {}) {
   }
   wat += ')\n';
   wat = narrow32(wat);
-  return { wat,
+  return { wat, patch: ctx.patch,
            entryName: 'f_' + entry.toString(16),
            funcs: [...texts.keys()].map(k => BigInt(k)),
            // the guest bytes each function was translated from: a patch anywhere in them stales the translation

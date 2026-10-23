@@ -2018,3 +2018,46 @@ Native on this host, same binary, same bench, 24 rounds, medians of rounds 9-24:
 round (STEADY 40); JSC defaults 39.5 (STEADY 34). So the JIT-on mix now runs at 4.9-5.3x the like-for-like native
 and the ratio is uniform across phases (fib 4x, math 4x, objects 5x, strings 5x, sorting 4x, maps 5.5x, json 6x):
 this is translation quality and engine overhead spread over everything JSC runs, not one pathological phase.
+
+### Where a clean JIT-on round goes (vprof188, rounds 9-24, 4.6 s, 3,842 ticks; per phase by the bench's marks)
+The bench now prints `M <phase>` before each phase and the per-write stats line carries the written text
+(`txt=`), so the tick log aligns to phases (/tmp/v8phase.py). The split is the same in every phase: translated
+units 30% named plus 10% as `wasm-function[7]` (the unexported `$f_X_m` body of a multi-entry unit; tier-up modules
+now get a full name section from the WAT), V8 builtins 18%, the engine's JS 7% (step 1.4, decode 1.4 - the
+interpreter, and the emitter under tier-ups), libc 14%, V8 C++ 12% (instantiation of units that import the shared
+table, Liftoff, Scavenger, BigInt), Liftoff 5%, GC 1%. Steady state still tiers 8 units a round (123 over rounds
+9-24: late-hot static functions and JIT re-translations after inline-cache repatches), each a Liftoff compile and
+an instance that initialises the imported table: ~12% of the round. The CPU profiler (--cpu-prof) cannot unwind
+the units (39% lands on the js-to-wasm wrapper) but confirms the JS side: Instance+Module 5.7% under tierUpAot,
+step+_run1+decode 6%.
+
+Against native's 46 ms the ~235 ms round is: units ~95 ms (2x native by themselves), compile churn ~28, the
+interpreter and dispatch glue ~40, libc and V8 runtime ~70. The two largest non-unit items are therefore the
+re-translation churn and whatever is still being interpreted in a steady round (IHIST next).
+
+### Patchable jumps (PATCHJMP): JSC's repatches no longer drop a JIT body's translation
+IHIST over a clean JIT-on run put 90% of the interpreted rips in one 640-byte JIT body (5a261ac0-5a261d00): the
+body's translation was dropped by every inline-cache repatch and the interpreter ran it until it was hot again.
+Units of anonymous memory now read their patchable sites back at run time: a `jmp`/`jcc` rel32 that LEAVES the
+function (an inline cache's jump to its stub) checks its opcode and displacement before it is taken - opcode
+changed: deopt to the instruction; displacement changed: chain to the new target through the dispatch table; a
+`call` rel32 dispatches to whatever the displacement says; `movabs reg, imm64` (JSC's operation pointer before
+`call reg`, repatched to the profiled variant) loads the immediate. The sites are reported to the engine
+(unit.patch), and a store that stays inside one passes without an invalidation (cwPatch). Loop and branch jumps
+inside a body are never repatched and stay static: the first cut checked every rel32 jump and cost 10-40% on the
+mix. OXWASM_PATCHJMP=0 turns it off.
+
+Result: correct (6+4 clean runs, suite28 green), re-translations of JIT code down (13-38 a run after round 8,
+from ~60), but the round time is unchanged within noise (232-297 vs 226-244: the machine's noise this session is
+±15%). The static late warm-up (60-110 tier-ups after round 8, all distinct functions) and the units' own 2x
+remain; the unattributed third of the profile is next (OXWASM_STATS per guest program to rule the agent out).
+
+The unattributed third of the steady profile, symbolized (vprof188 ticks against node's own symbol table and
+libc's exports): nothing big. libc 11.6% is memmove (ticks land on `__nss_database_lookup`, glibc's usual alias
+for the unexported memcpy variants) 1.6%, munmap 1.6%, a private lock 1.2%, morecore 1.2%, pthread_cond_signal
+1.2%, rename/open/write 2% (the unit store's per-tier-up file writes and the diagnostics' own log writes),
+mprotect. node's C++ 18% is Liftoff compiling (WasmFullDecoder, LiftoffAssembler: ~4%), instantiation
+(InitializeImportedIndirectFunctionTable 1.2%, WasmDispatchTable::Clear/Set), Scavenger (BigInt garbage from the
+interpreter and the dispatch glue), BigInt canonicalize/ToString, String hashing. The diagnostics themselves
+(OXWASM_COUNTCALLS's per-write stats line calls process.memoryUsage and getHeapStatistics, OXWASM_DBGFILE appends
+synchronously) are in every timing run so far; three diagnostics-free 40-round runs are queued as the reference.
