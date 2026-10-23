@@ -2251,3 +2251,35 @@ best 151, peak 12.6 GB. None of them settles: every ten rounds or so the DFG emi
 300-500 ms of translation (`tu=` in the per-round counters) plus 40-220k interpreted steps; the quiet rounds
 in between are 130-165 ms, with 3.5-4.8M translated entries a round (7.2M with the baseline JIT alone) and
 1,500-4,500 syscalls a round (2 with the baseline JIT alone), concurrent compiler thread or not.
+
+### Native reference on this box, per phase, and where the DFG rounds stand
+
+The opencode binary run natively here (x86-64 host, same script, 40 rounds, medians of rounds 21-40; measured
+while a sandbox run was also on the box, so a few percent pessimistic):
+
+| tiers | fib | math | objects | strings | sorting | maps | json | sum | STEADY |
+|---|---|---|---|---|---|---|---|---|---|
+| baseline JIT only | 1.0 | 5.0 | 4.0 | 4.5 | 8.0 | 11.5 | 4.0 | 38.0 | 33 |
+| baseline + DFG | 1.0 | 1.0 | 3.0 | 1.0 | 7.5 | 10.0 | 4.0 | 27.5 | 23 |
+| default (DFG + FTL) | 0.0 | 0.0 | 3.0 | 1.0 | 8.0 | 12.5 | 5.0 | 29.5 | 23 |
+
+oxwasm with the DFG on, after the cache has seen a few DFG runs (c226, 40 rounds): fib 2.0, math 3.0, objects
+17.0, strings 10.5, sorting 35.5, maps 64.0, json 28.5, sum 160.5; the last round 110 (objects 6, strings 4,
+sorting 29, maps 44, json 23). Against native baseline+DFG that is 5.8x on the median and 4x on the best round;
+fib and math (pure JIT code) are at 2-3x, and the gap is in the phases whose time is JavaScriptCore's C++
+runtime: maps (HashMap) 6.4x, json (parser, stringifier, string allocation) 7x, sorting (merge sort plus the
+comparator call boundary) 4.7x, objects 5.7x. That is the translated static code at its measured 39 bytes of
+machine code per guest instruction, half of it register shuffling.
+
+120 DFG rounds on the same cache (c227): medians by window 235 (21-40), 161, 191, 166, 145.5 (101-120), best
+119 ms; peak rss 12.3 GB (6.0 GB at 30 s, 11.3 at 60 s, 12.2 at 90 s). The resident set at that point:
+3.0 GB malloc heap, ~1.5 GB in 5,300 anonymous read-write regions of 200-392 KB (one per wasm module: 4,057
+tier-ups in the run, every DFG body its own module), 1.2 GB in 28 regions of 64 MB, the engines' wasm memories
+(1 GB + 3.9 GB reserved, 1.3 GB resident), 126 MB of wasm code in 3,354 executable regions. The per-module
+overhead and the malloc heap are the two things to cut before DFG can be the default on a 16 GB box.
+
+FTL on top (BUN_JSC_useFTLJIT=1): OOM-killed before the first round at 13.3 GB. DFG with the runtime units
+compiled by TurboFan only (OXWASM_NOLIFTOFF=1, c229, 60 rounds): medians 312 / 202 / 178 by 20-round window,
+best 141, peak rss 8.3 GB against 12-13 GB with Liftoff (the malloc heap 2.1 GB against 3.0-3.8). Same speed,
+a third less memory: the DFG configuration that fits a 16 GB box is DFG on, FTL off, NOLIFTOFF=1, one V8
+compile task, glibc's mmap threshold lowered.
