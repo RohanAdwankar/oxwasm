@@ -1788,3 +1788,26 @@ retried) the interpreted count per round goes from 17-20k to 650-2,000 and dispa
 over a run. Open as of this note: with the roots on, the opencode process hangs at exit with every thread but the main one
 dead and the main one blocked without a deadline (the shell's `wait` never returns, so the harness times out with no
 output); the three landing kinds are being bisected (OXWASM_RETROOT_KINDS).
+
+**Resolved:** the hang was the 'exit' landing kind rooting at the rip a sigreturn resumes at - whatever instruction
+dash's SIGCHLD interrupted inside its wait loop - and a unit rooted there broke the shell (`wait` returned only when
+the guard expired, then commands came back 127). Only a unit's normal return (its ret, or the frame exit after an
+in-frame deopt) roots now; an unwound exit (DeoptUnwind, BlockUnwind) does not. The shell reproduction
+(scratchpad waittest.sh: 16 heated `wait`s, then a guarded job) passes with every kind on; suite17 EXIT=0 with the
+roots on by default.
+
+### Two codegen measurements on the machine code itself (node --print-wasm-code, TurboFan, offline)
+Reading V8's output for one hot unit (f_530c370, 1,603 instructions) and the LLInt (465,958):
+
+- **Memory operands already cost what they must.** Every guest access is `leal r,[reg+0x200000+disp]` then
+  `[rbx+r]`: the 32-bit lea does the wrap and the base shift in one instruction. Folding the constant into the
+  load's `offset=` immediate instead (a text pass over the module, 22,668 operands rewritten in the unit) made the
+  machine code 0.6% LARGER: the i64 register still needs its own 32-bit move to zero-extend, and the displacement
+  then costs four more bytes. Not adopted; the pass is in the scratchpad.
+- **The LLInt's cost is register pressure.** 137,268 of its 465,958 instructions (29%) are spills and reloads to
+  the wasm frame (`[rbp-N]`), against 21,007 guest memory accesses; 18,969 more are v128 spills of the xmm locals.
+  Every bytecode handler re-enters the dispatch loop with all 16 GPR locals, the flag locals and the xmm locals
+  live, so the allocator spills most of them and each handler reloads what it touches. Native LLInt keeps its
+  working set pinned in registers. 2,563 `call rbx` sites (the slow-path call protocol) each cost the instance
+  reload after return (7,963 `movq rsi,[rbp-0x10]`), and 1,899 loop-budget compares sit on the back edges. For
+  the small unit the spill share is 15%.
