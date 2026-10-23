@@ -174,6 +174,7 @@ export const PGMAP = 0x300000, PGMAP_BYTES = 0x100000;
 // Largest wat text this emitter will hand the runtime for ONE function; see
 // the refusal at the end of the function emitter for the two measurements
 // that bracket it.
+const RBPSTORE = !(typeof process !== 'undefined' && process.env?.OXWASM_RBPSTORE === '0');   // A/B lever for the rbp-store rule in gstore
 const PATCHJMP = !(typeof process !== 'undefined' && process.env?.OXWASM_PATCHJMP === '0');   // see patchSite
 const STALE_UNWIND = !(typeof process !== 'undefined' && process.env?.OXWASM_STALEUNWIND === '0');   // see FTSTALE
 const WATCOMMENTS = typeof process !== 'undefined' && process.env?.OXWASM_WATCOMMENTS === '1';
@@ -2123,7 +2124,11 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   const GUARD_STACK = typeof process !== 'undefined' && process.env?.OXWASM_GUARD_STACK === '1';
   const gstore = (addr, size, next, mk, op) => {
     if (!STOREGUARD) return mk(addr);
-    if (!GUARD_STACK && op && (op.fs || ((op.base === 4 || (op.base === 5 && fpRbp)) && !(op.index >= 0)))) return mk(addr);
+    // A JIT body (anonymous memory) is entered mid-function, so no prologue marks rbp as its frame pointer, and every
+    // store to its JS frame ([rbp+d]: operands, the call-site index) paid the guard - 31 of 336 instructions in one
+    // body. JavaScriptCore keeps rbp as the call frame register throughout its JIT code and never writes code
+    // through it, so an rbp-based store without an index in such a unit is a frame store.
+    if (!GUARD_STACK && op && (op.fs || ((op.base === 4 || (op.base === 5 && (fpRbp || (ctx.anon && RBPSTORE)))) && !(op.index >= 0)))) return mk(addr);
     usesGa = true;
     // One byte per 64-byte line of the whole guest memory, indexed by the store's wasm address: a load and a
     // branch per store. (The window-relative bitmap it replaces cost two slot loads, a subtract, a compare and

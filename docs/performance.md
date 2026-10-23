@@ -2061,3 +2061,30 @@ mprotect. node's C++ 18% is Liftoff compiling (WasmFullDecoder, LiftoffAssembler
 interpreter and the dispatch glue), BigInt canonicalize/ToString, String hashing. The diagnostics themselves
 (OXWASM_COUNTCALLS's per-write stats line calls process.memoryUsage and getHeapStatistics, OXWASM_DBGFILE appends
 synchronously) are in every timing run so far; three diagnostics-free 40-round runs are queued as the reference.
+
+The diagnostics-free reference never ran as planned: with OXWASM_RETROOT at its default (continuation roots
+on) the JIT-on mix did 3 rounds in 400 s, three times out of three. Every usable timing run sets
+OXWASM_RETROOT=0; the diagnostics env (STATS/COUNTCALLS/ABORTDIAG) is not what makes the difference.
+
+### Frame stores skip the code-write guard in JIT units
+
+A store through rbp in an anonymous-memory (JIT) unit is a frame slot, not a code write: JSC's baseline JIT
+addresses the CallFrame and its locals off rbp (`mov [rbp+0x24], ecx` in every slow-path thunk), and nothing it
+emits writes code through rbp. The emitter already skipped the guard for rbp-based stores in static functions
+that use rbp as a frame pointer; JIT bodies never looked like a frame-pointer function to the analysis, so each
+of their frame stores paid the guard. Now rbp-based stores (no index register) skip it in anonymous units too.
+OXWASM_RBPSTORE=0 restores the guard (the knob is part of the unit-store key).
+
+Measured, JIT-on mix, 40 rounds, medians of rounds 21-40, continuation roots off:
+
+| | run 1 | run 2 | run 3 |
+|---|---|---|---|
+| guard kept (RBPSTORE=0) | 218.5 | 196.5 | 221.0 |
+| guard skipped | 199.0 | 204.0 | 203.5 |
+
+About 7% off the round and a tighter spread; the gain is in strings/json/maps, the phases that run the most
+JIT code. Clean 6/6, suite30 green.
+
+OXWASM_ABIRELOAD=1 on top (no post-call reload of callee-saved GPRs and caller-saved xmm): 186.0, 200.5, 202.0.
+Within noise of the guard skip alone, and it cannot be the default (the suite's call-mem test returns a value
+in rbx), so it stays opt-in.

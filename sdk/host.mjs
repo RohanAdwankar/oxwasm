@@ -49,7 +49,7 @@ let _engineHash = null;
 // OXWASM_UNITCACHE_FULLKEY=1 keys on the runtime too.
 // Env knobs that change what the emitter produces are part of the key too: a unit built with
 // OXWASM_STOREGUARD=1 or another loop-yield budget is not interchangeable with the default build.
-const CODEGEN_KNOBS = ['OXWASM_STOREGUARD', 'OXWASM_GUARDPG', 'OXWASM_MEMREG', 'OXWASM_THREADED', 'OXWASM_ABIRELOAD', 'OXWASM_GUARD_STACK', 'OXWASM_NOFUEL', 'OXWASM_LOOPYIELD', 'OXWASM_LOOPYIELD_N', 'OXWASM_INLINE', 'OXWASM_INLINE_BUDGET', 'OXWASM_NARROW', 'OXWASM_TAILCUT', 'OXWASM_BLOCKLOOPS', 'OXWASM_FTENTRY'];
+const CODEGEN_KNOBS = ['OXWASM_STOREGUARD', 'OXWASM_GUARDPG', 'OXWASM_MEMREG', 'OXWASM_THREADED', 'OXWASM_ABIRELOAD', 'OXWASM_GUARD_STACK', 'OXWASM_NOFUEL', 'OXWASM_LOOPYIELD', 'OXWASM_LOOPYIELD_N', 'OXWASM_INLINE', 'OXWASM_INLINE_BUDGET', 'OXWASM_NARROW', 'OXWASM_TAILCUT', 'OXWASM_BLOCKLOOPS', 'OXWASM_FTENTRY', 'OXWASM_RBPSTORE', 'OXWASM_PATCHJMP'];
 const engineHash = () => _engineHash ??= process.env.OXWASM_UNITCACHE_KEY || sha(CODEGEN_KNOBS.map((k) => k + '=' + (process.env[k] ?? '')).join(' '), ...(process.env.OXWASM_UNITCACHE_FULLKEY ? ['linux.mjs', 'aot_wat.mjs', 'interp.mjs', 'decode.mjs'] : ['aot_wat.mjs', 'decode.mjs']).map((f) => readFileSync(join(HERE, '..', 'engine', f))), process.version, process.env.OXWASM_FNVETO_FILE ? readFileSync(process.env.OXWASM_FNVETO_FILE) : '', process.env.OXWASM_FNALLOW_FILE ? readFileSync(process.env.OXWASM_FNALLOW_FILE) : '');
 function makeUnitStore(cacheDir) {
   const root = join(cacheDir, 'units', engineHash());
