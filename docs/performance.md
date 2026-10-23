@@ -2300,3 +2300,14 @@ thresholdForOptimizeSoon=20): 256.5 / 144 / 7.0 GB. Compiling earlier does not m
 the DFG keeps re-emitting. A worker profile through the inspector during the warm-up (t=22-47 s) is 62% guest
 wasm, 7% the host's output plumbing (send, writeSync, writeChunk, encode), 3% the boot snapshot, 3% module
 instantiation; the x86-to-wasm emitter does not appear in the top 25.
+
+### Recommended configuration for a long-running JIT guest (opencode sessions) on a 16 GB host
+
+Nothing in the SDK sets JavaScriptCore's options, so a real opencode session runs with its defaults: DFG and
+FTL on. In the mix that is OOM-killed at 13 GB with FTL, and 12-13 GB without it under Liftoff. What fits:
+BUN_JSC_useFTLJIT=1 off in the guest environment, OXWASM_NOLIFTOFF=1 and
+OXWASM_V8FLAGS="--experimental-wasm-compilation-hints --wasm-num-compilation-tasks=1" for the engine, and
+MALLOC_MMAP_THRESHOLD_=131072 MALLOC_TRIM_THRESHOLD_=4194304 in the host process's environment (glibc reads
+them at start; the SDK cannot set them for itself). Measured: 7-8.5 GB peak, rounds 120-145 ms at best and
+145-210 ms median against native 27.5 (DFG) / 29.5 (default). Short commands are the other way round (Liftoff
+and the default tiering, JIT off: docs above), so the launcher has to choose by workload.
