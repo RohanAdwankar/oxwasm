@@ -1973,3 +1973,42 @@ emitter and say nothing. The tell was in the tier-up trace once it printed the r
 now logs every noteAotFail): 315 of 416 refusals in a 15 s boot were the assembler's. Lesson: a change to the
 emitter is validated by the sandbox agent's cold boot (scratchpad boottest.mjs, 41-47 s) before anything else.
 With the check emitted correctly the suite and a six-and-six A/B (OXWASM_STALEUNWIND=0 vs 1, CWV=1000) run next.
+
+### Found: the round-5 abort was a translation reinstated from the per-binary unit capture after its bytes changed
+The chain of evidence, each step a knob that stays in the engine:
+- OXWASM_SHADOW_MEMHASH=1 (whole-memory chunk hashes around a shadowed dispatch, exact words with
+  OXWASM_SHADOW_MEMPRE=<chunks>) showed the compiled side storing where the interpreter never did: in the fatal
+  dispatch an inline-cache code pointer and a header word, i.e. a slow path the interpreter did not take.
+- OXWASM_SHADOW_CALLS=1 (every call site through x_callout during the compiled replay, registers compared with the
+  interpreter's recorded state at the same target and rsp) put the divergence before the first C++ call: the compiled
+  body called JavaScriptCore's ArithAdd slow operation with a stack address as an operand; the interpreter, from the
+  identical entry state, never reached that call.
+- OXWASM_BYTECHECK=1 (a copy of every JIT-region function's source bytes at translation, compared on each dispatch)
+  then said why: the body's translation was running after JSC had repatched its bytes - 4-byte jump displacements
+  at stable addresses (5a261101, 5a2611d3, 5a261e8e, 5a26205f ..., 20 a run, 3 of 3 runs abort).
+- OXWASM_WATCHADDR=<words> (every writer of a word, both tiers, with the guest rip) showed the writes DO pass the
+  store guard - libc memcpy's two 4-byte stores and JSC's own 4/8-byte stores all log through x_cw - and the
+  translation covering them was found and dropped (hit=.., droppedAt=..). Yet at the next dispatch it was back in the
+  map with no extent (hull= empty, line=0): re-registered, not recompiled.
+- The registration trace (call stacks for JIT-region registrations without an extent) named the path:
+  registerAll < tierUpAot, the unitBytes lookup. The per-binary child unit cache (childUnits: onUnitBytes captures
+  every compiled unit by entry address, unitBytes serves it back on the next tier-up of that entry, then the disk
+  store) captured JIT-region units too. After an invalidation, the next tier-up of the same entry got the OLD
+  translation back from the capture, registered with no extent, so nothing could ever drop it again, and JSC's
+  repatched bodies ran stale: the inline-cache slow path that aborted.
+
+Fix: a unit is remembered by entry address - disk store or in-memory capture - only when every function in it lies
+in file-backed bytes (the static image or a mapped library), and tierUpAot consults the byte caches only for such
+entries (_unitCacheable). Anonymous memory is never served by address.
+
+What the earlier levers were doing: vetoing the stub block kept the stubs (the entries of those stale bodies)
+interpreted, so the stale translations were never entered; STALEUNWIND helped at the margin because a live stale
+frame was one of the ways in; the heal did not matter (NOHEAL passing 2 of 2 was luck, the guard was firing anyway).
+
+Validated: six 24-round runs of the JIT-on mix (RETROOT=0, CWV=1000, OXWASM_BYTECHECK=1), no veto, all clean,
+zero stale bytes, 40-49 s each; the suite is green (suite27). Phase medians over rounds 9-24, in ms, six runs:
+fib 4, math 21, objects 34-35, strings 13-18, sorting 39-43, maps 76-86, json 33-41 - 226-244 ms a round against
+the native default's 45 (fib 3, math 14, objects 16, strings 7, sorting 26, maps 67, json 24 measured earlier on a
+different session of this machine; re-measure native before quoting a ratio). This is the first JIT-on number
+that is neither vetoed nor broken; everything before it in these notes for the JIT-on configuration was one or
+the other.

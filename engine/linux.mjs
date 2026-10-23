@@ -81,10 +81,15 @@ const CW_VOLATILE = Number(ENV.OXWASM_CW_VOLATILE || 8);
 // a 100x tax on exactly the loops that matter.
 const CW_ALLPAGES = ENV.OXWASM_CW_ALLPAGES === '1';
 const IDLEDIAG = ENV.OXWASM_IDLEDIAG === '1';
-const STALE_RT = ENV.OXWASM_STALEUNWIND !== '0';          // the engine side of FTSTALE (aot_wat.mjs): raise on invalidation, lower per dispatch
+const BYTECHECK = ENV.OXWASM_BYTECHECK === '1';
+const STALE_RT = ENV.OXWASM_STALEUNWIND !== '0';
+const STALE_ALL = ENV.OXWASM_STALEUNWIND === '2';          // experiment: an invalidation unwinds every JIT-region frame until the next top-level dispatch          // the engine side of FTSTALE (aot_wat.mjs): raise on invalidation, lower per dispatch
 const STALE_DEPTH = STALE_RT && ENV.OXWASM_STALEDEPTH !== '0';   // the interpreted callee of a callout counts its caller's frame
 const CWHIST = ENV.OXWASM_CWHIST === '1';
 const CWVERIFY = ENV.OXWASM_CWVERIFY === '1';
+// OXWASM_WATCHADDR=hex,hex: 8-byte guest words whose every writer is logged with the guest rip ([watch] lines): compiled stores
+// through the code-write guard (the words' lines are marked and never healed), interpreted stores through mem.wa.
+const WATCHADDR = ENV.OXWASM_WATCHADDR ? new Set(ENV.OXWASM_WATCHADDR.split(',').map((h) => BigInt('0x' + h) & ~7n)) : null;
 const CWTRACE = ENV.OXWASM_CWTRACE ? BigInt('0x' + ENV.OXWASM_CWTRACE) : null;   // one guest address: log every write covering it, the overlap decision, the drop, and re-registrations of translations covering it
 const EXACT_CW_OFF = ENV.OXWASM_CW_PAGE === '1';   // old behaviour: every store into a watched page drops the whole page
 const CW_QUIET = Number(ENV.OXWASM_CW_QUIET || 100_000);
@@ -115,6 +120,10 @@ const SHADOW_OK_SYS = new Set([228, 96, 201, 39, 186, 24, 102, 104, 107, 108, 11
 const SHADOW_DISP = ENV.OXWASM_SHADOW_DISP ? ENV.OXWASM_SHADOW_DISP.split('-').map(Number) : null;
 const AOTSKIP = ENV.OXWASM_AOTSKIP ? ENV.OXWASM_AOTSKIP.split('-').map(Number) : null;
 const DISPRING = !!ENV.OXWASM_DISPRING;
+// OXWASM_CHECKADD=<hex>: the address of JSC's jsAdd slow case (vetoed, so every call is a callout); each call's two
+// operands are checked for a cell whose JSType is not a primitive's, and the first such call dumps the dispatch ring
+// and the interpreted-rip tail - the abort at round 5 is that cell reaching toPrimitive, so this is the earliest look.
+const CHECKADD = ENV.OXWASM_CHECKADD ? BigInt('0x' + ENV.OXWASM_CHECKADD) : null;
 const EPISODES = ENV.OXWASM_EPISODES === '1';
 // OXWASM_RETROOT=<n> (0 = off): a return address the interpreter lands on n times with no unit of its own becomes a
 // unit root. A blocking syscall deep in a compiled call chain unwinds every wasm frame above it; when the thread
@@ -551,16 +560,21 @@ export class LinuxEngine {
   // dynamic linker) or a file mapping that was loaded when the key was computed and is still mapped.
   // Anonymous and JIT code can differ next run, so a unit that touches it is never stored.
   _unitBytesDone(k, bytes, unit) {
+    // Only a unit built from file-backed bytes (the static image, a mapped library) may be remembered by entry
+    // address - in the disk store OR the in-memory capture (onUnitBytes: the per-binary child cache, the snapshot's
+    // units). A unit of anonymous memory is JavaScriptCore's JIT output: the same entry address carries different
+    // bytes after every repatch, and the capture handed the OLD translation back at the next tier-up, after an
+    // invalidation had rightly dropped it - registered with no extent, so nothing could ever drop it again. That
+    // was the round-5 abort (inline-cache jump displacements memcpy'd into bodies whose translation kept running).
+    let covered = false;
+    try { const rs = unit._rs; covered = !!rs && unit.funcs.every((a) => rs.some((r) => a >= r.lo && a < r.hi && (r.map === null || (this.maps ?? []).includes(r.map)))); } catch {}
+    if (!covered) { this.stats.unitUncacheable = (this.stats.unitUncacheable | 0) + 1; return; }
     if (this.onUnitBytes) this.onUnitBytes(k, bytes);
     if (!this.unitStore) return;
-    try {
-      const ex = unit._ex; if (!ex) return;
-      const rs = unit._rs;
-      const covered = (a) => rs.some((r) => a >= r.lo && a < r.hi && (r.map === null || (this.maps ?? []).includes(r.map)));
-      if (!unit.funcs.every(covered)) return;
-      this.unitStore.put(ex, k.toString(16), bytes);
-    } catch {}
+    try { const ex = unit._ex; if (!ex) return; this.unitStore.put(ex, k.toString(16), bytes); } catch {}
   }
+  // an entry whose bytes are file-backed: the only kind a unit may be looked up by address for
+  _unitCacheable(k) { return (this._exeRanges ?? []).some((r) => k >= r.lo && k < r.hi) || (this.execRangesStatic ?? []).some(([x, y]) => k >= x && k < y); }
   // The store key: the static executable ranges as loaded, every file mapping's pristine bytes (what the
   // file says, not what the process has since written to it) with where it sits, and the guest base the
   // units were translated against (their address arithmetic is baked into the wasm). It is recomputed
@@ -616,6 +630,7 @@ export class LinuxEngine {
     if (ROOTVETO !== null) { const aa = BigInt(a); for (const [lo, hi] of ROOTVETO) if (aa >= lo && aa < hi) { (this._rootVetoed ??= new Set()).add(aa); this.aotFailed.add(aa); return; } }
     if (ENV.OXWASM_DISPLOG && this._ctor?.argv?.[0]?.includes('opencode')) { const [lo, hi] = ENV.OXWASM_DISPLOG.split('-').map(Number); if ((this.stats.disp || 0) >= lo && (this.stats.disp || 0) <= hi) console.error(`[reg disp=${this.stats.disp}] ${a.toString(16)}`); }
     this.aotFns.set(a, f); this._entryAdd(a);
+    if (BYTECHECK && !this._extents?.has(a) && a >= 0x5a000000n && a < 0x9b000000n) { const st = (new Error().stack || '').split('\n').slice(2, 6).map((l) => l.trim().replace(/^at /, '').replace(/ \(.*$/, '')).join('<'); if ((this._rneN = (this._rneN | 0) + 1) <= 40) __dbg(`[regnoext] ${a.toString(16)} disp=${this.stats.disp} via=${st}`); }
     if (f && !(this._extents?.has(a))) { let st = (this._noExtPg ??= new Map()).get(a >> 12n); if (!st) this._noExtPg.set(a >> 12n, st = new Set()); st.add(a); }
     // __noFtab bisect lever: an empty map makes every $ftr miss, so all
     // sites take their pre-existing x_callout / x_deopt fallbacks
@@ -815,7 +830,7 @@ export class LinuxEngine {
       if (CWTRACE !== null && (exact ? exact[0] <= CWTRACE && exact[1] > CWTRACE : lo <= CWTRACE && hi > CWTRACE)) __dbg(`[cwtrace] invalidate exact=${exact ? exact[0].toString(16) + '-' + exact[1].toString(16) : 'page'} hitK=${(hitK || []).map((k) => k.toString(16)).join(',')}`);
       // functions translated into one wasm module may call each other directly, so one going stale takes its siblings with it
       if (hitK && this._unitSibs) { const seen = new Set(hitK); for (let i = 0; i < hitK.length; i++) { const sibs = this._unitSibs.get(hitK[i]); if (sibs) for (const f of sibs) if (!seen.has(f)) { seen.add(f); hitK.push(f); } } }
-      if (hitK) for (const k of hitK) { if (this.aotFns.has(k)) { this.aotFns.delete(k); hit = true; dropped.push(k); } const sp0 = this._extSpans?.get(k); if (CWTRACE !== null && (sp0 || [this._extents.get(k) || [0n, 0n]]).some(([x, y]) => x <= CWTRACE && y > CWTRACE)) __dbg(`[cwtrace] drop fn=${k.toString(16)} inAot=${this.aotFns.has(k)} write=${lo.toString(16)}-${hi.toString(16)} exact=${exact ? exact[0].toString(16) + '-' + exact[1].toString(16) : '-'} disp=${this.stats.disp}`); this._extents.delete(k); this._extSpans?.delete(k); this._wideExt?.delete(k); changed = true; (gone ??= []).push(sp0 || null); }
+      if (hitK) for (const k of hitK) { if (this.aotFns.has(k)) { this.aotFns.delete(k); hit = true; dropped.push(k); } const sp0 = this._extSpans?.get(k); if (CWTRACE !== null && (sp0 || [this._extents.get(k) || [0n, 0n]]).some(([x, y]) => x <= CWTRACE && y > CWTRACE)) __dbg(`[cwtrace] drop fn=${k.toString(16)} inAot=${this.aotFns.has(k)} write=${lo.toString(16)}-${hi.toString(16)} exact=${exact ? exact[0].toString(16) + '-' + exact[1].toString(16) : '-'} disp=${this.stats.disp}`); this._extents.delete(k); this._extSpans?.delete(k); this._wideExt?.delete(k); changed = true; (gone ??= []).push(sp0 || null); if (BYTECHECK) (this._dropLog ??= new Map()).set(k, this.stats.disp | 0); }
       // a unit still being assembled was built from the old bytes too, whichever page its entries sit on
       if (hitK && this._inflight) for (const u of this._inflight) if (!u.cancelled && u.funcs.some((f) => hitK.includes(f))) {
         u.cancelled = true;
@@ -852,7 +867,7 @@ export class LinuxEngine {
     if (this.codePages && !exact) for (let q = p0; q <= p1 && p1 - p0 < 4096n; q++) this.codePages.delete(q);
     if (hit || dropped.length) this._ftDrop(dropped);
     // a dropped function may be live on the wasm stack: every JIT-region frame leaves at its next call return (FTSTALE)
-    if (STALE_RT && hit && this.wmem) { const dv = (this._ftdv ??= new DataView(this.wmem.buffer)), d = dv.getUint32(FTMAP + 8, true); if (d > dv.getUint32(FTSTALE, true)) dv.setUint32(FTSTALE, d, true); this.stats.staleUnwinds = (this.stats.staleUnwinds | 0) + 1; }
+    if (STALE_RT && hit && this.wmem) { const dv = (this._ftdv ??= new DataView(this.wmem.buffer)), d = STALE_ALL ? 0xFFFFFFFF : dv.getUint32(FTMAP + 8, true); if (d > dv.getUint32(FTSTALE, true)) dv.setUint32(FTSTALE, d, true); this.stats.staleUnwinds = (this.stats.staleUnwinds | 0) + 1; }
     return changed;
   }
   finishAotUnit(unit, instance) {
@@ -925,7 +940,7 @@ export class LinuxEngine {
     // closure translation on the main thread just to compute the lookup key —
     // measured at 30-second pump slices on GIMP's first menu open.
     if (this.unitStore && !this.unitBytes) this.unitBytes = (kk) => this._diskUnit(kk);
-    if (this.unitBytes) {
+    if (this.unitBytes && this._unitCacheable(k)) {
       const bytes = this.unitBytes(k);
       if (this.aotFns.get(k)) return;                      // registered by a bundle while looking
       if (bytes) {
@@ -1112,6 +1127,16 @@ export class LinuxEngine {
         ...(this._rootMaxInsns ? { maxInsns: this._rootMaxInsns } : this.unitMaxInsns ? { maxInsns: this.unitMaxInsns } : {}) });
       if (ENV.OXWASM_TUTRACE) __dbg(`[tu:wat] ${entry.toString(16)} ${unit.wat.length}B ${(performance.now() - _tc0) | 0}ms`);
       if (unit.funcs && unit.funcs.length > 1) { const sb = this._unitSibs ??= new Map(); for (const f of unit.funcs) sb.set(f, unit.funcs); }
+      // A multi-entry wrapper (`(func (export "f_X") (result i64) (return_call $f_Y_m ..))`) registers X as a function of its
+      // own but X had no extent: a store into its bytes found no translation to drop, the stale function stayed registered,
+      // and JavaScriptCore's inline-cache repatches (4-byte jump displacements, memcpy'd) ran old code - the round-5 abort.
+      // Give every wrapper entry the extent, spans and pages of the function it enters.
+      if (unit.ext && unit.wat) { const have = new Set(unit.ext.map((e) => e[0].toString())), byK = new Map(unit.ext.map((e) => [e[0].toString(16), e]));
+        const re = /\(func \(export "f_([0-9a-f]+)"\) \(result i64\) \(return_call \$f_([0-9a-f]+)_m/g; let m;
+        while ((m = re.exec(unit.wat)) !== null) { const x = BigInt('0x' + m[1]); if (have.has(x.toString())) continue; const t = byK.get(m[2]); if (!t) continue; unit.ext.push([x, t[1], t[2], t[3]]); have.add(x.toString()); this.stats.wrapExt = (this.stats.wrapExt | 0) + 1; } }
+      // OXWASM_BYTECHECK=1: keep a copy of the bytes each JIT-region function was translated from; dispatchAot compares
+      // them before running the function and reports a translation whose source changed without an invalidation
+      if (BYTECHECK && unit.ext && !_inStatic) { for (const [k, a, b, spans] of unit.ext) if (a !== null) { try { const cp = []; for (const [x, y] of (spans || [[a, b]])) cp.push([x, this.mem.view(x, y - x).slice()]); (this._byteCopy ??= new Map()).set(k, { cp, tag: this.stats.disp | 0 }); } catch {} } }
       if (unit.ext) { const ex = this._extents ??= new Map(); for (const [k, a, b, spans] of unit.ext) if (a !== null) {
         ex.set(k, [a, b]);
         if (CWVERIFY && !(this.execRangesStatic ?? []).some(([x, y]) => a >= x && a < y)) { try { for (const [sx, sy] of (spans || [[a, b]])) { if (sy - sx > 65536n) continue; const v = this.mem.view(sx, sy - sx); if (v) (this._extSnap ??= new Map()).set(k + ':' + sx, { k, a: sx, bytes: Uint8Array.from(v) }); } } catch {} }
@@ -1201,6 +1226,7 @@ export class LinuxEngine {
           const a = BigInt('0x' + name.slice(2));
           if (!this.aotFns.get(a) && !this.aotFailed.has(a)) this.registerAotFn(a, inst.exports[name]);
         }
+      if (BYTECHECK && !_inStatic) for (const name of Object.keys(inst.exports)) if (name.startsWith('f_')) { const a = BigInt('0x' + name.slice(2)); if (this.aotFns.has(a) && !this._extents?.has(a)) __dbg(`[noext] ${a.toString(16)} unit=${entry.toString(16)} inFuncs=${unit.funcs.some((x) => x === a)} ext=${(unit.ext || []).filter((e) => e[0] === a).map((e) => (e[1] === null ? 'null' : e[1].toString(16) + '-' + e[2].toString(16))).join('/') || 'none'} nfuncs=${unit.funcs.length} next=${unit.ext ? unit.ext.length : -1}`); }
       if (inst.exports.drive) this.aotDrive = inst.exports.drive;
       if (!this.aotFns.has(k)) { if (ENV.OXWASM_TUTRACE) __dbg(`[tu:missing] ${entry.toString(16)} inFuncs=${unit.funcs.some((a) => a === k)} export=${typeof inst.exports['f_' + entry.toString(16)]} failed=${this.aotFailed.has(k)} why=${this._aotWhy?.get(entry) ?? '-'} funcs=${unit.funcs.length} entryName=${unit.entryName} exports=${Object.keys(inst.exports).slice(0, 6).join(',')}`); throw new Error('entry missing from unit'); }
       this.stats.tiers.aot = (this.stats.tiers.aot || 0) + 1;
@@ -1261,6 +1287,9 @@ export class LinuxEngine {
   // Returns the rip to continue at.
   dispatchAot(f) {
     this.stats.disp = (this.stats.disp || 0) + 1;
+    if (BYTECHECK && this._byteCopy !== undefined) { const ent = this._byteCopy.get(this.cpu.rip); const cp = ent ? ent.cp : null; if (cp) for (const [x, old] of cp) { let cur; try { cur = this.mem.view(x, old.length); } catch { break; }
+        for (let i = 0; i < old.length; i++) if (cur[i] !== old[i]) { let j = i; while (j < old.length && cur[j] !== old[j]) j++; if ((this._bcN = (this._bcN | 0) + 1) <= 20) __dbg(`<STALE-BYTES fn=0x${this.cpu.rip.toString(16)} at=${(x + BigInt(i)).toString(16)} len=${j - i} old=${Buffer.from(old.subarray(i, Math.min(j, i + 16))).toString('hex')} new=${Buffer.from(cur.subarray(i, Math.min(j, i + 16))).toString('hex')} disp=${this.stats.disp} compiledAt=${ent.tag} inFns=${this.aotFns.has(this.cpu.rip)} line=${(() => { try { const ga = x + BigInt(i); const li = (this.RAMOFF + Number(ga - this.base)) >>> 6; return new Uint8Array(this.wmem.buffer)[this.CWBM + li]; } catch { return '?'; } })()} span=${(this._extSpans?.get(this.cpu.rip) ?? []).some(([sx, sy]) => sx <= x + BigInt(i) && sy > x + BigInt(i))} hull=${(this._extents?.get(this.cpu.rip) ?? []).map((v) => v.toString(16)).join('-')} droppedAt=${this._dropLog?.get(this.cpu.rip) ?? '-'} vol=${!!this._volatilePages?.has((x + BigInt(i)) & ~4095n)}>`); break; } } }
+    if (WATCHADDR !== null && !this._waArmed) { this._waArmed = true; try { for (const a of WATCHADDR) this._cwBitsOne(a >> 6n, true); } catch {} this.mem.wa = WATCHADDR; this.mem.waLog = (a, n, v) => this._waLog(a & ~7n, a, Number(n), 'I rip=' + this.cpu.rip.toString(16) + ' v=' + (typeof v === 'bigint' ? v.toString(16) : '?')); }
     if (HEARTBEAT && (this.stats.disp & HEARTBEAT) === 0 && this._ctor?.argv?.[0]?.includes(TRACE_ARGV)) console.error(`[hb] disp=${this.stats.disp} rip=${this.cpu.rip.toString(16)} tid=${this.threads[this.ti]?.id} rsp=${this.cpu.regs[4].toString(16)} t=${Math.round(this.nowMs())} interp=${this.stats.interpreted} aot=${this.stats.aotRuns}`);
     if (ENV.OXWASM_DISPLOG && this._ctor?.argv?.[0]?.includes('opencode')) { const [lo, hi] = ENV.OXWASM_DISPLOG.split('-').map(Number); if (this.stats.disp >= lo && this.stats.disp <= hi) console.error(`[disp ${this.stats.disp}] rip=${this.cpu.rip.toString(16)} rsp=${this.cpu.regs[4].toString(16)}`); }
     if (ENV.OXWASM_AOTSTOP && this.stats.disp === +ENV.OXWASM_AOTSTOP && this._ctor?.argv?.[0]?.includes('opencode')) { this._aotOff = true; if (ENV.OXWASM_AOTSTOP_HARD) { new DataView(this.wmem.buffer).setUint32(FTMAP, 0, true); new Uint8Array(this.wmem.buffer, FTHASH, FTHBYTES).fill(0); this._ftCount = 0; this._ftSeen = new PagedSet(this.codePages ??= new Set()); this._entries = null; } console.error('[aotstop] at disp', this.stats.disp); }
@@ -1277,7 +1306,7 @@ export class LinuxEngine {
     fdv.setUint32(FTFUEL, this.chainFuel ?? 0x0FFFFFFF, true);
     fdv.setUint32(FTLOOP, this.loopYield ?? LOOPYIELD_N, true);      // backward edges before a frame yields its loop head (see FTLOOP)
     const fn0 = fdv.getUint32(FTNEST, true); fdv.setUint32(FTNEST, 0, true);   // this dispatch's frame is top-level: its exit rip is honoured
-    if (STALE_RT && fdv.getUint32(FTSTALE, true) > fd0) fdv.setUint32(FTSTALE, fd0, true);   // frames above this depth are gone (see FTSTALE)
+    if (STALE_RT && (!STALE_ALL || fd0 === 0) && fdv.getUint32(FTSTALE, true) > fd0) fdv.setUint32(FTSTALE, fd0, true);   // frames above this depth are gone (see FTSTALE)
     this.syncOut();
     const entry = this.cpu.rip; this._lastEntry = entry;
     if (DISPRING) this._dr('disp', entry, this.cpu.regs[4]);
@@ -1386,6 +1415,12 @@ export class LinuxEngine {
     // capture interp outcome (before undo)
     const iRegs = cpu.regs.slice(), iXmm = cpu.xmm.slice();
     const iFlags = { ...cpu.f }, iFs = cpu.fsBase;
+    // OXWASM_SHADOW_MEMHASH=1: a store the compiled side makes where the interpreter made none is invisible to the
+    // journal comparison (it only knows the interpreter's addresses). Hash the whole guest memory in 64 KB chunks after
+    // the interpreted run and again after the compiled run; a chunk that differs names a stray store's neighbourhood.
+    let memH1 = null;
+    const memHash = () => { const u = new Uint32Array(this.wmem.buffer, this.RAMOFF); const nch = (u.length >>> 14) + 1, out = new Uint32Array(nch); for (let c = 0; c < nch; c++) { let h = 2166136261; const e = Math.min(u.length, (c + 1) << 14); for (let i = c << 14; i < e; i++) { h ^= u[i]; h = Math.imul(h, 16777619); } out[c] = h >>> 0; } return out; };
+    if (ENV.OXWASM_SHADOW_MEMHASH && ok) { try { memH1 = memHash(); } catch (e) { __dbg(`<SHADOW-MEMHASH-ERR ${e.message}>`); memH1 = null; } }
     const iVals = ok ? jr.map(([a, n, _o, snap]) =>
       snap ? this.mem.view(a, BigInt(snap.length)).slice() : this.mem.read(a, n)) : null;
     // undo the journal in reverse
@@ -1402,7 +1437,25 @@ export class LinuxEngine {
     // interpreter's stores, so a unit writing where it should not was invisible to the comparison.
     let snapLo = 0n, snap = null;
     if (trace !== null && ok) { try { snapLo = rsp0 - 16384n; snap = this.mem.view(snapLo, 16384n + 131072n).slice(); } catch { snap = null; } }
-    const exitRip = this.dispatchAot(f);
+    // OXWASM_SHADOW_MEMPRE=hex,hex: 64 KB chunks (guest addresses) copied before the compiled run, so a differing chunk
+    // can be reported word by word (a copy of the whole memory per dispatch was too much for the worker)
+    // OXWASM_SHADOW_CALLS=1: during the compiled replay every call site goes through x_callout (no chain fuel), and
+    // the callout compares the register file against the interpreter's recorded state at the same (target, rsp):
+    // a divergence BEFORE a C++ call shows up here even when the call itself never returns (the abort).
+    const callCmp = !!ENV.OXWASM_SHADOW_CALLS && trace !== null && ok;
+    let savedFuel; if (callCmp) { this._shTrace = { trace, TB }; savedFuel = this.chainFuel; this.chainFuel = 0; }
+    let memPre = null; if (memH1 !== null && ENV.OXWASM_SHADOW_MEMPRE) { try { memPre = new Map(); for (const h of ENV.OXWASM_SHADOW_MEMPRE.split(',')) { const c = Number((BigInt('0x' + h) - this.base) >> 16n); memPre.set(c, new Uint8Array(this.wmem.buffer, this.RAMOFF + (c << 16), 65536).slice()); } } catch (e) { __dbg(`<SHADOW-MEMHASH-ERR ${e.message}>`); memPre = null; } }
+    let exitRip; try { exitRip = this.dispatchAot(f); } finally { if (callCmp) { this._shTrace = null; this.chainFuel = savedFuel; } }
+    if (memH1 !== null) { const h2 = memHash(); const bad = []; for (let c = 0; c < h2.length && bad.length < 32; c++) if (h2[c] !== memH1[c]) bad.push(c);
+      if (bad.length) { (st.memDiff = st.memDiff || 0); st.memDiff++;
+        // the exact words: the pre-run copy (taken after the undo, when memory equals the state both sides started from)
+        // against the memory the compiled side left, in the differing chunks; words the interpreter also wrote are named
+        const wrote = new Set(); for (const [a, n, _o, snap] of jr) { const len = snap ? snap.length : Number(n); for (let i = 0; i < len; i += 8) wrote.add(((a + BigInt(i)) & ~7n).toString(16)); }
+        const cur = new Uint8Array(this.wmem.buffer, this.RAMOFF), words = [];
+        if (memPre !== null) for (const c of bad) { const pre = memPre.get(c); if (!pre) continue; const lo = c << 16;
+          for (let q = 0; q < 65536 && words.length < 40; q += 8) { let same = true; for (let i = 0; i < 8; i++) if (cur[lo + q + i] !== pre[q + i]) { same = false; break; }
+            if (!same) { const ga = this.base + BigInt(lo + q); const v = (b, k) => { let x = 0n; for (let i = 7; i >= 0; i--) x = (x << 8n) | BigInt(b[k + i]); return x.toString(16); }; words.push(`${ga.toString(16)}:${v(pre, q)}>${v(cur, lo + q)}${wrote.has(ga.toString(16)) ? '(I)' : ''}`); } } }
+        __dbg(`<SHADOW-MEMDIFF fn=0x${entryRip.toString(16)} disp=${this.stats.disp} exit=0x${BigInt.asUintN(64, exitRip).toString(16)} chunks=${bad.map((c) => (this.base + (BigInt(c) << 16n)).toString(16)).join(',')} journal=${jr.length} words=${words.join(' ')}>`); } }
     if (trace !== null) {
       if (!ok || (this._shadowDiverged ?? 0) >= 100) { st.aborted++; this._shadowBusy = false; return exitRip; }
       const ks = []; for (let i = 0; i < trace.length; i++) if (trace[i].rip === exitRip && trace[i].rsp === cpu.regs[4]) ks.push(i);
@@ -1495,6 +1548,11 @@ export class LinuxEngine {
   // OXWASM_DISPRING=1: a ring of the last 512 unit dispatches / callouts / deopts / frame finishes
   // (kind, addresses, rsp, dispatch number), dumped by _onBreak: the compiled-code history the
   // interpreted rip trace cannot see.
+  _waLog(word, g, size, how) {
+    let cur = '?'; try { cur = this.mem.read(word, 8n).toString(16); } catch {}
+    const ring = this._dring !== undefined ? (() => { const rr = this._dring, n = rr.length, i0 = this._dringI | 0; const l = []; for (let i = 0; i < n; i++) { const e = rr[(i0 + 1 + i) % n]; if (e) l.push(e.split(' ').slice(0, 3).join(' ')); } return l.slice(-6).join(' | '); })() : '';
+    __dbg(`[watch] ${word.toString(16)} store@${g.toString(16)} n=${size} ${how} was=${cur} disp=${this.stats.disp} t=${this.nowMs() | 0}ms ring=${ring}`);
+  }
   _dr(kind, a, b, c) { const N = DISPRING_N, r = (this._dring ??= new Array(N)); r[this._dringI = ((this._dringI | 0) + 1) % N] = `${kind} ${a.toString(16)} ${b === undefined ? '' : b.toString(16)} ${c === undefined ? '' : c.toString(16)} d=${this.stats.disp} rsp=${BigInt.asUintN(64, this.regview[4]).toString(16)} rbp=${BigInt.asUintN(64, this.regview[5]).toString(16)}${DISPRING_WATCH === null ? '' : ' w=' + DISPRING_WATCH.map((a) => { try { return this.mem.read(a, 8n).toString(16); } catch { return '?'; } }).join('/')}`; }
   _armFp(rip) {
     if (this._skipUntil !== undefined || rip < ARM_FP.lo || rip >= ARM_FP.hi) return;
@@ -1703,6 +1761,7 @@ export class LinuxEngine {
   }
   _codeWrite(waddr, next, size) {
     const g = this.base + BigInt((waddr >>> 0) - this.RAMOFF);
+    if (WATCHADDR !== null) { const e = g + BigInt(size >>> 0 || 1); for (let a = g & ~7n; a < e; a += 8n) if (WATCHADDR.has(a)) { const hk = this._extOverlap(g, e); this._waLog(a, g, size, 'C rip=' + (next === undefined ? '?' : BigInt.asUintN(64, next).toString(16)) + ' disjoint=' + this._cwDisjoint(g, e) + ' hit=' + (hk ? hk.map((k) => k.toString(16) + (this.aotFns.has(k) ? '+' : '-')).join(',') : 'none') + ' vol=' + !!this._volatilePages?.has(g & ~4095n)); break; } }
     if (CWVERIFY) { if (((this._cwN = (this._cwN | 0) + 1) & 255) === 0) this._cwVerify('write'); (this._cwRing ??= []).push([g.toString(16), size, next === undefined ? '?' : BigInt.asUintN(64, next).toString(16), this._cwDisjoint(g, g + BigInt(size >>> 0 || 1)) ? 'D' : 'X']); if (this._cwRing.length > 64) this._cwRing.shift(); }
     if (this._watchArmed) this._watchLog(g, BigInt(size >>> 0 || 1), 0n, 'compiled next=' + (next === undefined ? '?' : BigInt.asUintN(64, next).toString(16)));   // log, then invalidate as usual (the early return made watched runs skip invalidation)
     const n = BigInt(size >>> 0 || 1), end = g + n;
@@ -1732,7 +1791,7 @@ export class LinuxEngine {
       // gone stays marked until something unmarks it. 170k-270k of these a round made a 60 ms objects round take 800.
       // A line no translation covers any more is cleared here, on the store that found it; a line still shared with
       // live code keeps paying. Units still being assembled are in _extents already (they register at creation).
-      if (!CW_NOHEAL && !this._cwLineCovered(g & ~63n)) { this._cwBitsOne(g >> 6n, false); this.stats.cwHeal = (this.stats.cwHeal | 0) + 1; }
+      if (!CW_NOHEAL && !this._cwLineCovered(g & ~63n) && !(WATCHADDR !== null && [...WATCHADDR].some((a) => (a >> 6n) === (g >> 6n)))) { this._cwBitsOne(g >> 6n, false); this.stats.cwHeal = (this.stats.cwHeal | 0) + 1; }
       return;
     }
     const changed = this._invalidateCode(lo, hi, EXACT_CW_OFF ? undefined : [g, end]);
@@ -1998,6 +2057,21 @@ export class LinuxEngine {
         // The caller (compiled code) already spilled the whole register file to
         // memory before the call, and the guest return address is on the guest
         // stack. rsp lives in the regfile at slot 4.
+        if (this._shTrace) { const { trace: tr, TB: tb } = this._shTrace, rsp = BigInt.asUintN(64, this.regview[4]); let k = -1;
+          for (let i = 0; i < tr.length; i++) if (tr[i].rip === target && tr[i].rsp === rsp) { k = i; break; }
+          if (k < 0) { if ((this._shCallMiss = (this._shCallMiss | 0) + 1) <= 20) __dbg(`<SHADOW-CALLMISS target=0x${target.toString(16)} rsp=${rsp.toString(16)} disp=${this.stats.disp} steps=${tr.length} regs=${[0,1,2,6,7].map((r) => 'r' + r + '=' + BigInt.asUintN(64, this.regview[r]).toString(16)).join(' ')} last=${tr.slice(-3).map((e) => e.rip.toString(16) + '/' + e.rsp.toString(16)).join(',')}>`); }
+          else { const o = k * 48, d = []; for (let r = 0; r < 16; r++) { if (r === 11) continue; const a = BigInt.asUintN(64, this.regview[r]), b = BigInt.asUintN(64, tb[o + r]); if (a !== b) d.push(`r${r} aot=${a.toString(16)} interp=${b.toString(16)}`); }
+            if (d.length && (this._shCallDiff = (this._shCallDiff | 0) + 1) <= 20) __dbg(`<SHADOW-CALLDIFF target=0x${target.toString(16)} rsp=${rsp.toString(16)} step=${k} disp=${this.stats.disp} ${d.join(' ')}>`); } }
+        if (CHECKADD !== null && target === CHECKADD && (this._badAddN | 0) < 3) {
+          for (const r of [6, 2]) { const v = BigInt.asUintN(64, this.regview[r]); if (v === 0n || (v & 0xfffe000000000002n) !== 0n) continue;
+            let ty = -1; try { ty = Number(this.mem.read(v + 5n, 1n)); } catch {}
+            if (ty <= 0x20 && ty !== 2 && ty !== 3 && ty !== 6) { this._badAddN = (this._badAddN | 0) + 1;
+              let hdr = ''; try { hdr = Buffer.from(this.mem.view(v, 32n)).toString('hex'); } catch {}
+              __dbg(`[badadd] #${this._badAddN} reg=${r === 6 ? 'rsi' : 'rdx'} v=${v.toString(16)} type=${ty} hdr=${hdr} other=${BigInt.asUintN(64, this.regview[r === 6 ? 2 : 6]).toString(16)} rsp=${BigInt.asUintN(64, this.regview[4]).toString(16)} ret=${(() => { try { return this.mem.read(BigInt.asUintN(64, this.regview[4]), 8n).toString(16); } catch { return '?'; } })()} disp=${this.stats.disp} interp=${this.stats.interpreted} t=${this.nowMs() | 0}ms`);
+              if (this._dring !== undefined) { const rr = this._dring, n = rr.length, i0 = this._dringI | 0; const lines = []; for (let i = 0; i < n; i++) { const e = rr[(i0 + 1 + i) % n]; if (e) lines.push(e); } __dbg('[badadd-ring] ' + lines.slice(-60).join(' | ')); }
+              if (this.ripTrace !== undefined) { const seq = []; for (let i = 400; i >= 1; i--) { const x = this.ripTrace[(this.ripTraceI - i) & 65535]; seq.push(x < 0n ? 'A' + (-x).toString(16) : x.toString(16)); } __dbg('[badadd-rips] ' + seq.join(' ')); }
+            } }
+        }
         const rsp0 = BigInt.asUintN(64, this.regview[4]);
         if (globalThis.__frameTrace) console.error(`<callout target=${target.toString(16)} rsp=${rsp0.toString(16)} compiled=${this.aotFns.has(target)} iu=${this._iuDepth | 0}>`);
         if (rsp0 < 0x10000n && this.onBadRsp) this.onBadRsp(target, rsp0);
@@ -2824,7 +2898,8 @@ export class LinuxEngine {
     if (IDLEDIAG) { const t = this.threads[this.ti]; if (t) { t.lastSys = nr; t.lastSysRip = cpu.rip; t.lastSysArg = a1; } }
     if (ENV.OXWASM_COUNTCALLS === '1' && nr === 1 && this._ctor?.argv?.[0]?.includes('opencode')) { const c = new DataView(this.wmem.buffer).getBigUint64(FTMAP + 32, true); const st = this.stats, pv = this._lastStW ?? {}, d = (k) => (st[k] | 0) - (pv[k] | 0), sysSum = Object.values(st.sysMs ?? {}).reduce((x, y) => x + y, 0), sysN = Object.values(st.syscalls ?? {}).reduce((x, y) => x + y, 0), now = performance.now();
       if (ENV.OXWASM_IHIST_RESET && globalThis.__ihist && !this._ihReset && (now - (pv.now ?? now)) > +ENV.OXWASM_IHIST_RESET) { this._ihReset = true; globalThis.__ihist.clear(); if (this.deoptLog) this.deoptLog.clear(); if (this.calloutLog) this.calloutLog.clear(); if (this._episodes) this._episodes.clear(); }   // OXWASM_IHIST_RESET=<ms>: histograms count from the first round longer than this
-      __dbg(`[calls-w] hr=${process.hrtime.bigint() / 1000n} n=${c} d=${c - (this._lastCallsW ?? 0n)} interp=${d('interpreted')} disp=${d('disp')} ms=${(now - (pv.now ?? now)) | 0} tu=${(st.tuTotalMs - (pv.tuTotalMs || 0)) | 0}ms/${d('tiers_aot')} inval=${d('invalSlow')} cw=${d('codeWrites')} deopt=${d('deopts')} comp=${d('compiles')}/${d('unitHits')}/${d('tierCalls')} callout=${d('coNoF')} vol=${d('volatilePages')} sys=${sysN - (pv.sysN || 0)}/${(sysSum - (pv.sysSum || 0)) | 0}ms sig=${Object.entries(this._sigN ?? {}).map(([k, v]) => k + ':' + (v - ((pv._sigN ?? {})[k] | 0))).join(',')} heap=${(process.memoryUsage().heapUsed / 1048576) | 0}MB v8gc=${(() => { try { const h = process.getBuiltinModule('node:v8').getHeapStatistics(); return ((h.total_heap_size / 1048576) | 0) + 'MB/' + ((h.malloced_memory / 1048576) | 0) + 'MBm'; } catch { return '?'; } })()} ext=${(process.memoryUsage().external / 1048576) | 0}MB`);
+      let txt = ''; try { const n = Number(cpu.regs[2]); txt = Buffer.from(this.mem.view(BigInt.asUintN(64, cpu.regs[6]), BigInt(Math.min(n, 16)))).toString('latin1').replace(/[^ -~]/g, '.'); } catch {}
+      __dbg(`[calls-w] hr=${process.hrtime.bigint() / 1000n} txt=${JSON.stringify(txt)} n=${c} d=${c - (this._lastCallsW ?? 0n)} interp=${d('interpreted')} disp=${d('disp')} ms=${(now - (pv.now ?? now)) | 0} tu=${(st.tuTotalMs - (pv.tuTotalMs || 0)) | 0}ms/${d('tiers_aot')} inval=${d('invalSlow')} cw=${d('codeWrites')} deopt=${d('deopts')} comp=${d('compiles')}/${d('unitHits')}/${d('tierCalls')} callout=${d('coNoF')} vol=${d('volatilePages')} sys=${sysN - (pv.sysN || 0)}/${(sysSum - (pv.sysSum || 0)) | 0}ms sig=${Object.entries(this._sigN ?? {}).map(([k, v]) => k + ':' + (v - ((pv._sigN ?? {})[k] | 0))).join(',')} heap=${(process.memoryUsage().heapUsed / 1048576) | 0}MB v8gc=${(() => { try { const h = process.getBuiltinModule('node:v8').getHeapStatistics(); return ((h.total_heap_size / 1048576) | 0) + 'MB/' + ((h.malloced_memory / 1048576) | 0) + 'MBm'; } catch { return '?'; } })()} ext=${(process.memoryUsage().external / 1048576) | 0}MB`);
       this._lastCallsW = c; this._lastStW = { ...st, tiers_aot: st.tiers?.aot | 0, now, sysSum, sysN, _sigN: { ...(this._sigN ?? {}) } }; st.tiers_aot = st.tiers?.aot | 0; }
     if (ENV.OXWASM_JITSYS && (nr === 9 || nr === 10 || nr === 11 || nr === 25 || nr === 28) && this._ctor?.argv?.[0]?.includes('opencode')) {
       const lo = BigInt('0x' + (ENV.OXWASM_JITSYS === '1' ? '5a000000' : ENV.OXWASM_JITSYS.split('-')[0])), hi = BigInt('0x' + (ENV.OXWASM_JITSYS === '1' ? '5b000000' : ENV.OXWASM_JITSYS.split('-')[1]));
@@ -3579,7 +3654,7 @@ export class LinuxEngine {
           console.error('[fnprof] ' + rows.slice(0, 60).map(([c, a]) => a.toString(16) + 'x' + c).join(' '));
         }
         if (ENV.OXWASM_HASFN && ENV.OXWASM_STATS && this._ctor?.argv?.[0]?.includes(ENV.OXWASM_STATS)) console.error('[hasfn] ftdepth=' + new DataView(this.wmem.buffer).getUint32(FTMAP + 8, true) + ' limit=' + FTDLIMIT + ' ftCount=' + this._ftCount + ' ftFull=' + (this._ftFull | 0) + ' ' + ENV.OXWASM_HASFN.split(',').map((h) => h + '=' + (typeof this.aotFns.get(BigInt('0x' + h)))).join(' '));
-        if (ENV.OXWASM_STATS && this._ctor?.argv?.[0]?.includes(ENV.OXWASM_STATS)) { const st = this.stats; console.error(`[stats] ${this._ctor.argv[0]} interp=${st.interpreted} aotRuns=${st.aotRuns} compiledRuns=${st.compiledRuns} units=${this.aotFns.size} syscalls=${Object.values(st.syscalls).reduce((x, y) => x + y, 0)} wallMs=${Math.round(this.nowMs())} sysMs=${JSON.stringify(Object.fromEntries(Object.entries(st.sysMs ?? {}).filter(([, v]) => v > 50).map(([k, v]) => [k, Math.round(v)])))} tiers=${JSON.stringify(st.tiers)} extra=${JSON.stringify(Object.fromEntries(Object.entries(st).filter(([k, v]) => typeof v === 'number' && !['interpreted', 'aotRuns', 'compiledRuns'].includes(k))))} sysTop=${Object.entries(st.syscalls || {}).sort((x, y) => y[1] - x[1]).slice(0, 8).map(([k, v]) => k + ':' + v).join(',')}`); }
+        if (ENV.OXWASM_STATS && this._ctor?.argv?.[0]?.includes(ENV.OXWASM_STATS)) { const st = this.stats; console.error(`[stats] ${this._ctor.argv[0]} interp=${st.interpreted} aotRuns=${st.aotRuns} compiledRuns=${st.compiledRuns} units=${this.aotFns.size} syscalls=${Object.values(st.syscalls).reduce((x, y) => x + y, 0)} wallMs=${Math.round(this.nowMs())} sysMs=${JSON.stringify(Object.fromEntries(Object.entries(st.sysMs ?? {}).filter(([, v]) => v > 50).map(([k, v]) => [k, Math.round(v)])))} tiers=${JSON.stringify(st.tiers)} extra=${JSON.stringify(Object.fromEntries(Object.entries(st).filter(([k, v]) => typeof v === 'number' && !['interpreted', 'aotRuns', 'compiledRuns'].includes(k))))} sysTop=${Object.entries(st.syscalls || {}).sort((x, y) => y[1] - x[1]).slice(0, 8).map(([k, v]) => k + ':' + v).join(',')} shadow=${JSON.stringify(this._shadowStats ?? null)}`); }
         const t = this.threads[this.ti];
         if (this._shmAt?.length) this._shmExit(t);            // shared-memory attaches reach the segment before the image goes
         if (t.proc && nr === 60 && this.threads.some(x => x !== t && x.state !== 'dead' && x.proc === t.proc)) {

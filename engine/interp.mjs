@@ -25,7 +25,9 @@ export class Memory {
   // watch: optional write-watchpoint (addr, n, v) => void, called before any
   // write overlapping [watchLo, watchHi). Debug aid; null = no cost beyond
   // the null check.
-  constructor(regions) { this.regions = regions; this.pend = null; this.watch = null; this.jit = null; this.jitBase = 0n; }   // [{base, bytes}]
+  constructor(regions) { this.regions = regions; this.pend = null; this.watch = null; this.jit = null; this.jitBase = 0n; this.wa = null; }
+  // wa: a Set of watched 8-byte-aligned guest addresses (diagnostic, OXWASM_WATCHADDR); waLog(addr, n, v) is called on any overlapping write
+  waHit(addr, n) { const e = addr + BigInt(n); for (let a = addr & ~7n; a < e; a += 8n) if (this.wa.has(a)) return true; return false; }   // [{base, bytes}]
   // jit: optional page map (1 = a page the guest mapped or mprotected
   // executable at runtime: a JIT's code cache). Instructions decoded from
   // such a page keep their bytes and are checked against memory on every
@@ -61,6 +63,7 @@ export class Memory {
   }
   write(addr, n, v) {
     if (this.pend !== null) this.pend(addr, n);
+    if (this.wa !== undefined && this.wa !== null && this.waHit(addr, n)) this.waLog(addr, n, v);
     if (this.watch !== null && addr < this.watchHi && addr + n > this.watchLo) this.watch(addr, n, v);
     if (this.jrnl) this.jrnl.push([addr, n, this.read(addr, n), null]);
     const r = this.find(addr);
@@ -1048,7 +1051,7 @@ export class CPU {
           const overlapUp = this.regs[7] > this.regs[6] && this.regs[7] < this.regs[6] + len;
           if (src && dst && !overlapUp) {
             if (this.mem.jrnl) this.mem.jrnl.push([this.regs[7], 0n, null, dst.slice()]);
-            if (this.mem.watch !== null && this.regs[7] < this.mem.watchHi && this.regs[7] + len > this.mem.watchLo) this.mem.watch(this.regs[7], len, 0n);   // a bulk store into watched memory is still a store
+            if (this.mem.watch !== null && this.regs[7] < this.mem.watchHi && this.regs[7] + len > this.mem.watchLo) this.mem.watch(this.regs[7], len, 0n); if (this.mem.wa !== null && this.mem.wa !== undefined && this.mem.waHit(this.regs[7], len)) this.mem.waLog(this.regs[7], len, -1n);   // a bulk store into watched memory is still a store
             dst.set(src);
             this.regs[6] = (this.regs[6] + len) & MASK[8];
             this.regs[7] = (this.regs[7] + len) & MASK[8];
@@ -1114,7 +1117,7 @@ export class CPU {
           const dst = this.mem.view(this.regs[7], len);
           if (dst) {
             if (this.mem.jrnl) this.mem.jrnl.push([this.regs[7], 0n, null, dst.slice()]);
-            if (this.mem.watch !== null && this.regs[7] < this.mem.watchHi && this.regs[7] + len > this.mem.watchLo) this.mem.watch(this.regs[7], len, 0n);
+            if (this.mem.watch !== null && this.regs[7] < this.mem.watchHi && this.regs[7] + len > this.mem.watchLo) this.mem.watch(this.regs[7], len, 0n); if (this.mem.wa !== null && this.mem.wa !== undefined && this.mem.waHit(this.regs[7], len)) this.mem.waLog(this.regs[7], len, -1n);
             if (S === 1) dst.fill(Number(v));
             else { const b = []; for (let i = 0n; i < n; i++) b.push(Number((v >> (8n*i)) & 0xFFn));
                    for (let o = 0; o < dst.length; o += S) for (let i = 0; i < S; i++) dst[o+i] = b[i]; }

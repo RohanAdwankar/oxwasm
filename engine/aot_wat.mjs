@@ -4089,7 +4089,9 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     return L.join('\n');
   }
 
-  const bodies = []; for (let i=0;i<N;i++) bodies.push((WATCOMMENTS ? ';; blk ' + i + ' @' + blocks[i].start.toString(16) + '\n' : '') + emitBlock(i));
+  const fmtOp = (o) => { if (!o) return ''; if (o.kind === 'reg') return 'r' + o.r + (o.size ? ':' + o.size : ''); if (o.kind === 'imm') return '#' + BigInt.asIntN(64, BigInt(o.v)).toString(16); if (o.kind === 'mem') return '[' + (o.base >= 0 ? 'r' + o.base : '') + (o.index >= 0 ? '+r' + o.index + '*' + (o.scale ?? 1) : '') + (o.disp ? '+' + BigInt.asIntN(64, BigInt(o.disp)).toString(16) : '') + ']' + (o.size ? ':' + o.size : ''); return JSON.stringify(o, (k, v) => typeof v === 'bigint' ? v.toString(16) : v); };
+  const insnCmt = (b) => b.insns.map((x) => ';;   ' + x.rip.toString(16) + ' ' + x.mnem + ' ' + fmtOp(x.dst) + (x.src ? ', ' + fmtOp(x.src) : '') + (x.rel !== undefined ? ' rel=' + BigInt.asIntN(64, BigInt(x.rel)).toString(16) : '') + (x.cc !== undefined ? ' cc=' + x.cc : '')).join('\n') + '\n';
+  const bodies = []; for (let i=0;i<N;i++) bodies.push((WATCOMMENTS ? ';; blk ' + i + ' @' + blocks[i].start.toString(16) + '\n' + insnCmt(blocks[i]) : '') + emitBlock(i));
 
   // ---- spill/reload narrowing ------------------------------------------------
   // Two dataflow passes over the emitted text shrink the register protocol.
