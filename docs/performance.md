@@ -1910,3 +1910,12 @@ Two engine bugs surfaced on the way, both fixed and both in the default layout t
   with the threaded LLInt (whose final ret lands in the run loop and roots the return address), 6k a run in the
   default layout. The entries set is now the addresses the guest has actually called: deopts per run 677.
 - OXWASM_DEOPTSRC=1 attributes deopt targets to the entry dispatched from the run loop, which is what found it.
+
+### Continuation roots and JSC's JIT
+With the JIT on, continuation roots are harmful: a root in generated memory is re-translated as the JIT patches
+and reuses the bytes (first round 256 s, 828k callouts), and even restricted to the static image (the rule now)
+the rounds run at 190 s with 125M interpreted instructions and 408k callouts each - the root units' closures
+reach into JIT code. The JIT-on configuration is not usable regardless: roots off, the mix runs 10 rounds and
+hangs, or aborts at round 5 (SIGABRT, jsAddSlowCase on a freed cell) in 32 s with the old entries rule
+(OXWASM_ENTRIES=all), which is the fastest reproduction of that miscompile so far. Roots stay on by default
+for the JIT-off configuration they were measured on.

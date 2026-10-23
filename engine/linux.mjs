@@ -875,6 +875,10 @@ export class LinuxEngine {
   _retRoot(hk, kind) {
     if (!RETROOT_KINDS.has(kind)) return;
     if (this.aotFns.has(hk) || this.aotFailed.has(hk) || !this.assembleWat || !this.inExec(hk)) return;
+    // static code only: a root in generated (JIT) memory sits on bytes that are patched and reused, so it is
+    // invalidated and re-translated continuously - with JSC's JIT on, the mix's first round took 256 s and made
+    // 828k callouts, against 23 s for four rounds with roots off
+    if (!(this.execRangesStatic ?? []).some(([a, b]) => hk >= a && hk < b)) return;
     const n = (this.profile.get(hk) || 0) + 1;
     this.profile.set(hk, n);
     // A continuation inside a giant function (an LLInt opcode's slow-path return) would re-translate everything
@@ -5959,10 +5963,11 @@ export class LinuxEngine {
   // whose final ret lands in the run loop and roots the C++ return address.
   _knownEntries() {
     if (!this._entries) { const e = this._entries = new Set();
-      for (const t of this._callEntries ?? []) e.add(t.toString()); }
+      for (const t of this._callEntries ?? []) e.add(t.toString());
+      if (ENV.OXWASM_ENTRIES === 'all') { for (const k of this.aotCalls.keys()) e.add(k.toString()); for (const k of this.aotFns.keys()) e.add(k.toString()); for (const k of this._ftSeen) e.add(k.toString()); } }   // OXWASM_ENTRIES=all: the old rule (every export and profiled target), for bisecting
     return this._entries;
   }
-  _entryAdd(k) { }   // registration no longer makes an entry (see _knownEntries)
+  _entryAdd(k) { if (ENV.OXWASM_ENTRIES === 'all' && this._entries) this._entries.add(k.toString()); }   // registration no longer makes an entry (see _knownEntries)
   _killProcSiblings(t) {
     for (const x of this.threads) if (x !== t && x.proc === t.proc && x.state !== 'dead') {
       x.state = 'dead'; if (x.ctid) { try { this.mem.write(x.ctid, 4n, 0n); } catch {} }
