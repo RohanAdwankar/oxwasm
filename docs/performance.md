@@ -2293,3 +2293,10 @@ mismatch of 11 vs 10 units: the disk was full. Every engine edit makes a new boo
 ~/.cache/oxwasm/snapshots and 442 of them had accumulated with a dozen obsolete unit caches; deleting all but
 the newest three snapshots freed 18 GB and the suite is green again (suite38). Commit gates must read the
 suite's exit status, not just run it.)
+
+DFG optimize thresholds (cold99w, 40 rounds, NOLIFTOFF, medians of rounds 21-40 / best / peak rss): default
+208 / 141 / 8.5 GB; thresholdForOptimizeAfterWarmUp=LongWarmUp=100: 211 / 127 / 7.2 GB; =20 (plus
+thresholdForOptimizeSoon=20): 256.5 / 144 / 7.0 GB. Compiling earlier does not make the rounds settle earlier;
+the DFG keeps re-emitting. A worker profile through the inspector during the warm-up (t=22-47 s) is 62% guest
+wasm, 7% the host's output plumbing (send, writeSync, writeChunk, encode), 3% the boot snapshot, 3% module
+instantiation; the x86-to-wasm emitter does not appear in the top 25.
