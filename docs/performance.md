@@ -1875,3 +1875,7 @@ only comparable among themselves. Clean numbers, all with the madvise fast path 
 Native, same binary, JIT off: 104 ms; native default: 45 ms. So the stable configuration stands at 4.1-4.8x the
 like-for-like native and ~10x the native default. The roots are worth 5-10% here; the ABI reload lever is within
 noise (strings -10%, nothing else), so it stays opt-in; one GC marker instead of four is within noise too.
+
+**OXWASM_MEMREG=xmm** (only the xmm locals of a dispatch root in the regfile, GPRs stay locals) measured 441 and
+509 against the locals' 489 and 472 in alternating pairs: the machine's run-to-run noise (fib 20-26 for the same
+cache) is larger than any effect. Not adopted; opt-in like the other two modes.

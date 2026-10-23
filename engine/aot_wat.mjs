@@ -91,7 +91,7 @@ const MEMREG = (typeof process !== 'undefined' && process.env?.OXWASM_MEMREG) ||
 // Rewrites a finished function's text: `(local.get $rN)` and `(local.set $rN E)` become loads and stores of slot 8N,
 // an i32 local's store zero-extends (the register is 32-bit), `$xN` maps to its xmm slot, and the spill/reload sites
 // of the register protocol - now copies of a slot onto itself - are deleted.
-export function regsToMemory(s, isI32, xmmOff) {
+export function regsToMemory(s, isI32, xmmOff, only = null) {   // only='x': the xmm locals alone (OXWASM_MEMREG=xmm)
   const closeOf = (t, i) => { let d = 0; for (let k = i; k < t.length; k++) { const c = t[k]; if (c === '(') d++; else if (c === ')') { d--; if (d === 0) return k + 1; } } return -1; };
   let out = '', i = 0;
   const re = /\(local\.(get|set) \$([rx])(\d+)([ )])/g;
@@ -101,6 +101,7 @@ export function regsToMemory(s, isI32, xmmOff) {
     const m = re.exec(s);
     if (!m) break;
     const j = m.index, kind = m[1], cls = m[2], n = +m[3];
+    if (only !== null && cls !== only) { out += s.slice(i, j + m[0].length); i = j + m[0].length; continue; }
     const off = cls === 'r' ? n * 8 : xmmOff + n * 16;
     if (kind === 'get') {
       const op = cls === 'x' ? 'v128.load' : isI32(n) ? 'i32.load' : 'i64.load';
@@ -111,7 +112,7 @@ export function regsToMemory(s, isI32, xmmOff) {
     // set: rewrite the whole (local.set ...) extent so the i32 case can wrap its value
     const end = closeOf(s, j);
     const body = s.slice(j + m[0].length, end - 1);          // the value expression
-    const inner = regsToMemory(body, isI32, xmmOff);
+    const inner = regsToMemory(body, isI32, xmmOff, only);
     if (cls === 'x') out += s.slice(i, j) + `(v128.store offset=${off} (i32.const 0) ${inner})`;
     else if (isI32(n)) out += s.slice(i, j) + `(i64.store offset=${off} (i32.const 0) (i64.extend_i32_u ${inner}))`;
     else out += s.slice(i, j) + `(i64.store offset=${off} (i32.const 0) ${inner})`;
@@ -4234,7 +4235,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   // gets the dispatch layout.
   const MEGA_BIG = DISP && hasJtab && isDispatchRoot(a0, fnAddr);
   const finish = (w) => {
-    if (MEMREG && (MEMREG === 'all' || MEGA)) w = regsToMemory(w, isI32, XMMOFF);   // registers in the regfile, not locals (see MEMREG)
+    if (MEMREG && (MEMREG === 'all' || MEGA)) w = regsToMemory(w, isI32, XMMOFF, MEMREG === 'xmm' ? 'x' : null);   // registers in the regfile, not locals (see MEMREG; =xmm: only the xmm locals of a dispatch root)
     if (w.length > (MEGA_BIG ? MAXWAT_MEGA : MAXWAT)) throw new Error('emitted function exceeds the runtime limit: ' + w.length + ' bytes of wat');
     return w;
   };
