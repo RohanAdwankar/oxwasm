@@ -74,6 +74,13 @@ export const CWBM_SLOT = 176;
 // that is patched over and over is exactly what has to leave the set.
 export const CWMAP = 0x260000, CWMAP_PAGES = 0x20000;   // 128KB: 512MB of window span
 const STOREGUARD = typeof process !== 'undefined' && process.env?.OXWASM_STOREGUARD === '1';
+// OXWASM_GUARDPG=1: the guard reads a PAGE map at a fixed offset instead of the line map behind a slot. One byte per 4K
+// page of the whole 4 GB wasm address space, 1 MB at 0x300000 (below RAMOFF, after the volatile-page map), kept in step
+// with the line map by the engine. Per store that is a shift, a load with an immediate offset and a branch, against the
+// line map's slot load, shift, add, load and branch. Coarser: a store to data on a page that also holds translated code
+// calls the engine, which answers from the line map as before. Measured on JIT-off opencode: see docs/performance.md.
+const GUARDPG = typeof process !== 'undefined' && process.env?.OXWASM_GUARDPG === '1';
+export const PGMAP = 0x300000, PGMAP_BYTES = 0x100000;
 // Largest wat text this emitter will hand the runtime for ONE function; see
 // the refusal at the end of the function emitter for the two measurements
 // that bracket it.
@@ -2009,6 +2016,10 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     // a bit test on top: 29% of the machine code of the hot JSC functions.) A line is set only while a
     // translation built from its bytes is registered; the engine widens marks 15 bytes to the left so a wide
     // store that starts just before a span is seen too.
+    if (GUARDPG) return `(local.set $ga ${addr}) ` +
+           `(if (i32.load8_u offset=${PGMAP} (i32.shr_u (local.get $ga) (i32.const 12))) ` +
+           `(then (call $x_cw (local.get $ga) (i64.const ${next === undefined ? 0 : next}) (i32.const ${size})))) ` +
+           mk('(local.get $ga)');
     return `(local.set $ga ${addr}) ` +
            `(if (i32.load8_u (i32.add (i32.load (i32.const ${CWBM_SLOT})) (i32.shr_u (local.get $ga) (i32.const 6)))) ` +
            `(then (call $x_cw (local.get $ga) (i64.const ${next === undefined ? 0 : next}) (i32.const ${size})))) ` +

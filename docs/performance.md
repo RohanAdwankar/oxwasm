@@ -1750,3 +1750,41 @@ per-handler split would pay the call protocol per bytecode (~75 instructions) an
 the engine's own JS at ~15% (LoadIC/FindOrderedHashMapEntry/StrictEqual under `step`: ~21k interpreted instructions a
 round at ~7 us each, driven by 3-9 callouts a round into refused functions - 5b9a4e0 x158, refused for a `jne` that
 consumes the flags of a `call`), V8 internals ~15% (Liftoff compiles and instantiation of late units, the host GC).
+
+### The engine side of the JIT-off mix, itemised (cold77, V8 ticks over rounds 9-23, 10.3 s)
+With the cache complete and no tier-ups in steady state, the split is: wasm 71.5% (the LLInt function alone 21.5%, the
+rest a long tail - the hottest other unit, f_5b6f410, is 1.9%), the x86 interpreter and its megamorphic property-load
+builtins ~8% (LoadIC, LoadIC_Megamorphic, FindOrderedHashMapEntry, StrictEqual_Baseline under `step`), libc memcpy/memmove
+reached from `memory.copy` 4.3% (guest work, native pays it too), V8 C++ ~5%, the rest JS. So the translated code runs
+4.4x native by itself and the engine adds another 40% on top.
+
+Three engine costs found and measured on this configuration:
+
+- **madvise(DONTNEED) walked every table.** `_invalidateCode` only took its "no code on these pages" shortcut for ranges
+  under 64 pages; JSC's and bmalloc's decommits are 256 KB-1 MB, so every one walked the 15k-entry function map and every
+  keyed table: 150-180 slow invalidations a round, syscall 28 at 1,090 ms per 24-round run, 30-50 ms of a 650 ms round.
+  The shortcut now costs the smaller of the range's pages and the code-page set, with the wide-extent functions checked
+  by overlap. Syscall time per round fell to 9-14 ms (medians 660/676 vs 697-812 before).
+- **The store guard is 8-10% of the JIT-off round.** A cache built without OXWASM_STOREGUARD measures 625/597 ms medians
+  against 650/686 guarded, per phase fib 25-26 vs 30 and math 59-62 vs 75 (the arithmetic-heavy phases store least, so
+  there the guard is a larger share of less). With the JIT off nothing writes code after the loader's relocations (47
+  guarded stores hit a watched line in a run, all disjoint), so for this configuration the guard buys nothing; it is the
+  JIT's requirement. A cheaper form - a page-granular map at a fixed wasm offset, saving the slot load and the add per
+  store - is the next thing to try; the line map's precision only matters when the JIT is on.
+- **The interpreted instructions are thread resumes, not missing units.** OXWASM_EPISODES=1 keys every top-level
+  interpreted stretch by the rip it starts at and how it got there: 35,818 stretches and 402k instructions over 16 rounds,
+  and the top ones all start at a RETURN ADDRESS (libc+0x9bd82, pthread_cond_timedwait's continuation after
+  `call _pthread_cleanup_pop`: 2,113 x 27 instructions; a lock release at 4fd1aa0: 864 x 36). The mechanism: a futex wait
+  deep in a compiled call chain blocks, BlockUnwind drops every wasm frame above it, and on resume the callee's last
+  instructions run interpreted and `ret` INTO its unwound caller, whose continuation is mid-function - not an entry - so
+  it stays interpreted until the next call into a unit, and so does every frame above it. The size gate was not it
+  (OXWASM_SIZEGATE=0: identical 17-21k a round), and neither were callouts (0 a round).
+
+**Continuation roots (OXWASM_RETROOT, default 8).** A return address the interpreter lands on - by an interpreted `ret`,
+as a unit's exit rip, or as the rip a parked thread resumes at - eight times with no unit becomes a unit root, exactly
+like a loop head. With a 3,000-instruction budget on the root's own function (a continuation inside JSC's LLInt
+re-translated everything reachable from it: one root, 9.9 s; such roots now fail as 'function too large' and are never
+retried) the interpreted count per round goes from 17-20k to 650-2,000 and dispatches from ~1,500 to ~250-330; 280 roots
+over a run. Open as of this note: with the roots on, the opencode process hangs at exit with every thread but the main one
+dead and the main one blocked without a deadline (the shell's `wait` never returns, so the harness times out with no
+output); the three landing kinds are being bisected (OXWASM_RETROOT_KINDS).
