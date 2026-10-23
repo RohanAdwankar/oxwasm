@@ -2311,3 +2311,12 @@ MALLOC_MMAP_THRESHOLD_=131072 MALLOC_TRIM_THRESHOLD_=4194304 in the host process
 them at start; the SDK cannot set them for itself). Measured: 7-8.5 GB peak, rounds 120-145 ms at best and
 145-210 ms median against native 27.5 (DFG) / 29.5 (default). Short commands are the other way round (Liftoff
 and the default tiering, JIT off: docs above), so the launcher has to choose by workload.
+
+### Pricing a register-passing convention: 3% of the unit's code
+
+OXWASM_PRICE_NOSYNC=1 (unsound, pricing only) emits in-unit direct call sites without the regfile spill and
+reload. The 117-function unit rooted at 53818e0, TurboFan machine code: 800,095 instructions with the sync,
+776,179 without (-3%); frame spills 200,050 vs 198,797, register moves 207,230 vs 198,138. The spills are
+TurboFan's around every wasm call (all registers are caller-saved in V8's wasm convention) and do not depend on
+the engine's protocol; passing registers as parameters would not remove them. What removes them is fewer wasm
+calls, i.e. inlining, which is gated by the miscompile that cold65's aggressive budgets hit.

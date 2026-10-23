@@ -187,6 +187,7 @@ export const PGMAP = 0x300000, PGMAP_BYTES = 0x100000;
 // Largest wat text this emitter will hand the runtime for ONE function; see
 // the refusal at the end of the function emitter for the two measurements
 // that bracket it.
+const PRICE_NOSYNC = typeof process !== 'undefined' && process.env?.OXWASM_PRICE_NOSYNC === '1';   // pricing only, unsound (see the call case)
 const RBPSTORE = !(typeof process !== 'undefined' && process.env?.OXWASM_RBPSTORE === '0');   // A/B lever for the rbp-store rule in gstore
 const PATCHJMP = !(typeof process !== 'undefined' && process.env?.OXWASM_PATCHJMP === '0');   // see patchSite
 const STALE_UNWIND = !(typeof process !== 'undefined' && process.env?.OXWASM_STALEUNWIND === '0');   // see FTSTALE
@@ -3714,7 +3715,10 @@ function emitUnitFunction(a0, fnAddr, ctx) {
           // check, and no frame. Removing the frame IS the optimisation; the
           // three things around it were each measured to cost nothing.
           if (insn.inlineTo !== undefined) break;
-          L.push(SA_MARK);
+          // PRICING ONLY (OXWASM_PRICE_NOSYNC=1, unsound): an in-unit direct call site without the regfile spill and
+          // reload, to put a ceiling on what a register-passing convention for such calls could save on the caller side.
+          const priceNoSync = PRICE_NOSYNC && !patchable(insn) && canDirect(target.toString());
+          if (!priceNoSync) L.push(SA_MARK);
           // The callee's exit rip is kept (not dropped) and the guest rsp is checked against its
           // pre-push value once the regfile is reloaded: see retCheck below.
           const rb = T(); L.push(`(local.set ${rb} (i64.add (local.get $r4) (i64.const 8)))`);
@@ -3745,7 +3749,8 @@ function emitUnitFunction(a0, fnAddr, ctx) {
                    `  (then ${ftBurn} ${nestUp}(local.set $rex (call_indirect $ft (type $uft) (local.get $fti)))${nestDn} ${ftRestore})`,
                    `  (else (local.set $rex (call $x_callout (i64.const ${hexs(target)})))))`);
           }
-          L.push(RC_MARK, retCheck(rb, next));
+          if (!priceNoSync) L.push(RC_MARK);
+          L.push(retCheck(rb, next));
           break; }
         case 'callind': {   // compute target BEFORE the push moves rsp
           const t = T(); L.push(`(local.set ${t} ${rd(insn.src,8,next)})`);
