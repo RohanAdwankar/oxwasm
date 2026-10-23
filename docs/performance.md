@@ -2227,3 +2227,27 @@ Park roots chaining upward (a park-root unit's plain return roots the rip it lan
 250.5, 210.0, 247.0 with 68-76 roots and 584k-632k interpreted steps, against 242.5, 232.5 with 8-10 roots and
 700k steps. Another 15% of the steps for nothing measurable. On by default (it is cheap and bounded by the
 stack depth at the park); the interpreter is no longer where the round is.
+
+### DFG on: the JIT-corruption fix makes JavaScriptCore's optimising tier usable, and it halves the round's best case
+
+With the child-unit capture bug gone (3f77a6e), BUN_JSC_useDFGJIT=1 runs the mix without an abort. First run
+(cold99w, DFG on, FTL off): STEADY 146 ms, median of rounds 21-40 187 ms with compile spikes (rounds from 134 to
+1,252 ms; the DFG keeps compiling and every new body is translated: 3,683 tier-ups, 111 MB of WAT, 24 s of
+translation in the run). Per phase: fib 2.0 (was 4.0), math 2.5 (was 21.0), objects 26.5, strings 18.0,
+sorting 39.5, maps 66.0, json 32.5. Native with the same tiers (baseline+DFG) is 33 ms, all tiers 30 ms, so
+the best rounds are 4.4x native-with-DFG against 5x before, and the mix's calls into thunks (the call protocol
+at 7.2M entries a round) start to disappear at the source.
+
+The price is memory: 13.2 GB resident (the first DFG run was OOM-killed by the 16 GB cgroup at 13.7 GB). The
+growth is the process's malloc heap, 0 to 3.8 GB between 30 and 45 s of the run (the warm-up's translations and
+V8's compile zones for multi-MB modules) and never returned; the wasm memories are 912 + 411 MB. Next:
+--wasm-num-compilation-tasks=1 for the peak, and glibc's mmap threshold so compile zones are returned on free.
+
+Three 80-round DFG runs (cold99w): V8 compile tasks limited to one (c222): rounds 21-40 median 210, 41-60 180,
+61-80 228, best 131; peak rss 12.1 GB. Plus glibc MALLOC_MMAP_THRESHOLD_=131072 MALLOC_TRIM_THRESHOLD_=4 MB
+(c223): 217 / 174 / 224, best 129, peak 13.0 GB (the malloc heap fell from 3.8 to 1.6 GB; the rest of the
+resident set is anonymous mappings, i.e. not malloc). Plus BUN_JSC_useConcurrentJIT=0 (c224): 200 / 171 / 246,
+best 151, peak 12.6 GB. None of them settles: every ten rounds or so the DFG emits new bodies and the round pays
+300-500 ms of translation (`tu=` in the per-round counters) plus 40-220k interpreted steps; the quiet rounds
+in between are 130-165 ms, with 3.5-4.8M translated entries a round (7.2M with the baseline JIT alone) and
+1,500-4,500 syscalls a round (2 with the baseline JIT alone), concurrent compiler thread or not.
