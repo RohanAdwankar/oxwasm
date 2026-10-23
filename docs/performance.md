@@ -2283,3 +2283,7 @@ compiled by TurboFan only (OXWASM_NOLIFTOFF=1, c229, 60 rounds): medians 312 / 2
 best 141, peak rss 8.3 GB against 12-13 GB with Liftoff (the malloc heap 2.1 GB against 3.0-3.8). Same speed,
 a third less memory: the DFG configuration that fits a 16 GB box is DFG on, FTL off, NOLIFTOFF=1, one V8
 compile task, glibc's mmap threshold lowered.
+
+Releasing the funcref table slot of every dropped function (OXWASM_FTFREE=1): 225 slots freed in a 60-round
+DFG run, peak rss 7.6 GB against 8.3, and 4.0 s of table sets: V8's Table.set is O(instances) and with
+thousands of unit instances each set costs ~18 ms. Opt-in only; the dead modules are not the resident set.

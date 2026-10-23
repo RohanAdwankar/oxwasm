@@ -135,6 +135,7 @@ const EPISODES = ENV.OXWASM_EPISODES === '1';
 const RETROOT = ENV.OXWASM_RETROOT === undefined ? 8 : +ENV.OXWASM_RETROOT;
 const DEOPT_INPLACE = ENV.OXWASM_DEOPT_INPLACE !== '0';   // a deopt with no landing unit interprets its frame in place (see the deopt import)
 const RETROOT_CHAIN = ENV.OXWASM_RETROOT_CHAIN !== '0';
+const FTFREE = ENV.OXWASM_FTFREE === '1';   // opt-in: dropped functions release their funcref table slot (see _ftDrop); each set costs ~18 ms with thousands of instances
 const RETROOT_LIBEXIT = ENV.OXWASM_RETROOT_LIBEXIT === '1';
 const ROOTTRACE = ENV.OXWASM_ROOTTRACE ? BigInt('0x' + ENV.OXWASM_ROOTTRACE) : null;   // trace _retRoot decisions for one rip
 const RETROOT_MAX = +ENV.OXWASM_RETROOT_MAX || 3000;   // instruction budget of a continuation root's own function
@@ -752,7 +753,12 @@ export class LinuxEngine {
       for (let n = 0; n < (FTHMASK >> 4) + 1; n++) {
         const k = dv.getBigUint64(p, true);
         if (k === 0n) break;
-        if (k === au) { dv.setBigUint64(p, 1n, true); this._ftTomb++; break; }
+        if (k === au) {
+          // Release the funcref slot too: a slot that still holds the dropped export keeps its instance, module and
+          // code alive, and under a JIT that re-emits bodies (DFG: 4k tier-ups a run) the dead modules were most of
+          // the resident set. One table set per drop (O(instances) in V8; measured in tabSetMs). OXWASM_FTFREE=0 leaks as before.
+          if (FTFREE) { const slot = dv.getInt32(p + 8, true); if (slot >= 0 && slot < this.ftab.length) { const t0 = performance.now(); try { this.ftab.set(slot, null); this.stats.ftFreed = (this.stats.ftFreed | 0) + 1; } catch {} this.stats.tabSetMs = (this.stats.tabSetMs || 0) + (performance.now() - t0); } }
+          dv.setBigUint64(p, 1n, true); this._ftTomb++; break; }
         p = FTHASH + (((p - FTHASH) + 16) & FTHMASK);
       }
       this._ftSeen.delete(a); this._ftIdxOf?.delete(a);
