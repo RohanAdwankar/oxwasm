@@ -1811,3 +1811,24 @@ Reading V8's output for one hot unit (f_530c370, 1,603 instructions) and the LLI
   working set pinned in registers. 2,563 `call rbx` sites (the slow-path call protocol) each cost the instance
   reload after return (7,963 `movq rsi,[rbp-0x10]`), and 1,899 loop-budget compares sit on the back edges. For
   the small unit the spill share is 15%.
+
+### Continuation roots measured; the page-map guard is not a gain (cold77/cold82/cold83, 24-round JIT-off mix)
+Same engine, three configurations, two runs each, medians of rounds 9-24:
+
+| configuration | medians | interpreted/round | objects | strings | json |
+|---|---|---|---|---|---|
+| line guard, no roots (cold77) | 686, 681 | 15-20k | 101 | 82-85 | 76-83 |
+| line guard, roots (cold83 = cold77 + roots) | 640, 613 | 0.7-1.4k | 90-91 | 72 | 65-71 |
+| page-map guard, no roots (cold82) | 733, 677 | 18-23k | 119-129 | 82-89 | 82-89 |
+| page-map guard, roots | 673 | 1-1.6k | 110 | 77 | 81 |
+
+Continuation roots: 6-10% off the round, and the phases that block most (strings, json: allocation, hence GC
+hand-offs between the mutator and its helper threads) gain the most. On by default (OXWASM_RETROOT=0 turns them
+off). The page map (OXWASM_GUARDPG=1) is not faster despite the shorter guard sequence - its objects phase is
+consistently worse, which a cache built from scratch with a different unit composition may explain as well as the
+guard itself; it stays an opt-in knob. One of the three root runs (rr2) again returned from the guest only at the
+guard's expiry (secs=643, rounds and medians intact), so the late `wait` is intermittent with roots on, not gone;
+it is being hunted with the idle diagnostic.
+
+One more flag-materialization peephole landed on the way: ZF of a subtraction is now the operands' equality
+(`cmp a,b; je` instead of lea, movl, testl, jnz), 0.6% off the unit's machine code.
