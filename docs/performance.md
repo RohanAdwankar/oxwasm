@@ -2012,3 +2012,9 @@ the native default's 45 (fib 3, math 14, objects 16, strings 7, sorting 26, maps
 different session of this machine; re-measure native before quoting a ratio). This is the first JIT-on number
 that is neither vetoed nor broken; everything before it in these notes for the JIT-on configuration was one or
 the other.
+
+Native on this host, same binary, same bench, 24 rounds, medians of rounds 9-24: with the bench's JSC settings
+(baseline JIT only, growth factors 3) fib 1, math 5, objects 6.5, strings 3, sorting 10, maps 14.5, json 6 - 46 ms a
+round (STEADY 40); JSC defaults 39.5 (STEADY 34). So the JIT-on mix now runs at 4.9-5.3x the like-for-like native
+and the ratio is uniform across phases (fib 4x, math 4x, objects 5x, strings 5x, sorting 4x, maps 5.5x, json 6x):
+this is translation quality and engine overhead spread over everything JSC runs, not one pathological phase.
