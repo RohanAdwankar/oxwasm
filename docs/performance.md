@@ -2320,3 +2320,32 @@ reload. The 117-function unit rooted at 53818e0, TurboFan machine code: 800,095 
 TurboFan's around every wasm call (all registers are caller-saved in V8's wasm convention) and do not depend on
 the engine's protocol; passing registers as parameters would not remove them. What removes them is fewer wasm
 calls, i.e. inlining, which is gated by the miscompile that cold65's aggressive budgets hit.
+
+### The cold-key boot fault is the inliner, not a store race (corrected below)
+
+The suite under OXWASM_UNPRUNE_TINY=160 OXWASM_INLINE_BUDGET=200 OXWASM_INLINE_TOTAL=2000 faulted at the
+isolation test ("fault: 88" while the second sandbox booted), and so did one direct run of that test; four
+boots under each knob and the combination passed, and three reruns of the test passed (its "fault: dead0000"
+and "fault: 7878..." lines are its own deliberate guest faults). The failures were cold-key runs: the test
+creates two sandboxes in one process, two worker threads with one pid, and the unit store's temp file was
+named by pid alone, so both engines wrote the same temp path for the same boot unit and the second rename
+published a torn file the other read back. The temp name now carries the thread id and a nonce. cold65's
+"miscompile" was most likely this.
+
+### Aggressive inlining budgets: faster when they run, and they corrupt the guest heap
+
+OXWASM_UNPRUNE_TINY=160 OXWASM_INLINE_BUDGET=200 OXWASM_INLINE_TOTAL=2000 (defaults 16 / 160 / 640), fresh keys:
+- baseline JIT only (cold99i): cold build 237.5, then 186.0 (entries 6.55M a round against 7.16M), a libpas
+  panic at round 18 (`deallocation did fail at 0x5831c000: Alloc bit not set`), 209.5. Reference 240-253.
+- DFG (cold99j, NOLIFTOFF): cold 273.5 (best 160), a libpas panic at round 6 (`deallocation did fail at 0x3:
+  Large heap did not find object`), 248.5 (best 145).
+Two panics in six runs, against none in about fifty default-budget runs this session and one under the node-mode
+knobs (NOFUEL + LOOPYIELD=0). Something in the inlined or duplicated code frees a wrong pointer: a real
+miscompile, now with a reproducer rate of about one run in three. Single-knob runs follow to name the budget.
+
+Correction: with the temp name fixed, two cold-key runs of the isolation test still fault at 0x88 while the
+FIRST sandbox boots, and the single-knob boots that passed had restored the boot snapshot (keyed by engine
+sources and boot options, not by the unit cache key), so they never compiled the boot units with the knobs.
+The isolation test's sandboxes (network, memMB) have their own snapshot keys and boot cold. So the aggressive
+inlining budgets miscompile the default rootfs's boot deterministically on a cold compile, which is a
+reproducer; the temp-name change stays as hygiene.

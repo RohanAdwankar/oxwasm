@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 // Owns one guest CPython: boots it (from a snapshot when there is one), frames
 // the request/response protocol over its stdin/stdout, and steps the engine in
 // bounded slices so whoever drives it stays responsive.
@@ -8,6 +9,7 @@
 // be abandoned when that happens.
 import { makeNet } from './net.mjs';
 import { loadRootfs, resolveIn } from './rootfs.mjs';
+import { threadId } from 'node:worker_threads';
 import { readFileSync, statSync, existsSync, mkdirSync, renameSync, rmSync, unlinkSync, writeFileSync, readdirSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
@@ -49,7 +51,7 @@ let _engineHash = null;
 // OXWASM_UNITCACHE_FULLKEY=1 keys on the runtime too.
 // Env knobs that change what the emitter produces are part of the key too: a unit built with
 // OXWASM_STOREGUARD=1 or another loop-yield budget is not interchangeable with the default build.
-const CODEGEN_KNOBS = ['OXWASM_STOREGUARD', 'OXWASM_GUARDPG', 'OXWASM_MEMREG', 'OXWASM_THREADED', 'OXWASM_ABIRELOAD', 'OXWASM_GUARD_STACK', 'OXWASM_NOFUEL', 'OXWASM_LOOPYIELD', 'OXWASM_LOOPYIELD_N', 'OXWASM_INLINE', 'OXWASM_INLINE_BUDGET', 'OXWASM_NARROW', 'OXWASM_TAILCUT', 'OXWASM_BLOCKLOOPS', 'OXWASM_FTENTRY', 'OXWASM_RBPSTORE', 'OXWASM_PATCHJMP', 'OXWASM_CWDEFER'];
+const CODEGEN_KNOBS = ['OXWASM_STOREGUARD', 'OXWASM_GUARDPG', 'OXWASM_MEMREG', 'OXWASM_THREADED', 'OXWASM_ABIRELOAD', 'OXWASM_GUARD_STACK', 'OXWASM_NOFUEL', 'OXWASM_LOOPYIELD', 'OXWASM_LOOPYIELD_N', 'OXWASM_INLINE', 'OXWASM_INLINE_BUDGET', 'OXWASM_NARROW', 'OXWASM_TAILCUT', 'OXWASM_BLOCKLOOPS', 'OXWASM_FTENTRY', 'OXWASM_RBPSTORE', 'OXWASM_PATCHJMP', 'OXWASM_CWDEFER', 'OXWASM_UNPRUNE_TINY', 'OXWASM_INLINE_TOTAL'];
 const engineHash = () => _engineHash ??= process.env.OXWASM_UNITCACHE_KEY || sha(CODEGEN_KNOBS.map((k) => k + '=' + (process.env[k] ?? '')).join(' '), ...(process.env.OXWASM_UNITCACHE_FULLKEY ? ['linux.mjs', 'aot_wat.mjs', 'interp.mjs', 'decode.mjs'] : ['aot_wat.mjs', 'decode.mjs']).map((f) => readFileSync(join(HERE, '..', 'engine', f))), process.version, process.env.OXWASM_FNVETO_FILE ? readFileSync(process.env.OXWASM_FNVETO_FILE) : '', process.env.OXWASM_FNALLOW_FILE ? readFileSync(process.env.OXWASM_FNALLOW_FILE) : '');
 function makeUnitStore(cacheDir) {
   const root = join(cacheDir, 'units', engineHash());
@@ -74,7 +76,10 @@ function makeUnitStore(cacheDir) {
     put(ex, k, bytes) {
       const d = join(root, ex); mkdirSync(d, { recursive: true });
       if (!bytes || bytes.length === 0) return;
-      const f = join(d, k + '.wasm'), t = f + '.' + process.pid + '.tmp';
+      // The temp name carries the thread and a nonce, not just the pid: two sandboxes in one process are two worker
+      // threads with the same pid, and on a cold key both compiled the same boot units and wrote the same temp file;
+      // whichever renamed second published a torn file, and the other engine read it back and faulted during boot.
+      const f = join(d, k + '.wasm'), t = f + '.' + process.pid + '.' + threadId + '.' + randomBytes(4).toString('hex') + '.tmp';
       writeFileSync(t, bytes); renameSync(t, f);
     },
   };
