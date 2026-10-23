@@ -2287,3 +2287,9 @@ compile task, glibc's mmap threshold lowered.
 Releasing the funcref table slot of every dropped function (OXWASM_FTFREE=1): 225 slots freed in a 60-round
 DFG run, peak rss 7.6 GB against 8.3, and 4.0 s of table sets: V8's Table.set is O(instances) and with
 thousands of unit instances each set costs ~18 ms. Opt-in only; the dead modules are not the resident set.
+
+(Housekeeping: a suite run came back red at the snapshot step with a zlib "unexpected end of file" and a replay
+mismatch of 11 vs 10 units: the disk was full. Every engine edit makes a new boot snapshot under
+~/.cache/oxwasm/snapshots and 442 of them had accumulated with a dozen obsolete unit caches; deleting all but
+the newest three snapshots freed 18 GB and the suite is green again (suite38). Commit gates must read the
+suite's exit status, not just run it.)
