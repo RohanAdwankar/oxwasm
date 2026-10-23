@@ -1919,3 +1919,10 @@ reach into JIT code. The JIT-on configuration is not usable regardless: roots of
 hangs, or aborts at round 5 (SIGABRT, jsAddSlowCase on a freed cell) in 32 s with the old entries rule
 (OXWASM_ENTRIES=all), which is the fastest reproduction of that miscompile so far. Roots stay on by default
 for the JIT-off configuration they were measured on.
+
+The fast reproduction under the nested shadow comparator (OXWASM_SHADOW_RANGE over the JIT region,
+OXWASM_SHADOW_NESTED=1, OXWASM_SHADOW_EXIT=1, cap lifted) reports only SHADOW-NOEXIT at the two JS entry thunks
+(5a224000, 5a224160): the compiled run leaves them through a futex-driven unwind (a GC hand-off) that the shadow
+interpreter never reaches, so the comparator cannot align there. That is the same blind spot the earlier trace
+attempt hit. A comparator that treats a blocking unwind as a match point - compare the register file at the
+unwind rather than at the exit rip - is what the next attempt needs; the reproduction itself is now 32 s.
