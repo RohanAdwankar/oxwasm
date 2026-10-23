@@ -133,8 +133,10 @@ const EPISODES = ENV.OXWASM_EPISODES === '1';
 // starting at a return address (pthread_cond_wait's continuation alone 57k). A unit rooted at the return address runs
 // the continuation compiled; it exits at the function's ret like a loop-head root does.
 const RETROOT = ENV.OXWASM_RETROOT === undefined ? 8 : +ENV.OXWASM_RETROOT;
+const RETROOT_LIBEXIT = ENV.OXWASM_RETROOT_LIBEXIT === '1';
+const ROOTTRACE = ENV.OXWASM_ROOTTRACE ? BigInt('0x' + ENV.OXWASM_ROOTTRACE) : null;   // trace _retRoot decisions for one rip
 const RETROOT_MAX = +ENV.OXWASM_RETROOT_MAX || 3000;   // instruction budget of a continuation root's own function
-const RETROOT_KINDS = new Set((ENV.OXWASM_RETROOT_KINDS || 'ret,exit,park').split(','));   // which landings may root: ret (interpreted ret), exit (unit exit rip), park (thread resume rip)   // top-level interpreted stretches between dispatches, by starting rip: how they began, count, steps (printed with the exit stats)
+const RETROOT_KINDS = new Set((ENV.OXWASM_RETROOT_KINDS || 'park').split(','));   // default park only: exit roots in the image ran 10-50x slower with a JIT guest (docs/performance.md), ret roots measured neutral   // which landings may root: ret (interpreted ret), exit (unit exit rip), park (thread resume rip)   // top-level interpreted stretches between dispatches, by starting rip: how they began, count, steps (printed with the exit stats)
 if (ENV.OXWASM_SIGTRACE) globalThis.__sigtrace = true;   // raise / deliver lines on stderr
 const TRACE_ARGV = ENV.OXWASM_TRACE_ARGV ?? 'opencode';   // which program (argv0 substring; '' = every process) the heartbeat and syscall trace follow
 const HEARTBEAT = ENV.OXWASM_HEARTBEAT ? (+ENV.OXWASM_HEARTBEAT | 0) : 0;   // OXWASM_HEARTBEAT=2^k-1: a line every 2^k dispatches (does the engine still dispatch?)
@@ -922,12 +924,23 @@ export class LinuxEngine {
   }
 
   _retRoot(hk, kind) {
+    if (ROOTTRACE !== null && hk === ROOTTRACE) __dbg(`[roottrace] ${hk.toString(16)} kind=${kind} kinds=${RETROOT_KINDS.has(kind)} has=${this.aotFns.has(hk)} failed=${this.aotFailed.has(hk)} inExec=${this.inExec(hk)} cacheable=${this._unitCacheable(hk)} prof=${this.profile.get(hk) | 0}`);
+    // A unit that exits right after a `syscall` (the engine serviced it and the unit returned its continuation)
+    // leaves the thread at a syscall continuation, the same place a park resumes: pthread_cond_timedwait+252 was
+    // 393 such exits in 24 rounds, every one interpreted to the next translated entry. It is a park-kind root.
+    if (kind === 'exit' && !RETROOT_KINDS.has('exit') && RETROOT_KINDS.has('park')) { try { if (Number(this.mem.read(hk - 2n, 2n)) === 0x050f) kind = 'park'; } catch {} }
+    // OXWASM_RETROOT_LIBEXIT=1: exit-kind roots in file-backed LIBRARY text only (libc's pthread_cond_* continuations
+    // after a callout), never in the main image, where exit roots churned (249k callouts a run, 3.7 s rounds).
+    if (kind === 'exit' && RETROOT_LIBEXIT && !RETROOT_KINDS.has('exit') && !(this.execRangesStatic ?? []).some(([a, b]) => hk >= a && hk < b) && this._unitCacheable(hk)) kind = 'park';
     if (!RETROOT_KINDS.has(kind)) return;
     if (this.aotFns.has(hk) || this.aotFailed.has(hk) || !this.assembleWat || !this.inExec(hk)) return;
     // static code only: a root in generated (JIT) memory sits on bytes that are patched and reused, so it is
     // invalidated and re-translated continuously - with JSC's JIT on, the mix's first round took 256 s and made
     // 828k callouts, against 23 s for four rounds with roots off
-    if (!(this.execRangesStatic ?? []).some(([a, b]) => hk >= a && hk < b)) return;
+    // File-backed library text (libc) counts as static: the resume points after a blocking syscall are inside
+    // pthread_cond_wait/timedwait, clock_gettime and the futex loops, and with libc excluded every one of them
+    // ran interpreted until the next translated entry (25k steps a round on a fresh cache, 2.6 us each).
+    if (!this._unitCacheable(hk)) return;
     const n = (this.profile.get(hk) || 0) + 1;
     this.profile.set(hk, n);
     // A continuation inside a giant function (an LLInt opcode's slow-path return) would re-translate everything
@@ -2829,6 +2842,7 @@ export class LinuxEngine {
   // wake just re-blocks.
   wake() { this.blocked = null;
     for (const t of this.threads) if (t.state === 'blk') { t.state = 'run'; t.futex = null; }
+    if (RETROOT && !this.threads[this.ti].proc && !this.aotFns.has(this.cpu.rip)) this._retRoot(this.cpu.rip, 'park');   // the current thread resumes here (see switchTo)
     if (this.threads[this.ti].state === 'dead') {
       const i = this.threads.findIndex(t => t.state === 'run');
       if (i >= 0) this.switchTo(i);
@@ -2856,6 +2870,11 @@ export class LinuxEngine {
     else { if (this._mainFds) { this.fds = this._mainFds; this._mainFds = null; }
       if (this.mem.jrnl && this._vforkSaved) { this.mem.jrnl = null;
         this.aotBudget = this._vforkBudget; this._vforkBudget = undefined; this._vforkSaved = false; } }
+    // The thread we switch to resumes at a syscall's rip (a park) or just past one (a preempted syscall): a
+    // continuation root of the park kind, like the in-loop park() site. Without this the resume points after
+    // a preempted futex/clock_gettime in libc (pthread_cond_timedwait+252 ...) were never profiled and every
+    // resume ran interpreted to the next translated entry: 25k steps a round on a fresh cache.
+    if (RETROOT && !n.proc && n.state !== 'dead' && !this.aotFns.has(n.cpu.rip)) this._retRoot(n.cpu.rip, 'park');
   }
   reapTimers() { const now = this.nowMs();
     if (this.itimer?.at != null) this._checkAlarm();

@@ -2155,3 +2155,56 @@ The spill reduction is worth at most 4% of the round and the checks cost 5-8%: a
 and return, in the code that runs most, outweigh spills that sit mostly off the hot paths. Net 7% slower, so the
 knob stays off. The lesson is the same as the registers-in-memory one: TurboFan's spill count is not a proxy for
 time on this code; what runs is the call protocol, and anything added to it is paid at every call.
+
+### Node-mode knobs re-measured on a fresh cache: neutral, and one guest panic
+
+cold63 recorded OXWASM_NOFUEL=1 OXWASM_LOOPYIELD=0 as 5-10% off the round. On a fresh cache against the fresh
+reference (242-253 ms): both knobs 249.5, 243.0 (the cold build died with a libpas panic in the guest,
+`deallocation did fail ... Alloc bit not set`, the first such panic in this session's runs); NOFUEL alone 260.0,
+199.0. The 199 is not the knob: that run had objects 18 ms, strings 11, maps 67.5 against 33-41, 15-26 and 78-94
+in every other run on these caches, 6.56M translated entries a round against 7.16M, and 2.6k interpreted steps a
+round against 8.5-9.7k. The fast mode is the real lever, and it is about what gets interpreted after unit exits:
+the episode log puts the interpreted steps at exit rips in libc and the static image (4fd1aa0, 49547d82,
+495478e1, 39cc5be, 50023f5, 4a38918; a few hundred exits a round, 14-63 steps each) that carry prof=0, i.e. they
+are never profiled because continuation roots are off. Roots were turned off when JIT-on rounds ran at 190 s
+with them on; the cold-build extent bug above (a linear scan over thousands of wide extents on every code write)
+is a likely cause of that, so roots are being re-measured.
+
+### Continuation roots, by kind (fresh caches)
+
+- All kinds (OXWASM_RETROOT=8, the default before it was turned off): 9.75 s rounds, 850k interpreted steps and
+  4.3k syscalls a round. Not the extent bug.
+- `park` only (the rip a thread resumes at after a blocking syscall): 233.5, 233.5, 265.0 ms, 2 roots made in a
+  run. No effect, because every resume point that matters is in libc, and `_retRoot` only rooted the static
+  image (execRangesStatic: the main binary and ld.so; libc's text arrives later by mmap and was refused).
+- `park,exit`: 3.7 s rounds, 597 roots, 249k callouts to targets with no unit, and the episode log shows exits
+  landing on rips that HAVE a unit yet interpreting 65 steps from there (5612017: 1,263 episodes, 82k steps):
+  the exit-kind root is a return address, its unit's analysis cuts the call whose fall-through it is, and the
+  caller then deopts there on every call. The `exit` kind stays off.
+The next batch roots park rips in file-backed library text too.
+
+### Park roots in library text: 5-10% off the round; `exit` and `ret` kinds measured
+
+With libc eligible and the thread-resume sites (switchTo, wake) rooting the resumed rip as the park kind,
+JIT-on mix, 40 rounds, medians of rounds 21-40, fresh caches (reference 240-253 ms, OXWASM_RETROOT=0):
+
+| configuration | medians (ms) | roots | interpreted steps / run |
+|---|---|---|---|
+| park (cold99u, cold99w) | 216, 200, 225, 212, 251, 264, 243, 220 | 6-13 | 950k-1.26M |
+| park + exit roots in library text only (OXWASM_RETROOT_LIBEXIT=1) | 235, 251, 234.5 | 17-18 | 940k-960k |
+| park,ret + LIBEXIT | 230.5, 291.5, 244.5 | 273-276 | 835k-895k |
+
+Park roots take the libc resume points (clock_gettime, the futex loops) out of the interpreter and are worth
+5-10% with a wide spread. The hottest remaining episode (pthread_cond_timedwait+252, 500-700 exits a run) is a
+RETURN address after `call _pthread_cleanup_pop`, not a syscall continuation: the callee deopts, the chain
+unwinds to the interpreter, and every caller's continuation then runs interpreted to the next entry. Library-only
+exit roots take those 40k steps out and change nothing measurable; `ret` roots (273 of them) take 10% of the
+steps out and change nothing measurable either (one run at 291 with rounds from 236 to 933 ms: the spread on
+this box is now the largest term). The default is RETROOT=8 with KINDS=park (it was ret,exit,park, which runs
+10-50x slower with a JIT guest); LIBEXIT stays an opt-in knob.
+
+The interpreted steps are 31k exits a run at thousands of distinct return addresses, 30 steps each: a long flat
+tail that per-site rooting does not reach. What would reach it is not leaving the chain at all: the exits are
+deopts inside callees (2k deopts and 4k callouts to targets without a unit per run), and each one costs its whole
+caller chain. The deopt sources: an undecodable instruction at c5851d5 (106 a run, in a mapping outside the
+image), frame-gone exits at 4643330 (47), cpuid (13), and a long tail of cold-edge deopts.
