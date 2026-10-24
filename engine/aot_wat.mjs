@@ -7,6 +7,10 @@ import { readFileSync } from 'node:fs';
 // compiled machine code. Text backend, assembled by wat2wasm.
 import { decode } from './decode.mjs';
 
+// Every guest address fits 2^53, so the keys sort as doubles natively (a BigInt comparator sort was a visible share of the
+// translator's time on a big unit).
+const sortedAddrs = (m) => { const f = new Float64Array(m.size); let i = 0; for (const k of m.keys()) f[i++] = Number(k); f.sort(); const out = new Array(f.length); for (let j = 0; j < f.length; j++) out[j] = BigInt(f[j]); return out; };
+
 const MASK = { 1: 0xFFn, 2: 0xFFFFn, 4: 0xFFFFFFFFn, 8: 0xFFFFFFFFFFFFFFFFn };
 const SIGN = { 1: 0x80n, 2: 0x8000n, 4: 0x80000000n, 8: 0x8000000000000000n };
 
@@ -392,7 +396,7 @@ export function compileFunctionWatDispatch(mem, entry, { guestBase, ramBase, max
     if (['jmpind','callind','call','syscall'].includes(insn.mnem)) throw new Error('AOT: control leaves function: ' + insn.mnem);
     work.push(insn.next);
   }
-  const addrs = [...insnAt.keys()].map(BigInt).sort((a,b)=>a<b?-1:1);
+  const addrs = sortedAddrs(insnAt);
   const leaders = new Set([entry.toString()]);
   for (const a of addrs) { const insn = insnAt.get(a.toString());
     if (insn.mnem === 'jcc') { leaders.add(((insn.next+insn.rel)&MASK[8]).toString()); leaders.add(insn.next.toString()); }
@@ -658,14 +662,14 @@ export function analyze(mem, entry, { maxInsns = 20000, noJtab = false, entries 
     // A target outside the canonical user address range is a displacement that pointed nowhere (a `call` rel32 of
     // -0x18000000 in opencode's image): wasm offsets wrap at 4 GB, so the fetch would read whatever lies there and
     // decode it as this function's code. It is a deopt point like undecodable bytes, and no extent is built from it.
-    if (rip >= 0x800000000000n) { insnAt.set(key, { mnem: 'udec', rip, next: rip + 1n, len: 1, bogus: true }); continue; }
-    if (COLD !== null && COLD.has(kn) && rip !== entry) { insnAt.set(key, { mnem: 'udec', rip, next: rip + 1n, len: 1, cold: true }); continue; }
+    if (rip >= 0x800000000000n) { insnAt.set(kn, { mnem: 'udec', rip, next: rip + 1n, len: 1, bogus: true }); continue; }
+    if (COLD !== null && COLD.has(kn) && rip !== entry) { insnAt.set(kn, { mnem: 'udec', rip, next: rip + 1n, len: 1, cold: true }); continue; }
     try { insn = decode(fetcher(rip), rip); }
     catch (e) {
       // Undecodable bytes (padding, data, an unsupported encoding) become a
       // deopt point: if control ever actually reaches it, the engine resumes
       // in the interpreter and faults exactly as native would.
-      insnAt.set(key, { mnem: 'udec', rip, next: rip + 1n, len: 1 });
+      insnAt.set(kn, { mnem: 'udec', rip, next: rip + 1n, len: 1 });
       continue;
     }
     // Two kinds of instruction escape to the interpreter via a deopt point
@@ -693,19 +697,19 @@ export function analyze(mem, entry, { maxInsns = 20000, noJtab = false, entries 
     // refusal - mawk ran the whole function interpreted 1,996 times.
     if (insn.mnem === 'x87' && insn.op === 0xD9 && (insn.sub === 5 || insn.sub === 7) && insn.rm) insn.mnem = 'fcw';
     if (ESC_RANGES && ESC_RANGES.some(([lo, hi]) => rip >= lo && rip < hi) && insn.mnem !== 'ret') {   // bisect aid: this instruction runs in the interpreter
-      insnAt.set(key, { mnem: 'udec', rip, next: rip + BigInt(insn.len), len: insn.len });
+      insnAt.set(kn, { mnem: 'udec', rip, next: rip + BigInt(insn.len), len: insn.len });
       continue;
     }
     if (['hlt','ud2','int3','int','cpuid','loopx','fxsave','fxrstor','x87','rcl','rcr','emms','popf'].includes(insn.mnem)) {   // rcl/rcr: rare, interpreter-only
-      insnAt.set(key, { mnem: 'udec', rip, next: rip + BigInt(insn.len), len: insn.len });
+      insnAt.set(kn, { mnem: 'udec', rip, next: rip + BigInt(insn.len), len: insn.len });
       continue;
     }
     if (insn.mnem === 'sse4' && !sse4Compiled(insn)) {
-      insnAt.set(key, { mnem: 'udec', rip, next: rip + BigInt(insn.len), len: insn.len });
+      insnAt.set(kn, { mnem: 'udec', rip, next: rip + BigInt(insn.len), len: insn.len });
       continue;
     }
-    insn.rip = rip; insn.next = rip + BigInt(insn.len); insnAt.set(key, insn);
-    byNext.set(insn.next.toString(), insn);
+    insn.rip = rip; insn.next = rip + BigInt(insn.len); insnAt.set(kn, insn);
+    byNext.set(Number(insn.next), insn);
     if (rip < lo) lo = rip; if (rip > hi) hi = rip;
     if (insn.mnem === 'ret' || insn.mnem === 'retn') continue;
     if (insn.mnem === 'jmpind') {
@@ -728,7 +732,7 @@ export function analyze(mem, entry, { maxInsns = 20000, noJtab = false, entries 
       // and resolver-probed labels, and a forward jmp to a loop's condition
       // block (gcc's loop layout) was cut as a tail call - ten sweep cases
       // died on wild addresses
-      if (TAILCUT && tgt !== entry && callTargets && callTargets.has(tgt.toString()) && !insnAt.has(tgt.toString()) && (!globalThis.__tailCutAllow || globalThis.__tailCutAllow(globalThis.__tailCutN = (globalThis.__tailCutN | 0) + 1))) { insn.tailCut = true; if (globalThis.__tailTrace) console.error(`<tailcut fn=${entry.toString(16)} at=${rip.toString(16)} -> ${tgt.toString(16)}>`); continue; }
+      if (TAILCUT && tgt !== entry && callTargets && callTargets.has(tgt.toString()) && !insnAt.has(Number(tgt)) && (!globalThis.__tailCutAllow || globalThis.__tailCutAllow(globalThis.__tailCutN = (globalThis.__tailCutN | 0) + 1))) { insn.tailCut = true; if (globalThis.__tailTrace) console.error(`<tailcut fn=${entry.toString(16)} at=${rip.toString(16)} -> ${tgt.toString(16)}>`); continue; }
       work.push(tgt); continue; }
     if (insn.mnem === 'jcc') { work.push((insn.next + insn.rel) & M); work.push(insn.next); continue; }
     if (insn.mnem === 'call') {
@@ -767,7 +771,7 @@ export function analyze(mem, entry, { maxInsns = 20000, noJtab = false, entries 
     && !['cmp','test','bt'].includes(p.mnem);
   const defAbove = (from, r) => { let cur = from;
     for (let s = 0; s < 16; s++) {
-      const p = byNext.get(cur.rip.toString());
+      const p = byNext.get(Number(cur.rip));
       if (!p || p.mnem === 'udec') return null;
       if (wrReg(p, r)) return p;
       cur = p;
@@ -802,9 +806,9 @@ export function analyze(mem, entry, { maxInsns = 20000, noJtab = false, entries 
       if (idx >= 0) {
         let cur = ld ?? j, n = -1;
         for (let st = 0; st < 12 && n < 0; st++) {
-          const q = byNext.get(cur.rip.toString()); if (!q || q.mnem === 'udec') break;
+          const q = byNext.get(Number(cur.rip)); if (!q || q.mnem === 'udec') break;
           if (q.mnem === 'cmp' && q.dst?.kind === 'reg' && q.dst.r === idx && q.src?.kind === 'imm') {
-            const br = insnAt.get(q.next.toString());
+            const br = insnAt.get(Number(q.next));
             if (br?.mnem === 'jcc' && (br.cond === 'a' || br.cond === 'ae' || br.cond === 'b' || br.cond === 'be'))
               n = Number(q.src.v) + (br.cond === 'a' || br.cond === 'be' ? 1 : 0);
             else break;
@@ -848,9 +852,9 @@ export function analyze(mem, entry, { maxInsns = 20000, noJtab = false, entries 
     // deopt target: rustc's compile died on a wild address.
     const idx = ld.src.index; let cur = ld, n = -1;
     for (let s = 0; s < 12 && n < 0; s++) {
-      const q = byNext.get(cur.rip.toString()); if (!q || q.mnem === 'udec') break;
+      const q = byNext.get(Number(cur.rip)); if (!q || q.mnem === 'udec') break;
       if (q.mnem === 'cmp' && q.dst?.kind === 'reg' && q.dst.r === idx && q.src?.kind === 'imm') {
-        const br = insnAt.get(q.next.toString());
+        const br = insnAt.get(Number(q.next));
         if (br?.mnem === 'jcc' && (br.cond === 'a' || br.cond === 'ae' || br.cond === 'b' || br.cond === 'be'))
           n = Number(q.src.v) + (br.cond === 'a' || br.cond === 'be' ? 1 : 0);   // ja/jbe: K is the last index; jae/jb: K is the count
         else break;                                          // a case test on the index: no guard between here and the load
@@ -912,12 +916,12 @@ export function analyze(mem, entry, { maxInsns = 20000, noJtab = false, entries 
   // Only functions with a discovered jump table take this path; any other overlap still refuses the function.
   if (jtabs.size) {
     const junk = new Set();
-    const junkTail = (x) => { const pr = byNext.get(x.rip.toString()); return pr && (pr.mnem === 'call' || junk.has(pr.rip.toString())) ? pr : null; };
+    const junkTail = (x) => { const pr = byNext.get(Number(x.rip)); return pr && (pr.mnem === 'call' || junk.has(pr.rip.toString())) ? pr : null; };
     for (let round = 0; round < 64; round++) {
-      const as = [...insnAt.keys()].map(BigInt).sort((a, b) => a < b ? -1 : 1);
+      const as = sortedAddrs(insnAt);
       const victims = [];
       for (let i = 1; i < as.length; i++) {
-        const p = insnAt.get(as[i - 1].toString()), q = insnAt.get(as[i].toString());
+        const p = insnAt.get(Number(as[i - 1])), q = insnAt.get(Number(as[i]));
         if (!p || !q || as[i] >= as[i - 1] + BigInt(p.len) || q.next === p.next) continue;
         const v = junkTail(p) ? p : junkTail(q) ? q : null;
         if (v) victims.push(v);
@@ -926,20 +930,20 @@ export function analyze(mem, entry, { maxInsns = 20000, noJtab = false, entries 
       for (const v of victims) {
         const pr = junkTail(v); if (!pr) continue;
         if (pr.mnem === 'call') pr.noretCut = true;
-        junk.add(v.rip.toString()); insnAt.delete(v.rip.toString());
+        junk.add(v.rip.toString()); insnAt.delete(Number(v.rip));
       }
     }
   }
-  const addrs = [...insnAt.keys()].map(BigInt).sort((a,b)=>a<b?-1:1);
+  const addrs = sortedAddrs(insnAt);
   const leaders = new Set([entry.toString()]);
-  for (const a of addrs) { const insn = insnAt.get(a.toString());
+  for (const a of addrs) { const insn = insnAt.get(Number(a));
     if (insn.mnem === 'jcc') { leaders.add(((insn.next+insn.rel)&M).toString()); leaders.add(insn.next.toString()); }
     if (insn.mnem === 'jmp') leaders.add(((insn.next+insn.rel)&M).toString()); }
   for (const [, ts] of jtabs) for (const t of ts) leaders.add(t.toString());
   // a deopt point ends its block; whatever was decoded right after it (a
   // label some other path reaches) starts a new one, it is never a
   // fall-through of the escape
-  for (const a of addrs) { const insn = insnAt.get(a.toString()); if (insn.mnem === 'udec') leaders.add(insn.next.toString()); }
+  for (const a of addrs) { const insn = insnAt.get(Number(a)); if (insn.mnem === 'udec') leaders.add(insn.next.toString()); }
   // Decode integrity. Two instructions may not overlap, and a jmp/ret/
   // indirect jump may only end a block: the emitter handles those as a
   // block's last instruction, so one in the middle would be dropped and
@@ -953,14 +957,14 @@ export function analyze(mem, entry, { maxInsns = 20000, noJtab = false, entries 
   // address becomes a leader and the two blocks rejoin there (before, the
   // lock path fell through into the middle of a block and deopted).
   for (let i = 1; i < addrs.length; i++) {
-    const p = insnAt.get(addrs[i - 1].toString()), q = insnAt.get(addrs[i].toString());
+    const p = insnAt.get(Number(addrs[i - 1])), q = insnAt.get(Number(addrs[i]));
     if (addrs[i] < addrs[i - 1] + BigInt(p.len)) {
       if (q.next === p.next) leaders.add(p.next.toString());
       else throw new Error(`overlapping decode: ${addrs[i].toString(16)} inside ${addrs[i - 1].toString(16)}`);
     }
   }
   const blocks = []; let cur = null;
-  for (const a of addrs) { if (leaders.has(a.toString())) { cur = { start: a, insns: [] }; blocks.push(cur); } cur.insns.push(insnAt.get(a.toString())); }
+  for (const a of addrs) { if (leaders.has(a.toString())) { cur = { start: a, insns: [] }; blocks.push(cur); } cur.insns.push(insnAt.get(Number(a))); }
   for (const b of blocks) for (let i = 0; i < b.insns.length - 1; i++) {
     const m = b.insns[i].mnem;
     if (m === 'jmp' || m === 'jcc' || m === 'ret' || m === 'retn' || m === 'jmpind') throw new Error(`terminator inside a block: ${m} at ${b.insns[i].rip.toString(16)}`);

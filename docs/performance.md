@@ -2470,3 +2470,12 @@ instructions in the main function (28.0% frame spill/reload, 27.1% register move
 NOLIFTOFF, one compile task, fresh key, medians of rounds 21-40): V8 defaults 191.5, 223.0, 217.5;
 --turboshaft-wasm 215.0, 224.5, 208.5; --no-wasm-stack-checks 230.0, 224.5, 248.5. Nothing beyond the 190-250
 spread that identical runs show on this key.
+
+### Translator: Number keys in the analysis maps (-17% translation time, identical output)
+
+In the profile of translating the 117-function hot unit (offline, tools: scratchpad trtime.mjs), a quarter of the time was
+BigInt `toString` plus string-keyed Map operations per instruction in `analyze`. The analysis maps (insnAt, byNext) are
+keyed by Number now and the address sorts use a native double sort. Same generated WAT byte for byte (sha1 equal on four
+units), translation 2.8 s -> 2.35 s. The rest of the time is spread thin: emission 17%, drain 17%, string assembly 12%,
+analysis 11%, decode 7%. Suite: only the cold-start "unrelated sandbox ... sandbox timeout reached" check failed
+(the same timing check that fails on the first run after any source edit); the network checks passed this time.
