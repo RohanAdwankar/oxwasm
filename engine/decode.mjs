@@ -2,6 +2,21 @@
 // decode(fetch, rip) -> { mnem, size, dst, src, src2, cond, len, ... }
 // fetch(i) returns the byte at rip+i.
 
+const ALU = { 0: 'add', 1: 'or', 2: 'adc', 3: 'sbb', 4: 'and', 5: 'sub', 6: 'xor', 7: 'cmp' };
+const SHIFT = { 0: 'rol', 1: 'ror', 2: 'rcl', 3: 'rcr', 4: 'shl', 5: 'shr', 7: 'sar' };
+const SSE_OPS = { 0x6E:1, 0x7E:1, 0xD6:1, 0x6F:1, 0x7F:1, 0x10:1, 0x11:1,
+                      0x28:1, 0x29:1, 0x6C:1, 0xEF:1, 0x74:1, 0xD7:1, 0xDB:1, 0xEB:1,
+                      0x60:1, 0x61:1, 0x62:1, 0x68:1, 0x69:1, 0x6A:1, 0x6D:1,
+                      0x70:1, 0xC2:1, 0xD4:1, 0xFE:1, 0xFD:1, 0xFC:1, 0x75:1, 0x76:1, 0x12:1, 0x13:1, 0x16:1, 0x17:1, 0x14:1, 0x15:1, 0x66:1, 0x65:1, 0x64:1, 0xFB:1, 0xFA:1, 0xF9:1, 0xF8:1,
+                      0xDA:1, 0xDE:1, 0xEA:1, 0xEE:1, 0xD8:1, 0xD9:1, 0xDC:1, 0xDD:1,
+                      0xE8:1, 0xE9:1, 0xEC:1, 0xED:1, 0xE0:1, 0xE3:1, 0xD5:1, 0xE5:1, 0xE4:1,
+                      0xF4:1, 0xF6:1, 0x63:1, 0x67:1, 0x6B:1, 0xC5:1, 0xC4:1,
+                      0xDF:1, 0xF5:1, 0xE7:1, 0xF0:1, 0xD0:1, 0x7C:1, 0x7D:1,                                  // pandn, pmaddwd, movntdq
+                      0xD1:1, 0xD2:1, 0xD3:1, 0xE1:1, 0xE2:1, 0xF1:1, 0xF2:1, 0xF3:1,  // p{sll,srl,sra}{w,d,q} by-reg
+                      0x54:1, 0x55:1, 0x56:1, 0x57:1, 0x2A:1, 0x2C:1, 0x2D:1, 0x2E:1, 0x2F:1,
+                      0x50:1, 0x51:1, 0x58:1, 0x59:1, 0x5A:1, 0x5B:1, 0x5C:1, 0x5D:1, 0x5E:1, 0x5F:1, 0x2B:1, 0xC6:1, 0xE6:1 };
+const SSE_IMM8 = { 0x70:1, 0xC5:1, 0xC4:1, 0xC6:1, 0xC2:1 };
+const SSE_GRP_SHIFT = { 0x71:1, 0x72:1, 0x73:1 };
 const COND = ['o','no','b','ae','e','ne','be','a','s','ns','p','np','l','ge','le','g'];
 
 export function decode(fetch, rip) {
@@ -47,29 +62,30 @@ export function decode(fetch, rip) {
     out[2] = reg; return out;
   }
   function imm(n) {                           // sign-extended immediate
+    if (n <= 4) { let v = 0; for (let k = 0; k < n; k++) v |= b() << (8 * k); return BigInt(n === 4 ? v | 0 : (v << (32 - 8 * n)) >> (32 - 8 * n)); }
     let v = 0n;
     for (let k = 0; k < n; k++) v |= BigInt(b()) << BigInt(8 * k);
     const sign = 1n << BigInt(8 * n - 1);
     return (v ^ sign) - sign;
   }
   function immU(n) {                          // zero-extended
+    if (n <= 4) { let v = 0; for (let k = 0; k < n; k++) v |= b() << (8 * k); return BigInt(n === 4 ? v >>> 0 : v); }
     let v = 0n;
     for (let k = 0; k < n; k++) v |= BigInt(b()) << BigInt(8 * k);
     return v;
   }
   const fin = (o) => (o.len = i, o);
-  const ALU = { 0: 'add', 1: 'or', 2: 'adc', 3: 'sbb', 4: 'and', 5: 'sub', 6: 'xor', 7: 'cmp' };
-  const SHIFT = { 0: 'rol', 1: 'ror', 2: 'rcl', 3: 'rcr', 4: 'shl', 5: 'shr', 7: 'sar' };   // rcl/rcr: Go's runtime (page-allocator bit math) uses rcr
 
   const op = p;
-  // ALU r/m,r and r,r/m families: base opcodes 0x00,0x08,0x20,0x28,0x30,0x38
-  for (const [base, mnem] of [[0x00,'add'],[0x08,'or'],[0x10,'adc'],[0x18,'sbb'],[0x20,'and'],[0x28,'sub'],[0x30,'xor'],[0x38,'cmp']]) {
-    if (op === base + 1) { const [r, rm] = modrm(osz); return fin({ mnem, dst: rm, src: r, size: osz }); }
-    if (op === base + 3) { const [r, rm] = modrm(osz); return fin({ mnem, dst: r, src: rm, size: osz }); }
-    if (op === base)     { const [r, rm] = modrm(1);  return fin({ mnem, dst: rm, src: r, size: 1 }); }
-    if (op === base + 2) { const [r, rm] = modrm(1);  return fin({ mnem, dst: r, src: rm, size: 1 }); }
-    if (op === base + 4) return fin({ mnem, dst: reg8(0), src: { kind: 'imm', v: imm(1) }, size: 1 });
-    if (op === base + 5) return fin({ mnem, dst: mkreg(0, osz), src: { kind: 'imm', v: imm(osz === 2 ? 2 : 4) }, size: osz });
+  // ALU r/m,r and r,r/m families: base opcodes 0x00,0x08,0x20,0x28,0x30,0x38 (low 3 bits 0-5)
+  if (op < 0x40 && (op & 7) < 6) {
+    const mnem = ALU[op >> 3], k = op & 7;
+    if (k === 1) { const [r, rm] = modrm(osz); return fin({ mnem, dst: rm, src: r, size: osz }); }
+    if (k === 3) { const [r, rm] = modrm(osz); return fin({ mnem, dst: r, src: rm, size: osz }); }
+    if (k === 0) { const [r, rm] = modrm(1);  return fin({ mnem, dst: rm, src: r, size: 1 }); }
+    if (k === 2) { const [r, rm] = modrm(1);  return fin({ mnem, dst: r, src: rm, size: 1 }); }
+    if (k === 4) return fin({ mnem, dst: reg8(0), src: { kind: 'imm', v: imm(1) }, size: 1 });
+    return fin({ mnem, dst: mkreg(0, osz), src: { kind: 'imm', v: imm(osz === 2 ? 2 : 4) }, size: osz });
   }
   if (op >= 0xA0 && op <= 0xA3) {             // mov al/eax/rax <-> [moffs64] (V8 external refs)
     const sz = op & 1 ? osz : 1;
@@ -196,19 +212,6 @@ export function decode(fetch, rip) {
       return fin({ mnem: 'sse4', map: o2, op: o3, p66: opsize === 2, pF3: !!rep, pF2: !!rep2, W, xr, rm, imm8 });
     }
     if (o2 === 0xB8 && rep) { const [r, rm] = modrm(osz); return fin({ mnem: 'popcnt', dst: r, src: rm, size: osz }); }
-    const SSE_OPS = { 0x6E:1, 0x7E:1, 0xD6:1, 0x6F:1, 0x7F:1, 0x10:1, 0x11:1,
-                      0x28:1, 0x29:1, 0x6C:1, 0xEF:1, 0x74:1, 0xD7:1, 0xDB:1, 0xEB:1,
-                      0x60:1, 0x61:1, 0x62:1, 0x68:1, 0x69:1, 0x6A:1, 0x6D:1,
-                      0x70:1, 0xC2:1, 0xD4:1, 0xFE:1, 0xFD:1, 0xFC:1, 0x75:1, 0x76:1, 0x12:1, 0x13:1, 0x16:1, 0x17:1, 0x14:1, 0x15:1, 0x66:1, 0x65:1, 0x64:1, 0xFB:1, 0xFA:1, 0xF9:1, 0xF8:1,
-                      0xDA:1, 0xDE:1, 0xEA:1, 0xEE:1, 0xD8:1, 0xD9:1, 0xDC:1, 0xDD:1,
-                      0xE8:1, 0xE9:1, 0xEC:1, 0xED:1, 0xE0:1, 0xE3:1, 0xD5:1, 0xE5:1, 0xE4:1,
-                      0xF4:1, 0xF6:1, 0x63:1, 0x67:1, 0x6B:1, 0xC5:1, 0xC4:1,
-                      0xDF:1, 0xF5:1, 0xE7:1, 0xF0:1, 0xD0:1, 0x7C:1, 0x7D:1,                                  // pandn, pmaddwd, movntdq
-                      0xD1:1, 0xD2:1, 0xD3:1, 0xE1:1, 0xE2:1, 0xF1:1, 0xF2:1, 0xF3:1,  // p{sll,srl,sra}{w,d,q} by-reg
-                      0x54:1, 0x55:1, 0x56:1, 0x57:1, 0x2A:1, 0x2C:1, 0x2D:1, 0x2E:1, 0x2F:1,
-                      0x50:1, 0x51:1, 0x58:1, 0x59:1, 0x5A:1, 0x5B:1, 0x5C:1, 0x5D:1, 0x5E:1, 0x5F:1, 0x2B:1, 0xC6:1, 0xE6:1 };
-    const SSE_IMM8 = { 0x70:1, 0xC5:1, 0xC4:1, 0xC6:1, 0xC2:1 };
-    const SSE_GRP_SHIFT = { 0x71:1, 0x72:1, 0x73:1 };
     if (SSE_GRP_SHIFT[o2]) {
       const m = b(), sub = (m >> 3) & 7, xrm = (m & 7) | (B << 3);
       return fin({ mnem: 'ssegrpshift', op: o2, sub, xrm, imm8: Number(immU(1)), p66: opsize === 2 });

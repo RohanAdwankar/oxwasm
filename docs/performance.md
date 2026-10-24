@@ -2414,3 +2414,17 @@ exactly as an ordinary call return does, and hands the exit up otherwise (shares
 Five DFG runs afterwards (cold99q2, NOLIFTOFF, medians of rounds 21-40): 176.5 (cold build), 152.5, 249.5, 155.5,
 168.5, no panic; the 120-round run before the fix settled at 163-190 in later windows with best rounds 114.
 Native with the same tiers: 27.5. suite44 green.
+
+### Decoder tables hoisted (24% faster decode); delaying translation of generated code does not help
+
+In the DFG profile (rounds 50-69, cold99q2) about 40% of the ticks are translation of newly generated code on the
+main thread: decode 15%, the analysis drain 15% (Map.set with a string key per instruction), analyze, emit,
+assemble. engine/decode.mjs rebuilt its ALU, SHIFT and SSE tables and an array of eight pairs on every call and
+used BigInt per immediate byte; the tables are module constants now, the ALU family is decoded by arithmetic and
+immediates by Number. Output identical to the old decoder over 2.4M instructions and 400k arbitrary byte offsets
+of the opencode binary; decode time of the sweep 5.2 s -> 4.0 s. suite45 green.
+
+OXWASM_ANON_HEAT (calls before generated code is translated; default = 4), DFG, medians of rounds 21-40 / 41-60:
+default 188 / 162 (warm); 50: 262 / 200 and 234 / 213; 300: 330 / 184 and 245 / 184; 2000: 228 / 220. Delaying
+makes the interpreter and the callouts carry the code longer than the translation would have cost; the default
+stays.
