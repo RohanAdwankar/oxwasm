@@ -2461,3 +2461,12 @@ first probe of 169.254.169.254 times out and the sandbox is then gone). The same
 commit that was green before it (6f0bf69, checked in a separate worktree), and the host's own request to
 169.254.169.254 now returns 403 from the agent proxy: the environment's network path changed, not the engine. Every
 other suite section, including the compiled-tier, decoder and hardware-comparison checks, passes.)
+
+### Turboshaft for wasm and V8's stack checks: no effect
+
+TurboFan machine code of the 117-function hot unit (offline, --print-wasm-code): default pipeline 154,207
+instructions in the main function (28.0% frame spill/reload, 27.1% register moves); --turboshaft-wasm 156,891
+(29.2% / 23.6%), with or without its instruction-selection and load-elimination options. Timed (baseline JIT,
+NOLIFTOFF, one compile task, fresh key, medians of rounds 21-40): V8 defaults 191.5, 223.0, 217.5;
+--turboshaft-wasm 215.0, 224.5, 208.5; --no-wasm-stack-checks 230.0, 224.5, 248.5. Nothing beyond the 190-250
+spread that identical runs show on this key.
