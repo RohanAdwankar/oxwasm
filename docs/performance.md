@@ -2399,3 +2399,7 @@ OXWASM_INLINE_BUDGET=200, OXWASM_INLINE_TOTAL=2000 (were 16 / 160 / 640); suite4
 No panic in any of the 22 runs. The curve is flat above 300/4000; the defaults are now 320 / 300 / 4000: about
 20% off the round against the old defaults (240 -> ~188). DFG with the 160/200/2000 budgets: 179-195.
 suite43 green.
+
+After the budgets: DFG at 320/300/4000 (cold99f2, 40 rounds, NOLIFTOFF, one compile task): 244.5 (cold build, 386 s),
+203.0, 196.0, peak rss 7.9-9.3 GB: within 40 rounds the DFG's own warm-up is still in the window. OXWASM_UNPRUNE_HOT=4000
+on the baseline JIT: 241 (cold), 203.5, 203.5, no gain over the same budgets without it; it stays off.
