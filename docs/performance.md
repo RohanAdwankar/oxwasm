@@ -2455,3 +2455,9 @@ peak rss 3.8-5.0 GB against 5.3-6.1, 9-15k deopts a run, 6-7M entries a round (6
 round is not faster (170-200 without): the hot code is the same code; TurboFan's output for it does not improve
 when the cold blocks around it are gone, and the instruction cache was not the limit. The value is memory and
 build time (and so DFG headroom), at the price of a workload-specific profile; off by default.
+
+(Suite note: since the container restart the isolation test's "with a network" sandbox checks fail (7-8 of 53: the
+first probe of 169.254.169.254 times out and the sandbox is then gone). The same failures occur on the last
+commit that was green before it (6f0bf69, checked in a separate worktree), and the host's own request to
+169.254.169.254 now returns 403 from the agent proxy: the environment's network path changed, not the engine. Every
+other suite section, including the compiled-tier, decoder and hardware-comparison checks, passes.)
