@@ -1435,7 +1435,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
                  pad: last.mnem === 'retn' ? Number(last.n) : 0}); succs.push([t]); }
     else if (last.inlineTailRet !== undefined) { const t = idxOfEdge(last.inlineTailRet);
       if (t < 0) throw new Error('AOT: inlined tail-call return site not a block');
-      term.push({kind:'inlinetail', t, ta: (next+last.rel)&MM}); succs.push([t]); }
+      term.push({kind:'inlinetail', t, ta: (next+last.rel)&MM, rt: BigInt(last.inlineTailRet)}); succs.push([t]); }
     // a spliced block's own branches, resolved by copy-local id. `ta`/`fa`
     // stay the REAL guest addresses so a target outside the callee still has
     // somewhere real to deopt to.
@@ -4055,24 +4055,28 @@ function emitUnitFunction(a0, fnAddr, ctx) {
     } else if (t.kind === 'inlinetail') {
       // a sibling call inside an inlined copy: the call protocol of a normal
       // call site (spill, chain or direct call, reload), then on to the
-      // inlined site's continuation. The sibling's ret popped the return
-      // address the inlined call pushed, so rsp needs no adjustment here.
+      // inlined site's continuation. The sibling's ret pops the return address the inlined call pushed, so rsp
+      // should be back at its pre-pop value and the exit rip the continuation: verified like any call's return
+      // (the sibling may unwind, switch stacks or rewrite its slot), and handed up when it does not hold.
       const target = t.ta;
       L.push(SA_MARK);
+      const rbt = T(); if (INLINE_RETCHECK) L.push(`(local.set ${rbt} (i64.add (local.get $r4) (i64.const 8)))`);
+      const sink = INLINE_RETCHECK ? '(local.set $rex ' : '(drop ';
       if (canDirect(target.toString()))
         L.push(ftSave(),
                `(if ${ftOk}`,
-               `  (then ${ftBurn} ${nestUp}(drop (call $f_${target.toString(16)}))${nestDn} ${ftRestore})`,
-               `  (else (drop (call $x_callout (i64.const ${hexs(target)})))))`);
+               `  (then ${ftBurn} ${nestUp}${sink}(call $f_${target.toString(16)}))${nestDn} ${ftRestore})`,
+               `  (else ${sink}(call $x_callout (i64.const ${hexs(target)})))))`);
       else {
         usesFtr = true;
         L.push(icResolve(`(i64.const ${hexs(target)})`),
                ftSave(),
                `(if ${ftHit}`,
-               `  (then ${ftBurn} ${nestUp}(drop (call_indirect $ft (type $uft) (local.get $fti)))${nestDn} ${ftRestore})`,
-               `  (else (drop (call $x_callout (i64.const ${hexs(target)})))))`);
+               `  (then ${ftBurn} ${nestUp}${sink}(call_indirect $ft (type $uft) (local.get $fti)))${nestDn} ${ftRestore})`,
+               `  (else ${sink}(call $x_callout (i64.const ${hexs(target)})))))`);
       }
       L.push(RC_MARK);
+      if (INLINE_RETCHECK) L.push(retCheck(rbt, t.rt));
       const b = brTo(t.t); if (b) L.push(b);
     } else if (t.kind === 'inlineret') {
       // pop what the inlined call pushed. The continuation is known

@@ -2403,3 +2403,14 @@ suite43 green.
 After the budgets: DFG at 320/300/4000 (cold99f2, 40 rounds, NOLIFTOFF, one compile task): 244.5 (cold build, 386 s),
 203.0, 196.0, peak rss 7.9-9.3 GB: within 40 rounds the DFG's own warm-up is still in the window. OXWASM_UNPRUNE_HOT=4000
 on the baseline JIT: 241 (cold), 203.5, 203.5, no gain over the same budgets without it; it stays off.
+
+### The same assumption in the inlined tail call (fixed), and the DFG numbers after it
+
+A DFG run at the new budgets died at round 3 with `deallocation did fail at 0x3: Large heap did not find object`,
+the signature the first return fix removed from the boot. The `inlinetail` terminator (a callee that ends in a
+`jmp` to a sibling, inlined into its caller) called the sibling and DROPPED its exit address, continuing at the
+call site's continuation. It now verifies the exit rip against the continuation and rsp against its pre-pop value
+exactly as an ordinary call return does, and hands the exit up otherwise (shares OXWASM_INLINE_RETCHECK).
+Five DFG runs afterwards (cold99q2, NOLIFTOFF, medians of rounds 21-40): 176.5 (cold build), 152.5, 249.5, 155.5,
+168.5, no panic; the 120-round run before the fix settled at 163-190 in later windows with best rounds 114.
+Native with the same tiers: 27.5. suite44 green.
