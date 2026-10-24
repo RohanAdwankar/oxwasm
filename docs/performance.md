@@ -2428,3 +2428,14 @@ OXWASM_ANON_HEAT (calls before generated code is translated; default = 4), DFG, 
 default 188 / 162 (warm); 50: 262 / 200 and 234 / 213; 300: 330 / 184 and 245 / 184; 2000: 228 / 220. Delaying
 makes the interpreter and the callouts carry the code longer than the translation would have cost; the default
 stays.
+
+### V8's own wasm-into-wasm inlining: no gain
+
+Baseline JIT, OXWASM_NOLIFTOFF=1, one compile task, fresh key (cold99v8), medians of rounds 21-40. V8 defaults
+(inlining off): 228.5 (cold build), 202.5, 170.0, 186.5. --experimental-wasm-inlining
+--wasm-inlining-ignore-call-counts: 228.5, 210.5, 199.0. The same with --wasm-inlining-max-size=2000
+--wasm-inlining-budget=20000 --wasm-inlining-factor=6: 201.0, 195.5, 210.5. Peak rss 5.3-6.1 GB in all. The
+default-flag runs span 170-202 on this key, so the spread between identical runs is as large as any effect here;
+nothing in V8's inliner moves the round beyond noise (the direct calls inside a unit were already largely
+removed by our own inliner). One slip worth keeping in mind: the first batch of this experiment passed the flags
+in the wrong argument slot and so measured only defaults; the numbers above are the corrected runs.
