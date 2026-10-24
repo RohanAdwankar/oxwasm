@@ -105,6 +105,9 @@ const GUARDPG = typeof process !== 'undefined' && process.env?.OXWASM_GUARDPG ==
 // and 8 xmm from the regfile only to spill them again - the hottest 0x100 bytes of JSC's interpreter. With the
 // registers in memory a handler loads what it reads and stores what it writes, the loop carries no live ranges,
 // and a call needs no spill or reload at all. OXWASM_MEMREG=all applies it to every function (a measurement lever).
+// OXWASM_MEMREG_COLD=K: in every function the K least-used guest GPRs (by static references; never rsp) live in the regfile
+// instead of wasm locals, so TurboFan has fewer values to allocate. Registers in memory lost when applied to all of them.
+const MEMREG_COLD = Number((typeof process !== 'undefined' && process.env?.OXWASM_MEMREG_COLD) || 0);
 const MEMREG = (typeof process !== 'undefined' && process.env?.OXWASM_MEMREG) || '';
 // OXWASM_THREADED=1: a dispatch root (an interpreter) is emitted as one wasm function PER HANDLER REGION instead of
 // one giant function. A region is the set of blocks reachable from a handler entry (a jump-table target) without
@@ -151,7 +154,7 @@ export function splitDispatchRoot(an, entry) {
 // Rewrites a finished function's text: `(local.get $rN)` and `(local.set $rN E)` become loads and stores of slot 8N,
 // an i32 local's store zero-extends (the register is 32-bit), `$xN` maps to its xmm slot, and the spill/reload sites
 // of the register protocol - now copies of a slot onto itself - are deleted.
-export function regsToMemory(s, isI32, xmmOff, only = null) {   // only='x': the xmm locals alone (OXWASM_MEMREG=xmm)
+export function regsToMemory(s, isI32, xmmOff, only = null, regSet = null) {   // regSet: only these GPRs move to memory (xmm locals stay)   // only='x': the xmm locals alone (OXWASM_MEMREG=xmm)
   const closeOf = (t, i) => { let d = 0; for (let k = i; k < t.length; k++) { const c = t[k]; if (c === '(') d++; else if (c === ')') { d--; if (d === 0) return k + 1; } } return -1; };
   let out = '', i = 0;
   const re = /\(local\.(get|set) \$([rx])(\d+)([ )])/g;
@@ -161,7 +164,7 @@ export function regsToMemory(s, isI32, xmmOff, only = null) {   // only='x': the
     const m = re.exec(s);
     if (!m) break;
     const j = m.index, kind = m[1], cls = m[2], n = +m[3];
-    if (only !== null && cls !== only) { out += s.slice(i, j + m[0].length); i = j + m[0].length; continue; }
+    if ((only !== null && cls !== only) || (regSet !== null && (cls !== 'r' || !regSet.has(n)))) { out += s.slice(i, j + m[0].length); i = j + m[0].length; continue; }
     const off = cls === 'r' ? n * 8 : xmmOff + n * 16;
     if (kind === 'get') {
       const op = cls === 'x' ? 'v128.load' : isI32(n) ? 'i32.load' : 'i64.load';
@@ -172,7 +175,7 @@ export function regsToMemory(s, isI32, xmmOff, only = null) {   // only='x': the
     // set: rewrite the whole (local.set ...) extent so the i32 case can wrap its value
     const end = closeOf(s, j);
     const body = s.slice(j + m[0].length, end - 1);          // the value expression
-    const inner = regsToMemory(body, isI32, xmmOff, only);
+    const inner = regsToMemory(body, isI32, xmmOff, only, regSet);
     if (cls === 'x') out += s.slice(i, j) + `(v128.store offset=${off} (i32.const 0) ${inner})`;
     else if (isI32(n)) out += s.slice(i, j) + `(i64.store offset=${off} (i32.const 0) (i64.extend_i32_u ${inner}))`;
     else out += s.slice(i, j) + `(i64.store offset=${off} (i32.const 0) ${inner})`;
@@ -4424,6 +4427,11 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   // gets the dispatch layout.
   const MEGA_BIG = DISP && hasJtab && isDispatchRoot(a0, fnAddr);
   const finish = (w) => {
+    if (MEMREG_COLD > 0 && !(MEMREG && (MEMREG === 'all' || MEGA))) {   // the K least-used guest GPRs of this function live in the regfile, the rest stay in locals
+      const cnt = new Array(16).fill(0); for (const m of w.matchAll(/\(local\.(?:get|set) \$r(\d+)[ )]/g)) cnt[+m[1]]++;
+      const cand = [...cnt.keys()].filter((r) => r !== 4 && cnt[r] > 0 || false).sort((a, b) => cnt[a] - cnt[b]).slice(0, MEMREG_COLD);
+      if (cand.length) w = regsToMemory(w, isI32, XMMOFF, null, new Set(cand));
+    }
     if (MEMREG && (MEMREG === 'all' || MEGA)) w = regsToMemory(w, isI32, XMMOFF, MEMREG === 'xmm' ? 'x' : null);   // registers in the regfile, not locals (see MEMREG; =xmm: only the xmm locals of a dispatch root)
     if (w.length > (MEGA_BIG ? MAXWAT_MEGA : MAXWAT)) throw new Error('emitted function exceeds the runtime limit: ' + w.length + ' bytes of wat');
     return w;

@@ -2479,3 +2479,14 @@ keyed by Number now and the address sorts use a native double sort. Same generat
 units), translation 2.8 s -> 2.35 s. The rest of the time is spread thin: emission 17%, drain 17%, string assembly 12%,
 analysis 11%, decode 7%. Suite: only the cold-start "unrelated sandbox ... sandbox timeout reached" check failed
 (the same timing check that fails on the first run after any source edit); the network checks passed this time.
+
+### Selective registers-in-memory (OXWASM_MEMREG_COLD=K): fewer instructions, same time
+
+The registers-in-memory experiments put all 16 GPRs in the regfile (30-40% slower). A middle point: in every function the K
+least-referenced guest GPRs (never rsp) live in the regfile and the rest stay in wasm locals. TurboFan's machine code for the
+hot 117-function unit's main function: K=0 156,479 instructions (28.0% frame spills, 27.2% register moves); K=4 138,991
+(22.7% / 19.8%); K=6 120,148; K=8 115,788 (spills 43.8k -> 17.6k). Timed (baseline JIT, NOLIFTOFF, fresh key per K, medians of
+rounds 21-40): K=0 249 (cold build), 210, 215; K=4 230.5, 208.5, 232; K=6 230.5, 214.5, 234.5; K=8 281, 246, and a third run.
+Instruction count fell by up to 26% and the round did not move: the spill and move work TurboFan was doing on the cold registers
+is replaced by loads and stores of the same cost, which is why this is off by default and why instruction counts are not a
+proxy for time on this code.
