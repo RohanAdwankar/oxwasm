@@ -188,6 +188,7 @@ export const PGMAP = 0x300000, PGMAP_BYTES = 0x100000;
 // the refusal at the end of the function emitter for the two measurements
 // that bracket it.
 const PRICE_NOSYNC = typeof process !== 'undefined' && process.env?.OXWASM_PRICE_NOSYNC === '1';   // pricing only, unsound (see the call case)
+const INLINE_RETCHECK = !(typeof process !== 'undefined' && process.env?.OXWASM_INLINE_RETCHECK === '0');   // an inlined ret verifies the popped address (see the inlineret case)
 const RBPSTORE = !(typeof process !== 'undefined' && process.env?.OXWASM_RBPSTORE === '0');   // A/B lever for the rbp-store rule in gstore
 const PATCHJMP = !(typeof process !== 'undefined' && process.env?.OXWASM_PATCHJMP === '0');   // see patchSite
 const STALE_UNWIND = !(typeof process !== 'undefined' && process.env?.OXWASM_STALEUNWIND === '0');   // see FTSTALE
@@ -1430,7 +1431,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       term.push({kind:'inlinecall', t, ta: last.next}); succs.push([t]); }
     else if (last.inlineRet !== undefined) { const t = idxOfEdge(last.inlineRet);
       if (t < 0) throw new Error('AOT: inlined return site not a block');
-      term.push({kind:'inlineret', t, ta: last.next,
+      term.push({kind:'inlineret', t, ta: last.next, rt: BigInt(last.inlineRet),
                  pad: last.mnem === 'retn' ? Number(last.n) : 0}); succs.push([t]); }
     else if (last.inlineTailRet !== undefined) { const t = idxOfEdge(last.inlineTailRet);
       if (t < 0) throw new Error('AOT: inlined tail-call return site not a block');
@@ -4077,6 +4078,12 @@ function emitUnitFunction(a0, fnAddr, ctx) {
       // pop what the inlined call pushed. The continuation is known
       // statically, so the popped address is discarded rather than returned:
       // rsp moves exactly as it would natively, and control just falls on.
+      // ... unless the callee rewrote its return slot (an exception unwinder or a stack switch ends in a `ret` that pops
+      // some other address): then this is a real return to wherever the slot says, as an ordinary `ret` is
+      if (INLINE_RETCHECK) L.push(`(if (i64.ne (i64.load ${wasmAddr({base:4,index:-1,disp:0n},lnext)}) (i64.const ${hexs(t.rt)})) (then`,
+        `  (local.set $rex (i64.load ${wasmAddr({base:4,index:-1,disp:0n},lnext)}))`,
+        `  (local.set $r4 (i64.add (local.get $r4) (i64.const ${8 + t.pad})))`,
+        `  ${SX_MARK}`, `  (return (local.get $rex))))`);
       L.push(`(local.set $r4 (i64.add (local.get $r4) (i64.const ${8 + t.pad})))`);
       const b = brTo(t.t); if (b) L.push(b);
     } else if (t.kind === 'ret') {
@@ -4597,6 +4604,8 @@ export function compileUnitWat(mem, entry, opts = {}) {
   // and tier-up from 877ms to 4018ms. Pruning is worth more than inlining.
   // The inliner works with what is in the closure.
   const ONLY = (typeof process !== 'undefined' && process.env?.OXWASM_INLINE_ONLY) || '';
+  const HOSTS = (typeof process !== 'undefined' && process.env?.OXWASM_INLINE_HOSTS) || '';   // inline only INTO these functions (bisect aid)
+  const INLINE_HOSTS = HOSTS ? new Set(HOSTS.split(',').map(h => h.trim())) : null;
   const INLINE_ONLY = ONLY ? new Set(ONLY.split(',').map(h => BigInt('0x' + h.trim()).toString())) : null;
   const { guestBase, ramBase, maxFuncs = 96, maxInsns = 20000, skip } = opts;
   const TINY = opts.tiny ?? Number((typeof process !== 'undefined' && process.env?.OXWASM_UNPRUNE_TINY) ?? 16);
@@ -4787,7 +4796,7 @@ export function compileUnitWat(mem, entry, opts = {}) {
         // the unit CONTAINS - the callee keeps its own standalone function for
         // callers in other units - only how this one function reaches it.
         let use = an;
-        if (INLINE) {
+        if (INLINE && !(INLINE_HOSTS && !INLINE_HOSTS.has(BigInt(k).toString(16)))) {
           const tp0 = PHASE ? performance.now() : 0;
           try {
             const m = inlineCallees(an, BigInt(k), (t) =>

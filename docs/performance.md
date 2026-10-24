@@ -2362,3 +2362,20 @@ functions, eight of them into 1a9cd50, and vetoing 1a9cd50 (never compiled) stil
 many inlined copies at once, not one bad body, which points at a limit crossed by the volume (the 54-callee
 hosts 1abb0f8/1abb5b6 emit multi-MB functions) rather than at a wrong-code rule. Not resolved; the budgets stay
 at the defaults, and OXWASM_INLINE_LOG=1 now prints each unit's inlined callees and each tiny copy.
+
+### The inliner miscompile: an inlined `ret` assumed it returned to the call site (fixed)
+
+Found by bisecting: all 31 inline hosts fault, one host (1aa1c00) alone faults, and the 56-callee leave-one-out
+named no single callee, so the bug was not in any callee's body. The inlined `ret` popped the return slot and
+DISCARDED the popped address, falling on to the call site's continuation. A callee that rewrites its own return
+slot (a C++ exception unwinder's eh_return, a stack switch) pops some other address; the unit then carried on at
+the wrong place with the wrong frame, which is a corrupted guest heap a few instructions later (the libpas
+panics, the boot's fault at 0x88). The more callees inlined, the more chances one of them was such a path,
+hence the threshold between inline totals 1200 and 1600 and the size-looking dependence.
+
+The inlined return now loads the popped address and compares it with the continuation; on a mismatch it does an
+ordinary return to the address the slot holds (OXWASM_INLINE_RETCHECK=0 removes the check). One load and a
+compare per inlined return. With the check the boot passes at the total that always faulted, the suite is green
+(suite41), and six benchmark runs at OXWASM_UNPRUNE_TINY=160 OXWASM_INLINE_BUDGET=200 OXWASM_INLINE_TOTAL=2000
+(baseline JIT only, fresh key, medians of rounds 21-40): 223.5 (cold build), 211.5, 213.0, 211.0, 203.5, 197.0,
+no panic in any, against 232-254 for the default budgets on comparable keys: 12-15% off the round.
