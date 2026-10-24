@@ -2384,3 +2384,18 @@ DFG with the aggressive budgets and the return check (cold99n, NOLIFTOFF, one co
 195.0, no panic (reference DFG 187-208). The budgets are now the defaults: OXWASM_UNPRUNE_TINY=160,
 OXWASM_INLINE_BUDGET=200, OXWASM_INLINE_TOTAL=2000 (were 16 / 160 / 640); suite42 green. Note the unit cache
 (~/.cache/oxwasm/units) is keyed by the emitter source hash, so existing caches rebuild once.
+
+### Inlining budget sweep after the return-check fix (baseline JIT, fresh keys, medians of rounds 21-40, warm runs)
+
+| tiny / budget / total | runs (ms) |
+|---|---|
+| 160 / 200 / 2000 (default for a day) | 197.0, 203.5, 211.0, 211.5, 213.0, 201.5 |
+| 160 / 400 / 6000 | 187.0, 191.0 |
+| 320 / 300 / 4000 | 190.5, 182.0 (cold build 184) |
+| 320 / 600 / 8000 | 207.5, 195.5 |
+| 640 / 600 / 10000 | 194.0, 205.0 |
+| 16 / 160 / 640 (the old defaults) | 232-254 |
+
+No panic in any of the 22 runs. The curve is flat above 300/4000; the defaults are now 320 / 300 / 4000: about
+20% off the round against the old defaults (240 -> ~188). DFG with the 160/200/2000 budgets: 179-195.
+suite43 green.
