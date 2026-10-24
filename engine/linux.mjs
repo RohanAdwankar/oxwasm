@@ -1801,6 +1801,10 @@ export class LinuxEngine {
   // Deferred guard (CWRING in aot_wat.mjs): units record the stores that hit a marked line and call this at their
   // next spill point; the engine also drains it on every entry from compiled code (dispatch, callout, deopt,
   // syscall, loop yield) so nothing is dispatched or interpreted with a stale translation.
+  _blkDump() {
+    try { const cnt = [...(globalThis.__blkCnt ?? [])], seen = [...(globalThis.__blkSeen ?? new Map())];
+      process.getBuiltinModule('node:fs').writeFileSync(ENV.OXWASM_BLKTRACE_FILE || '/tmp/blkprof.json', JSON.stringify({ seen, cnt })); } catch {}
+  }
   _cwFlush() {
     if (!this.wmem) return;
     const dv = (this._ftdv ??= new DataView(this.wmem.buffer));
@@ -2014,6 +2018,10 @@ export class LinuxEngine {
     return {
       codewrite: (a, next, size) => this._codeWrite(a, next, size),
       cwflush: () => this._cwFlush(),
+      blk: (a) => {   // OXWASM_BLKTRACE profile: count block entries; dump now and then (the worker may be killed without an exit hook)
+        const c = (globalThis.__blkCnt ??= new Map()); a = a >>> 0; c.set(a, (c.get(a) | 0) + 1);
+        if ((globalThis.__blkN = (globalThis.__blkN | 0) + 1) % 4000000 === 0) this._blkDump();
+      },
       loophot: (a) => { if (this._ftdv !== undefined && this._ftdv.getUint32(CWRING, true) !== 0) this._cwFlush(); return this._loopHot(BigInt.asUintN(64, a)); },
       trace: (rip) => this._traceEntry(BigInt.asUintN(64, rip), 'C'),
       // rip = guest address of the syscall instruction (an emit-time constant)

@@ -2439,3 +2439,19 @@ default-flag runs span 170-202 on this key, so the spread between identical runs
 nothing in V8's inliner moves the round beyond noise (the direct calls inside a unit were already largely
 removed by our own inliner). One slip worth keeping in mind: the first batch of this experiment passed the flags
 in the wrong argument slot and so measured only defaults; the numbers above are the corrected runs.
+
+### Hot/cold splitting from a block-entry profile: smaller and faster to build, not faster to run
+
+OXWASM_BLKTRACE=1 instruments every block of static code with a counter call (and records each translated block's
+range); tools/coldset.py turns the dump into a cold set (translated, never entered, and not inside an executed
+block's range); OXWASM_COLD_FILE=<set> then makes control reaching a cold block a deopt point, as at undecodable
+bytes, so the cold blocks and everything only they reach are never translated. In the benchmark workload 68% of
+the 274,532 translated blocks are cold. The unit rooted at the hottest function drops from 117 functions and 20 MB
+of WAT to 5 functions and 248 KB; its main function from 9,229 to 6,123 machine instructions.
+
+A first set that ignored coverage (a leader in one unit is the middle of an executed block in another) was wrong:
+4.2 million deopts and 290 ms. With coverage: three runs 244.5 (cold build, 106 s against 210 s), 205.5, 252.5 ms,
+peak rss 3.8-5.0 GB against 5.3-6.1, 9-15k deopts a run, 6-7M entries a round (6.1M without the cut). The steady
+round is not faster (170-200 without): the hot code is the same code; TurboFan's output for it does not improve
+when the cold blocks around it are gone, and the instruction cache was not the limit. The value is memory and
+build time (and so DFG headroom), at the price of a workload-specific profile; off by default.

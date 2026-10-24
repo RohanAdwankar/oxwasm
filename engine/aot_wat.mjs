@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 // oxwasm M3 — AOT whole-function translator, x86-64 machine code -> WAT.
 // Recovers the function CFG and emits ONE wasm function: all 16 GPRs in
 // i64 locals for the function's lifetime, any control flow via the
@@ -200,6 +201,13 @@ const MAXWAT = Number(process.env.OXWASM_MAXWAT || 5_000_000);
 // OXWASM_TRACE_RANGE=lo-hi (hex): functions entered in the range call $x_trace at entry, after the regfile reloads, so the
 // engine can log their entry state and compare it with the interpreter's (OXWASM_EXEC_ANON=0) run of the same program.
 const TRACE_RANGE = typeof process !== 'undefined' && process.env?.OXWASM_TRACE_RANGE ? process.env.OXWASM_TRACE_RANGE.split('-').map((h) => BigInt('0x' + h)) : null;
+// OXWASM_BLKTRACE=1: every block of STATIC code counts its entry through the `blk` import (a profile run: slow, one-off), and the
+// emitted block starts are recorded in globalThis.__blkSeen. OXWASM_COLD_FILE=<file>: block starts (decimal or 0x hex, one per line)
+// that are NEVER translated: control reaching one deopts to the interpreter, as at undecodable bytes. A hot/cold split from a
+// BLKTRACE profile makes the functions TurboFan sees a fraction of their size.
+export const BLKTRACE = typeof process !== 'undefined' && process.env?.OXWASM_BLKTRACE === '1';
+const COLD = (typeof process !== 'undefined' && process.env?.OXWASM_COLD_FILE)
+  ? new Set(readFileSync(process.env.OXWASM_COLD_FILE, 'utf8').split('\n').map((l) => l.trim()).filter(Boolean).map(Number)) : null;
 const ESC_RANGES = typeof process !== 'undefined' && process.env?.OXWASM_ESC_RANGES ? process.env.OXWASM_ESC_RANGES.split(',').map((r) => { const [a, b] = r.split('-'); return [BigInt('0x' + a), BigInt('0x' + b)]; }) : null;
 const MEGA_SITE = Number((typeof process !== 'undefined' && process.env?.OXWASM_MEGA_SITE) || 256);
 // ... and the root has to be one of its handlers: a small function whose tail jump
@@ -651,6 +659,7 @@ export function analyze(mem, entry, { maxInsns = 20000, noJtab = false, entries 
     // -0x18000000 in opencode's image): wasm offsets wrap at 4 GB, so the fetch would read whatever lies there and
     // decode it as this function's code. It is a deopt point like undecodable bytes, and no extent is built from it.
     if (rip >= 0x800000000000n) { insnAt.set(key, { mnem: 'udec', rip, next: rip + 1n, len: 1, bogus: true }); continue; }
+    if (COLD !== null && COLD.has(kn) && rip !== entry) { insnAt.set(key, { mnem: 'udec', rip, next: rip + 1n, len: 1, cold: true }); continue; }
     try { insn = decode(fetcher(rip), rip); }
     catch (e) {
       // Undecodable bytes (padding, data, an unsupported encoding) become a
@@ -2957,6 +2966,7 @@ function emitUnitFunction(a0, fnAddr, ctx) {
   const jtabStarts = new Set([...jtabUnion].map(j => blocks[j].start));
   function emitBlock(i) {
     const blk = blocks[i]; const L = [];
+    if (BLKTRACE && !ctx.anon) { (globalThis.__blkSeen ??= new Map()).set(Number(blk.start), Number(blk.insns.length ? blk.insns[blk.insns.length - 1].next : blk.start)); L.push(`(call $x_blk (i32.const ${Number(blk.start) | 0}))`); }
     if (BLKPROF.size && BLKPROF.has(fnAddr.toString())) { const sl = blkprofSlot(blk.start); L.push(`(i64.store (i32.const ${sl}) (i64.add (i64.load (i32.const ${sl})) (i64.const 1)))`); }
     const producers = new Set();
     for (let idx = 0; idx < blk.insns.length; idx++) if (matProducers.has(i+':'+idx)) producers.add(idx);
@@ -4854,7 +4864,8 @@ export function compileUnitWat(mem, entry, opts = {}) {
   // Only when the guard is on, so a module built without it keeps exactly the
   // imports every existing consumer supplies.
   if (STOREGUARD) wat += '  (import "env" "codewrite" (func $x_cw (param i32 i64 i32)))\n';   // (address, guest rip after the storing instruction)
-  if (CWDEFER) wat += '  (import "env" "cwflush" (func $x_cwflush))\n';   // flush the recorded code writes (see CWRING)
+  if (CWDEFER) wat += '  (import "env" "cwflush" (func $x_cwflush))\n';
+  if (BLKTRACE) wat += '  (import "env" "blk" (func $x_blk (param i32)))\n';   // flush the recorded code writes (see CWRING)
   if (TRACE_RANGE) wat += '  (import "env" "trace" (func $x_trace (param i64)))\n';
   // the global dispatch table + its in-wasm resolver, iff some site chains
   // through it (indirect call, out-of-unit static call, indirect tail jump)
