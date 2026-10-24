@@ -4555,11 +4555,11 @@ export const LOOPYIELD_N = (typeof process !== 'undefined' && +process.env?.OXWA
 const inlineEnabled = () => globalThis.__inline ??
   !(typeof process !== 'undefined' && process.env?.OXWASM_INLINE === '0');
 const inlineBudget = () => Number(
-  (typeof process !== 'undefined' && process.env?.OXWASM_INLINE_BUDGET) || 160);
+  (typeof process !== 'undefined' && process.env?.OXWASM_INLINE_BUDGET) || 200);   // was 160: see the inlined-ret fix in docs/performance.md
 // Per-function cap on duplicated instructions. A callee at 8 sites is 8
 // copies, so the interesting limit is the total, not the per-callee size.
 const inlineTotal = () => Number(
-  (typeof process !== 'undefined' && process.env?.OXWASM_INLINE_TOTAL) || 640);
+  (typeof process !== 'undefined' && process.env?.OXWASM_INLINE_TOTAL) || 2000);   // was 640
 
 
 // Text peephole over a finished module: `(i64.and X (i64.const 0xFFFFFFFF))` becomes `(i64.extend_i32_u (i32.wrap_i64 X))`.
@@ -4608,7 +4608,7 @@ export function compileUnitWat(mem, entry, opts = {}) {
   const INLINE_HOSTS = HOSTS ? new Set(HOSTS.split(',').map(h => h.trim())) : null;
   const INLINE_ONLY = ONLY ? new Set(ONLY.split(',').map(h => BigInt('0x' + h.trim()).toString())) : null;
   const { guestBase, ramBase, maxFuncs = 96, maxInsns = 20000, skip } = opts;
-  const TINY = opts.tiny ?? Number((typeof process !== 'undefined' && process.env?.OXWASM_UNPRUNE_TINY) ?? 16);
+  const TINY = opts.tiny ?? Number((typeof process !== 'undefined' && process.env?.OXWASM_UNPRUNE_TINY) ?? 160);   // was 16
   const tinyMemo = opts.tinyMemo || new Map();
   const isTiny = (a) => {
     if (!(TINY > 0)) return false;

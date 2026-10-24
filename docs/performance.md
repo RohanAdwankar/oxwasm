@@ -2379,3 +2379,8 @@ compare per inlined return. With the check the boot passes at the total that alw
 (suite41), and six benchmark runs at OXWASM_UNPRUNE_TINY=160 OXWASM_INLINE_BUDGET=200 OXWASM_INLINE_TOTAL=2000
 (baseline JIT only, fresh key, medians of rounds 21-40): 223.5 (cold build), 211.5, 213.0, 211.0, 203.5, 197.0,
 no panic in any, against 232-254 for the default budgets on comparable keys: 12-15% off the round.
+
+DFG with the aggressive budgets and the return check (cold99n, NOLIFTOFF, one compile task): 193.5 (cold build), 179.0,
+195.0, no panic (reference DFG 187-208). The budgets are now the defaults: OXWASM_UNPRUNE_TINY=160,
+OXWASM_INLINE_BUDGET=200, OXWASM_INLINE_TOTAL=2000 (were 16 / 160 / 640); suite42 green. Note the unit cache
+(~/.cache/oxwasm/units) is keyed by the emitter source hash, so existing caches rebuild once.
