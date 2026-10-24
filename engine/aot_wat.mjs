@@ -4666,7 +4666,7 @@ export function compileUnitWat(mem, entry, opts = {}) {
     if (skip && k !== entry.toString() && skip(k) && !isTiny(a)) {
       if (!(HOTUN > 0 && hotSites.has(k) && hotSpent < HOTUN)) continue;
       hotOnly = true;
-    }
+    } else if (skip && k !== entry.toString() && skip(k) && typeof process !== 'undefined' && process.env?.OXWASM_INLINE_LOG) console.error(`[tiny-dup] ${entry.toString(16)} <- ${a.toString(16)}`);   // a pruned callee kept as a tiny copy (OXWASM_FNVETO_FILE bisects)
     // A callee whose analysis or emit failed in an earlier unit fails the
     // same way in this one (the bytes have not changed; the engine clears the
     // memo when they do): poison it without analysing again. rustc-asm
@@ -4798,6 +4798,7 @@ export function compileUnitWat(mem, entry, opts = {}) {
                   (st.rej = st.rej || []).push(BigInt(t).toString(16) + ':' + why + ' in ' + k);
                 } : null });
             if (m) { use = m;
+              if (typeof process !== 'undefined' && process.env?.OXWASM_INLINE_LOG) console.error(`[inlined] ${BigInt(k).toString(16)} <- ${[...m.inlined].map((t) => BigInt(t).toString(16)).join(',')}`);   // for OXWASM_INLINE_ONLY bisects
               for (const t of m.inlined) uses.get(k).add(typeof t === 'string' ? t : BigInt(t).toString());   // an inlined body is a use too
               globalThis.__inlStats = globalThis.__inlStats || { fns: 0, callees: 0 };
               globalThis.__inlStats.fns++; globalThis.__inlStats.callees += m.inlined.length; }

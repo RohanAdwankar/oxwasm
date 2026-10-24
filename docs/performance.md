@@ -2349,3 +2349,16 @@ sources and boot options, not by the unit cache key), so they never compiled the
 The isolation test's sandboxes (network, memMB) have their own snapshot keys and boot cold. So the aggressive
 inlining budgets miscompile the default rootfs's boot deterministically on a cold compile, which is a
 reproducer; the temp-name change stays as hygiene.
+
+### The aggressive-inlining boot fault: what is and is not established
+
+Cold boot of the default rootfs (fresh snapshot key, so the boot units really compile) with
+OXWASM_UNPRUNE_TINY=160 OXWASM_INLINE_BUDGET=200 OXWASM_INLINE_TOTAL=2000 faults at 0x88 every time (7 of 7).
+Each of these passes: tiny copies alone, inlining off with tiny=160, budget 200 with total 400, budget 160 with
+total 2000, tiny=64 with 200/2000, and each single knob. Restricting the inliner to either half of the 56
+callees it uses passes; the full set faults (OXWASM_INLINE_ONLY). A leave-one-out over the 56 (43 faults, 13
+passes) names no single culprit: the 13 whose removal fixes the boot are inlined into 20-odd different host
+functions, eight of them into 1a9cd50, and vetoing 1a9cd50 (never compiled) still faults. So the failure needs
+many inlined copies at once, not one bad body, which points at a limit crossed by the volume (the 54-callee
+hosts 1abb0f8/1abb5b6 emit multi-MB functions) rather than at a wrong-code rule. Not resolved; the budgets stay
+at the defaults, and OXWASM_INLINE_LOG=1 now prints each unit's inlined callees and each tiny copy.
