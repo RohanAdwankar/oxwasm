@@ -2514,3 +2514,7 @@ With the baseline JIT and growth factor 64, raising BUN_JSC_largeHeapSize to 256
 ## JSC generational/concurrent GC off (rejected)
 
 Baseline JIT with growth factor 64: useGenerationalGC=0 gives sums 196.0 and 197.5 ms; useConcurrentGC=0 gives 231.0 and 177.0 ms. All inside the 165-225 ms noise band of the reference, so neither option helps. Native remains 27.5 ms; goal not met.
+
+## V8 turboshaft/loop flags on DFG + growth factor 64 (no effect)
+
+Window sums (ms, two runs each): reference 151.0/136.5; --turboshaft-wasm-instruction-selection-experimental 149.0/128.5; --no-wasm-loop-peeling --no-wasm-loop-unrolling 134.0/131.0; --turboshaft-wasm-load-elimination 105.5/147.0. The one 105.5 was not reproduced (147.0), so all are within the +-15% noise. Native is 27.5 ms; goal not met.
