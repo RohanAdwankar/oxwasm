@@ -2532,3 +2532,7 @@ Size of the table-update lead: the engine's own tabSetMs counter reads 2,433 ms 
 ## Static composition of the emitted WAT (400-unit sample of a DFG run)
 
 73% of i64.store instructions (374,590 of 509,830) are full register-file stores to fixed slots, with 251,904 matching reloads; 73,665 code-write guard calls; 53,063 indirect/cross-unit calls; 85,383 $rex sets. Counts are static, so they do not say which are executed. Earlier hot/cold work (memory-only gain) suggests most sit on exit, deopt and call-out paths. Open question for the emitter project: weight each sync site by BLKTRACE block counts to find any that are on hot paths. Goal not met (about 100 ms vs 27.5 ms native).
+
+## Where the register-file syncs sit (read from a dumped unit)
+
+Reading u_5a6dbb.wat: the unmatched-return path stores the live registers and returns (cold), but every non-inlined call site also stores the live registers to the register file before the call and each unit entry reloads all 16 (emitter line ~604). So the register file is the calling convention, and a hot call pays stores at the site plus loads in the callee. Passing live registers as wasm parameters/results instead would remove that memory traffic, but V8 passes only a few i64 params in registers and spills the rest to the stack, and the callee set of used registers must be known per function. Not attempted: the expected gain is a fraction of the 3.7x gap and it changes the ABI of every unit (cold rebuild plus full suite).
