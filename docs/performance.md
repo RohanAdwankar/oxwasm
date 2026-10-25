@@ -2500,3 +2500,9 @@ maps 52-65, json 28-30). DFG with factor 64 (cold99dg, 60 rounds, medians of rou
 104-106; peak rss 6.2-8.9 GB), against 150-190 for DFG at factor 3 in comparable windows. This is a guest environment
 setting, not an engine change: the SDK sets none of JSC's options, so a launcher for a long-running session should set
 the three factors high (memory permitting: 64x a 100 MB live heap would not fit a small guest; 16 is the safer pick).
+
+Two 120-round DFG runs with growth factor 64 (cold99dg, windows of 20 rounds, medians): 204, 170, 134, 160, 160 and
+266, 136, 152, 122, 137 ms; best rounds 99-109; peak rss 7.0-7.3 GB. Settled medians 120-160 ms against 27.5 native with
+the same tiers: 4.4-5.8x. Best configuration measured so far: DFG on (FTL off), growth factor 64 (16 if memory is tight),
+OXWASM_NOLIFTOFF=1, V8 --wasm-num-compilation-tasks=1, glibc MALLOC_MMAP_THRESHOLD_=131072 MALLOC_TRIM_THRESHOLD_=4194304,
+inlining defaults as committed.
