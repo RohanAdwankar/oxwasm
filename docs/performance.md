@@ -2490,3 +2490,13 @@ rounds 21-40): K=0 249 (cold build), 210, 215; K=4 230.5, 208.5, 232; K=6 230.5,
 Instruction count fell by up to 26% and the round did not move: the spill and move work TurboFan was doing on the cold registers
 is replaced by loads and stores of the same cost, which is why this is off by default and why instruction counts are not a
 proxy for time on this code.
+
+### JSC heap growth factors (guest option): fewer collections, 10-15% off the allocation-heavy phases
+
+The collector is native code and runs translated. BUN_JSC_{small,medium,large}HeapGrowthFactor (the harness uses 3; JSC's
+default is 2) set how much the heap may grow between collections. Baseline JIT, NOLIFTOFF, same warm cache, medians of
+rounds 21-40: factor 3: 210, 215; factor 16: 168.5, 195.5; factor 64: 182.0, 179.0 (objects 17 against 24-37, strings 11,
+maps 52-65, json 28-30). DFG with factor 64 (cold99dg, 60 rounds, medians of rounds 41-60): 126, 128, 195 (best rounds
+104-106; peak rss 6.2-8.9 GB), against 150-190 for DFG at factor 3 in comparable windows. This is a guest environment
+setting, not an engine change: the SDK sets none of JSC's options, so a launcher for a long-running session should set
+the three factors high (memory permitting: 64x a 100 MB live heap would not fit a small guest; 16 is the safer pick).
