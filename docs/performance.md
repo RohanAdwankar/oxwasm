@@ -2522,3 +2522,7 @@ Window sums (ms, two runs each): reference 151.0/136.5; --turboshaft-wasm-instru
 ## More V8 flags on DFG + growth factor 64 (no effect)
 
 Window sums (ms, two runs each): --turboshaft-wasm-instruction-selection-staged 118.0/129.5; --turboshaft-future 128.5/102.0; --no-wasm-code-gc with 4 GB committed code 111.0/157.5. Reference was 151.0/136.5. Spread inside each pair is as large as the difference from reference, so none is a demonstrated gain. Native is 27.5 ms; goal not met.
+
+## Profile of a DFG + growth factor 64 run (node --prof, whole process)
+
+Steady figure for the run was 102 ms (best of rounds 20..39). Ticks after 60% of the run: 80% inside the node binary, almost all of it TurboFan (LinearScanAllocator, LiveRange::Covers, GraphReducer, Scheduler) attributed to dispatchAot, plus WasmDispatchTable::Clear under registerAotFn and tierUpAot (about 6,000 ticks). 6,010 wasm functions were created in that window. Individual rounds still spike (round 20: 138 ms, round 25: 689 ms) while the settled median is lower, so wall clock for a real session includes compile bursts the medians hide. Two leads: the funcref-table update cost per registered function (WasmDispatchTable::Clear), and synchronous compilation on the dispatch path. tools/winprof.py now skips log lines interleaved by concurrent writers. Goal not met.

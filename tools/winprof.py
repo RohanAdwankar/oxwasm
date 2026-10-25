@@ -10,11 +10,13 @@ for l in open(dbg, errors='replace'):
 fr = pn[fr_r - 1] * 1000; to = pn[to_r] * 1000
 starts = []; ends = []; names = []; cts = []; ticks = []; libs = []
 for l in open(log, errors='replace'):
-    if l.startswith('code-creation,'):
-        p = l.rstrip('\n').split(','); s = int(p[4], 16); starts.append(s); ends.append(s + int(p[5])); names.append(p[6]); cts.append(int(p[3]))
-    elif l.startswith('tick,'):
+    try:
+      if l.startswith('code-creation,'):
+        p = l.rstrip('\n').split(','); s = int(p[4], 16); e = s + int(p[5]); t = int(p[3]); starts.append(s); ends.append(e); names.append(p[6]); cts.append(t)
+      elif l.startswith('tick,'):
         p = l.rstrip('\n').split(','); ticks.append((int(p[2]), [int(x, 16) for x in [p[1]] + p[5:] if x and x != '0']))
-    elif l.startswith('shared-library,'):
+    except ValueError: continue   # lines interleaved by concurrent writers
+    if l.startswith('shared-library,'):
         p = l.split(','); libs.append((p[1], int(p[2], 16), int(p[3], 16)))
 def loadsyms(f, base):
     a = []
