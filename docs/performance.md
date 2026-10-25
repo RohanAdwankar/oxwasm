@@ -2510,3 +2510,7 @@ inlining defaults as committed.
 ## JSC large-heap-size floor (rejected)
 
 With the baseline JIT and growth factor 64, raising BUN_JSC_largeHeapSize to 256 MB (sums 170.5, 225.5 ms) and 768 MB (175.5, 164.5 ms) is inside the existing 170-200 ms run-to-run band. Once the growth factors are 64 the heap-size thresholds add nothing. The DFG settled medians (about 120-160 ms) remain the best result; native is 27.5 ms, so the goal (within 20%) is still not met.
+
+## JSC generational/concurrent GC off (rejected)
+
+Baseline JIT with growth factor 64: useGenerationalGC=0 gives sums 196.0 and 197.5 ms; useConcurrentGC=0 gives 231.0 and 177.0 ms. All inside the 165-225 ms noise band of the reference, so neither option helps. Native remains 27.5 ms; goal not met.
