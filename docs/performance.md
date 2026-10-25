@@ -2506,3 +2506,7 @@ Two 120-round DFG runs with growth factor 64 (cold99dg, windows of 20 rounds, me
 the same tiers: 4.4-5.8x. Best configuration measured so far: DFG on (FTL off), growth factor 64 (16 if memory is tight),
 OXWASM_NOLIFTOFF=1, V8 --wasm-num-compilation-tasks=1, glibc MALLOC_MMAP_THRESHOLD_=131072 MALLOC_TRIM_THRESHOLD_=4194304,
 inlining defaults as committed.
+
+## JSC large-heap-size floor (rejected)
+
+With the baseline JIT and growth factor 64, raising BUN_JSC_largeHeapSize to 256 MB (sums 170.5, 225.5 ms) and 768 MB (175.5, 164.5 ms) is inside the existing 170-200 ms run-to-run band. Once the growth factors are 64 the heap-size thresholds add nothing. The DFG settled medians (about 120-160 ms) remain the best result; native is 27.5 ms, so the goal (within 20%) is still not met.
