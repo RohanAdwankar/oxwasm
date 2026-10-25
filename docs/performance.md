@@ -2518,3 +2518,7 @@ Baseline JIT with growth factor 64: useGenerationalGC=0 gives sums 196.0 and 197
 ## V8 turboshaft/loop flags on DFG + growth factor 64 (no effect)
 
 Window sums (ms, two runs each): reference 151.0/136.5; --turboshaft-wasm-instruction-selection-experimental 149.0/128.5; --no-wasm-loop-peeling --no-wasm-loop-unrolling 134.0/131.0; --turboshaft-wasm-load-elimination 105.5/147.0. The one 105.5 was not reproduced (147.0), so all are within the +-15% noise. Native is 27.5 ms; goal not met.
+
+## More V8 flags on DFG + growth factor 64 (no effect)
+
+Window sums (ms, two runs each): --turboshaft-wasm-instruction-selection-staged 118.0/129.5; --turboshaft-future 128.5/102.0; --no-wasm-code-gc with 4 GB committed code 111.0/157.5. Reference was 151.0/136.5. Spread inside each pair is as large as the difference from reference, so none is a demonstrated gain. Native is 27.5 ms; goal not met.
